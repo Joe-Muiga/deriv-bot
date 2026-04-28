@@ -1,0 +1,36 @@
+# render.yaml – Render.com deployment configuration
+# Docs: https://render.com/docs/render-yaml-reference
+
+services:
+  - type: web
+    name: sifm-deriv-bot
+    runtime: python
+    region: oregon    # or frankfurt for EU
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+
+    # Render free plan: always-on via our self-ping mechanism
+    plan: free
+
+    envVars:
+      # ── REQUIRED: add these in Render Dashboard → Environment ──────────
+      - key: DERIV_API_TOKEN
+        sync: false          # enter manually – never commit to git!
+
+      - key: DERIV_APP_ID
+        value: "1089"        # replace with your app ID from api.deriv.com
+
+      # ── Auto-populated by Render ────────────────────────────────────────
+      - key: RENDER_EXTERNAL_URL
+        fromService:
+          name: sifm-deriv-bot
+          type: web
+          property: host
+
+      # ── Optional tweaks ─────────────────────────────────────────────────
+      - key: LOG_LEVEL
+        value: INFO
+
+      - key: PORT
+        value: "8080"
