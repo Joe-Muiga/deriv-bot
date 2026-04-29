@@ -88,7 +88,7 @@ class BotEngine:
         ws_task = asyncio.create_task(self.client.connect())
 
         # Wait up to 60 s for connection
-        for _ in range(60):
+        for _ in range(300):
             if self.client.is_connected:
                 break
             await asyncio.sleep(1)
