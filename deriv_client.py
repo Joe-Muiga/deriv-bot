@@ -98,6 +98,7 @@ class DerivClient:
                 logger.debug(f"Dispatch error: {exc}")
 
     async def _handle(self, msg: dict):
+        logger.debug(f"RAW MSG: {msg}")
         msg_type = msg.get("msg_type", "")
         req_id   = msg.get("req_id")
         error    = msg.get("error")
