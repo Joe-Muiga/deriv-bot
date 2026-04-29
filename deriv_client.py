@@ -150,7 +150,7 @@ class DerivClient:
 
     # ─── Request helper ───────────────────────────────────────────────────────
 
-    async def _send(self, payload: dict, timeout: float = 15.0) -> dict:
+    async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
         """Send a request and await the response."""
         if not self._ws or not self._connected:
             raise RuntimeError("Not connected")
@@ -175,7 +175,7 @@ class DerivClient:
         if not config.DERIV_API_TOKEN:
             raise ValueError("DERIV_API_TOKEN is not set. "
                              "Add it to your Render environment variables.")
-        resp = await self._send({"authorize": config.DERIV_API_TOKEN})
+        resp = await self._send({"authorize": config.DERIV_API_TOKEN}, timeout=30.0)
         account = resp.get("authorize", {})
         self._balance  = float(account.get("balance", 0))
         self._authorized = True
