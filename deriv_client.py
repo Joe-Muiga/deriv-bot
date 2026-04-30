@@ -62,8 +62,8 @@ class DerivClient:
                 logger.info(f"Connecting to {config.DERIV_WS_URL} …")
                 async with websockets.connect(
                     config.DERIV_WS_URL,
-                    ping_interval=30,
-                    ping_timeout=10,
+                    ping_interval=20,
+                    ping_timeout=20,
                     close_timeout=5,
                 ) as ws:
                     self._ws        = ws
