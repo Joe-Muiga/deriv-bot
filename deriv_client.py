@@ -174,14 +174,18 @@ class DerivClient:
 
     async def _authorize(self):
         if not config.DERIV_API_TOKEN:
-            raise ValueError("DERIV_API_TOKEN is not set. "
-                             "Add it to your Render environment variables.")
-        resp = await self._send({"authorize": config.DERIV_API_TOKEN}, timeout=30.0)
-        account = resp.get("authorize", {})
-        self._balance  = float(account.get("balance", 0))
+            raise ValueError("DERIV_API_TOKEN is not set. ")
+        payload = {"authorie": config.DERIV_API_TOKEN, "req_id": 1}
+        await self._ws.send(json.dumps(payload))
+      # wait for response manually
+        raw = await asyncio.wait_for(self.ws.recv(), timeout=30)
+        msg = json.loads(raw)
+        account = msg.get("authorize" , {})
+        self._balance = float(account.get("balance", 0))
         self._authorized = True
-        logger.info(f"Authorized as {account.get('email', '?')} | "
-                    f"Balance: ${self._balance:.4f}")
+        self._req_id_counter = 2 
+        logger.info(f"Authorized | Balance: ${self._balance:.4f}")
+        
 
     async def _subscribe_balance(self):
         await self._send({"balance": 1, "subscribe": 1})
