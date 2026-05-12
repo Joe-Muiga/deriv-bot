@@ -55,6 +55,7 @@ class DerivClient:
 
     async def connect(self):
         """Connect, authorize, and start the message-dispatch loop."""
+        self._connected.set()
         self._loop = asyncio.get_event_loop()
         retry_delay = 2
         while True:
@@ -188,7 +189,7 @@ class DerivClient:
         logger.info(f"Authorized | Balance: ${self._balance:.4f}")
 
     async def _subscribe_balance(self):
-        await self._send({"balance": 1, "subscribe": 1})
+        await self._send({"balance": 1, "req_id": 2})
         logger.info("Balance subscription active")
 
     def on_balance(self, callback: Callable[[float], None]):
@@ -207,6 +208,7 @@ class DerivClient:
         Fetch historical OHLCV bars via ticks_history.
         Returns list of {epoch, open, high, low, close} dicts.
         """
+        await self._connected.wait()                    
         try:
             resp = await self._send({
                 "ticks_history": symbol,
