@@ -14,25 +14,27 @@ DERIV_WS_URL    = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 DERIV_CURRENCY  = "USD"
 
 # ─── Timeframes ──────────────────────────────────────────────────────────────
-HTF_GRANULARITY  = 3600   # 1 hour
-LTF_GRANULARITY  = 300    # 5 minutes
+HTF_GRANULARITY  = 3600   # 1 hour  – structure/bias detection
+LTF_GRANULARITY  = 60     # 1 MINUTE – was 5M; 5x more candles = 5x more signals
 HTF_BARS         = 100
-LTF_BARS         = 200
+LTF_BARS         = 300    # 300 x 1M = 5 hours of LTF history
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
 DAILY_LOSS_LIMIT_PCT  = 0.09
 RISK_PER_TRADE_PCT    = 0.01
-MIN_STAKE             = 0.35
+MIN_STAKE             = 0.50   # Deriv minimum
 MAX_STAKE             = 500.0
-MAX_CONCURRENT_TRADES = 3
+MAX_CONCURRENT_TRADES = 1      # Keep at 1 while balance is low
 
-# ─── Strategy (RELAXED for realistic signal generation) ──────────────────────
-MIN_MODULES_FOR_SIGNAL = 1     # CHANGED: 1/3 modules enough to trade (was 2)
-MIN_INDICATOR_VOTES    = 4     # CHANGED: 4/7 indicators (was 5/7)
-OB_EXPIRY_BARS         = 50    # CHANGED: OBs live longer (was 20)
-ATR_ZONE_FACTOR        = 1.0   # CHANGED: wider zone tolerance (was 0.5)
-NEWS_BLOCK_MINUTES     = 30
-DIVERGENCE_STRENGTH_MIN = 0.1  # CHANGED: easier divergence (was 0.3)
+# ─── Strategy ────────────────────────────────────────────────────────────────
+# ACCURACY: require 2/3 modules (strict)
+# FREQUENCY: comes from 1M LTF + dual-EMA module that fires continuously in trends
+MIN_MODULES_FOR_SIGNAL  = 2     # Accuracy gate — do NOT lower this
+MIN_INDICATOR_VOTES     = 4     # 4/7 indicators must agree
+OB_EXPIRY_BARS          = 35    # Balanced (was 20 orig, 50 relaxed)
+ATR_ZONE_FACTOR         = 0.75  # Balanced zone width
+NEWS_BLOCK_MINUTES      = 30
+DIVERGENCE_STRENGTH_MIN = 0.15
 
 # ─── Trade Execution ──────────────────────────────────────────────────────────
 TRADE_DURATION      = 5
