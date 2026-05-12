@@ -84,11 +84,14 @@ class BotEngine:
         logger.info("  SIFM Deriv Trading Bot  –  starting")
         logger.info("=" * 64)
 
+        # Register balance callback BEFORE connecting so we don't miss updates
+        self.client.on_balance(self._on_balance)
+
         # Start WebSocket in background
         ws_task = asyncio.create_task(self.client.connect())
 
-        # Wait up to 60 s for connection
-        for _ in range(300):
+        # Wait up to 60 s for connection + authorisation
+        for _ in range(60):
             if self.client.is_connected:
                 break
             await asyncio.sleep(1)
@@ -98,7 +101,6 @@ class BotEngine:
             ws_task.cancel()
             return
 
-        self.client.on_balance(self._on_balance)
         self.risk.set_balance(self.client.balance)
 
         # Discover tradeable symbols
@@ -138,10 +140,6 @@ class BotEngine:
         logger.info(f"Symbol queue: {len(self._queue)} instruments")
 
     # ─── Dashboard push loop ──────────────────────────────────────────────────
-
-  async def on_authorize(self, response):
-    # Only start loading historical data after auth confirmed
-    await self.load_all_symbols()
 
     async def _dashboard_loop(self):
         while True:
