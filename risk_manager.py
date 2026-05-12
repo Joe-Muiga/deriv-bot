@@ -124,7 +124,7 @@ class RiskManager:
 import os
 
 if os.environ.get("FORCE_RESET_DAILY_LOSS", "").lower() == "true":
-    Risk_Manager.force_reset_daily(current_balance)
+    RiskManager.force_reset_daily(current_balance)
 
     @property
     def is_paused(self) -> bool:
