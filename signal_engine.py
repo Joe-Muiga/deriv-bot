@@ -1,9 +1,15 @@
 """
 signal_engine.py – Phase B of SIFM: Lower-Timeframe Entry Scan.
 
-Module 1 – MTFA alignment + RSI (divergence OR oversold/overbought)
-Module 2 – Candlestick confluence
-Module 3 – 7-indicator quantitative vote (≥ 4/7 required)
+Design philosophy:
+  HIGH FREQUENCY: Module 1 uses dual EMA alignment (9/21) which fires on every
+                  bar where the trend is intact — many signals per hour on 1M LTF.
+  HIGH ACCURACY:  Requires 2/3 modules confirmed. Module 3 (7-indicator vote)
+                  is the quality gate. Both must agree with HTF bias.
+
+Module 1 – Dual EMA alignment + RSI momentum confirmation
+Module 2 – Candlestick confluence (pattern confirmation)
+Module 3 – 7-indicator quantitative vote (≥4/7 required)
 """
 
 import numpy as np
@@ -28,43 +34,61 @@ class SignalResult:
     reason:     str
 
 
-# ─── Module 1 – MTFA + RSI ───────────────────────────────────────────────────
+# ─── Module 1 – Dual EMA Alignment + RSI Momentum ────────────────────────────
 
 def module1_mtfa_rsi(ltf_bars: List[Candle], htf_bias: str) -> int:
     """
-    CHANGED: Now fires on EMA slope alone OR RSI divergence alone (not both).
-    Also added RSI oversold/overbought as a trigger.
+    Primary frequency driver.
+
+    Uses dual EMA (9/21) crossover on the LTF — the same logic as the HTF
+    structure detector but on the lower timeframe. When both HTF and LTF EMAs
+    agree, the trend is strongly confirmed.
+
+    Also checks:
+    - RSI momentum: above 50 (bullish) or below 50 (bearish) — simple and reliable
+    - RSI not extreme: avoids entering at overbought/oversold exhaustion
+    - Divergence as a bonus signal
+
+    Fires on EVERY bar where EMAs are aligned → high frequency in trending markets.
     """
     if len(ltf_bars) < 25:
         return 0
+
     closes = np.array([b.close for b in ltf_bars])
 
-    ema20 = ind.ema(closes, 20)
-    rsi14 = ind.rsi(closes, 14)
+    ema9_arr  = ind.ema(closes, 9)
+    ema21_arr = ind.ema(closes, 21)
+    rsi14     = ind.rsi(closes, 14)
 
-    valid_ema = ema20[~np.isnan(ema20)]
+    valid9    = ema9_arr[~np.isnan(ema9_arr)]
+    valid21   = ema21_arr[~np.isnan(ema21_arr)]
     valid_rsi = rsi14[~np.isnan(rsi14)]
 
-    if len(valid_ema) < 2:
+    if len(valid9) < 3 or len(valid21) < 3:
         return 0
 
-    slope = valid_ema[-1] - valid_ema[-2]
+    e9  = valid9[-1]
+    e21 = valid21[-1]
+    # EMA slope over last 3 bars (sensitive to recent direction changes)
+    slope9 = valid9[-1] - valid9[-3]
+
     last_rsi = float(valid_rsi[-1]) if len(valid_rsi) else 50.0
 
-    # Divergence (bonus confirmation, not required)
     try:
         div = ind.find_rsi_divergence(closes, rsi14, lookback=20)
     except Exception:
         div = 0
 
     if htf_bias == "LONG":
-        # CHANGED: EMA slope up OR RSI oversold (<35) OR divergence
-        if slope > 0 or last_rsi < 35 or div == +1:
+        ema_aligned = e9 > e21 and slope9 > 0          # EMA bullish alignment
+        rsi_ok      = 45 < last_rsi < 75               # Momentum up, not exhausted
+        if ema_aligned or rsi_ok or div == +1:
             return +1
 
     if htf_bias == "SHORT":
-        # CHANGED: EMA slope down OR RSI overbought (>65) OR divergence
-        if slope < 0 or last_rsi > 65 or div == -1:
+        ema_aligned = e9 < e21 and slope9 < 0          # EMA bearish alignment
+        rsi_ok      = 25 < last_rsi < 55               # Momentum down, not exhausted
+        if ema_aligned or rsi_ok or div == -1:
             return -1
 
     return 0
@@ -74,10 +98,16 @@ def module1_mtfa_rsi(ltf_bars: List[Candle], htf_bias: str) -> int:
 
 def module2_candlestick(ltf_bars: List[Candle]) -> int:
     """
-    CHANGED: Volume confirmation relaxed from 1.5× to 1.1× average.
-    Also added pin bar / hammer detection.
+    Pattern confirmation module.
+    Volume threshold: 1.1× average (relaxed for frequency).
+    Includes: engulfing, morning/evening star, hammer/pin bar,
+              shooting star, three-line strike, momentum candle.
+
+    A "momentum candle" is added: a large body candle (>1.5× average body)
+    in the trend direction with above-average volume. Very common on 1M charts
+    during trend continuation — boosts frequency significantly.
     """
-    if len(ltf_bars) < 4:
+    if len(ltf_bars) < 5:
         return 0
 
     c    = ltf_bars
@@ -87,14 +117,26 @@ def module2_candlestick(ltf_bars: List[Candle]) -> int:
 
     volumes = [b.volume for b in ltf_bars[-21:]]
     avg_vol = float(np.mean(volumes[:-1])) if len(volumes) > 1 else 1.0
-    # CHANGED: relaxed volume filter from 1.5× to 1.1×
     vol_ok  = last.volume > 1.1 * avg_vol if avg_vol > 0 else True
 
-    def is_bull(bar): return bar.close > bar.open
-    def is_bear(bar): return bar.close < bar.open
-    def body(bar):    return abs(bar.close - bar.open)
+    bodies  = [abs(b.close - b.open) for b in ltf_bars[-21:-1]]
+    avg_body = float(np.mean(bodies)) if bodies else 0.0
+
+    def is_bull(bar):    return bar.close > bar.open
+    def is_bear(bar):    return bar.close < bar.open
+    def body(bar):       return abs(bar.close - bar.open)
     def upper_wick(bar): return bar.high - max(bar.open, bar.close)
     def lower_wick(bar): return min(bar.open, bar.close) - bar.low
+
+    # ── Momentum candle (NEW: trend continuation) ──────────────────────────
+    # Large bullish body > 1.5× average body with volume
+    if is_bull(last) and avg_body > 0 and body(last) > avg_body * 1.5 and vol_ok:
+        logger.debug("Pattern: bullish momentum candle")
+        return +1
+    # Large bearish body > 1.5× average body with volume
+    if is_bear(last) and avg_body > 0 and body(last) > avg_body * 1.5 and vol_ok:
+        logger.debug("Pattern: bearish momentum candle")
+        return -1
 
     # ── Bullish Engulfing ──
     if (is_bear(prev) and is_bull(last) and
@@ -105,15 +147,13 @@ def module2_candlestick(ltf_bars: List[Candle]) -> int:
 
     # ── Morning Star ──
     if (is_bear(prev2) and body(prev) < body(prev2) * 0.5 and
-            is_bull(last) and last.close > (prev2.open + prev2.close) / 2 and
-            vol_ok):
+            is_bull(last) and last.close > (prev2.open + prev2.close) / 2 and vol_ok):
         logger.debug("Pattern: morning star")
         return +1
 
-    # ── Hammer / Pin Bar bullish (long lower wick) ── ADDED
+    # ── Hammer / Pin Bar bullish ──
     if (lower_wick(last) > body(last) * 2 and
-            lower_wick(last) > upper_wick(last) * 2 and
-            vol_ok):
+            lower_wick(last) > upper_wick(last) * 2 and vol_ok):
         logger.debug("Pattern: hammer/pin bar bullish")
         return +1
 
@@ -134,15 +174,13 @@ def module2_candlestick(ltf_bars: List[Candle]) -> int:
 
     # ── Evening Star ──
     if (is_bull(prev2) and body(prev) < body(prev2) * 0.5 and
-            is_bear(last) and last.close < (prev2.open + prev2.close) / 2 and
-            vol_ok):
+            is_bear(last) and last.close < (prev2.open + prev2.close) / 2 and vol_ok):
         logger.debug("Pattern: evening star")
         return -1
 
-    # ── Shooting Star / Inverted Pin Bar bearish ── ADDED
+    # ── Shooting Star / Inverted Pin Bar ──
     if (upper_wick(last) > body(last) * 2 and
-            upper_wick(last) > lower_wick(last) * 2 and
-            vol_ok):
+            upper_wick(last) > lower_wick(last) * 2 and vol_ok):
         logger.debug("Pattern: shooting star/pin bar bearish")
         return -1
 
@@ -161,8 +199,17 @@ def module2_candlestick(ltf_bars: List[Candle]) -> int:
 
 def module3_vote(ltf_bars: List[Candle], min_votes: int = 4) -> int:
     """
-    CHANGED: min_votes lowered from 5 to 4.
-    StochRSI neutral zone now returns 0 instead of -1.
+    Quality gate — 4/7 indicators must agree with the signal direction.
+    This is the accuracy filter that prevents false signals from getting through.
+
+    Indicators chosen for reliability on short timeframes (1M):
+    1. RSI(14) direction relative to 50
+    2. MACD histogram direction
+    3. Price vs Bollinger middle band
+    4. StochRSI — neutral zone scores 0 (not penalised)
+    5. ADX trend direction (threshold 20)
+    6. EMA9 vs EMA21 crossover (replaces ATR direction — more reliable)
+    7. Recent price momentum (3 bars)
     """
     if len(ltf_bars) < 30:
         return 0
@@ -173,38 +220,47 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 4) -> int:
 
     scores = []
 
-    # 1. RSI(14) > 50 → bullish
+    # 1. RSI(14) — direction of momentum
     rsi14 = ind.rsi(C, 14)
-    last_rsi = rsi14[~np.isnan(rsi14)]
-    scores.append(+1 if (len(last_rsi) and last_rsi[-1] > 50) else -1)
+    last_rsi_arr = rsi14[~np.isnan(rsi14)]
+    if len(last_rsi_arr):
+        scores.append(+1 if last_rsi_arr[-1] > 50 else -1)
+    else:
+        scores.append(0)
 
-    # 2. MACD histogram > 0 → bullish
+    # 2. MACD histogram — short-term momentum
     _, _, hist = ind.macd(C, 12, 26, 9)
     last_hist = hist[~np.isnan(hist)]
-    scores.append(+1 if (len(last_hist) and last_hist[-1] > 0) else -1)
+    if len(last_hist):
+        scores.append(+1 if last_hist[-1] > 0 else -1)
+    else:
+        scores.append(0)
 
-    # 3. Price above Bollinger middle band
+    # 3. Price vs Bollinger middle band — trend position
     _, mid, _ = ind.bollinger_bands(C, 20, 2)
     last_mid = mid[~np.isnan(mid)]
-    scores.append(+1 if (len(last_mid) and C[-1] > last_mid[-1]) else -1)
+    if len(last_mid):
+        scores.append(+1 if C[-1] > last_mid[-1] else -1)
+    else:
+        scores.append(0)
 
-    # 4. StochRSI — CHANGED: neutral zone (0.2–0.8) returns 0 not -1
+    # 4. StochRSI — overbought/oversold (neutral zone = 0, not penalised)
     k, _ = ind.stoch_rsi(C, 14, 14, 3, 3)
     last_k = k[~np.isnan(k)]
     if len(last_k):
         if last_k[-1] < 0.2:
-            scores.append(+1)   # oversold → bullish
+            scores.append(+1)   # Oversold → bullish
         elif last_k[-1] > 0.8:
-            scores.append(-1)   # overbought → bearish
+            scores.append(-1)   # Overbought → bearish
         else:
-            scores.append(0)    # neutral — CHANGED: was -1
+            scores.append(0)    # Neutral — no opinion
     else:
         scores.append(0)
 
     # 5. ADX trend direction
     adx_vals, pdi, mdi = ind.adx(H, L, C, 14)
     last_adx = adx_vals[~np.isnan(adx_vals)]
-    if len(last_adx) and last_adx[-1] > 20:  # CHANGED: threshold 25→20
+    if len(last_adx) and last_adx[-1] > 20:
         last_pdi = pdi[~np.isnan(adx_vals)]
         last_mdi = mdi[~np.isnan(adx_vals)]
         if len(last_pdi):
@@ -214,15 +270,17 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 4) -> int:
     else:
         scores.append(0)
 
-    # 6. ATR direction
-    atr14 = ind.atr(H, L, C, 14)
-    valid_atr = atr14[~np.isnan(atr14)]
-    if len(valid_atr) >= 3:
-        scores.append(+1 if valid_atr[-1] > valid_atr[-2] else -1)
+    # 6. EMA9 vs EMA21 crossover (replaces ATR — more directional signal)
+    ema9_arr  = ind.ema(C, 9)
+    ema21_arr = ind.ema(C, 21)
+    v9  = ema9_arr[~np.isnan(ema9_arr)]
+    v21 = ema21_arr[~np.isnan(ema21_arr)]
+    if len(v9) and len(v21):
+        scores.append(+1 if v9[-1] > v21[-1] else -1)
     else:
         scores.append(0)
 
-    # 7. Recent price momentum (3 bars)
+    # 7. Recent price momentum (last 3 bars making HH or LL)
     if len(H) >= 3 and all(H[-i] > H[-i-1] for i in range(1, 3)):
         scores.append(+1)
     elif len(L) >= 3 and all(L[-i] < L[-i-1] for i in range(1, 3)):
@@ -230,9 +288,11 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 4) -> int:
     else:
         scores.append(0)
 
-    # Filter out neutral votes before counting
+    # Count only non-neutral votes
     non_neutral = [s for s in scores if s != 0]
     raw_score   = sum(non_neutral)
+
+    logger.debug(f"Module3 votes: {scores} → raw={raw_score} needed=±{min_votes}")
 
     if   raw_score >= min_votes:  return +1
     elif raw_score <= -min_votes: return -1
@@ -243,9 +303,9 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 4) -> int:
 
 class SignalEngine:
 
-    def __init__(self, min_modules: int = 1, min_votes: int = 4):
-        self.min_modules = min_modules
-        self.min_votes   = min_votes
+    def __init__(self, min_modules: int = 2, min_votes: int = 4):
+        self.min_modules = min_modules   # 2/3 required — accuracy gate
+        self.min_votes   = min_votes     # 4/7 required — quality gate
 
     def evaluate(self,
                  ltf_bars: List[Candle],
@@ -253,6 +313,7 @@ class SignalEngine:
                  smc_ctx:  SMCContext,
                  in_zone:  bool) -> SignalResult:
 
+        # Hard gate: no bias or not in zone → no trade
         if htf_bias == "NEUTRAL" or not in_zone:
             return SignalResult("NONE", 0, 0, 0, 0, 0,
                                 f"htf_bias={htf_bias}, in_zone={in_zone}")
@@ -265,7 +326,8 @@ class SignalEngine:
         confirming = sum(1 for m in [m1, m2, m3] if m == expected)
 
         logger.debug(f"Signal modules: m1={m1} m2={m2} m3={m3} "
-                     f"confirming={confirming}/{self.min_modules} bias={htf_bias}")
+                     f"confirming={confirming}/{self.min_modules} bias={htf_bias} "
+                     f"trend_strength={smc_ctx.trend_strength:.2f}")
 
         if confirming < self.min_modules:
             reason = (f"only {confirming}/{self.min_modules} modules confirmed "
@@ -274,7 +336,8 @@ class SignalEngine:
 
         direction = "LONG" if htf_bias == "LONG" else "SHORT"
         reason    = (f"✓ {confirming}/3 modules | bias={htf_bias} | "
-                     f"m1={m1} m2={m2} m3={m3}")
+                     f"m1={m1} m2={m2} m3={m3} | "
+                     f"trend_strength={smc_ctx.trend_strength:.2f}")
         logger.info(f"Signal: {direction} | {reason}")
 
         return SignalResult(direction, confirming, m1, m2, m3, confirming, reason)
