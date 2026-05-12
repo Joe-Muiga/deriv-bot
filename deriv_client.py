@@ -31,7 +31,7 @@ class DerivClient:
 
     def __init__(self):
         self._ws: Optional[Any] = None
-        self._connected: bool   = False
+        self._connected: asyncio.Event = asyncio.Event()   # set when connected+authorized
         self._authorized: bool  = False
 
         # Pending requests: req_id → asyncio.Future
@@ -55,8 +55,6 @@ class DerivClient:
 
     async def connect(self):
         """Connect, authorize, and start the message-dispatch loop."""
-        self._connected = asyncio.Event()
-        self._connected.set()
         self._loop = asyncio.get_event_loop()
         retry_delay = 2
         while True:
@@ -69,12 +67,12 @@ class DerivClient:
                     close_timeout=5,
                 ) as ws:
                     self._ws        = ws
-                    self._connected = True
                     retry_delay     = 2
                     logger.info("WebSocket connected ✓")
 
                     await self._authorize()
                     await self._subscribe_balance()
+                    self._connected.set()        # signal: ready for requests
                     await self._dispatch_loop()
 
             except ConnectionClosed as exc:
@@ -82,7 +80,7 @@ class DerivClient:
             except Exception as exc:
                 logger.error(f"WebSocket error: {exc}. Retrying in {retry_delay}s …")
             finally:
-                self._connected  = False
+                self._connected.clear()          # block callers while reconnecting
                 self._authorized = False
                 self._ws         = None
 
@@ -155,7 +153,7 @@ class DerivClient:
 
     async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
         """Send a request and await the response."""
-        if not self._ws or not self._connected:
+        if not self._ws or not self._connected.is_set():
             raise RuntimeError("Not connected")
 
         req_id             = self._req_id_counter
@@ -190,8 +188,11 @@ class DerivClient:
         logger.info(f"Authorized | Balance: ${self._balance:.4f}")
 
     async def _subscribe_balance(self):
-        await self._send({"balance": 1, "req_id": 2})
-        logger.info("Balance subscription active")
+        try:
+            await self._send({"balance": 1}, timeout=15)
+            logger.info("Balance subscription active")
+        except Exception as exc:
+            logger.warning(f"Balance subscription failed: {exc} — continuing anyway")
 
     def on_balance(self, callback: Callable[[float], None]):
         """Register a callback for balance updates."""
@@ -325,4 +326,4 @@ class DerivClient:
 
     @property
     def is_connected(self) -> bool:
-        return self._connected and self._authorized
+        return self._connected.is_set() and self._authorized
