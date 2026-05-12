@@ -55,6 +55,7 @@ class DerivClient:
 
     async def connect(self):
         """Connect, authorize, and start the message-dispatch loop."""
+        self._connected = asyncio.Event()
         self._connected.set()
         self._loop = asyncio.get_event_loop()
         retry_delay = 2
