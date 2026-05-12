@@ -83,17 +83,7 @@ class RiskManager:
 
         self._current_balance = balance
         self._check_loss_limit()
-    def force_reset_daily(self, current_balance: float):
-    """
-    ONE-TIME OVERRIDE: Resets the daily loss counter using the current balance
-    as the new starting point. Does NOT change the day tag (so midnight reset
-    still happens later). Use this to 'start fresh' mid-day after a loss limit hit.
-    """
-    self._day_start_balance = current_balance
-    self._paused = False
-    logger.warning(f"⚠️ FORCE RESET daily loss limit. New start balance = ${current_balance:.4f}. "
-                   f"Trading re-enabled for the remainder of today ({self._day_tag}).")
-    @property
+   
     def current_balance(self) -> float:
         return self._current_balance
 
