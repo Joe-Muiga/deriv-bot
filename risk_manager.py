@@ -121,8 +121,7 @@ class RiskManager:
                 # small buffer before re-enabling (won't happen same day
                 # unless balance recovers via external deposit)
                 pass  # keep paused until midnight
-
-  import os
+import os
 
 if os.environ.get("FORCE_RESET_DAILY_LOSS", "").lower() == "true":
     risk_manager.force_reset_daily(current_balance)
