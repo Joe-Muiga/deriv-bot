@@ -139,6 +139,10 @@ class BotEngine:
 
     # ─── Dashboard push loop ──────────────────────────────────────────────────
 
+  async def on_authorize(self, response):
+    # Only start loading historical data after auth confirmed
+    await self.load_all_symbols()
+
     async def _dashboard_loop(self):
         while True:
             try:
