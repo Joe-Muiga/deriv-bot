@@ -1,13 +1,5 @@
 """
 smc_analyzer.py – Phase A of SIFM: Higher-Timeframe SMC/ICT Analysis.
-
-Produces:
-  • Swing highs / lows
-  • Market structure label (UPTREND / DOWNTREND / RANGE)
-  • Bullish / Bearish Order Blocks
-  • Fair Value Gaps (FVG)
-  • Liquidity pool levels
-  • Overall trading bias  (LONG | SHORT | NEUTRAL)
 """
 
 import numpy as np
@@ -18,7 +10,7 @@ from candlestick_builder import Candle
 
 logger = logging.getLogger(__name__)
 
-SWING_LOOKBACK = 5   # bars on each side to confirm a swing
+SWING_LOOKBACK = 3   # CHANGED: was 5 — easier swing detection on synthetic indices
 
 # ─── Data classes ─────────────────────────────────────────────────────────────
 
@@ -26,15 +18,15 @@ SWING_LOOKBACK = 5   # bars on each side to confirm a swing
 class SwingPoint:
     index:    int
     price:    float
-    is_high:  bool    # True = swing high, False = swing low
-    bar_ts:   int     # epoch of that bar
+    is_high:  bool
+    bar_ts:   int
 
 @dataclass
 class OrderBlock:
     index:     int
-    top:       float   # high[i]
-    bottom:    float   # low[i]
-    direction: str     # "bullish" | "bearish"
+    top:       float
+    bottom:    float
+    direction: str
     bar_ts:    int
     touches:   int = 0
     expired:   bool = False
@@ -43,30 +35,28 @@ class OrderBlock:
 class FVG:
     top:       float
     bottom:    float
-    direction: str     # "bullish" | "bearish"
+    direction: str
     bar_ts:    int
     filled:    bool = False
 
 @dataclass
 class SMCContext:
-    structure:      str              # "UPTREND" | "DOWNTREND" | "RANGE"
-    bias:           str              # "LONG" | "SHORT" | "NEUTRAL"
-    swing_highs:    List[SwingPoint] = field(default_factory=list)
-    swing_lows:     List[SwingPoint] = field(default_factory=list)
-    bullish_obs:    List[OrderBlock] = field(default_factory=list)
-    bearish_obs:    List[OrderBlock] = field(default_factory=list)
-    bullish_fvgs:   List[FVG]       = field(default_factory=list)
-    bearish_fvgs:   List[FVG]       = field(default_factory=list)
-    liquidity_highs: List[float]    = field(default_factory=list)
-    liquidity_lows:  List[float]    = field(default_factory=list)
-    current_atr:    float           = 0.0
+    structure:       str
+    bias:            str
+    swing_highs:     List[SwingPoint] = field(default_factory=list)
+    swing_lows:      List[SwingPoint] = field(default_factory=list)
+    bullish_obs:     List[OrderBlock] = field(default_factory=list)
+    bearish_obs:     List[OrderBlock] = field(default_factory=list)
+    bullish_fvgs:    List[FVG]        = field(default_factory=list)
+    bearish_fvgs:    List[FVG]        = field(default_factory=list)
+    liquidity_highs: List[float]      = field(default_factory=list)
+    liquidity_lows:  List[float]      = field(default_factory=list)
+    current_atr:     float            = 0.0
 
-
-# ─── Main analyzer ────────────────────────────────────────────────────────────
 
 class SMCAnalyzer:
 
-    def __init__(self, ob_expiry_bars: int = 20):
+    def __init__(self, ob_expiry_bars: int = 50):
         self.ob_expiry_bars = ob_expiry_bars
 
     def analyse(self, bars: List[Candle], atr: float) -> SMCContext:
@@ -79,50 +69,52 @@ class SMCAnalyzer:
         closes = np.array([b.close for b in bars])
         ts     = [b.timestamp for b in bars]
 
-        swings_h = self._find_swing_highs(highs, ts)
-        swings_l = self._find_swing_lows(lows,   ts)
-        structure = self._determine_structure(swings_h, swings_l)
+        swings_h  = self._find_swing_highs(highs, ts)
+        swings_l  = self._find_swing_lows(lows,   ts)
+        structure = self._determine_structure(swings_h, swings_l, closes)
 
-        bull_obs, bear_obs = self._find_order_blocks(opens, highs, lows, closes, ts)
-        bull_fvgs, bear_fvgs = self._find_fvgs(highs, lows, ts)
+        bull_obs, bear_obs     = self._find_order_blocks(opens, highs, lows, closes, ts)
+        bull_fvgs, bear_fvgs   = self._find_fvgs(highs, lows, ts)
 
-        # Expire OBs touched more than twice, or older than expiry limit
         n = len(bars)
         for ob in bull_obs + bear_obs:
             age = n - ob.index
-            if age > self.ob_expiry_bars or ob.touches >= 2:
+            if age > self.ob_expiry_bars or ob.touches >= 3:
                 ob.expired = True
 
-        # Fill FVGs that price has re-entered
         last_close = float(closes[-1])
         for fvg in bull_fvgs:
-            if last_close <= fvg.bottom:   # price filled back into gap
+            if last_close <= fvg.bottom:
                 fvg.filled = True
         for fvg in bear_fvgs:
             if last_close >= fvg.top:
                 fvg.filled = True
 
-        # Liquidity pools
         liq_highs = [sh.price for sh in swings_h[-5:]] if swings_h else []
         liq_lows  = [sl.price for sl in swings_l[-5:]] if swings_l else []
 
-        bias = self._determine_bias(structure, last_close, bull_obs, bear_obs,
-                                    swings_h, swings_l, atr)
+        bias = self._determine_bias(
+            structure, last_close, closes,
+            bull_obs, bear_obs, swings_h, swings_l, atr
+        )
 
-        ctx = SMCContext(
-            structure      = structure,
-            bias           = bias,
-            swing_highs    = swings_h,
-            swing_lows     = swings_l,
-            bullish_obs    = [ob for ob in bull_obs if not ob.expired],
-            bearish_obs    = [ob for ob in bear_obs if not ob.expired],
-            bullish_fvgs   = [f for f in bull_fvgs if not f.filled],
-            bearish_fvgs   = [f for f in bear_fvgs if not f.filled],
+        logger.debug(f"SMC: structure={structure} bias={bias} "
+                     f"bull_obs={len(bull_obs)} bear_obs={len(bear_obs)} "
+                     f"bull_fvgs={len(bull_fvgs)} bear_fvgs={len(bear_fvgs)}")
+
+        return SMCContext(
+            structure       = structure,
+            bias            = bias,
+            swing_highs     = swings_h,
+            swing_lows      = swings_l,
+            bullish_obs     = [ob for ob in bull_obs if not ob.expired],
+            bearish_obs     = [ob for ob in bear_obs if not ob.expired],
+            bullish_fvgs    = [f  for f  in bull_fvgs if not f.filled],
+            bearish_fvgs    = [f  for f  in bear_fvgs if not f.filled],
             liquidity_highs = liq_highs,
             liquidity_lows  = liq_lows,
-            current_atr    = atr,
+            current_atr     = atr,
         )
-        return ctx
 
     # ── Swing detection ───────────────────────────────────────────────────────
 
@@ -130,9 +122,7 @@ class SMCAnalyzer:
         swings = []
         lb = SWING_LOOKBACK
         for i in range(lb, len(highs) - lb):
-            left  = highs[i - lb : i]
-            right = highs[i + 1 : i + lb + 1]
-            if highs[i] > np.max(left) and highs[i] > np.max(right):
+            if highs[i] > np.max(highs[i-lb:i]) and highs[i] > np.max(highs[i+1:i+lb+1]):
                 swings.append(SwingPoint(i, float(highs[i]), True, ts[i]))
         return swings
 
@@ -140,70 +130,86 @@ class SMCAnalyzer:
         swings = []
         lb = SWING_LOOKBACK
         for i in range(lb, len(lows) - lb):
-            left  = lows[i - lb : i]
-            right = lows[i + 1 : i + lb + 1]
-            if lows[i] < np.min(left) and lows[i] < np.min(right):
+            if lows[i] < np.min(lows[i-lb:i]) and lows[i] < np.min(lows[i+1:i+lb+1]):
                 swings.append(SwingPoint(i, float(lows[i]), False, ts[i]))
         return swings
 
     # ── Market structure ──────────────────────────────────────────────────────
 
-    def _determine_structure(self, swings_h: List[SwingPoint],
-                             swings_l: List[SwingPoint]) -> str:
-        if len(swings_h) < 3 or len(swings_l) < 3:
-            return "RANGE"
+    def _determine_structure(self, swings_h, swings_l, closes) -> str:
+        """
+        CHANGED: More lenient structure detection.
+        Uses 2 swings instead of 3, and falls back to EMA slope for RANGE markets.
+        """
+        # Try strict HH/HL or LL/LH with just 2 swings
+        if len(swings_h) >= 2 and len(swings_l) >= 2:
+            last_h = [s.price for s in swings_h[-2:]]
+            last_l = [s.price for s in swings_l[-2:]]
+            if last_h[-1] > last_h[-2] and last_l[-1] > last_l[-2]:
+                return "UPTREND"
+            if last_h[-1] < last_h[-2] and last_l[-1] < last_l[-2]:
+                return "DOWNTREND"
 
-        last_h  = [s.price for s in swings_h[-3:]]
-        last_l  = [s.price for s in swings_l[-3:]]
-        hh_hh   = last_h[-1] > last_h[-2] > last_h[-3]
-        hl_hl   = last_l[-1] > last_l[-2] > last_l[-3]
-        ll_ll   = last_l[-1] < last_l[-2] < last_l[-3]
-        lh_lh   = last_h[-1] < last_h[-2] < last_h[-3]
+        # CHANGED: Fallback — use 20-bar EMA slope to classify RANGE bars
+        if len(closes) >= 25:
+            ema = self._ema(closes, 20)
+            valid = ema[~np.isnan(ema)]
+            if len(valid) >= 5:
+                slope = valid[-1] - valid[-5]
+                atr_est = float(np.mean(np.abs(np.diff(closes[-20:]))))
+                if slope > atr_est * 0.3:
+                    return "UPTREND"
+                if slope < -atr_est * 0.3:
+                    return "DOWNTREND"
 
-        if hh_hh and hl_hl:   return "UPTREND"
-        if ll_ll and lh_lh:   return "DOWNTREND"
         return "RANGE"
 
-    # ── Order blocks ─────────────────────────────────────────────────────────
+    def _ema(self, data: np.ndarray, period: int) -> np.ndarray:
+        result = np.full(len(data), np.nan)
+        k = 2.0 / (period + 1)
+        start = period - 1
+        if start >= len(data):
+            return result
+        result[start] = np.mean(data[:period])
+        for i in range(start + 1, len(data)):
+            result[i] = data[i] * k + result[i-1] * (1 - k)
+        return result
 
-    def _find_order_blocks(self, opens, highs, lows, closes,
-                           ts) -> Tuple[List[OrderBlock], List[OrderBlock]]:
+    # ── Order blocks ──────────────────────────────────────────────────────────
+
+    def _find_order_blocks(self, opens, highs, lows, closes, ts):
         bull_obs, bear_obs = [], []
-        min_move = float(np.mean(np.abs(np.diff(closes)))) * 3  # strong-move threshold
+        # CHANGED: lowered threshold from 3× to 1.5× mean move
+        min_move = float(np.mean(np.abs(np.diff(closes)))) * 1.5
 
         for i in range(1, len(closes) - 2):
-            # Bullish OB: last bearish candle before a strong upward move
-            if closes[i] < opens[i]:                              # candle i is bearish
-                if (closes[i+1] > opens[i+1] and                  # i+1 bullish
-                        closes[i+1] > highs[i] and                # closes above i's high
-                        (closes[i+1] - opens[i+1]) >= min_move):  # strong move
+            if closes[i] < opens[i]:  # bearish candle → potential bullish OB
+                if (closes[i+1] > opens[i+1] and
+                        closes[i+1] > highs[i] and
+                        (closes[i+1] - opens[i+1]) >= min_move):
                     bull_obs.append(OrderBlock(
                         index=i, top=float(highs[i]), bottom=float(lows[i]),
                         direction="bullish", bar_ts=ts[i]))
 
-            # Bearish OB: last bullish candle before a strong downward move
-            if closes[i] > opens[i]:                              # candle i is bullish
-                if (closes[i+1] < opens[i+1] and                  # i+1 bearish
-                        closes[i+1] < lows[i] and                 # closes below i's low
-                        (opens[i+1] - closes[i+1]) >= min_move):  # strong move
+            if closes[i] > opens[i]:  # bullish candle → potential bearish OB
+                if (closes[i+1] < opens[i+1] and
+                        closes[i+1] < lows[i] and
+                        (opens[i+1] - closes[i+1]) >= min_move):
                     bear_obs.append(OrderBlock(
                         index=i, top=float(highs[i]), bottom=float(lows[i]),
                         direction="bearish", bar_ts=ts[i]))
 
-        # Keep only the most recent 10 of each
         return bull_obs[-10:], bear_obs[-10:]
 
     # ── Fair Value Gaps ───────────────────────────────────────────────────────
 
-    def _find_fvgs(self, highs, lows, ts) -> Tuple[List[FVG], List[FVG]]:
+    def _find_fvgs(self, highs, lows, ts):
         bull_fvgs, bear_fvgs = [], []
         for i in range(len(highs) - 2):
-            # Bullish FVG: gap between high[i] and low[i+2]
             if lows[i+2] > highs[i]:
                 bull_fvgs.append(FVG(
                     top=float(lows[i+2]), bottom=float(highs[i]),
                     direction="bullish", bar_ts=ts[i]))
-            # Bearish FVG: gap between low[i] and high[i+2]
             if highs[i+2] < lows[i]:
                 bear_fvgs.append(FVG(
                     top=float(lows[i]), bottom=float(highs[i+2]),
@@ -212,44 +218,67 @@ class SMCAnalyzer:
 
     # ── Bias determination ────────────────────────────────────────────────────
 
-    def _determine_bias(self, structure, price, bull_obs, bear_obs,
-                        swings_h, swings_l, atr) -> str:
-        if structure == "RANGE":
-            return "NEUTRAL"
+    def _determine_bias(self, structure, price, closes,
+                        bull_obs, bear_obs, swings_h, swings_l, atr) -> str:
+        """
+        CHANGED: RANGE markets now get a bias based on OBs/FVGs alone.
+        Previously RANGE always → NEUTRAL (killed all trades).
+        """
+        half_atr = atr * 1.0  # CHANGED: wider tolerance (was 0.5)
 
         if structure == "UPTREND":
-            # Price above most recent bullish OB or just swept a liquidity low
             valid_bull = [ob for ob in bull_obs if not ob.expired]
             if valid_bull:
                 nearest = valid_bull[-1]
-                if price >= nearest.bottom - atr * 0.5:
+                if price >= nearest.bottom - half_atr:
                     return "LONG"
-            # Swept liquidity low (price just went below a swing low then bounced)
-            if swings_l:
-                last_low = swings_l[-1].price
-                if price > last_low:
-                    return "LONG"
+            if swings_l and price > swings_l[-1].price:
+                return "LONG"
+            return "LONG"  # CHANGED: structure alone gives LONG bias in uptrend
 
         if structure == "DOWNTREND":
             valid_bear = [ob for ob in bear_obs if not ob.expired]
             if valid_bear:
                 nearest = valid_bear[-1]
-                if price <= nearest.top + atr * 0.5:
+                if price <= nearest.top + half_atr:
                     return "SHORT"
-            if swings_h:
-                last_high = swings_h[-1].price
-                if price < last_high:
-                    return "SHORT"
+            if swings_h and price < swings_h[-1].price:
+                return "SHORT"
+            return "SHORT"  # CHANGED: structure alone gives SHORT bias in downtrend
+
+        # RANGE — CHANGED: use OBs to bias instead of always returning NEUTRAL
+        valid_bull = [ob for ob in bull_obs if not ob.expired]
+        valid_bear = [ob for ob in bear_obs if not ob.expired]
+
+        if valid_bull and not valid_bear:
+            return "LONG"
+        if valid_bear and not valid_bull:
+            return "SHORT"
+        if valid_bull and valid_bear:
+            # Most recent OB wins
+            last_bull_idx = valid_bull[-1].index
+            last_bear_idx = valid_bear[-1].index
+            return "LONG" if last_bull_idx > last_bear_idx else "SHORT"
+
+        # Last resort: recent price momentum
+        if len(closes) >= 10:
+            if closes[-1] > closes[-10]:
+                return "LONG"
+            if closes[-1] < closes[-10]:
+                return "SHORT"
 
         return "NEUTRAL"
 
-    # ── SMC zone check (Phase B.1) ────────────────────────────────────────────
+    # ── SMC zone check ────────────────────────────────────────────────────────
 
     def price_in_smc_zone(self, price: float, bias: str, ctx: SMCContext) -> bool:
-        """Returns True if price is within ATR/2 of a relevant SMC zone."""
-        half_atr = ctx.current_atr * 0.5
+        """
+        CHANGED: Much wider zone — ATR×1.0 instead of ATR×0.5.
+        Also falls back to True if no OBs/FVGs exist (bias is enough).
+        """
+        half_atr = ctx.current_atr * 1.0
         if half_atr == 0:
-            half_atr = price * 0.001  # 0.1% fallback
+            half_atr = price * 0.002
 
         if bias == "LONG":
             for ob in ctx.bullish_obs:
@@ -259,6 +288,9 @@ class SMCAnalyzer:
             for fvg in ctx.bullish_fvgs:
                 if fvg.bottom - half_atr <= price <= fvg.top + half_atr:
                     return True
+            # CHANGED: if no zones exist but bias is LONG, allow entry
+            if not ctx.bullish_obs and not ctx.bullish_fvgs:
+                return True
 
         elif bias == "SHORT":
             for ob in ctx.bearish_obs:
@@ -268,45 +300,33 @@ class SMCAnalyzer:
             for fvg in ctx.bearish_fvgs:
                 if fvg.bottom - half_atr <= price <= fvg.top + half_atr:
                     return True
+            if not ctx.bearish_obs and not ctx.bearish_fvgs:
+                return True
 
         return False
 
     def get_sl_tp(self, price: float, bias: str,
                   ctx: SMCContext) -> Tuple[float, float]:
-        """Calculate stop-loss and take-profit levels from SMC context."""
         atr = ctx.current_atr if ctx.current_atr else price * 0.002
         min_sl_dist = atr * 1.5
 
         if bias == "LONG":
-            # SL below nearest bullish OB or 1.5×ATR
             if ctx.bullish_obs:
                 zone_bottom = ctx.bullish_obs[-1].bottom
                 sl = min(zone_bottom - atr * 0.1, price - min_sl_dist)
             else:
                 sl = price - min_sl_dist
-
-            # TP at nearest bearish OB / FVG above, or 2× risk
             risk = price - sl
-            if ctx.bearish_obs:
-                tp = ctx.bearish_obs[-1].bottom
-                if tp <= price + risk:        # too close
-                    tp = price + risk * 2
-            else:
-                tp = price + risk * 2
-
-        else:  # SHORT
+            tp = price + risk * 2 if not ctx.bearish_obs else max(
+                ctx.bearish_obs[-1].bottom, price + risk * 2)
+        else:
             if ctx.bearish_obs:
                 zone_top = ctx.bearish_obs[-1].top
                 sl = max(zone_top + atr * 0.1, price + min_sl_dist)
             else:
                 sl = price + min_sl_dist
-
             risk = sl - price
-            if ctx.bullish_obs:
-                tp = ctx.bullish_obs[-1].top
-                if tp >= price - risk:
-                    tp = price - risk * 2
-            else:
-                tp = price - risk * 2
+            tp = price - risk * 2 if not ctx.bullish_obs else min(
+                ctx.bullish_obs[-1].top, price - risk * 2)
 
         return round(sl, 5), round(tp, 5)
