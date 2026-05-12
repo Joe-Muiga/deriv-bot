@@ -122,6 +122,11 @@ class RiskManager:
                 # unless balance recovers via external deposit)
                 pass  # keep paused until midnight
 
+  import os
+
+if os.environ.get("FORCE_RESET_DAILY_LOSS", "").lower() == "true":
+    risk_manager.force_reset_daily(current_balance)
+
     @property
     def is_paused(self) -> bool:
         """True if trading is paused for today due to loss limit or max concurrent."""
