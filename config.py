@@ -20,7 +20,7 @@ HTF_BARS         = 100
 LTF_BARS         = 300    # 300 x 1M = 5 hours of LTF history
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  = 0.09
+DAILY_LOSS_LIMIT_PCT  = 0.9
 RISK_PER_TRADE_PCT    = 0.01
 MIN_STAKE             = 0.50   # Deriv minimum
 MAX_STAKE             = 500.0
