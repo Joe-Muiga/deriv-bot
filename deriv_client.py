@@ -174,18 +174,18 @@ class DerivClient:
 
     async def _authorize(self):
         if not config.DERIV_API_TOKEN:
-            raise ValueError("DERIV_API_TOKEN is not set. ")
-        payload = {"authorie": config.DERIV_API_TOKEN, "req_id": 1}
+            raise ValueError("DERIV_API_TOKEN is not set.")
+        # FIX 1: "authorie" → "authorize" (typo in key name)
+        payload = {"authorize": config.DERIV_API_TOKEN, "req_id": 1}
         await self._ws.send(json.dumps(payload))
-      # wait for response manually
-        raw = await asyncio.wait_for(self.ws.recv(), timeout=30)
+        # FIX 2: self.ws → self._ws (missing underscore caused AttributeError)
+        raw = await asyncio.wait_for(self._ws.recv(), timeout=30)
         msg = json.loads(raw)
-        account = msg.get("authorize" , {})
+        account = msg.get("authorize", {})
         self._balance = float(account.get("balance", 0))
         self._authorized = True
-        self._req_id_counter = 2 
+        self._req_id_counter = 2
         logger.info(f"Authorized | Balance: ${self._balance:.4f}")
-        
 
     async def _subscribe_balance(self):
         await self._send({"balance": 1, "subscribe": 1})
