@@ -1,41 +1,15 @@
 """
-bot_engine.py – Central async orchestrator (parallel + HCM edition).
+bot_engine.py – Central async orchestrator (parallel, always-3/3 edition).
 
-What changed in this revision
-------------------------------
-1.  High Confidence Mode (HCM)
-    The "startup advantage" — the observation that the first few trades of
-    each session are almost always wins — is now formalised as HCM and runs
-    permanently under two conditions:
+Signal quality gates (ALL must pass before a trade fires):
+  1. SMC zone check      – price inside a valid HTF order block / FVG
+  2. 3/3 signal modules  – M1 (EMA+RSI), M2 (candlestick), M3 (vote) all agree
+  3. 5/7 indicator votes – Module 3 quantitative gate
+  4. Volatility filter   – LTF ATR ≤ 2× HTF ATR
+  5. News filter         – no high-impact event within NEWS_BLOCK_MINUTES
+  6. Freshness guard     – MIN_SECONDS_BETWEEN_SAME_SYMBOL since last trade
 
-        a) First HCM_DAILY_TRADE_COUNT completed trades of the UTC day.
-        b) After HCM_LOSS_TRIGGER consecutive losses (recovery mode).
-
-    In HCM:
-        • All 3 signal modules must confirm (not just 2).
-        • The same indicator vote threshold applies (5/7).
-        • Only the single top-ranked signal fires per cycle.
-
-2.  Signal freshness guard
-    _last_traded_bar[symbol] records the LTF bar epoch at which the last
-    trade for that symbol was executed.  A new trade is blocked until at
-    least MIN_BARS_BETWEEN_SAME_SYMBOL fresh bars have closed, preventing
-    the bot from re-entering the exact same failing setup repeatedly.
-
-3.  Adaptive quality thresholds
-    _get_quality_thresholds() returns (min_modules, min_votes) appropriate
-    for the current mode (HCM or standard), injected into signal.evaluate().
-
-4.  Parallel scanning (retained from previous revision)
-    All initialised symbols are evaluated simultaneously via asyncio.gather.
-    Signals are ranked by composite probability score; the highest-conviction
-    opportunity is executed first, up to MAX_CONCURRENT_TRADES slots.
-
-5.  Per-class LTF granularity (retained from previous revision)
-    Forex (frx*): 15-min LTF.   Synthetics / crypto: 1-min LTF.
-
-6.  90 % daily loss limit (retained from previous revision)
-    Pause until UTC midnight when balance falls to ≤ 10 % of day start.
+No streak-based blocking.  A qualifying signal always executes.
 """
 
 import asyncio
@@ -100,8 +74,8 @@ class BotEngine:
         )
         self.smc     = SMCAnalyzer(ob_expiry_bars=config.OB_EXPIRY_BARS)
         self.signal  = SignalEngine(
-            min_modules = config.MIN_MODULES_FOR_SIGNAL,
-            min_votes   = config.MIN_INDICATOR_VOTES,
+            min_modules = config.MIN_MODULES_FOR_SIGNAL,   # always 3
+            min_votes   = config.MIN_INDICATOR_VOTES,      # always 5
         )
         self.news    = NewsFilter(block_minutes=config.NEWS_BLOCK_MINUTES)
         self.journal = TradeJournal()
@@ -111,7 +85,6 @@ class BotEngine:
         self._htf: Dict[str, CandlestickBuilder] = {}
         self._ltf: Dict[str, CandlestickBuilder] = {}
 
-        # Init tracking
         self._initializing: Set[str] = set()
         self._init_sem = asyncio.Semaphore(config.INIT_BATCH_SIZE)
 
@@ -121,65 +94,25 @@ class BotEngine:
         # Symbol queue
         self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
 
-        # ── HCM & session state ────────────────────────────────────────────
-        # Number of trades completed in the current UTC day.
-        # While this is < HCM_DAILY_TRADE_COUNT the bot runs in HCM.
-        self._daily_trades: int = 0
+        # Freshness guard: symbol → epoch time of last executed trade
+        self._last_traded_time: Dict[str, float] = {}
 
-        # Consecutive losses since the last win.
-        # Resets to 0 on each win; when it reaches HCM_LOSS_TRIGGER the bot
-        # re-enters HCM until the next win resets it again.
-        self._consecutive_losses: int = 0
-
-        # Tracks which UTC day the counters belong to so they auto-reset.
-        self._current_day: str = ""
-
-        # Signal freshness: symbol → LTF bar epoch of last executed trade.
-        # Prevents re-entering the same setup on consecutive bars.
-        self._last_traded_bar: Dict[str, int] = {}
+        # Stats for dashboard only (never used to gate trades)
+        self._daily_trades:        int = 0
+        self._consecutive_losses:  int = 0
+        self._consecutive_wins:    int = 0
+        self._current_day:         str = ""
 
         self._last_symbol_refresh = 0.0
-        self._last_dashboard_push = 0.0
-
-    # ─── Mode helpers ─────────────────────────────────────────────────────────
-
-    @property
-    def _in_hcm(self) -> bool:
-        """True when High Confidence Mode is active."""
-        startup_window   = self._daily_trades < config.HCM_DAILY_TRADE_COUNT
-        recovery_mode    = self._consecutive_losses >= config.HCM_LOSS_TRIGGER
-        return startup_window or recovery_mode
-
-    def _get_quality_thresholds(self) -> Tuple[int, int]:
-        """Return (min_modules, min_votes) for the current mode."""
-        if self._in_hcm:
-            return config.HCM_MIN_MODULES, config.HCM_MIN_VOTES
-        return config.MIN_MODULES_FOR_SIGNAL, config.MIN_INDICATOR_VOTES
-
-    def _max_executions_this_cycle(self) -> int:
-        """In HCM only the single best signal fires; otherwise fill all slots."""
-        return config.HCM_MAX_EXECUTE if self._in_hcm else config.MAX_CONCURRENT_TRADES
-
-    def _check_day_rollover(self):
-        """Reset daily counters at UTC midnight."""
-        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
-        if today != self._current_day:
-            self._current_day        = today
-            self._daily_trades       = 0
-            self._consecutive_losses = 0
-            logger.info(
-                f"UTC day rolled over → {today} | "
-                f"HCM active (first {config.HCM_DAILY_TRADE_COUNT} trades)"
-            )
 
     # ─── Entry point ──────────────────────────────────────────────────────────
 
     async def run(self):
         logger.info("=" * 64)
-        logger.info("  SIFM Deriv Bot  –  parallel + HCM edition")
+        logger.info("  SIFM Deriv Bot  –  always-3/3, parallel edition")
         logger.info("=" * 64)
 
-        self._check_day_rollover()
+        self._reset_day_if_needed()
         self.client.on_balance(self._on_balance)
 
         ws_task = asyncio.create_task(self.client.connect())
@@ -194,10 +127,7 @@ class BotEngine:
             return
 
         self.risk.set_balance(self.client.balance)
-        logger.info(
-            f"Starting balance: ${self.client.balance:.4f} | "
-            f"HCM active: {self._in_hcm}"
-        )
+        logger.info(f"Starting balance: ${self.client.balance:.4f}")
 
         await self._refresh_symbols()
 
@@ -222,6 +152,17 @@ class BotEngine:
         self.risk.set_balance(balance)
         logger.info(f"Balance sync: ${balance:.4f}")
 
+    # ─── Day tracking (dashboard only) ────────────────────────────────────────
+
+    def _reset_day_if_needed(self):
+        today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+        if today != self._current_day:
+            self._current_day       = today
+            self._daily_trades      = 0
+            self._consecutive_losses = 0
+            self._consecutive_wins   = 0
+            logger.info(f"New UTC day: {today}")
+
     # ─── Symbol discovery ─────────────────────────────────────────────────────
 
     async def _refresh_symbols(self):
@@ -238,7 +179,7 @@ class BotEngine:
             max_symbols=config.MAX_SYMBOLS_PER_QUEUE)
         self._last_symbol_refresh = time.time()
         logger.info(
-            f"Symbol queue refreshed: {len(self._queue)} instruments | "
+            f"Queue refreshed: {len(self._queue)} symbols | "
             f"session: {self.symbols.current_session}"
         )
 
@@ -249,14 +190,10 @@ class BotEngine:
                    if s not in self._htf and s not in self._initializing]
         if not pending:
             return
-        logger.info(f"Initialising {len(pending)} symbol(s) …")
-        results = await asyncio.gather(
+        await asyncio.gather(
             *[self._init_data(s) for s in pending],
             return_exceptions=True,
         )
-        for sym, res in zip(pending, results):
-            if isinstance(res, Exception):
-                logger.error(f"Init failed [{sym}]: {res}")
 
     # ─── Dashboard ────────────────────────────────────────────────────────────
 
@@ -271,27 +208,26 @@ class BotEngine:
     def _push_dashboard(self):
         summary = self.journal.session_summary()
         risk_s  = self.risk.summary()
-        mode    = "HCM 🔒" if self._in_hcm else "Standard"
         update_status(
             running               = True,
-            mode                  = mode,
             balance               = self.client.balance,
             day_start_balance     = self.risk.day_start_balance,
             paused_for_loss_limit = self.risk.is_paused,
             daily_trades          = self._daily_trades,
             consecutive_losses    = self._consecutive_losses,
+            consecutive_wins      = self._consecutive_wins,
             trades_today          = risk_s["total_trades"],
             wins_today            = risk_s["wins"],
             losses_today          = risk_s["losses"],
+            win_rate              = risk_s["win_rate"],
             session               = self.symbols.current_session,
             tradeable_count       = len(self._queue),
+            open_trades           = risk_s["open_trades"],
             gross_profit          = summary.get("gross_profit", 0),
             gross_loss            = summary.get("gross_loss", 0),
             profit_factor         = summary.get("profit_factor", 0),
-            avg_rr                = summary.get("avg_rr", 0),
             best_trade            = summary.get("best_trade", 0),
             worst_trade           = summary.get("worst_trade", 0),
-            streak                = summary.get("streak", 0),
             recent_trades         = self.journal.recent_trades(20),
             best_symbols          = self.symbols.best_symbols(10),
         )
@@ -299,108 +235,76 @@ class BotEngine:
     # ─── Main loop ────────────────────────────────────────────────────────────
 
     async def _main_loop(self):
-        """
-        Each cycle:
-          0. Check day rollover → reset daily counters if needed.
-          1. Refresh symbol list hourly.
-          2. Skip if trading is paused (90 % daily loss limit).
-          3. Ensure all queued symbols have historical data loaded.
-          4. Evaluate all initialised symbols in parallel.
-          5. Rank signals by composite probability score.
-          6. Execute top signal(s) respecting HCM limits and concurrency cap.
-          7. Sleep for the remainder of SCAN_INTERVAL.
-        """
         while True:
             cycle_start = time.time()
 
-            # 0. Day rollover check
-            self._check_day_rollover()
+            self._reset_day_if_needed()
 
-            # 1. Hourly symbol refresh
             if time.time() - self._last_symbol_refresh > SYMBOL_REFRESH_EVERY:
                 await self._refresh_symbols()
 
-            # 2. Loss-limit pause
+            # 90% daily loss limit pause
             if self.risk.is_paused:
                 mins = self.risk.minutes_until_midnight()
                 logger.info(
-                    f"⛔ Trading paused (90 % daily loss) | "
-                    f"resumes in ~{mins:.0f} min | "
-                    f"balance=${self.client.balance:.4f}"
+                    f"⛔ Paused (90% daily loss) | "
+                    f"resumes in ~{mins:.0f} min"
                 )
                 await asyncio.sleep(60)
                 continue
 
             if not self._queue:
-                logger.warning("Empty symbol queue – refreshing in 30 s")
                 await asyncio.sleep(30)
                 await self._refresh_symbols()
                 continue
 
-            # 3. Initialise any new symbols
             await self._ensure_all_initialized()
 
-            # 4. Parallel signal scan
-            min_mod, min_vot = self._get_quality_thresholds()
-            candidates       = await self._scan_all_parallel(min_mod, min_vot)
+            # Scan all symbols in parallel
+            candidates = await self._scan_all_parallel()
 
-            # 5. Rank by composite probability score (highest first)
+            # Rank by composite probability score
             candidates.sort(key=lambda x: x[4], reverse=True)
 
-            mode_label = "HCM 🔒" if self._in_hcm else "Standard"
             if candidates:
                 top = candidates[0]
                 logger.info(
-                    f"[{mode_label}] 🏆 Best signal: [{top[0]}] "
-                    f"{top[1].direction} | score={top[4]:.4f} | {top[1].reason}"
+                    f"🏆 Best: [{top[0]}] {top[1].direction} | "
+                    f"score={top[4]:.4f} | {top[1].reason}"
                 )
-            else:
-                logger.debug(f"[{mode_label}] No qualifying signals this cycle")
 
-            # 6. Execute — HCM limits to 1, standard fills concurrency slots
-            max_exec  = self._max_executions_this_cycle()
-            executed  = 0
+            # Execute ALL qualifying signals up to concurrent limit
+            # No streak check — if it passed all 6 gates, it trades
+            executed = 0
             for sym, sig, price, smc_ctx, score in candidates:
-                if executed >= max_exec:
-                    break
                 if not self.risk.can_trade():
                     break
                 update_status(
                     current_symbol = sym,
-                    last_signal    = (
-                        f"[{sym}] {sig.direction} | "
-                        f"score={score:.4f} | {sig.reason}"
-                    ),
+                    last_signal    = f"[{sym}] {sig.direction} score={score:.4f}",
                 )
                 await self._execute(sym, sig, price, smc_ctx, score)
                 executed += 1
 
             if candidates and executed == 0:
                 logger.debug(
-                    f"Signals found but blocked "
-                    f"(open={self.risk._open_trade_count}/"
-                    f"{self.risk.max_concurrent})"
+                    f"Signals ready but all slots full "
+                    f"({self.risk._open_trade_count}/"
+                    f"{self.risk.max_concurrent} open)"
                 )
 
-            # 7. Sleep for remainder of cycle
             elapsed = time.time() - cycle_start
             await asyncio.sleep(max(0.1, SCAN_INTERVAL - elapsed))
 
     # ─── Parallel signal collection ───────────────────────────────────────────
 
-    async def _scan_all_parallel(
-        self, min_modules: int, min_votes: int
-    ) -> List[Tuple]:
-        """
-        Evaluate every initialised symbol concurrently.
-        Returns list of (symbol, SignalResult, price, smc_ctx, composite_score).
-        """
+    async def _scan_all_parallel(self) -> List[Tuple]:
         ready = [s for s in self._queue if s in self._htf]
         if not ready:
             return []
 
         results = await asyncio.gather(
-            *[self._scan_for_signal(s, min_modules, min_votes) for s in ready],
+            *[self._scan_for_signal(s) for s in ready],
             return_exceptions=True,
         )
 
@@ -412,19 +316,12 @@ class BotEngine:
                 valid.append(res)
         return valid
 
-    # ─── Single-symbol signal evaluation ─────────────────────────────────────
+    # ─── Single-symbol evaluation (pure – no side effects) ───────────────────
 
-    async def _scan_for_signal(
-        self,
-        symbol:      str,
-        min_modules: int,
-        min_votes:   int,
-    ) -> Optional[Tuple]:
+    async def _scan_for_signal(self, symbol: str) -> Optional[Tuple]:
         """
-        Run the full SIFM pipeline for one symbol.
-
-        Pure evaluation — no trade is executed here.
         Returns (symbol, sig, price, smc_ctx, composite_score) or None.
+        A result here means ALL 6 gates have been cleared.
         """
         htf = self._htf.get(symbol)
         ltf = self._ltf.get(symbol)
@@ -433,22 +330,12 @@ class BotEngine:
         if htf.count < 20 or ltf.count < 30:
             return None
 
-        # ── Signal freshness guard ─────────────────────────────────────────
-        ltf_bars_list = ltf.completed_bars
-        if not ltf_bars_list:
-            return None
-        current_bar_epoch = ltf_bars_list[-1].timestamp
-        last_epoch        = self._last_traded_bar.get(symbol, 0)
-        gran_ltf          = _ltf_granularity(symbol)
-        min_gap_seconds   = config.MIN_BARS_BETWEEN_SAME_SYMBOL * gran_ltf
-        if current_bar_epoch < last_epoch + min_gap_seconds:
-            logger.debug(
-                f"[{symbol}] Freshness guard: waiting for "
-                f"{config.MIN_BARS_BETWEEN_SAME_SYMBOL} bar gap"
-            )
+        # Gate 1 – Freshness guard (time-based, not streak-based)
+        last_t = self._last_traded_time.get(symbol, 0.0)
+        if time.time() - last_t < config.MIN_SECONDS_BETWEEN_SAME_SYMBOL:
             return None
 
-        # ── Phase A: HTF SMC structure ─────────────────────────────────────
+        # Gate 2 – HTF SMC structure
         htf_bars    = htf.completed_bars
         H           = np.array([b.high  for b in htf_bars])
         L           = np.array([b.low   for b in htf_bars])
@@ -461,31 +348,34 @@ class BotEngine:
         if smc_ctx.bias == "NEUTRAL":
             return None
 
-        # ── Phase B.1: Price in SMC zone? ─────────────────────────────────
+        # Gate 3 – Price in SMC zone
+        ltf_bars_list = ltf.completed_bars
+        if not ltf_bars_list:
+            return None
         current_price = float(ltf_bars_list[-1].close)
         in_zone = self.smc.price_in_smc_zone(
             current_price, smc_ctx.bias, smc_ctx)
         if not in_zone:
             return None
 
-        # ── Phase B.2-B.3: Signal modules (thresholds injected) ───────────
+        # Gate 4 – 3/3 modules + 5/7 votes
         sig = self.signal.evaluate(
             ltf_bars    = ltf_bars_list,
             htf_bias    = smc_ctx.bias,
             smc_ctx     = smc_ctx,
             in_zone     = in_zone,
-            min_modules = min_modules,
-            min_votes   = min_votes,
+            min_modules = config.MIN_MODULES_FOR_SIGNAL,
+            min_votes   = config.MIN_INDICATOR_VOTES,
         )
         if sig.direction == "NONE":
             return None
 
-        # ── Filters ────────────────────────────────────────────────────────
+        # Gate 5 – News filter
         if self.news.is_blocked(symbol):
-            logger.debug(f"[{symbol}] News block — skipped")
+            logger.debug(f"[{symbol}] Skipped: news block")
             return None
 
-        # Volatility filter: LTF ATR must not exceed 2× HTF ATR
+        # Gate 6 – Volatility filter
         ltf_H = np.array([b.high  for b in ltf_bars_list])
         ltf_L = np.array([b.low   for b in ltf_bars_list])
         ltf_C = np.array([b.close for b in ltf_bars_list])
@@ -493,22 +383,16 @@ class BotEngine:
         valid_la    = ltf_atr_arr[~np.isnan(ltf_atr_arr)]
         ltf_atr     = float(valid_la[-1]) if len(valid_la) else 0.0
         if htf_atr > 0 and ltf_atr > 2 * htf_atr:
-            logger.debug(
-                f"[{symbol}] Volatility filter — ltf_atr={ltf_atr:.5f} "
-                f"> 2×htf_atr={htf_atr:.5f}"
-            )
+            logger.debug(f"[{symbol}] Skipped: high volatility")
             return None
 
-        # ── Composite probability score ────────────────────────────────────
-        # 70% from signal engine (module agreement + vote density)
-        # 30% from SMC trend conviction
+        # Composite score: 70% signal quality + 30% SMC trend strength
         trend_score = min(getattr(smc_ctx, "trend_strength", 0.5), 1.0)
         composite   = round(sig.probability_score * 0.70 + trend_score * 0.30, 4)
 
         logger.debug(
-            f"[{symbol}] {sig.direction} | "
-            f"base={sig.probability_score:.4f} "
-            f"trend={trend_score:.4f} composite={composite:.4f}"
+            f"[{symbol}] ✓ All gates cleared | "
+            f"{sig.direction} | score={composite:.4f}"
         )
         return (symbol, sig, current_price, smc_ctx, composite)
 
@@ -518,11 +402,10 @@ class BotEngine:
                        price: float, smc_ctx, score: float = 0.0):
         stake = self.risk.calculate_stake()
         ac    = get_symbol_class(symbol)
-        mode  = "HCM" if self._in_hcm else "STD"
 
         logger.info(
-            f"▶ [{mode}] {sig.direction} {symbol} | ${stake:.2f} | "
-            f"score={score:.4f} | modules={sig.strength}/3 | "
+            f"▶ {sig.direction} {symbol} | stake=${stake:.2f} | "
+            f"score={score:.4f} | modules=3/3 | "
             f"balance=${self.client.balance:.4f}"
         )
 
@@ -565,10 +448,8 @@ class BotEngine:
 
         self._open_contracts[cid] = (symbol, sig.direction, stake, price, rec)
 
-        # Mark this bar as traded for the freshness guard
-        ltf = self._ltf.get(symbol)
-        if ltf and ltf.completed_bars:
-            self._last_traded_bar[symbol] = ltf.completed_bars[-1].timestamp
+        # Freshness guard timestamp — set on open, regardless of outcome
+        self._last_traded_time[symbol] = time.time()
 
         await self.client.subscribe_contract(
             cid,
@@ -577,7 +458,7 @@ class BotEngine:
             ),
         )
 
-    # ─── Contract result callback ─────────────────────────────────────────────
+    # ─── Contract result ──────────────────────────────────────────────────────
 
     async def _on_contract_result(self, cid: str, msg: dict):
         poc = msg.get("proposal_open_contract", {})
@@ -607,45 +488,25 @@ class BotEngine:
 
         self.symbols.record_trade(symbol, won=won, pnl=pnl)
 
-        # ── Update HCM counters ────────────────────────────────────────────
+        # Dashboard counters only — never used to block trades
         self._daily_trades += 1
-
         if won:
-            prev_losses = self._consecutive_losses
+            self._consecutive_wins  += 1
             self._consecutive_losses = 0
-            if prev_losses >= config.HCM_LOSS_TRIGGER:
-                logger.info(
-                    f"✅ WIN after {prev_losses} consecutive losses — "
-                    f"exiting recovery HCM"
-                )
         else:
             self._consecutive_losses += 1
-            if self._consecutive_losses >= config.HCM_LOSS_TRIGGER:
-                logger.warning(
-                    f"❌ {self._consecutive_losses} consecutive losses — "
-                    f"HCM (recovery mode) activated"
-                )
+            self._consecutive_wins   = 0
 
-        still_hcm  = self._in_hcm
-        mode_label = "HCM 🔒" if still_hcm else "Standard"
-        outcome    = "✅ WIN" if won else "❌ LOSS"
-
+        outcome = "✅ WIN" if won else "❌ LOSS"
         logger.info(
-            f"{outcome} | {symbol} | dir={direction} | "
-            f"pnl=${pnl:+.4f} | stake=${stake:.2f} | "
-            f"balance=${bal_after:.4f} | "
-            f"daily_trades={self._daily_trades} | "
-            f"consec_losses={self._consecutive_losses} | "
-            f"mode={mode_label}"
+            f"{outcome} | {symbol} {direction} | "
+            f"pnl=${pnl:+.4f} | balance=${bal_after:.4f} | "
+            f"streak: {self._consecutive_wins}W / {self._consecutive_losses}L"
         )
 
     # ─── Data initialisation ──────────────────────────────────────────────────
 
     async def _init_data(self, symbol: str):
-        """
-        Load historical OHLCV and subscribe to live ticks for one symbol.
-        Semaphore-controlled to cap concurrent WebSocket requests.
-        """
         if symbol in self._initializing or symbol in self._htf:
             return
         self._initializing.add(symbol)
@@ -691,8 +552,8 @@ class BotEngine:
 
                 ltf_label = "15m" if _is_forex(symbol) else "1m"
                 logger.info(
-                    f"{symbol}: ready | htf={htf_b.count}×1h | "
-                    f"ltf={ltf_b.count}×{ltf_label}"
+                    f"{symbol}: ready | "
+                    f"htf={htf_b.count}×1h | ltf={ltf_b.count}×{ltf_label}"
                 )
 
             except Exception as exc:
@@ -706,8 +567,7 @@ class BotEngine:
     # ─── Tick handler ─────────────────────────────────────────────────────────
 
     def _on_tick(self, symbol: str, tick: dict):
-        import time as _t
-        epoch = int(tick.get("epoch", _t.time()))
+        epoch = int(tick.get("epoch", time.time()))
         price = float(tick.get("quote", 0))
         if price == 0:
             return
