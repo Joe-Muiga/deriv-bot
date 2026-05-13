@@ -9,7 +9,11 @@ Signal quality gates (ALL must pass before a trade fires):
   5. News filter         – no high-impact event within NEWS_BLOCK_MINUTES
   6. Freshness guard     – MIN_SECONDS_BETWEEN_SAME_SYMBOL since last trade
 
-No streak-based blocking.  A qualifying signal always executes.
+Hard stops (the ONLY two things that can ever block a trade):
+  A. Balance is zero / negative
+  B. 90% daily loss limit is hit
+
+No streak-based blocking. No open-count cap. Every 3/3 signal fires, period.
 """
 
 import asyncio
@@ -70,7 +74,7 @@ class BotEngine:
             risk_per_trade   = config.RISK_PER_TRADE_PCT,
             min_stake        = config.MIN_STAKE,
             max_stake        = config.MAX_STAKE,
-            max_concurrent   = config.MAX_CONCURRENT_TRADES,
+            max_concurrent   = 999,  # effectively unlimited – only hard stops apply
         )
         self.smc     = SMCAnalyzer(ob_expiry_bars=config.OB_EXPIRY_BARS)
         self.signal  = SignalEngine(
@@ -110,6 +114,7 @@ class BotEngine:
     async def run(self):
         logger.info("=" * 64)
         logger.info("  SIFM Deriv Bot  –  always-3/3, parallel edition")
+        logger.info("  Hard stops only: zero balance | 90% daily loss")
         logger.info("=" * 64)
 
         self._reset_day_if_needed()
@@ -157,8 +162,8 @@ class BotEngine:
     def _reset_day_if_needed(self):
         today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
         if today != self._current_day:
-            self._current_day       = today
-            self._daily_trades      = 0
+            self._current_day        = today
+            self._daily_trades       = 0
             self._consecutive_losses = 0
             self._consecutive_wins   = 0
             logger.info(f"New UTC day: {today}")
@@ -243,12 +248,21 @@ class BotEngine:
             if time.time() - self._last_symbol_refresh > SYMBOL_REFRESH_EVERY:
                 await self._refresh_symbols()
 
-            # 90% daily loss limit pause
-            if self.risk.is_paused:
+            # ── HARD STOP A: 90% daily loss limit ─────────────────────────────
+            if self.risk.is_paused:                         # hard stop
                 mins = self.risk.minutes_until_midnight()
                 logger.info(
-                    f"⛔ Paused (90% daily loss) | "
+                    f"⛔ Paused (90% daily loss limit hit) | "
                     f"resumes in ~{mins:.0f} min"
+                )
+                await asyncio.sleep(60)
+                continue
+
+            # ── HARD STOP B: zero / negative balance ──────────────────────────
+            if self.client.balance <= 0:                    # hard stop
+                logger.critical(
+                    f"⛔ Balance is zero or negative (${self.client.balance:.4f}). "
+                    f"Trading halted."
                 )
                 await asyncio.sleep(60)
                 continue
@@ -273,25 +287,25 @@ class BotEngine:
                     f"score={top[4]:.4f} | {top[1].reason}"
                 )
 
-            # Execute ALL qualifying signals up to concurrent limit
-            # No streak check — if it passed all 6 gates, it trades
-            executed = 0
+            # ── Execute ALL qualifying signals ─────────────────────────────────
+            # The only two things that can stop a trade from firing here are:
+            #   1. Balance hits zero         (hard stop B)
+            #   2. 90% daily loss limit hit  (hard stop A)
+            # No open-count cap. No streak. No mode. Every 3/3 signal fires.
             for sym, sig, price, smc_ctx, score in candidates:
-                if not self.risk.can_trade():
+                # Re-check hard stops before each individual execution
+                if self.risk.is_paused:                     # hard stop A
+                    logger.info("⛔ 90% daily loss limit — stopping execution loop")
                     break
+                if self.client.balance <= 0:                # hard stop B
+                    logger.critical("⛔ Balance ≤ 0 — stopping execution loop")
+                    break
+
                 update_status(
                     current_symbol = sym,
                     last_signal    = f"[{sym}] {sig.direction} score={score:.4f}",
                 )
                 await self._execute(sym, sig, price, smc_ctx, score)
-                executed += 1
-
-            if candidates and executed == 0:
-                logger.debug(
-                    f"Signals ready but all slots full "
-                    f"({self.risk._open_trade_count}/"
-                    f"{self.risk.max_concurrent} open)"
-                )
 
             elapsed = time.time() - cycle_start
             await asyncio.sleep(max(0.1, SCAN_INTERVAL - elapsed))
@@ -321,7 +335,8 @@ class BotEngine:
     async def _scan_for_signal(self, symbol: str) -> Optional[Tuple]:
         """
         Returns (symbol, sig, price, smc_ctx, composite_score) or None.
-        A result here means ALL 6 gates have been cleared.
+        A result here means ALL 6 quality gates have been cleared.
+        Hard stops are checked separately in _main_loop.
         """
         htf = self._htf.get(symbol)
         ltf = self._ltf.get(symbol)
@@ -353,6 +368,7 @@ class BotEngine:
         if not ltf_bars_list:
             return None
         current_price = float(ltf_bars_list[-1].close)
+
         in_zone = self.smc.price_in_smc_zone(
             current_price, smc_ctx.bias, smc_ctx)
         if not in_zone:
