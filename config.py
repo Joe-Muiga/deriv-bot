@@ -43,12 +43,12 @@ DAILY_LOSS_LIMIT_PCT  = 0.90
 RISK_PER_TRADE_PCT    = 0.01        # 1 % of current balance per trade
 MIN_STAKE             = 0.50        # Deriv minimum
 MAX_STAKE             = 500.0
-MAX_CONCURRENT_TRADES = 4           # Keep at 1 — losses compound quickly.
+MAX_CONCURRENT_TRADES = 1           # Keep at 1 — losses compound quickly.
                                     # Raise only after win-rate exceeds 55 %.
 
 # ─── Standard Signal Quality ─────────────────────────────────────────────────
 # Active after HCM ends and while consecutive losses < HCM_LOSS_TRIGGER.
-MIN_MODULES_FOR_SIGNAL  = 3         # 2-of-3 modules must confirm
+MIN_MODULES_FOR_SIGNAL  = 2         # 2-of-3 modules must confirm
 MIN_INDICATOR_VOTES     = 5         # 5-of-7 indicators must agree (raised from 4)
 
 # ─── High Confidence Mode (HCM) ──────────────────────────────────────────────
@@ -59,7 +59,7 @@ HCM_MIN_MODULES       = 3           # ALL 3 modules must agree
 HCM_MIN_VOTES         = 5           # 5/7 indicators (same as normal but
                                     # combined with the 3/3 module gate this
                                     # is dramatically stricter overall)
-HCM_MAX_EXECUTE       = 3           # only the single top-scored signal fires
+HCM_MAX_EXECUTE       = 1           # only the single top-scored signal fires
 
 # ─── Strategy ────────────────────────────────────────────────────────────────
 OB_EXPIRY_BARS          = 35
@@ -69,7 +69,7 @@ DIVERGENCE_STRENGTH_MIN = 0.15
 
 # Minimum LTF bars that must elapse between two trades on the SAME symbol.
 # Prevents re-entering the same failing setup on consecutive bars.
-MIN_BARS_BETWEEN_SAME_SYMBOL = 3
+MIN_SECONDS_BETWEEN_SAME_SYMBOL = 300  # 5 min cooldown per symbol after any trade
 
 # ─── Trade Execution ─────────────────────────────────────────────────────────
 TRADE_DURATION      = 5
