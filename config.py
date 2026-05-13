@@ -54,17 +54,17 @@ MIN_INDICATOR_VOTES     = 5         # 5-of-7 indicators must agree (raised from 
 # ─── High Confidence Mode (HCM) ──────────────────────────────────────────────
 # Replicates the "startup advantage": wait for complete, unambiguous confluence.
 HCM_DAILY_TRADE_COUNT = 3           # first N completed trades of the day
-HCM_LOSS_TRIGGER      = 1           # consecutive losses that re-activate HCM
+HCM_LOSS_TRIGGER      = 2           # consecutive losses that re-activate HCM
 HCM_MIN_MODULES       = 3           # ALL 3 modules must agree
 HCM_MIN_VOTES         = 5           # 5/7 indicators (same as normal but
                                     # combined with the 3/3 module gate this
                                     # is dramatically stricter overall)
-HCM_MAX_EXECUTE       = 1           # only the single top-scored signal fires
+HCM_MAX_EXECUTE       = 3           # only the single top-scored signal fires
 
 # ─── Strategy ────────────────────────────────────────────────────────────────
 OB_EXPIRY_BARS          = 35
 ATR_ZONE_FACTOR         = 0.75
-NEWS_BLOCK_MINUTES      = 5
+NEWS_BLOCK_MINUTES      = 30
 DIVERGENCE_STRENGTH_MIN = 0.15
 
 # Minimum LTF bars that must elapse between two trades on the SAME symbol.
