@@ -1,8 +1,10 @@
 """
-config.py – SIFM Deriv Trading Bot configuration.
+config.py – Centralised configuration for the SIFM Deriv Trading Bot.
+All secrets are loaded from environment variables; defaults are safe fallbacks.
 """
 import os
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # ─── Deriv API ────────────────────────────────────────────────────────────────
@@ -12,55 +14,39 @@ DERIV_WS_URL    = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 DERIV_CURRENCY  = "USD"
 
 # ─── Timeframes ──────────────────────────────────────────────────────────────
-HTF_GRANULARITY           = 3600   # 1-hour HTF for all symbols
-HTF_BARS                  = 100
-LTF_GRANULARITY_FOREX     = 900    # 15-min LTF for forex pairs
-LTF_GRANULARITY_SYNTHETIC = 60     # 1-min  LTF for synthetics
-LTF_BARS_FOREX            = 200
-LTF_BARS_SYNTHETIC        = 300
+HTF_GRANULARITY       = 3600   # 1 hour (seconds) – used for all symbols
+FOREX_LTF_GRANULARITY = 900    # 15 min for forex pairs
+OTHER_LTF_GRANULARITY = 60     # 1 min for crypto, synthetics, metals, indices
+# LTF_GRANULARITY kept for backward compat with test_local.py only
+LTF_GRANULARITY       = 60
+HTF_BARS              = 100    # historical HTF bars to fetch
+LTF_BARS              = 200    # historical LTF bars to fetch
 
-# ─── Symbol filtering ────────────────────────────────────────────────────────
-# Pure Volatility Indices (R_*) are random-walk instruments.
-# SMC has no edge on them. They are excluded from the scan entirely.
-# Only instruments with genuine trending structure are traded.
-SMC_ELIGIBLE_SYNTHETICS = [
-    "BOOM500",  "BOOM1000",    # Boom indices  – strong upward trend + spikes
-    "CRASH500", "CRASH1000",   # Crash indices – strong downward trend + spikes
-    "stpRNG",                  # Step index    – structured movement
-]
-# Any symbol whose name starts with these prefixes is EXCLUDED
-EXCLUDED_PREFIXES = ("R_", "1HZ")   # Volatility indices – random walk, skip
-
-# ─── Risk ────────────────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  = 0.90   # pause at 90% drawdown from day start
-RISK_PER_TRADE_PCT    = 0.01
-MIN_STAKE             = 0.50
-MAX_STAKE             = 500.0
-MAX_CONCURRENT_TRADES = 999    # no concurrent cap – only balance/loss-limit stops trades
-
-# ─── Signal quality (hardcoded – never lower these) ──────────────────────────
-MIN_MODULES_FOR_SIGNAL = 3     # ALL 3 modules must agree
-MIN_INDICATOR_VOTES    = 5     # 5-of-7 indicators must agree
+# ─── Risk Management ─────────────────────────────────────────────────────────
+# Trading pauses ONLY when balance drops 90% below day-start balance.
+# No other balance-based throttle exists.
+DAILY_LOSS_LIMIT_PCT  = 0.90   # pause if down 90% of day-start balance
+RISK_PER_TRADE_PCT    = 0.01   # risk 1% of current balance per trade
+MIN_STAKE             = 0.35   # Deriv's absolute minimum stake (USD)
+MAX_STAKE             = 500.0  # hard cap per trade for safety
+MAX_CONCURRENT_TRADES = 10     # raised to allow high throughput
 
 # ─── Strategy ────────────────────────────────────────────────────────────────
-OB_EXPIRY_BARS                  = 35
-ATR_ZONE_FACTOR                 = 0.75
-NEWS_BLOCK_MINUTES              = 30
-DIVERGENCE_STRENGTH_MIN         = 0.15
-MIN_SECONDS_BETWEEN_SAME_SYMBOL = 60   # 1-min cooldown per symbol (was 300)
+MIN_MODULES_FOR_SIGNAL  = 2    # need ≥ 2 / 3 SIFM modules to fire
+MIN_INDICATOR_VOTES     = 4    # Module-3: need ≥ 4 / 7 indicators aligned
+OB_EXPIRY_BARS          = 20   # order-block expires after N HTF bars
+ATR_ZONE_FACTOR         = 0.5  # price must be within 0.5×ATR of SMC zone
+NEWS_BLOCK_MINUTES      = 30   # silence trading 30 min before high-impact news
+DIVERGENCE_STRENGTH_MIN = 0.3  # minimum normalised divergence strength
 
-# ─── Trade execution ─────────────────────────────────────────────────────────
-TRADE_DURATION      = 5
-TRADE_DURATION_UNIT = "m"
+# ─── Trade Execution ──────────────────────────────────────────────────────────
+TRADE_DURATION      = 5    # contract duration value
+TRADE_DURATION_UNIT = "m"  # "t"=ticks, "s"=sec, "m"=min, "h"=hr, "d"=day
 
-# ─── Scanning ────────────────────────────────────────────────────────────────
-SCAN_INTERVAL         = 3
-MAX_SYMBOLS_PER_QUEUE = 50
-INIT_BATCH_SIZE       = 5
-INIT_BATCH_DELAY      = 0.5
-
-# ─── Render ──────────────────────────────────────────────────────────────────
+# ─── Render keep-alive ───────────────────────────────────────────────────────
 PORT                = int(os.environ.get("PORT", 8080))
 SELF_URL            = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
 KEEP_ALIVE_INTERVAL = 40
-LOG_LEVEL           = os.environ.get("LOG_LEVEL", "INFO")
+
+# ─── Logging ─────────────────────────────────────────────────────────────────
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
