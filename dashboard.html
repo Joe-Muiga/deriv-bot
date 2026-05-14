@@ -7,131 +7,44 @@
   <meta http-equiv="refresh" content="10">
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
-
-    body {
-      font-family: 'Segoe UI', system-ui, sans-serif;
-      background: #0a0e1a;
-      color: #c9d1d9;
-      min-height: 100vh;
-      padding: 20px;
-    }
-
+    body { font-family: 'Segoe UI', system-ui, sans-serif; background: #0a0e1a; color: #c9d1d9; min-height: 100vh; padding: 20px; }
     h1 { font-size: 1.5rem; font-weight: 700; color: #e6edf3; }
-    h2 { font-size: 1rem; font-weight: 600; color: #8b949e; letter-spacing: .05em;
-         text-transform: uppercase; margin-bottom: 12px; }
-
-    .header {
-      display: flex; align-items: center; justify-content: space-between;
-      margin-bottom: 24px;
-      border-bottom: 1px solid #21262d;
-      padding-bottom: 16px;
-    }
-
-    .status-dot {
-      width: 10px; height: 10px; border-radius: 50%;
-      display: inline-block; margin-right: 8px;
-      animation: pulse 2s infinite;
-    }
+    h2 { font-size: 1rem; font-weight: 600; color: #8b949e; letter-spacing: .05em; text-transform: uppercase; margin-bottom: 12px; }
+    .header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 24px; border-bottom: 1px solid #21262d; padding-bottom: 16px; }
+    .status-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; margin-right: 8px; animation: pulse 2s infinite; }
     .dot-green  { background: #3fb950; }
     .dot-yellow { background: #d29922; }
     .dot-red    { background: #f85149; }
-
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50%       { opacity: 0.4; }
-    }
-
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-
-    .card {
-      background: #161b22;
-      border: 1px solid #21262d;
-      border-radius: 10px;
-      padding: 18px 20px;
-    }
-
-    .card-value {
-      font-size: 2rem; font-weight: 700;
-      line-height: 1.1; margin-top: 6px;
-    }
-
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+    .card { background: #161b22; border: 1px solid #21262d; border-radius: 10px; padding: 18px 20px; }
+    .card-value { font-size: 2rem; font-weight: 700; line-height: 1.1; margin-top: 6px; }
     .card-sub { font-size: 0.78rem; color: #8b949e; margin-top: 4px; }
-    .green  { color: #3fb950; }
-    .red    { color: #f85149; }
-    .yellow { color: #d29922; }
-    .blue   { color: #58a6ff; }
-    .purple { color: #bc8cff; }
-
-    .progress-bar {
-      height: 6px; border-radius: 3px;
-      background: #21262d; margin-top: 10px; overflow: hidden;
-    }
-    .progress-fill {
-      height: 100%; border-radius: 3px;
-      background: linear-gradient(90deg, #238636, #3fb950);
-      transition: width .5s ease;
-    }
-    .progress-fill.danger {
-      background: linear-gradient(90deg, #da3633, #f85149);
-    }
-
+    .green  { color: #3fb950; } .red    { color: #f85149; } .yellow { color: #d29922; }
+    .blue   { color: #58a6ff; } .purple { color: #bc8cff; }
+    .progress-bar { height: 6px; border-radius: 3px; background: #21262d; margin-top: 10px; overflow: hidden; }
+    .progress-fill { height: 100%; border-radius: 3px; background: linear-gradient(90deg, #238636, #3fb950); transition: width .5s ease; }
+    .progress-fill.danger { background: linear-gradient(90deg, #da3633, #f85149); }
     .section { margin-bottom: 24px; }
-
-    table {
-      width: 100%; border-collapse: collapse; font-size: .875rem;
-    }
-    th {
-      text-align: left; padding: 8px 10px;
-      color: #8b949e; border-bottom: 1px solid #21262d;
-      font-weight: 500; font-size: .78rem; text-transform: uppercase;
-    }
+    table { width: 100%; border-collapse: collapse; font-size: .875rem; }
+    th { text-align: left; padding: 8px 10px; color: #8b949e; border-bottom: 1px solid #21262d; font-weight: 500; font-size: .78rem; text-transform: uppercase; }
     td { padding: 8px 10px; border-bottom: 1px solid #161b22; }
     tr:last-child td { border-bottom: none; }
     tr:hover td { background: #1c2128; }
-
-    .badge {
-      display: inline-block; padding: 2px 8px;
-      border-radius: 12px; font-size: .75rem; font-weight: 600;
-    }
-    .badge-win  { background: #0f2d18; color: #3fb950; }
-    .badge-loss { background: #2d0f0f; color: #f85149; }
-    .badge-long { background: #0d2137; color: #58a6ff; }
-    .badge-short{ background: #2a1a0e; color: #d29922; }
-
-    .paused-banner {
-      background: #2d1b00; border: 1px solid #d29922;
-      border-radius: 8px; padding: 12px 16px;
-      margin-bottom: 20px; color: #d29922;
-      font-weight: 600;
-    }
-
-    .ticker {
-      font-family: 'Courier New', monospace;
-      font-size: .8rem; color: #8b949e;
-    }
-
-    footer {
-      text-align: center; color: #484f58;
-      font-size: .75rem; margin-top: 32px;
-    }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: .75rem; font-weight: 600; }
+    .badge-win  { background: #0f2d18; color: #3fb950; } .badge-loss { background: #2d0f0f; color: #f85149; }
+    .badge-long { background: #0d2137; color: #58a6ff; } .badge-short{ background: #2a1a0e; color: #d29922; }
+    .paused-banner { background: #2d1b00; border: 1px solid #d29922; border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; color: #d29922; font-weight: 600; }
+    .ticker { font-family: 'Courier New', monospace; font-size: .8rem; color: #8b949e; }
+    footer { text-align: center; color: #484f58; font-size: .75rem; margin-top: 32px; }
   </style>
 </head>
 <body>
 
 <div class="header">
   <div>
-    <h1>
-      <span class="status-dot {{dot_class}}" id="dot"></span>
-      SIFM Deriv Bot
-    </h1>
-    <div style="color:#8b949e; font-size:.85rem; margin-top:4px;">
-      {{session}} &nbsp;·&nbsp; Uptime {{uptime}}
-    </div>
+    <h1><span class="status-dot {{dot_class}}" id="dot"></span>SIFM Deriv Bot</h1>
+    <div style="color:#8b949e; font-size:.85rem; margin-top:4px;">{{session}} &nbsp;·&nbsp; Uptime {{uptime}}</div>
   </div>
   <div style="text-align:right">
     <div style="font-size:.8rem; color:#8b949e;">Scanning</div>
@@ -142,92 +55,63 @@
 
 {{paused_banner}}
 
-<!-- KPI Cards -->
 <div class="grid">
-
   <div class="card">
     <h2>Balance</h2>
     <div class="card-value {{balance_color}}">$ {{balance}}</div>
     <div class="card-sub">Started today @ ${{day_start}}</div>
   </div>
-
   <div class="card">
     <h2>Daily P&L</h2>
     <div class="card-value {{pnl_color}}">{{daily_pnl_sign}}$ {{daily_pnl_abs}}</div>
     <div class="card-sub">{{daily_pnl_pct}} % of day start</div>
-    <div class="progress-bar">
-      <div class="progress-fill {{danger_class}}" style="width:{{loss_bar_pct}}%"></div>
-    </div>
-    <div class="card-sub" style="margin-top:6px;">{{loss_bar_pct}}% of 9% limit used</div>
+    <div class="progress-bar"><div class="progress-fill {{danger_class}}" style="width:{{loss_bar_pct}}%"></div></div>
+    <div class="card-sub" style="margin-top:6px;">{{loss_bar_pct}}% of 90% limit used</div>
   </div>
-
   <div class="card">
     <h2>Win Rate</h2>
     <div class="card-value {{wr_color}}">{{win_rate}}%</div>
     <div class="card-sub">{{wins}} W / {{losses}} L &nbsp;({{trades}} total)</div>
   </div>
-
   <div class="card">
     <h2>Profit Factor</h2>
     <div class="card-value {{pf_color}}">{{profit_factor}}</div>
     <div class="card-sub">Gross profit / Gross loss</div>
   </div>
-
   <div class="card">
     <h2>Streak</h2>
     <div class="card-value {{streak_color}}">{{streak_label}}</div>
     <div class="card-sub">Consecutive {{streak_type}}</div>
   </div>
-
   <div class="card">
     <h2>Session</h2>
     <div class="card-value blue" style="font-size:1.1rem; margin-top:10px;">{{session}}</div>
     <div class="card-sub">{{tradeable_count}} symbols in queue</div>
   </div>
-
 </div>
 
-<!-- Recent Trades -->
 <div class="section card">
   <h2>Recent Trades</h2>
   <table>
-    <thead>
-      <tr>
-        <th>Time</th>
-        <th>Symbol</th>
-        <th>Dir</th>
-        <th>Stake</th>
-        <th>P&L</th>
-        <th>Bal After</th>
-        <th>Result</th>
-      </tr>
-    </thead>
-    <tbody>
-      {{recent_rows}}
-    </tbody>
+    <thead><tr><th>Time</th><th>Symbol</th><th>Dir</th><th>Stake</th><th>P&L</th><th>Bal After</th><th>Result</th></tr></thead>
+    <tbody>{{recent_rows}}</tbody>
   </table>
 </div>
 
-<!-- Best Symbols -->
 <div class="section card">
   <h2>Symbol Leaderboard</h2>
   <table>
-    <thead>
-      <tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>P&L</th><th>Score</th></tr>
-    </thead>
-    <tbody>
-      {{symbol_rows}}
-    </tbody>
+    <thead><tr><th>Symbol</th><th>Trades</th><th>Win Rate</th><th>P&L</th><th>Score</th></tr></thead>
+    <tbody>{{symbol_rows}}</tbody>
   </table>
 </div>
 
-<!-- Last Signal -->
 <div class="section card">
   <h2>Last Signal</h2>
   <div class="ticker">{{last_signal}}</div>
 </div>
 
-<footer>SIFM Deriv Bot &nbsp;·&nbsp; {{now_utc}} UTC &nbsp;·&nbsp; Risk 1% / trade · 9% daily loss limit</footer>
+<footer>SIFM Deriv Bot &nbsp;·&nbsp; {{now_utc}} UTC &nbsp;·&nbsp; Risk 1% / trade · 90% daily loss limit</footer>
 
 </body>
 </html>
