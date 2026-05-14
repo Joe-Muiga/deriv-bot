@@ -1,27 +1,41 @@
 """
-restart_scheduler.py – Triggers a fresh Render deployment every 15 minutes.
+restart_scheduler.py – Graceful auto-redeploy on Render.
 
-Why: The bot stops generating trades after several executions; a fresh deploy
-reliably restores profitable trading without any code changes.
+Cycle (repeats forever):
+  1. Sleep a random interval between MIN_INTERVAL and MAX_INTERVAL.
+  2. Signal the bot to pause new trade entries (sets redeploy_pending = True).
+  3. Wait up to DRAIN_TIMEOUT seconds for all active trades to close.
+  4. POST to RENDER_DEPLOY_HOOK_URL → Render builds a fresh instance.
+  5. The new instance starts with redeploy_pending = False (clean slate).
 
-Behaviour:
-  - Runs in a daemon thread (never blocks the bot or Flask).
-  - Waits 15 minutes, then POSTs to RENDER_DEPLOY_HOOK_URL.
-  - On failure, logs the error and retries on the next 15-minute tick.
-  - If RENDER_DEPLOY_HOOK_URL is not set, logs a one-time warning and exits
-    (safe no-op for local development).
+bot_engine.py integration required (two calls):
+  • Before opening any new trade:
+        from keep_alive import is_redeploy_pending
+        if is_redeploy_pending():
+            return  # skip – redeploy is imminent
+
+  • Whenever your open-position count changes (open OR close a trade):
+        from keep_alive import set_active_trades
+        set_active_trades(len(self.open_positions))  # or equivalent
 """
 
 import logging
+import random
 import threading
 import time
 
 import requests
 import config
+from keep_alive import set_redeploy_pending, get_active_trades
 
 logger = logging.getLogger(__name__)
 
-_INTERVAL_SECONDS = 900  # 15 minutes
+# ── Tuneable constants ────────────────────────────────────────────────────────
+MIN_INTERVAL  = 50 * 60   # 50 min in seconds
+MAX_INTERVAL  = 90 * 60   # 90 min in seconds
+DRAIN_TIMEOUT = 10 * 60   # wait at most 10 min for open trades to close
+DRAIN_POLL    = 5         # poll active-trade count every 5 seconds
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _scheduler_loop() -> None:
@@ -36,32 +50,70 @@ def _scheduler_loop() -> None:
         return
 
     logger.info(
-        f"Restart scheduler started – will trigger a fresh deploy "
-        f"every {_INTERVAL_SECONDS // 60} minutes."
+        f"Restart scheduler started "
+        f"(random interval {MIN_INTERVAL // 60}–{MAX_INTERVAL // 60} min, "
+        f"drain timeout {DRAIN_TIMEOUT // 60} min)."
     )
 
     while True:
-        time.sleep(_INTERVAL_SECONDS)
+        # ── 1. Random sleep ──────────────────────────────────────────────────
+        interval = random.randint(MIN_INTERVAL, MAX_INTERVAL)
+        logger.info(
+            f"Restart scheduler: next redeploy in "
+            f"{interval // 60}m {interval % 60}s."
+        )
+        time.sleep(interval)
 
+        # ── 2. Pause new trade entries ────────────────────────────────────────
+        logger.info(
+            "Restart scheduler: signalling bot to pause new trade entries …"
+        )
+        set_redeploy_pending(True)
+
+        # ── 3. Drain open trades ──────────────────────────────────────────────
+        deadline = time.time() + DRAIN_TIMEOUT
+        while time.time() < deadline:
+            active = get_active_trades()
+            if active == 0:
+                logger.info(
+                    "Restart scheduler: all trades closed – proceeding to deploy."
+                )
+                break
+            logger.info(
+                f"Restart scheduler: {active} open trade(s) remaining, "
+                f"waiting …"
+            )
+            time.sleep(DRAIN_POLL)
+        else:
+            logger.warning(
+                f"Restart scheduler: drain timeout – "
+                f"{get_active_trades()} trade(s) still open. Deploying anyway."
+            )
+
+        # ── 4. Trigger Render redeploy ────────────────────────────────────────
         logger.info("Restart scheduler: POSTing to Render deploy hook …")
         try:
-            response = requests.post(url, timeout=15)
-            if response.ok:
+            r = requests.post(url, timeout=15)
+            if r.ok:
                 logger.info(
-                    f"Restart scheduler: deploy triggered successfully "
-                    f"(HTTP {response.status_code}). "
-                    "Render will build and redeploy the bot shortly."
+                    f"Restart scheduler: deploy triggered ✓ (HTTP {r.status_code}). "
+                    "Render is building a fresh instance."
                 )
+                # Leave redeploy_pending = True – the dying process won't open
+                # any more trades and the new process starts clean (False).
             else:
                 logger.error(
-                    f"Restart scheduler: deploy hook returned an unexpected status – "
-                    f"HTTP {response.status_code}: {response.text[:200]}"
+                    f"Restart scheduler: deploy hook returned "
+                    f"HTTP {r.status_code}: {r.text[:200]} – "
+                    "clearing pause flag; will retry next cycle."
                 )
+                set_redeploy_pending(False)
         except requests.RequestException as exc:
             logger.error(
-                f"Restart scheduler: POST to deploy hook failed – {exc}. "
-                "Will retry on the next 15-minute tick."
+                f"Restart scheduler: POST failed – {exc}. "
+                "Clearing pause flag; will retry next cycle."
             )
+            set_redeploy_pending(False)
 
 
 def start_restart_scheduler() -> None:
