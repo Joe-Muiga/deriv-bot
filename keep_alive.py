@@ -44,12 +44,38 @@ _state: dict = {
     "streak":                0,
     "recent_trades":         [],
     "best_symbols":          [],
+    # ── Redeploy coordination (set by restart_scheduler, read by bot_engine) ──
+    "redeploy_pending":      False,   # True  → stop opening new trades
+    "active_trades":         0,       # count of currently open positions
 }
 
 
 def update_status(**kwargs):
     _state.update(kwargs)
     _state["uptime_seconds"] = int(time.time() - _state["start_time"])
+
+
+# ── Redeploy-coordination helpers (used by restart_scheduler + bot_engine) ───
+
+def set_redeploy_pending(value: bool) -> None:
+    """Called by restart_scheduler to pause/resume new trade entries."""
+    _state["redeploy_pending"] = value
+    logger.info(f"redeploy_pending set to {value}")
+
+
+def is_redeploy_pending() -> bool:
+    """bot_engine calls this before opening any new trade."""
+    return bool(_state["redeploy_pending"])
+
+
+def set_active_trades(count: int) -> None:
+    """bot_engine calls this whenever a trade opens or closes."""
+    _state["active_trades"] = max(0, int(count))
+
+
+def get_active_trades() -> int:
+    """restart_scheduler polls this to know when all trades have closed."""
+    return int(_state["active_trades"])
 
 
 _DASH_TEMPLATE: str = ""
