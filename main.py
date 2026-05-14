@@ -5,12 +5,14 @@ Architecture:
   • Thread 1 (main) : Flask web server for Render's health checks
   • Thread 2        : asyncio event loop running the bot engine
   • Thread 3        : self-ping keep-alive (pings /health every 40 s)
+  • Thread 4        : restart scheduler (triggers a fresh deploy every 15 min)
 
 Environment variables required:
-  DERIV_API_TOKEN       – your Deriv API token (trade + read scope)
-  DERIV_APP_ID          – your Deriv app ID  (default 1089 = demo)
-  RENDER_EXTERNAL_URL   – set automatically by Render  (e.g. https://yourapp.onrender.com)
-  PORT                  – set automatically by Render   (default 8080)
+  DERIV_API_TOKEN        – your Deriv API token (trade + read scope)
+  DERIV_APP_ID           – your Deriv app ID  (default 1089 = demo)
+  RENDER_EXTERNAL_URL    – set automatically by Render  (e.g. https://yourapp.onrender.com)
+  PORT                   – set automatically by Render   (default 8080)
+  RENDER_DEPLOY_HOOK_URL – deploy hook URL from Render dashboard (optional; enables auto-redeploy)
 """
 
 import asyncio
@@ -49,6 +51,7 @@ def _run_bot():
 # ─── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     from keep_alive import app, start_keep_alive
+    from restart_scheduler import start_restart_scheduler
 
     logger.info("Starting SIFM Deriv Trading Bot …")
     logger.info(f"  Deriv App ID : {config.DERIV_APP_ID}")
@@ -59,11 +62,14 @@ if __name__ == "__main__":
     # 1. Start keep-alive pinger
     start_keep_alive()
 
-    # 2. Start bot in background thread
+    # 2. Start auto-redeploy scheduler (no-op if RENDER_DEPLOY_HOOK_URL is unset)
+    start_restart_scheduler()
+
+    # 3. Start bot in background thread
     bot_thread = threading.Thread(target=_run_bot, name="bot-engine", daemon=True)
     bot_thread.start()
     logger.info("Bot engine thread started ✓")
 
-    # 3. Flask in main thread (Render requires a bound web server)
+    # 4. Flask in main thread (Render requires a bound web server)
     logger.info(f"Starting Flask on 0.0.0.0:{config.PORT}")
     app.run(host="0.0.0.0", port=config.PORT, use_reloader=False, threaded=True)
