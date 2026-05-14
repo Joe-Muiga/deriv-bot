@@ -1,18 +1,16 @@
 """
-symbol_manager.py – Intelligent symbol rotation with adaptive prioritisation.
+symbol_manager.py – Symbol rotation with performance scoring.
 
-Logic:
-  • Maintains a performance score per symbol (win-rate, profit, recency).
-  • Symbols with consistent losses are temporarily deprioritised.
-  • Synthetics (always available) fill the queue when real markets are closed.
-  • Market-hours awareness prevents scanning closed instruments.
-  • Every N cycles the bot re-queries Deriv's active_symbols list.
+Cooldown / streak-suppression logic has been removed entirely.
+Every active symbol is always eligible for scanning regardless of
+recent win/loss history.  The score is used only for dashboard display
+and queue ordering – it never blocks a symbol from being scanned.
 """
 
 import time
 import logging
 import datetime
-from typing import List, Dict, Optional, Set
+from typing import List, Dict, Set
 from dataclasses import dataclass, field
 import pytz
 
@@ -22,15 +20,13 @@ logger = logging.getLogger(__name__)
 
 UTC = pytz.utc
 
-# Market session hours in UTC  (open_hour, open_min, close_hour, close_min)
 SESSIONS = {
-    "sydney":    (21, 0, 6, 0),   # 21:00–06:00 UTC
-    "tokyo":     (0,  0, 9, 0),   # 00:00–09:00 UTC
-    "london":    (7,  0, 16, 0),  # 07:00–16:00 UTC
-    "new_york":  (12, 0, 21, 0),  # 12:00–21:00 UTC
+    "sydney":   (21, 0,  6, 0),
+    "tokyo":    ( 0, 0,  9, 0),
+    "london":   ( 7, 0, 16, 0),
+    "new_york": (12, 0, 21, 0),
 }
 
-# Map Deriv symbol prefix → relevant session(s)
 SYMBOL_SESSION: Dict[str, List[str]] = {
     "frxEURUSD": ["london", "new_york"],
     "frxGBPUSD": ["london", "new_york"],
@@ -46,11 +42,10 @@ SYMBOL_SESSION: Dict[str, List[str]] = {
     "frxXAGUSD": ["london", "new_york"],
     "frxUSOIL":  ["new_york"],
     "frxUKOIL":  ["london"],
-    "cryBTCUSD": [],  # 24/7
-    "cryETHUSD": [],  # 24/7
+    "cryBTCUSD": [],
+    "cryETHUSD": [],
 }
 
-# Synthetics are always available
 for s in sym_module.SYNTHETIC:
     SYMBOL_SESSION[s] = []
 
@@ -62,7 +57,6 @@ class SymbolStats:
     wins:          int   = 0
     total_pnl:     float = 0.0
     last_trade_ts: float = 0.0
-    cooldown_until: float = 0.0   # epoch – deprioritised until this time
 
     @property
     def win_rate(self) -> float:
@@ -70,39 +64,26 @@ class SymbolStats:
 
     @property
     def score(self) -> float:
-        """Higher = more desirable to trade."""
         recency_bonus = 0.1 if time.time() - self.last_trade_ts > 3600 else 0
-        pnl_score     = min(self.total_pnl * 10, 1.0)   # capped at +1
-        wr_score      = self.win_rate                     # 0–1
-        return wr_score + pnl_score + recency_bonus
+        pnl_score     = min(self.total_pnl * 10, 1.0)
+        return self.win_rate + pnl_score + recency_bonus
 
 
 class SymbolManager:
-    """
-    Maintains and rotates the symbol scan queue intelligently.
-    """
 
     def __init__(self,
-                 refresh_interval:  int = 3600,   # re-check active symbols hourly
-                 cooldown_trades:   int = 3,       # consecutive losses before cooldown
-                 cooldown_seconds:  int = 1800):   # 30-minute cooldown
+                 refresh_interval: int = 3600):
         self._refresh_interval = refresh_interval
-        self._cooldown_trades  = cooldown_trades
-        self._cooldown_seconds = cooldown_seconds
-
-        self._stats:    Dict[str, SymbolStats] = {}
-        self._active:   Set[str] = set(sym_module.SYNTHETIC)  # start with synthetics
+        self._stats:  Dict[str, SymbolStats] = {}
+        self._active: Set[str] = set(sym_module.SYNTHETIC)
         self._last_refresh: float = 0.0
-        self._consecutive_losses: Dict[str, int] = {}
 
-        # Initialise stats for all known symbols
         for sym in sym_module.ALL_SYMBOLS:
             self._stats[sym] = SymbolStats(symbol=sym)
 
     # ── Active symbol list ────────────────────────────────────────────────────
 
     def update_active(self, active_symbols_from_api: List[str]):
-        """Call with the list returned by DerivClient.get_active_symbols()."""
         self._active = set(active_symbols_from_api) | set(sym_module.SYNTHETIC)
         self._last_refresh = time.time()
         logger.info(f"SymbolManager: {len(self._active)} active symbols")
@@ -113,45 +94,24 @@ class SymbolManager:
     # ── Session hours check ───────────────────────────────────────────────────
 
     def _in_session(self, symbol: str) -> bool:
-        """Return True if this symbol's main market is currently open."""
         sessions = SYMBOL_SESSION.get(symbol, None)
-        if sessions is None:
-            # Unknown symbol – assume tradeable (synthetics etc.)
+        if sessions is None or sessions == []:
             return True
-        if sessions == []:
-            # 24/7 instrument
-            return True
-
         now_utc = datetime.datetime.utcnow()
-        h, m    = now_utc.hour, now_utc.minute
-        now_min = h * 60 + m   # minutes since midnight
-
+        now_min = now_utc.hour * 60 + now_utc.minute
         for sess_name in sessions:
             oh, om, ch, cm = SESSIONS[sess_name]
             open_min  = oh * 60 + om
             close_min = ch * 60 + cm
             if open_min < close_min:
-                # Same-day session
                 if open_min <= now_min <= close_min:
                     return True
             else:
-                # Overnight session (e.g. Sydney 21:00–06:00)
                 if now_min >= open_min or now_min <= close_min:
                     return True
         return False
 
-    # ── Cooldown management ───────────────────────────────────────────────────
-
-    def _apply_cooldown(self, symbol: str):
-        until = time.time() + self._cooldown_seconds
-        self._stats[symbol].cooldown_until = until
-        logger.warning(f"SymbolManager: {symbol} on cooldown for "
-                       f"{self._cooldown_seconds//60} min after consecutive losses")
-
-    def _in_cooldown(self, symbol: str) -> bool:
-        return time.time() < self._stats[symbol].cooldown_until
-
-    # ── Trade outcome recording ───────────────────────────────────────────────
+    # ── Trade outcome recording (stats only, no suppression) ─────────────────
 
     def record_trade(self, symbol: str, won: bool, pnl: float):
         if symbol not in self._stats:
@@ -161,55 +121,37 @@ class SymbolManager:
         st.wins          += int(won)
         st.total_pnl     += pnl
         st.last_trade_ts  = time.time()
-
-        # Track consecutive losses for cooldown
-        if won:
-            self._consecutive_losses[symbol] = 0
-        else:
-            n = self._consecutive_losses.get(symbol, 0) + 1
-            self._consecutive_losses[symbol] = n
-            if n >= self._cooldown_trades:
-                self._apply_cooldown(symbol)
-                self._consecutive_losses[symbol] = 0
+        # No cooldown, no consecutive-loss tracking.
 
     # ── Queue generation ──────────────────────────────────────────────────────
 
-    def get_queue(self, max_symbols: int = 30) -> List[str]:
+    def get_queue(self, max_symbols: int = 200) -> List[str]:
         """
-        Return a prioritised list of symbols to scan next.
-        Order: synthetic (always) → session-open + high-score → rest.
+        Return ALL active symbols sorted by (session-open first, score desc).
+        No symbol is ever excluded due to recent performance.
         """
-        now = time.time()
         candidates = []
-
         for sym in sym_module.ALL_SYMBOLS:
             if sym not in self._active:
                 continue
-            if self._in_cooldown(sym):
-                continue
-
             in_sess = self._in_session(sym)
             score   = self._stats[sym].score if sym in self._stats else 0.5
             candidates.append((sym, in_sess, score))
 
-        # Sort: session-open first, then by score descending
         candidates.sort(key=lambda x: (not x[1], -x[2]))
         queue = [c[0] for c in candidates[:max_symbols]]
 
-        # Always ensure at least some synthetics at the front
-        synthetics_in_queue = [s for s in queue if s in sym_module.SYNTHETIC]
-        if not synthetics_in_queue:
-            queue = sym_module.SYNTHETIC[:3] + queue
+        # Always ensure synthetics are present
+        if not any(s in sym_module.SYNTHETIC for s in queue):
+            queue = list(sym_module.SYNTHETIC[:3]) + queue
 
         return queue
 
     def best_symbols(self, n: int = 5) -> List[dict]:
-        """Return top N symbols by score for dashboard display."""
         scored = sorted(
             [(s, st) for s, st in self._stats.items() if st.trades > 0],
             key=lambda x: x[1].score,
-            reverse=True
-        )
+            reverse=True)
         return [
             {"symbol": s, "trades": st.trades,
              "win_rate": round(st.win_rate * 100, 1),
@@ -222,19 +164,16 @@ class SymbolManager:
         return {
             s: {"trades": st.trades, "wins": st.wins,
                 "win_rate": round(st.win_rate * 100, 1),
-                "pnl": round(st.total_pnl, 4),
-                "cooldown": st.cooldown_until > time.time()}
+                "pnl": round(st.total_pnl, 4)}
             for s, st in self._stats.items()
             if st.trades > 0
         }
 
     @property
     def current_session(self) -> str:
-        """Return active market session name(s) for display."""
         active = []
         now_utc = datetime.datetime.utcnow()
-        h, m    = now_utc.hour, now_utc.minute
-        now_min = h * 60 + m
+        now_min = now_utc.hour * 60 + now_utc.minute
         for name, (oh, om, ch, cm) in SESSIONS.items():
             open_min  = oh * 60 + om
             close_min = ch * 60 + cm
