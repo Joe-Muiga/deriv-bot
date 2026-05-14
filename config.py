@@ -48,5 +48,8 @@ PORT                = int(os.environ.get("PORT", 8080))
 SELF_URL            = os.environ.get("RENDER_EXTERNAL_URL", f"http://localhost:{PORT}")
 KEEP_ALIVE_INTERVAL = 40
 
+# ─── Render auto-redeploy ────────────────────────────────────────────────────
+RENDER_DEPLOY_HOOK_URL = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
+
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
