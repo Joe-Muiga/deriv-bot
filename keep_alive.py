@@ -3,8 +3,8 @@ keep_alive.py – Flask web server + self-ping thread + HTML dashboard.
 
 Routes:
   /          → Live HTML dashboard (auto-refreshes every 10 s)
-  /health    → Plain JSON health check (used by self-pinger + Render)
-  /stats     → Detailed JSON stats for API consumers
+  /health    → Plain JSON health check
+  /stats     → Detailed JSON stats
   /trades    → Recent trade list as JSON
   /symbols   → Symbol leaderboard as JSON
 """
@@ -21,31 +21,29 @@ import config
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# ─── Shared state (written by bot engine, read by dashboard) ──────────────────
-
 _state: dict = {
-    "running":             False,
-    "balance":             0.0,
-    "day_start_balance":   0.0,
-    "trades_today":        0,
-    "wins_today":          0,
-    "losses_today":        0,
+    "running":               False,
+    "balance":               0.0,
+    "day_start_balance":     0.0,
+    "trades_today":          0,
+    "wins_today":            0,
+    "losses_today":          0,
     "paused_for_loss_limit": False,
-    "current_symbol":      "—",
-    "last_signal":         "No signal yet",
-    "uptime_seconds":      0,
-    "start_time":          time.time(),
-    "session":             "Starting …",
-    "tradeable_count":     0,
-    "gross_profit":        0.0,
-    "gross_loss":          0.0,
-    "profit_factor":       0.0,
-    "avg_rr":              0.0,
-    "best_trade":          0.0,
-    "worst_trade":         0.0,
-    "streak":              0,
-    "recent_trades":       [],
-    "best_symbols":        [],
+    "current_symbol":        "—",
+    "last_signal":           "No signal yet",
+    "uptime_seconds":        0,
+    "start_time":            time.time(),
+    "session":               "Starting …",
+    "tradeable_count":       0,
+    "gross_profit":          0.0,
+    "gross_loss":            0.0,
+    "profit_factor":         0.0,
+    "avg_rr":                0.0,
+    "best_trade":            0.0,
+    "worst_trade":           0.0,
+    "streak":                0,
+    "recent_trades":         [],
+    "best_symbols":          [],
 }
 
 
@@ -53,8 +51,6 @@ def update_status(**kwargs):
     _state.update(kwargs)
     _state["uptime_seconds"] = int(time.time() - _state["start_time"])
 
-
-# ─── Dashboard HTML rendering ────────────────────────────────────────────────
 
 _DASH_TEMPLATE: str = ""
 
@@ -73,13 +69,15 @@ def _render_dashboard() -> str:
     if not _DASH_TEMPLATE:
         _load_template()
 
-    s = _state
+    s         = _state
     balance   = s["balance"]
     day_start = s["day_start_balance"]
     daily_pnl = balance - day_start
     pnl_pct   = (daily_pnl / day_start * 100) if day_start else 0
     loss_pct  = max(-pnl_pct, 0)
-    loss_bar_pct = min(loss_pct / 9 * 100, 100)
+
+    # Progress bar shows percentage of the 90% loss limit consumed
+    loss_bar_pct = min(loss_pct / 90 * 100, 100)
 
     wins     = s["wins_today"]
     losses   = s["losses_today"]
@@ -88,8 +86,9 @@ def _render_dashboard() -> str:
     pf       = s.get("profit_factor", 0)
     streak   = s.get("streak", 0)
 
-    dot_class     = "dot-green"  if s["running"] and not s["paused_for_loss_limit"] else \
-                    "dot-yellow" if s["paused_for_loss_limit"] else "dot-red"
+    dot_class    = ("dot-green"  if s["running"] and not s["paused_for_loss_limit"]
+                    else "dot-yellow" if s["paused_for_loss_limit"]
+                    else "dot-red")
     balance_color = "green" if balance >= day_start else "red"
     pnl_color     = "green" if daily_pnl >= 0 else "red"
     pnl_sign      = "+" if daily_pnl >= 0 else "-"
@@ -104,23 +103,22 @@ def _render_dashboard() -> str:
     if s["paused_for_loss_limit"]:
         paused_banner = (
             '<div class="paused-banner">'
-            '⛔ Daily loss limit (9%) reached. Trading paused until UTC midnight.'
+            '⛔ Daily loss limit (90%) reached. Trading paused until UTC midnight.'
             '</div>'
         )
 
     up     = s["uptime_seconds"]
     uptime = f"{up//3600}h {(up%3600)//60}m"
 
-    # Recent trades table rows
     recent_rows = ""
     for t in reversed(s.get("recent_trades", [])[-20:]):
         pnl   = t.get("pnl", 0)
         won   = t.get("won", False)
-        badge = '<span class="badge badge-win">WIN</span>'  if won else \
-                '<span class="badge badge-loss">LOSS</span>'
-        dir_b = '<span class="badge badge-long">LONG</span>' \
-                if t.get("direction") == "LONG" else \
-                '<span class="badge badge-short">SHORT</span>'
+        badge = ('<span class="badge badge-win">WIN</span>'  if won else
+                 '<span class="badge badge-loss">LOSS</span>')
+        dir_b = ('<span class="badge badge-long">LONG</span>'
+                 if t.get("direction") == "LONG" else
+                 '<span class="badge badge-short">SHORT</span>')
         pnl_c = "green" if pnl >= 0 else "red"
         ts    = t.get("exit_time", "")[:19].replace("T", " ")
         recent_rows += (
@@ -135,12 +133,9 @@ def _render_dashboard() -> str:
             f"</tr>"
         )
     if not recent_rows:
-        recent_rows = (
-            "<tr><td colspan='7' style='text-align:center;color:#484f58'>"
-            "No trades yet</td></tr>"
-        )
+        recent_rows = ("<tr><td colspan='7' style='text-align:center;color:#484f58'>"
+                       "No trades yet</td></tr>")
 
-    # Symbol leaderboard rows
     symbol_rows = ""
     for sym in s.get("best_symbols", [])[:10]:
         pnl   = sym.get("pnl", 0)
@@ -157,48 +152,44 @@ def _render_dashboard() -> str:
             f"</tr>"
         )
     if not symbol_rows:
-        symbol_rows = (
-            "<tr><td colspan='5' style='text-align:center;color:#484f58'>"
-            "No data yet</td></tr>"
-        )
+        symbol_rows = ("<tr><td colspan='5' style='text-align:center;color:#484f58'>"
+                       "No data yet</td></tr>")
 
     html = _DASH_TEMPLATE
     for k, v in {
-        "{{dot_class}}":        dot_class,
-        "{{session}}":          s.get("session", "—"),
-        "{{uptime}}":           uptime,
-        "{{current_symbol}}":   s.get("current_symbol", "—"),
-        "{{paused_banner}}":    paused_banner,
-        "{{balance}}":          f"{balance:.4f}",
-        "{{balance_color}}":    balance_color,
-        "{{day_start}}":        f"{day_start:.4f}",
-        "{{daily_pnl_sign}}":   pnl_sign,
-        "{{daily_pnl_abs}}":    f"{abs(daily_pnl):.4f}",
-        "{{daily_pnl_pct}}":    f"{pnl_pct:+.2f}",
-        "{{pnl_color}}":        pnl_color,
-        "{{loss_bar_pct}}":     f"{loss_bar_pct:.0f}",
-        "{{danger_class}}":     danger_class,
-        "{{win_rate}}":         f"{win_rate:.1f}",
-        "{{wr_color}}":         wr_color,
-        "{{wins}}":             str(wins),
-        "{{losses}}":           str(losses),
-        "{{trades}}":           str(trades),
-        "{{profit_factor}}":    f"{pf:.3f}",
-        "{{pf_color}}":         pf_color,
-        "{{streak_label}}":     streak_label,
-        "{{streak_color}}":     streak_color,
-        "{{streak_type}}":      streak_type,
-        "{{tradeable_count}}":  str(s.get("tradeable_count", 0)),
-        "{{last_signal}}":      s.get("last_signal", "—"),
-        "{{now_utc}}":          datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-        "{{recent_rows}}":      recent_rows,
-        "{{symbol_rows}}":      symbol_rows,
+        "{{dot_class}}":       dot_class,
+        "{{session}}":         s.get("session", "—"),
+        "{{uptime}}":          uptime,
+        "{{current_symbol}}":  s.get("current_symbol", "—"),
+        "{{paused_banner}}":   paused_banner,
+        "{{balance}}":         f"{balance:.4f}",
+        "{{balance_color}}":   balance_color,
+        "{{day_start}}":       f"{day_start:.4f}",
+        "{{daily_pnl_sign}}":  pnl_sign,
+        "{{daily_pnl_abs}}":   f"{abs(daily_pnl):.4f}",
+        "{{daily_pnl_pct}}":   f"{pnl_pct:+.2f}",
+        "{{pnl_color}}":       pnl_color,
+        "{{loss_bar_pct}}":    f"{loss_bar_pct:.0f}",
+        "{{danger_class}}":    danger_class,
+        "{{win_rate}}":        f"{win_rate:.1f}",
+        "{{wr_color}}":        wr_color,
+        "{{wins}}":            str(wins),
+        "{{losses}}":          str(losses),
+        "{{trades}}":          str(trades),
+        "{{profit_factor}}":   f"{pf:.3f}",
+        "{{pf_color}}":        pf_color,
+        "{{streak_label}}":    streak_label,
+        "{{streak_color}}":    streak_color,
+        "{{streak_type}}":     streak_type,
+        "{{tradeable_count}}": str(s.get("tradeable_count", 0)),
+        "{{last_signal}}":     s.get("last_signal", "—"),
+        "{{now_utc}}":         datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "{{recent_rows}}":     recent_rows,
+        "{{symbol_rows}}":     symbol_rows,
     }.items():
         html = html.replace(k, str(v))
     return html
 
-
-# ─── Flask routes ─────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -212,7 +203,7 @@ def health():
 
 @app.route("/stats")
 def stats_route():
-    s = _state
+    s         = _state
     balance   = s["balance"]
     day_start = s["day_start_balance"]
     return jsonify({
@@ -245,10 +236,8 @@ def symbols_route():
     return jsonify({"symbols": _state.get("best_symbols", [])})
 
 
-# ─── Self-ping keep-alive ─────────────────────────────────────────────────────
-
 def _ping_loop():
-    time.sleep(20)   # wait for Flask to be ready
+    time.sleep(20)
     while True:
         try:
             r = requests.get(f"{config.SELF_URL}/health", timeout=10)
