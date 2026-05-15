@@ -1,14 +1,13 @@
 """
 risk_manager.py – Phase C risk overlay for the SIFM bot.
 
-Responsibilities:
-  • Track daily starting balance and current balance
-  • Enforce the 90 % daily loss limit (pause until UTC midnight)
-      → Trading halts once the balance has fallen to ≤10 % of the
-        day-start snapshot.  It resumes automatically at UTC midnight.
-  • Compound position sizing (1 % of CURRENT balance per trade)
-  • Apply minimum / maximum stake constraints
-  • Record trade outcomes
+Changes vs previous version:
+  • Tracks current win/loss streak internally (_current_streak).
+  • calculate_stake() uses the streak to scale position size:
+      - Win streak  → stake grows by WIN_STREAK_STAKE_FACTOR per win, capped.
+      - Loss streak → stake collapses to MIN_STAKE immediately.
+  • Trading pauses ONLY when balance drops 90% below the day-start value.
+    No other balance-based throttle exists.
 """
 
 import time
@@ -34,23 +33,13 @@ class TradeRecord:
 
 
 class RiskManager:
-    """
-    Manages risk rules for a single trading session.
-
-    The '90 % daily loss' rule
-    --------------------------
-    At the start of each UTC day the starting balance is snapshotted.
-    If the CURRENT balance ever drops below (day_start × 0.10) — meaning
-    90 % of the day's capital has been lost — trading is paused for the
-    remainder of that UTC day and automatically resumes at UTC midnight.
-    """
 
     def __init__(self,
-                 daily_loss_limit: float = 0.90,   # 90 % drawdown threshold
+                 daily_loss_limit: float = 0.90,
                  risk_per_trade:   float = 0.01,
-                 min_stake:        float = 0.50,
+                 min_stake:        float = 0.35,
                  max_stake:        float = 500.0,
-                 max_concurrent:   int   = 5):
+                 max_concurrent:   int   = 10):
 
         self.daily_loss_limit = daily_loss_limit
         self.risk_per_trade   = risk_per_trade
@@ -60,12 +49,15 @@ class RiskManager:
 
         self._current_balance:   float = 0.0
         self._day_start_balance: float = 0.0
-        self._day_tag:           str   = ""    # "YYYY-MM-DD" of current day
+        self._day_tag:           str   = ""
         self._paused:            bool  = False
         self._open_trade_count:  int   = 0
         self._trades:            list  = []
 
-        # Aggregate stats (session-lifetime, not reset daily)
+        # Streak tracking: positive = consecutive wins, negative = consecutive losses
+        self._current_streak: int = 0
+
+        # Session stats
         self.total_trades: int   = 0
         self.wins:         int   = 0
         self.losses:       int   = 0
@@ -74,22 +66,18 @@ class RiskManager:
     # ── Balance management ────────────────────────────────────────────────────
 
     def set_balance(self, balance: float):
-        """Called whenever a fresh balance is received from Deriv."""
         today = self._today_tag()
-
         if today != self._day_tag:
-            # New UTC day → reset daily tracking
             self._day_tag           = today
             self._day_start_balance = balance
             self._paused            = False
-            logger.info(
-                f"New trading day {today} | "
-                f"Starting balance: ${balance:.4f}"
-            )
-
+            self._current_streak    = 0
+            logger.info(f"New trading day {today} | "
+                        f"Starting balance: ${balance:.4f}")
         self._current_balance = balance
         self._check_loss_limit()
 
+    @property
     def current_balance(self) -> float:
         return self._current_balance
 
@@ -107,92 +95,102 @@ class RiskManager:
             return 0.0
         return self.daily_pnl / self._day_start_balance
 
+    @property
+    def current_streak(self) -> int:
+        """Positive = win streak length, negative = loss streak length."""
+        return self._current_streak
+
     # ── Loss limit check ──────────────────────────────────────────────────────
 
     def _check_loss_limit(self):
         if self._day_start_balance == 0:
             return
-        # loss_pct is positive when we are losing money
         loss_pct = -self.daily_pnl_pct
-        if loss_pct >= self.daily_loss_limit:
-            if not self._paused:
-                self._paused = True
-                logger.warning(
-                    f"⛔ Daily loss limit reached! "
-                    f"Down {loss_pct * 100:.2f}% from today's start "
-                    f"(${self._day_start_balance:.4f} → "
-                    f"${self._current_balance:.4f}). "
-                    f"Trading PAUSED until UTC midnight."
-                )
-        # We never auto-unpause mid-day even if balance somehow recovers
-        # (e.g. external deposit).  The unpause happens at day rollover
-        # inside set_balance() when a new UTC day is detected.
+        if loss_pct >= self.daily_loss_limit and not self._paused:
+            self._paused = True
+            logger.warning(
+                f"⛔ 90% daily loss limit reached! "
+                f"Down {loss_pct*100:.2f}% "
+                f"(${self._day_start_balance:.4f} → ${self._current_balance:.4f}). "
+                f"Trading PAUSED until UTC midnight.")
 
     @property
     def is_paused(self) -> bool:
-        """True if trading is paused due to the loss limit."""
         return self._paused
 
     def can_trade(self) -> bool:
-        """Returns True if a new trade is allowed right now."""
         if self._paused:
             return False
         if self._current_balance <= 0:
             return False
         if self._open_trade_count >= self.max_concurrent:
-            logger.debug(
-                f"Max concurrent trades reached "
-                f"({self._open_trade_count}/{self.max_concurrent})"
-            )
+            logger.debug(f"Max concurrent trades reached ({self.max_concurrent})")
             return False
         return True
 
-    # ── Position sizing ───────────────────────────────────────────────────────
+    # ── Position sizing (streak-aware) ────────────────────────────────────────
 
     def calculate_stake(self) -> float:
         """
-        Compound position size = 1 % of CURRENT balance.
-        Always clamped to [min_stake, max_stake].
+        Returns the stake for the next trade based on the current streak.
+
+        Win streak:  stake = base × (1 + streak × factor), capped at 3× base.
+        Loss streak: stake = MIN_STAKE (no risk until streak resets).
+        Neutral (0): stake = base (normal 1% risk).
         """
-        raw   = self._current_balance * self.risk_per_trade
-        stake = max(self.min_stake, min(raw, self.max_stake))
-        return round(stake, 2)
+        base = self._current_balance * self.risk_per_trade
+
+        if self._current_streak > 0:
+            multiplier = min(
+                1.0 + self._current_streak * config.WIN_STREAK_STAKE_FACTOR,
+                config.MAX_WIN_STREAK_MULT)
+            raw = base * multiplier
+            logger.debug(f"Win streak {self._current_streak} → "
+                         f"stake multiplier {multiplier:.2f}x")
+        elif self._current_streak < 0:
+            # Loss streak: always use minimum stake
+            raw = self.min_stake
+            logger.debug(f"Loss streak {self._current_streak} → "
+                         f"using minimum stake ${self.min_stake:.2f}")
+        else:
+            raw = base
+
+        return round(max(self.min_stake, min(raw, self.max_stake)), 2)
 
     # ── Trade lifecycle ───────────────────────────────────────────────────────
 
     def register_open(self, symbol: str, direction: str,
                       stake: float, entry_price: float) -> TradeRecord:
-        rec = TradeRecord(
-            symbol=symbol, direction=direction,
-            stake=stake, entry_price=entry_price
-        )
+        rec = TradeRecord(symbol=symbol, direction=direction,
+                          stake=stake, entry_price=entry_price)
         self._trades.append(rec)
         self._open_trade_count += 1
         self.total_trades      += 1
-        logger.info(
-            f"Trade OPEN  | {symbol} {direction} | "
-            f"stake=${stake:.2f} | price={entry_price} | "
-            f"open={self._open_trade_count}/{self.max_concurrent}"
-        )
+        logger.info(f"Trade OPEN  | {symbol} {direction} | "
+                    f"stake=${stake:.2f} | price={entry_price} | "
+                    f"streak={self._current_streak}")
         return rec
 
-    def register_close(self, rec: TradeRecord,
-                       exit_price: float, pnl: float):
+    def register_close(self, rec: TradeRecord, exit_price: float, pnl: float):
         rec.exit_price         = exit_price
         rec.pnl                = pnl
         rec.won                = pnl > 0
         self._open_trade_count = max(0, self._open_trade_count - 1)
         self.total_pnl        += pnl
+
         if rec.won:
-            self.wins   += 1
+            self.wins           += 1
+            # Extend win streak, reset loss streak
+            self._current_streak = max(0, self._current_streak) + 1
         else:
-            self.losses += 1
-        logger.info(
-            f"Trade CLOSE | {rec.symbol} {rec.direction} | "
-            f"pnl=${pnl:+.4f} | {'WIN' if rec.won else 'LOSS'} | "
-            f"balance=${self._current_balance:.4f} | "
-            f"open={self._open_trade_count}/{self.max_concurrent}"
-        )
+            self.losses         += 1
+            # Extend loss streak (negative), reset win streak
+            self._current_streak = min(0, self._current_streak) - 1
+
+        logger.info(f"Trade CLOSE | {rec.symbol} {rec.direction} | "
+                    f"pnl=${pnl:+.4f} | {'WIN' if rec.won else 'LOSS'} | "
+                    f"streak={self._current_streak} | "
+                    f"balance=${self._current_balance:.4f}")
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
@@ -203,8 +201,7 @@ class RiskManager:
     def minutes_until_midnight(self) -> float:
         now      = datetime.datetime.utcnow()
         midnight = (now + datetime.timedelta(days=1)).replace(
-            hour=0, minute=0, second=0, microsecond=0
-        )
+            hour=0, minute=0, second=0, microsecond=0)
         return (midnight - now).total_seconds() / 60
 
     def summary(self) -> dict:
@@ -221,4 +218,5 @@ class RiskManager:
             "total_pnl":         round(self.total_pnl, 4),
             "paused":            self._paused,
             "open_trades":       self._open_trade_count,
+            "streak":            self._current_streak,
         }
