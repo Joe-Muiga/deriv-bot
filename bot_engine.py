@@ -20,6 +20,7 @@ Timeframes:
 """
 
 import asyncio
+import datetime as _dt
 import logging
 import time
 import traceback
@@ -39,7 +40,7 @@ from news_filter import NewsFilter
 from trade_journal import TradeJournal
 from symbol_manager import SymbolManager
 import indicators as ind
-from keep_alive import update_status
+from keep_alive import update_status, set_active_trades, is_redeploy_pending
 from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
@@ -92,6 +93,12 @@ class BotEngine:
         self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
         self._last_symbol_refresh = 0.0
 
+        # Fix 1 & 5: confirmed-loss tracking (not open-stake balance drop)
+        self._confirmed_daily_loss: float = 0.0
+        self._day_start_balance_local: float = 0.0
+        self._confirmed_paused: bool = False
+        self._current_utc_day: int = -1
+
     # ── Timeframe routing ─────────────────────────────────────────────────────
 
     @staticmethod
@@ -120,6 +127,28 @@ class BotEngine:
             quality_bonus = 0.25
         return round(module_score + quality_bonus, 4)
 
+    # ── Fix 1 & 5: confirmed loss limit check ────────────────────────────────
+
+    def _check_confirmed_loss_limit(self):
+        """
+        Evaluate daily loss limit using only confirmed closed losing PnL.
+        Resets at UTC midnight.
+        """
+        today = _dt.datetime.utcnow().day
+        if today != self._current_utc_day:
+            # UTC day has rolled over — reset tracking
+            self._confirmed_daily_loss = 0.0
+            self._day_start_balance_local = self.client.balance
+            self._current_utc_day = today
+            logger.info(
+                f"UTC day reset — day_start_balance=${self._day_start_balance_local:.4f}")
+
+        if self._day_start_balance_local > 0:
+            loss_ratio = self._confirmed_daily_loss / self._day_start_balance_local
+            self._confirmed_paused = loss_ratio >= config.DAILY_LOSS_LIMIT_PCT
+        else:
+            self._confirmed_paused = False
+
     # ── Entry point ───────────────────────────────────────────────────────────
 
     async def run(self):
@@ -140,6 +169,10 @@ class BotEngine:
 
         self.client.on_balance(self._on_balance)
         self.risk.set_balance(self.client.balance)
+
+        # Fix 5: initialise confirmed-loss tracking after balance is known
+        self._day_start_balance_local = self.client.balance
+        self._current_utc_day = _dt.datetime.utcnow().day
 
         await self._refresh_symbols()
         await self._init_all_symbols()
@@ -204,7 +237,8 @@ class BotEngine:
             running               = True,
             balance               = self.client.balance,
             day_start_balance     = self.risk.day_start_balance,
-            paused_for_loss_limit = self.risk.is_paused,
+            # Fix 4: use confirmed-loss pause flag, not live-balance pause
+            paused_for_loss_limit = self._confirmed_paused,
             trades_today          = risk_s["total_trades"],
             wins_today            = risk_s["wins"],
             losses_today          = risk_s["losses"],
@@ -230,9 +264,25 @@ class BotEngine:
                 await self._refresh_symbols()
                 await self._init_all_symbols()
 
-            if self.risk.is_paused:
+            # Fix 2: honour redeploy pending — drain open contracts first
+            if is_redeploy_pending():
+                if self._open_contracts:
+                    logger.info(
+                        f"Redeploy pending – waiting for "
+                        f"{len(self._open_contracts)} open trade(s)")
+                    await asyncio.sleep(10)
+                    continue
+                else:
+                    logger.info(
+                        "Redeploy pending – all trades closed, safe to restart")
+                    await asyncio.sleep(30)
+                    continue
+
+            # Fix 1: pause on confirmed closed-trade losses, not live balance drop
+            if self._confirmed_paused:
                 mins = self.risk.minutes_until_midnight()
-                logger.info(f"⛔ 90% drawdown – paused, resumes in ~{mins:.0f} min")
+                logger.info(
+                    f"⛔ 90% confirmed drawdown – paused, resumes in ~{mins:.0f} min")
                 await asyncio.sleep(60)
                 continue
 
@@ -332,7 +382,14 @@ class BotEngine:
                     f"streak={self.risk.current_streak} | "
                     f"balance=${self.client.balance:.4f}")
 
-            await asyncio.sleep(SCAN_CYCLE_SLEEP)
+            # Fix 3: after placing trades, wait for contracts to settle
+            if executed_count:
+                wait_secs = config.TRADE_DURATION * 60 + 10
+                logger.info(
+                    f"Trades placed – waiting {wait_secs}s for contracts to settle")
+                await asyncio.sleep(wait_secs)
+            else:
+                await asyncio.sleep(SCAN_CYCLE_SLEEP)
 
     # ── Per-symbol scan ───────────────────────────────────────────────────────
 
@@ -455,6 +512,9 @@ class BotEngine:
 
         self._open_contracts[cid] = (symbol, sig.direction, stake, price, rec)
 
+        # Fix 2: update active trades count after opening
+        set_active_trades(len(self._open_contracts))
+
         await self.client.subscribe_contract(
             cid,
             lambda msg, _cid=cid: asyncio.create_task(
@@ -491,10 +551,26 @@ class BotEngine:
         # record_trade applies 15-min cooldown on the symbol if it was a loss
         self.symbols.record_trade(symbol, won=pnl > 0, pnl=pnl)
 
+        # Fix 1: accumulate confirmed closed losses only
+        if pnl < 0:
+            self._confirmed_daily_loss += abs(pnl)
+
+        # Re-evaluate confirmed loss limit after every closed trade
+        self._check_confirmed_loss_limit()
+
+        # Fix 2: update active trades count after closing
+        set_active_trades(len(self._open_contracts))
+
         outcome = "✅ WIN" if pnl > 0 else "❌ LOSS"
         logger.info(
             f"{outcome} | {symbol} | pnl=${pnl:+.4f} | "
             f"balance=${bal_after:.4f} | streak={self.risk.current_streak}")
+
+        # Fix 4: push dashboard immediately on every trade close
+        try:
+            self._push_dashboard()
+        except Exception:
+            pass
 
     # ── Data initialisation ───────────────────────────────────────────────────
 
