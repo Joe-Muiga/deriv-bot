@@ -1,25 +1,44 @@
 """
 signal_engine.py – Phase B of SIFM: Lower-Timeframe Entry Scan.
 
-v5 → v6 changes:
-  1. Module 1: unchanged (slope OR RSI divergence, OR-gate kept).
-     RSI divergence lookback reduced 20 → 10 so it fires on the 30–50-bar
-     windows typical of 1-min synthetic charts.
+v6 → v7 changes (Priority 3):
 
-  2. Module 2: unchanged (volume guard skipped for synthetics, pin bar /
-     shooting star patterns included).
+  FIX 1 – Signal self-validation (_validate_recent_price_action):
+    Added as the FINAL gate before any direction is returned from evaluate().
+    Takes the last N closed bars (default 5) and checks that net price
+    movement is not clearly contradicting the proposed signal direction.
 
-  3. Module 3 – weighted votes:
-     RSI(14), MACD histogram, and Bollinger mid-band are the most reliable
-     momentum indicators on synthetic instruments.  Each now contributes
-     2 votes instead of 1 (total vote pool = 10; neutral votes = 0 as before).
-     StochRSI, ADX, ATR-direction, and Price-Structure each contribute 1 vote.
-     min_votes default kept at 3 — but because RSI+MACD alone yield 4 votes
-     when they agree, any two reliable indicators aligning is now sufficient.
+    Validation rules:
+      • LONG signal: require that net price change over the lookback is
+        ≥ -0.05% (i.e. price is not actively falling more than 0.05%).
+        A mildly negative or flat reading is allowed — it may be a pullback
+        into a valid entry zone.  But if price has fallen > 0.05% in the
+        last 5 bars, the signal is contradicted and NONE is returned.
+      • SHORT signal: symmetric — net change must be ≤ +0.05%.
+      • Additionally: at least ⌈lookback/2⌉ of the bars must have body
+        direction (close vs open) agreeing with the proposed direction.
+        This catches cases where the net is flat but every candle is
+        against the bias.
 
-     Vote labels updated to show weight: e.g. "RSI×2=+2".
+    This filter alone is expected to cut loss rate significantly because
+    it refuses signals whose direction is contradicted by immediate price
+    reality — the single most common cause of inverted-signal losses on
+    synthetics.
 
-  4. Debug logging added at each module level (carried over from v5).
+  FIX 2 – Module 3 ATR direction vote corrected:
+    Previously assigned +1 (bull vote) when ATR was expanding regardless
+    of price direction — expanding volatility is not inherently bullish.
+    Now the ATR vote combines ATR direction WITH price direction:
+      • ATR expanding AND price rising  → +1 bull
+      • ATR expanding AND price falling → +1 bear
+      • ATR contracting                 → 0 (neutral, volatility squeezing)
+    This is economically correct and avoids diluting the directional vote
+    pool with a momentum-agnostic indicator.
+
+  FIX 3 – Module 1 divergence lookback:
+    Kept at 10 bars (set in v6) — appropriate for 1-min synthetic charts.
+
+  No changes to module2 patterns or the min_votes default.
 """
 
 import numpy as np
@@ -31,6 +50,11 @@ import indicators as ind
 from smc_analyzer import SMCContext
 
 logger = logging.getLogger(__name__)
+
+# Threshold: signal direction vs recent bars contradiction
+_VALIDATION_NET_TOLERANCE = 0.0005   # 0.05% — flat/micro-pullbacks allowed
+_VALIDATION_LOOKBACK      = 5        # closed bars to inspect
+_VALIDATION_MIN_AGREEMENT = 3        # min bars with correct body direction
 
 
 @dataclass
@@ -44,13 +68,82 @@ class SignalResult:
     reason:    str
 
 
+# ─── Signal self-validation ───────────────────────────────────────────────────
+
+def _validate_recent_price_action(ltf_bars: List[Candle],
+                                  direction: str,
+                                  lookback: int = _VALIDATION_LOOKBACK) -> bool:
+    """
+    Priority 3 — Confirm that recent price action does NOT clearly contradict
+    the proposed signal direction.
+
+    Returns True  → signal passes validation (proceed to execute).
+    Returns False → signal rejected (return NONE instead).
+
+    Two criteria must BOTH be satisfied:
+      1. Net price change over `lookback` bars is within tolerance.
+         For LONG: net ≥ -_VALIDATION_NET_TOLERANCE
+         For SHORT: net ≤ +_VALIDATION_NET_TOLERANCE
+      2. At least ⌈lookback/2⌉ bars have body direction matching the signal.
+         Candle body direction: close > open → bullish; close < open → bearish.
+
+    Note: a LONG signal with a mild pullback (slightly negative net) is still
+    valid — it may be a textbook SMC retracement into an OB.  The filter
+    only catches signals where recent bars are CLEARLY running away from the
+    proposed direction.
+    """
+    if len(ltf_bars) < lookback + 1:
+        # Not enough data — do not filter (conservative pass)
+        return True
+
+    # Use completed bars only (exclude the currently forming bar)
+    recent = ltf_bars[-(lookback + 1): -1]   # exactly `lookback` closed bars
+    if len(recent) < lookback:
+        return True
+
+    start_price = float(recent[0].close)
+    end_price   = float(recent[-1].close)
+    ref         = start_price if start_price != 0 else 1.0
+    net_pct     = (end_price - start_price) / ref
+
+    # ── Criterion 1: net direction ────────────────────────────────────────────
+    if direction == "LONG"  and net_pct < -_VALIDATION_NET_TOLERANCE:
+        logger.debug(
+            f"Signal validation FAILED (LONG): net_pct={net_pct:.5f} < "
+            f"-{_VALIDATION_NET_TOLERANCE} — price falling over last {lookback} bars")
+        return False
+
+    if direction == "SHORT" and net_pct > +_VALIDATION_NET_TOLERANCE:
+        logger.debug(
+            f"Signal validation FAILED (SHORT): net_pct={net_pct:.5f} > "
+            f"+{_VALIDATION_NET_TOLERANCE} — price rising over last {lookback} bars")
+        return False
+
+    # ── Criterion 2: candle body agreement ───────────────────────────────────
+    min_agree = -(-lookback // 2)   # ceiling division = ⌈lookback/2⌉
+    if direction == "LONG":
+        agreeing = sum(1 for b in recent if b.close >= b.open)
+    else:
+        agreeing = sum(1 for b in recent if b.close <= b.open)
+
+    if agreeing < min_agree:
+        logger.debug(
+            f"Signal validation FAILED ({direction}): only {agreeing}/{lookback} "
+            f"bars agree (need {min_agree}) — candle bodies contradict signal")
+        return False
+
+    logger.debug(
+        f"Signal validation PASSED ({direction}): net_pct={net_pct:.5f}, "
+        f"agreeing={agreeing}/{lookback}")
+    return True
+
+
 # ─── Module 1 – MTFA + RSI Divergence ────────────────────────────────────────
 
 def module1_mtfa_rsi(ltf_bars: List[Candle], htf_bias: str) -> int:
     """
     Fires on EITHER EMA slope alignment OR RSI divergence (OR-gate).
-    Divergence lookback reduced 20 → 10 to fire on 30–50-bar windows
-    typical of 1-min synthetic charts.
+    Divergence lookback = 10 bars (appropriate for 1-min synthetic charts).
     """
     if len(ltf_bars) < 25:
         return 0
@@ -58,20 +151,17 @@ def module1_mtfa_rsi(ltf_bars: List[Candle], htf_bias: str) -> int:
 
     ema20 = ind.ema(closes, 20)
     rsi14 = ind.rsi(closes, 14)
-    div   = ind.find_rsi_divergence(closes, rsi14, lookback=10)  # was 20
+    div   = ind.find_rsi_divergence(closes, rsi14, lookback=10)
 
     valid_ema = ema20[~np.isnan(ema20)]
     if len(valid_ema) < 2:
         return 0
     slope = valid_ema[-1] - valid_ema[-2]
 
-    # Primary path: EMA slope aligned with HTF bias
     slope_ok_long  = htf_bias == "LONG"  and slope > 0
     slope_ok_short = htf_bias == "SHORT" and slope < 0
-
-    # Secondary path: RSI divergence
-    div_ok_long  = htf_bias == "LONG"  and div == +1
-    div_ok_short = htf_bias == "SHORT" and div == -1
+    div_ok_long    = htf_bias == "LONG"  and div == +1
+    div_ok_short   = htf_bias == "SHORT" and div == -1
 
     if slope_ok_long  or div_ok_long:
         logger.debug(
@@ -185,15 +275,12 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 3) -> int:
       Bollinger    × 2   – price vs mean-reversion anchor
       StochRSI     × 1   – oversold/overbought only (neutral zone = 0)
       ADX trend    × 1   – trend strength (non-trending = 0)
-      ATR direction× 1   – expanding vs contracting volatility
+      ATR+Price    × 1   – volatility expansion confirms EXISTING move direction
+                           (FIX 2: was pure ATR direction, now requires price
+                            to also move in the same direction)
       Price struct × 1   – HH/HL or LH/LL in last 3 bars
 
     min_votes = 3 (default unchanged).
-    Because RSI + MACD together contribute 4 bull votes when they agree,
-    any two reliable indicators pointing the same way crosses the threshold.
-
-    Neutral votes (StochRSI in 0.2–0.8, ADX < 25, flat ATR, ranging price)
-    contribute 0 and do NOT dilute the directional count.
     """
     if len(ltf_bars) < 30:
         return 0
@@ -257,7 +344,6 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 3) -> int:
     adx_vals, pdi, mdi = ind.adx(H, L, C, 14)
     last_adx = adx_vals[~np.isnan(adx_vals)]
     if len(last_adx) and last_adx[-1] > 25:
-        # Align pdi/mdi to last_adx length
         offset   = len(adx_vals) - len(last_adx)
         last_pdi = pdi[offset:]
         last_mdi = mdi[offset:]
@@ -268,16 +354,27 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 3) -> int:
     bear_votes += max(0, -v)
     labels.append(f"ADX={v:+d}")
 
-    # ── 6. ATR direction × 1 ─────────────────────────────────────────────────
+    # ── 6. ATR + Price direction × 1 (FIX 2) ─────────────────────────────────
+    # Expanding ATR is NOT inherently bullish or bearish.
+    # Vote is awarded only when volatility is EXPANDING in the direction
+    # that price is ALREADY moving — confirms the move has momentum behind it.
+    # Contracting ATR (squeeze) → neutral (0 votes).
     atr14     = ind.atr(H, L, C, 14)
     valid_atr = atr14[~np.isnan(atr14)]
-    if len(valid_atr) >= 3:
-        v = +1 if valid_atr[-1] > valid_atr[-2] else -1
+    if len(valid_atr) >= 3 and len(C) >= 3:
+        atr_expanding = valid_atr[-1] > valid_atr[-2]
+        price_rising  = float(C[-1]) > float(C[-2])
+        if atr_expanding:
+            # Volatility expanding: give the vote to whichever direction price moved
+            v = +1 if price_rising else -1
+        else:
+            # Volatility contracting → squeeze → no directional edge
+            v = 0
     else:
         v = 0
     bull_votes += max(0,  v)
     bear_votes += max(0, -v)
-    labels.append(f"ATR={v:+d}")
+    labels.append(f"ATR_dir={v:+d}")
 
     # ── 7. Price-action structure × 1 ────────────────────────────────────────
     if len(H) >= 3 and all(H[-i] > H[-i - 1] for i in range(1, 3)):
@@ -309,7 +406,16 @@ class SignalEngine:
 
     def evaluate(self, ltf_bars: List[Candle], htf_bias: str,
                  smc_ctx: SMCContext, in_zone: bool) -> SignalResult:
+        """
+        Evaluate all three modules and return a directional signal.
 
+        Priority 3 — Final gate:
+          After all modules confirm, _validate_recent_price_action() is called.
+          If the last 5 closed bars clearly contradict the proposed direction,
+          the signal is downgraded to NONE.  This prevents executing on signals
+          that are technically valid from a structural standpoint but where
+          immediate price action has already moved the wrong way.
+        """
         if htf_bias == "NEUTRAL" or not in_zone:
             return SignalResult("NONE", 0, 0, 0, 0, 0,
                                 f"htf_bias={htf_bias}, in_zone={in_zone}")
@@ -332,8 +438,17 @@ class SignalEngine:
                                 confirming, reason)
 
         direction = "LONG" if htf_bias == "LONG" else "SHORT"
-        reason    = (f"✓ {confirming}/3 modules | bias={htf_bias} | "
-                     f"m1={m1} m2={m2} m3={m3}")
+
+        # ── Priority 3: self-validation against recent bars ───────────────────
+        if not _validate_recent_price_action(ltf_bars, direction):
+            reason = (f"signal validation FAILED: recent bars contradict "
+                      f"{direction} | m1={m1} m2={m2} m3={m3}")
+            logger.info(f"Signal REJECTED by validation: {direction} | {reason}")
+            return SignalResult("NONE", confirming, m1, m2, m3,
+                                confirming, reason)
+
+        reason = (f"✓ {confirming}/3 modules | bias={htf_bias} | "
+                  f"m1={m1} m2={m2} m3={m3} | validation=PASS")
         logger.info(f"Signal: {direction} | {reason}")
 
         return SignalResult(direction, confirming, m1, m2, m3,
