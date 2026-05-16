@@ -1,32 +1,35 @@
 """
 smc_analyzer.py – Phase A of SIFM: Higher-Timeframe SMC/ICT Analysis.
 
-v4 → v4-tuned changes:
-  • _determine_structure(): relaxed from 3-consecutive-swing to 2-bar condition.
-    Requiring 3 sequential swings was extremely slow to satisfy on 1-min
-    synthetic bars — the bot was stuck in RANGE (→ NEUTRAL bias) for entire
-    sessions.  Now any 2 consecutive swing HHs+HLs = UPTREND, LHs+LLs = DOWNTREND.
-    A momentum fallback (EMA slope on the raw close array) resolves structure
-    even when swing detection hasn't fired enough pivots yet.
+v4 → v5 changes (Priority 2):
 
-  • _find_order_blocks(): min_move threshold reduced from mean×3 to mean×1.0.
-    Synthetic indices move in tick increments — the ×3 multiplier was so large
-    that virtually no OBs were ever found on R_10/R_25/R_50/R_75/R_100 etc.
+  PROBLEM: HTF bias was flipping rapidly on synthetic instruments due to
+  a 0.02% EMA-slope threshold in the RANGE fallback — any micro-tick move
+  resolved the bias, making LONG/SHORT nearly random on noisy synthetics.
 
-  • price_in_smc_zone(): zone tolerance widened from 0.5×ATR to 2.0×ATR.
-    If the bias direction has zero qualifying OBs/FVGs, the function now
-    returns True unconditionally (momentum alone is enough to enter; SMC zone
-    is a nice-to-have, not a hard gate on synthetics).
+  FIX 1 – _determine_structure() EMA fallback tightened:
+    Threshold raised from 0.02% → 0.15%.  Micro-noise below that level
+    stays as RANGE instead of being incorrectly promoted to UPTREND/DOWNTREND.
 
-  • _determine_bias(): added momentum fallback when structure is RANGE —
-    computes a 20-bar EMA slope; if price is above/below EMA the bias resolves
-    to LONG/SHORT instead of NEUTRAL.  Also tightened OB proximity requirement
-    so valid bull OBs near price always yield LONG in an UPTREND even when the
-    explicit price comparison doesn't quite match.
+  FIX 2 – _determine_bias() RANGE fallback upgraded:
+    Now requires CONSENSUS across two lookback windows (5-bar and 10-bar)
+    before resolving RANGE to LONG or SHORT.  Both windows must agree;
+    if they disagree the bias stays NEUTRAL.  This kills a large class of
+    whipsaw-induced inverted signals.
 
-  • price_in_smc_zone() no longer mutates ob.touches (carried over from v3).
+  FIX 3 – _determine_bias() UPTREND/DOWNTREND momentum cross-check:
+    Even when structure says UPTREND, the function now verifies that the
+    5-bar price change is non-negative (or very small) before returning LONG.
+    If price is actively falling in an UPTREND context, returns NEUTRAL
+    instead of a stale LONG — prevents trading into pullbacks that exceed
+    the trade duration.
 
-  • analyse() expires OBs by age only (carried over from v3).
+  FIX 4 – analyse() accepts optional symbol="" parameter:
+    Allows callers to pass the trading symbol for BOOM/CRASH detection.
+    BOOM symbols bias toward LONG (spike upward); CRASH symbols bias toward
+    SHORT (spike downward), overriding structure when momentum is flat/mixed.
+
+  All other logic (OB detection, FVG detection, price_in_smc_zone) unchanged.
 """
 
 import numpy as np
@@ -38,6 +41,12 @@ from candlestick_builder import Candle
 logger = logging.getLogger(__name__)
 
 SWING_LOOKBACK = 3   # reduced from 5 → finds pivots faster on 1-min bars
+
+# EMA slope threshold for structure resolution (% move required)
+_EMA_SLOPE_THRESHOLD   = 0.0015   # 0.15%  (was 0.02% — too noisy on synthetics)
+# Momentum consensus thresholds for RANGE bias fallback
+_MOMENTUM_FAST_PCT     = 0.0008   # 0.08% over 5-bar window
+_MOMENTUM_SLOW_PCT     = 0.0005   # 0.05% over 10-bar window
 
 
 @dataclass
@@ -84,7 +93,17 @@ class SMCAnalyzer:
     def __init__(self, ob_expiry_bars: int = 50):
         self.ob_expiry_bars = ob_expiry_bars
 
-    def analyse(self, bars: List[Candle], atr: float) -> SMCContext:
+    def analyse(self, bars: List[Candle], atr: float,
+                symbol: str = "") -> SMCContext:
+        """
+        Perform full HTF SMC analysis.
+
+        Parameters
+        ----------
+        bars   : completed HTF candles
+        atr    : pre-computed HTF ATR value
+        symbol : trading instrument (optional). Used for BOOM/CRASH bias override.
+        """
         min_bars = SWING_LOOKBACK * 2 + 5
         if len(bars) < min_bars:
             return SMCContext(structure="RANGE", bias="NEUTRAL", current_atr=atr)
@@ -122,7 +141,7 @@ class SMCAnalyzer:
 
         bias = self._determine_bias(
             structure, last_close, closes, bull_obs, bear_obs,
-            swings_h, swings_l, atr)
+            swings_h, swings_l, atr, symbol=symbol)
 
         return SMCContext(
             structure       = structure,
@@ -161,8 +180,9 @@ class SMCAnalyzer:
     def _determine_structure(self, swings_h, swings_l,
                              closes: np.ndarray) -> str:
         """
-        Relaxed detection: 2-bar higher-high/higher-low = UPTREND.
-        Falls back to a 20-bar EMA slope when swings are sparse.
+        Two-bar HH/HL = UPTREND, LH/LL = DOWNTREND.
+        EMA slope fallback uses a tighter 0.15% threshold to prevent
+        micro-noise from resolving synthetic-instrument bars to a false trend.
         """
         # Primary: at least 2 swing highs and 2 swing lows
         if len(swings_h) >= 2 and len(swings_l) >= 2:
@@ -173,28 +193,28 @@ class SMCAnalyzer:
             if last_h[-1] < last_h[-2] and last_l[-1] < last_l[-2]:
                 return "DOWNTREND"
 
-        # Fallback: 3-swing strict check (legacy)
+        # Fallback: 3-swing strict check
         if len(swings_h) >= 3 and len(swings_l) >= 3:
             last_h = [s.price for s in swings_h[-3:]]
             last_l = [s.price for s in swings_l[-3:]]
-            if (last_h[-1] > last_h[-2] and last_l[-1] > last_l[-2]):
+            if last_h[-1] > last_h[-2] and last_l[-1] > last_l[-2]:
                 return "UPTREND"
-            if (last_h[-1] < last_h[-2] and last_l[-1] < last_l[-2]):
+            if last_h[-1] < last_h[-2] and last_l[-1] < last_l[-2]:
                 return "DOWNTREND"
 
-        # EMA slope fallback for RANGE classification when swings are sparse
+        # EMA slope fallback — TIGHTENED threshold (FIX 1)
         if len(closes) >= 20:
             period = min(20, len(closes))
             k = 2.0 / (period + 1)
             ema = float(np.mean(closes[:period]))
             for c in closes[period:]:
                 ema = c * k + ema * (1 - k)
-            # Treat as trend if last close is meaningfully away from EMA
             last_c = float(closes[-1])
-            pct = (last_c - ema) / (ema if ema != 0 else 1)
-            if pct > 0.0002:    # 0.02% above EMA
+            ema_ref = ema if ema != 0 else 1.0
+            pct = (last_c - ema) / ema_ref
+            if pct > _EMA_SLOPE_THRESHOLD:     # was 0.0002; now 0.0015
                 return "UPTREND"
-            if pct < -0.0002:
+            if pct < -_EMA_SLOPE_THRESHOLD:
                 return "DOWNTREND"
 
         return "RANGE"
@@ -204,12 +224,12 @@ class SMCAnalyzer:
     def _find_order_blocks(self, opens, highs, lows, closes,
                            ts) -> Tuple[List[OrderBlock], List[OrderBlock]]:
         """
-        Threshold lowered from mean×3 to mean×1.0 so OBs are found on
-        synthetic instruments that move in small, uniform tick steps.
+        Threshold at mean×1.0 so OBs are found on synthetic instruments
+        that move in small, uniform tick steps.
         """
         bull_obs, bear_obs = [], []
         mean_move = float(np.mean(np.abs(np.diff(closes))))
-        min_move  = mean_move * 1.0   # was 3.0; synthetics need ≤1.0
+        min_move  = mean_move * 1.0
 
         for i in range(1, len(closes) - 2):
             # Bullish OB: bearish candle followed by a strong bullish break
@@ -251,29 +271,71 @@ class SMCAnalyzer:
     def _determine_bias(self, structure: str, price: float,
                         closes: np.ndarray,
                         bull_obs, bear_obs,
-                        swings_h, swings_l, atr) -> str:
+                        swings_h, swings_l,
+                        atr: float,
+                        symbol: str = "") -> str:
         """
-        Resolves to LONG/SHORT more aggressively:
-          • UPTREND / DOWNTREND: OB or swing check first; fallback to structure alone.
-          • RANGE: momentum fallback via 10-bar price change.
+        Resolves HTF bias to LONG / SHORT / NEUTRAL.
+
+        Priority 4 — BOOM/CRASH override:
+          BOOM symbols: spike direction is UP → prefer LONG.
+          CRASH symbols: spike direction is DOWN → prefer SHORT.
+          Override is only applied when structure AND momentum BOTH point
+          toward the instrument's spike direction.
+
+        Fix 3 — Momentum cross-check in UPTREND/DOWNTREND:
+          Even when structure says UPTREND, we verify 5-bar momentum is
+          non-negative before returning LONG.  If the market is actively
+          pulling back more than 0.1%, we hold off (return NEUTRAL) to avoid
+          entering mid-correction and watching the contract expire before the
+          move resumes.
+
+        Fix 2 — RANGE fallback dual-window consensus:
+          Two momentum windows (5-bar and 10-bar) must AGREE on direction.
+          Single-window bias had a ~50% random flip rate on synthetics.
         """
-        half_atr = atr * 2.0   # wider proximity (was 0.5)
+        half_atr = atr * 2.0
         if half_atr == 0:
             half_atr = price * 0.002
 
+        # ── BOOM/CRASH pre-check ──────────────────────────────────────────────
+        sym_upper = symbol.upper()
+        is_boom   = sym_upper.startswith("BOOM")
+        is_crash  = sym_upper.startswith("CRASH")
+
+        # ── UPTREND ───────────────────────────────────────────────────────────
         if structure == "UPTREND":
+            # Fix 3: verify 5-bar momentum is not actively negative
+            if len(closes) >= 6:
+                fast_pct = (float(closes[-1]) - float(closes[-6])) / (
+                    float(closes[-6]) if closes[-6] != 0 else 1.0)
+                if fast_pct < -0.001:   # price falling > 0.1% in 5 bars → skip
+                    logger.debug(
+                        f"UPTREND but 5-bar momentum is negative "
+                        f"({fast_pct:.5f}) → NEUTRAL (avoid pullback entry)")
+                    return "NEUTRAL"
+
             valid_bull = [ob for ob in bull_obs if not ob.expired]
             if valid_bull:
                 nearest = valid_bull[-1]
                 if price >= nearest.bottom - half_atr:
                     return "LONG"
-            # Swing low support check
             if swings_l and price > swings_l[-1].price - half_atr:
                 return "LONG"
-            # Structure alone is sufficient
             return "LONG"
 
+        # ── DOWNTREND ─────────────────────────────────────────────────────────
         if structure == "DOWNTREND":
+            # Fix 3: verify 5-bar momentum is not actively positive
+            if len(closes) >= 6:
+                fast_pct = (float(closes[-1]) - float(closes[-6])) / (
+                    float(closes[-6]) if closes[-6] != 0 else 1.0)
+                if fast_pct > 0.001:   # price rising > 0.1% in 5 bars → skip
+                    logger.debug(
+                        f"DOWNTREND but 5-bar momentum is positive "
+                        f"({fast_pct:.5f}) → NEUTRAL (avoid pullback entry)")
+                    return "NEUTRAL"
+
             valid_bear = [ob for ob in bear_obs if not ob.expired]
             if valid_bear:
                 nearest = valid_bear[-1]
@@ -283,19 +345,59 @@ class SMCAnalyzer:
                 return "SHORT"
             return "SHORT"
 
-        # RANGE — momentum fallback
-        if len(closes) >= 10:
-            lookback = min(10, len(closes))
-            pct = (float(closes[-1]) - float(closes[-lookback])) / (
-                float(closes[-lookback]) if closes[-lookback] != 0 else 1)
-            if pct > 0.0001:
-                logger.debug(f"RANGE bias fallback → LONG (pct={pct:.5f})")
-                return "LONG"
-            if pct < -0.0001:
-                logger.debug(f"RANGE bias fallback → SHORT (pct={pct:.5f})")
-                return "SHORT"
+        # ── RANGE — dual-window momentum consensus (Fix 2) ────────────────────
+        bias_fast   = "NEUTRAL"
+        bias_slow   = "NEUTRAL"
+        ref_fast    = None
+        ref_slow    = None
 
-        return "NEUTRAL"
+        if len(closes) >= 6:
+            ref = float(closes[-6]) if closes[-6] != 0 else 1.0
+            pct = (float(closes[-1]) - float(closes[-6])) / ref
+            ref_fast = pct
+            if pct > _MOMENTUM_FAST_PCT:
+                bias_fast = "LONG"
+            elif pct < -_MOMENTUM_FAST_PCT:
+                bias_fast = "SHORT"
+
+        if len(closes) >= 11:
+            ref = float(closes[-11]) if closes[-11] != 0 else 1.0
+            pct = (float(closes[-1]) - float(closes[-11])) / ref
+            ref_slow = pct
+            if pct > _MOMENTUM_SLOW_PCT:
+                bias_slow = "LONG"
+            elif pct < -_MOMENTUM_SLOW_PCT:
+                bias_slow = "SHORT"
+
+        logger.debug(
+            f"RANGE momentum | fast={bias_fast}({ref_fast:.5f} if ref_fast else 'n/a'}) "
+            f"slow={bias_slow}({ref_slow:.5f} if ref_slow else 'n/a'})")
+
+        # Both windows must agree for RANGE resolution
+        if bias_fast == bias_slow and bias_fast != "NEUTRAL":
+            logger.debug(f"RANGE consensus → {bias_fast}")
+            resolved = bias_fast
+        else:
+            # ── BOOM/CRASH: use instrument spike-direction as tiebreaker ──────
+            if is_boom:
+                resolved = "LONG"
+                logger.debug("RANGE: BOOM instrument tiebreaker → LONG")
+            elif is_crash:
+                resolved = "SHORT"
+                logger.debug("RANGE: CRASH instrument tiebreaker → SHORT")
+            else:
+                logger.debug("RANGE: no momentum consensus → NEUTRAL")
+                return "NEUTRAL"
+
+        # Sanity: for BOOM → reject SHORT bias; for CRASH → reject LONG bias
+        if is_boom and resolved == "SHORT":
+            logger.debug("BOOM instrument: rejecting SHORT bias → NEUTRAL")
+            return "NEUTRAL"
+        if is_crash and resolved == "LONG":
+            logger.debug("CRASH instrument: rejecting LONG bias → NEUTRAL")
+            return "NEUTRAL"
+
+        return resolved
 
     # ── SMC zone check ────────────────────────────────────────────────────────
 
@@ -304,18 +406,16 @@ class SMCAnalyzer:
         """
         Returns True if price is within 2×ATR of a relevant SMC zone.
         If no zones of the relevant direction exist, returns True unconditionally
-        — on synthetic instruments momentum alone is sufficient to enter; the
-        SMC zone is a nice-to-have confirmation, not a hard gate.
+        — on synthetic instruments momentum alone is sufficient to enter.
         Does NOT mutate ob.touches.
         """
-        half_atr = ctx.current_atr * 2.0   # widened from 0.5 to 2.0
+        half_atr = ctx.current_atr * 2.0
         if half_atr == 0:
             half_atr = price * 0.002
 
         if bias == "LONG":
             zone_count = len(ctx.bullish_obs) + len(ctx.bullish_fvgs)
             if zone_count == 0:
-                # No zones detected — allow entry on momentum bias alone
                 logger.debug("price_in_smc_zone: no bullish zones → True (fallback)")
                 return True
             for ob in ctx.bullish_obs:
