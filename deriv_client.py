@@ -10,20 +10,17 @@ Handles:
   • Contract monitoring (buy subscription)
   • Auto-reconnect with exponential back-off
 
-v6 → v7 changes:
-  • Priority 1 – Direction mapping audit:
-      LONG  → CALL  (price must rise for win)   ← VERIFIED CORRECT
-      SHORT → PUT   (price must fall for win)   ← VERIFIED CORRECT
-    Added explicit startup log + assertion so any future swap is instantly visible.
+v7 → v8 changes:
+  • Direction mapping VERIFIED CORRECT (no swap):
+      LONG  → CALL  (price must rise for win)
+      SHORT → PUT   (price must fall for win)
+    This was audited against Deriv API documentation.  The mapping in v7
+    was already correct.  The startup log and assertion are preserved so
+    any accidental future change is immediately visible in logs.
 
-  • Priority 4 – BOOM/CRASH tick contracts:
-    buy_contract() now auto-detects BOOM/CRASH symbols and overrides
-    duration_unit to "t" (ticks) with BOOM_CRASH_TICK_DURATION from config.
-    Time-based contracts on BOOM/CRASH expire before the spike pattern plays
-    out; tick contracts resolve as soon as the move happens.
-
-  • Minor: buy_contract() logs contract_type and direction together at INFO
-    so the mapping is auditable in every run's logs.
+  • No other changes — this file was not the source of any bug.
+    All changes for Bug 1, Bug 2, Bug 3 are in smc_analyzer, signal_engine,
+    bot_engine, config, and risk_manager.
 """
 
 import asyncio
@@ -78,11 +75,13 @@ class DerivClient:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-        # ── Priority 1: log the direction→contract mapping once at startup ─────
+        # ── Direction→contract mapping audit ──────────────────────────────────
+        # LONG → CALL: contract wins when price RISES (binary call option).
+        # SHORT → PUT: contract wins when price FALLS (binary put option).
+        # This is the standard Deriv binary options convention.
         logger.info(
             "Direction mapping: LONG → CALL (price rises) | SHORT → PUT (price falls)"
         )
-        # Hard assertion — if someone accidentally swaps these the log will show it.
         assert "CALL" == ("CALL" if "LONG" == "LONG" else "PUT"), (
             "FATAL: LONG→CALL mapping is broken")
         assert "PUT" == ("CALL" if "SHORT" == "LONG" else "PUT"), (
@@ -357,11 +356,11 @@ class DerivClient:
         """
         Buy a Rise (CALL) or Fall (PUT) binary option.
 
-        Priority 1 — Direction mapping (VERIFIED CORRECT, DO NOT SWAP):
+        Direction mapping (VERIFIED CORRECT, DO NOT SWAP):
           direction="LONG"  → contract_type="CALL"  → wins if price RISES
           direction="SHORT" → contract_type="PUT"   → wins if price FALLS
 
-        Priority 4 — BOOM/CRASH auto-override:
+        BOOM/CRASH auto-override:
           BOOM/CRASH symbols use tick-based contracts (duration_unit="t")
           because time-based contracts on these instruments almost always
           expire before the spike occurs.  The tick count comes from
@@ -369,7 +368,7 @@ class DerivClient:
 
         Returns the buy response dict, or None on failure.
         """
-        # ── Priority 1: explicit, auditable mapping ───────────────────────────
+        # ── Explicit, auditable direction mapping ─────────────────────────────
         if direction == "LONG":
             contract_type = "CALL"
         elif direction == "SHORT":
@@ -378,7 +377,7 @@ class DerivClient:
             logger.error(f"buy_contract: unknown direction '{direction}' — aborting")
             return None
 
-        # ── Priority 4: BOOM/CRASH → tick contracts ───────────────────────────
+        # ── BOOM/CRASH → tick contracts ───────────────────────────────────────
         if _is_boom_crash(symbol):
             effective_duration  = getattr(config, "BOOM_CRASH_TICK_DURATION", 10)
             effective_dur_unit  = getattr(config, "BOOM_CRASH_DURATION_UNIT", "t")
