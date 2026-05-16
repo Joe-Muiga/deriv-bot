@@ -2,31 +2,29 @@
 config.py – Centralised configuration for the SIFM Deriv Trading Bot.
 All secrets are loaded from environment variables; defaults are safe fallbacks.
 
-v8 → v9 changes (Priority 4):
+v9 → v10 changes (Bug 3 tuning):
 
-  • TRADE_DURATION: 3 → 5 minutes.
-    The signal is built on 1-min and 60-min bars.  A 3-minute contract
-    expires before the LTF structure has time to play out.  5 minutes gives
-    the trade room to develop without becoming a slow "hold for hours" bet.
+  • MIN_SIGNAL_PROBABILITY: 2.0 → 1.8.
+    With the improved SMC momentum fallbacks in smc_analyzer v6 producing
+    fewer NEUTRAL biases, the signal pipeline now generates more candidates.
+    Lowering the threshold from 2.0 → 1.8 captures 2/3-module signals with
+    a good quality bonus, increasing trade frequency on synthetics without
+    compromising the structural validation already in place.
 
-  • BOOM_CRASH_TICK_DURATION: NEW (10 ticks).
-    BOOM/CRASH contracts are auto-detected in deriv_client.py and switched
-    to tick-based resolution.  A tick contract wins or loses the moment
-    price ticks in the right direction N times — perfectly suited for the
-    spike-pattern nature of BOOM/CRASH instruments.
+  • SYMBOL_LOSS_COOLDOWN_SECONDS: 180 → 120.
+    Reducing the forex/non-synthetic cooldown after a loss from 3 minutes
+    to 2 minutes. The synthetic instruments already use 90 s; 120 s brings
+    forex closer to synthetic cadence to prevent over-blocking.
 
-  • BOOM_CRASH_DURATION_UNIT: NEW ("t").
-    Duration unit override for BOOM/CRASH — passed to the Deriv API.
+  • SYNTHETIC_LOSS_COOLDOWN_SECONDS: 90 → 60.
+    On 1-min bars with 5-min contracts, 90 s of cooldown blocked the next
+    entry opportunity. 60 s = 1 LTF bar, which is the minimum sensible
+    gap before re-evaluating the symbol.
 
-  • MIN_SIGNAL_PROBABILITY: 1.8 → 2.0.
-    Raised back after the self-validation step in signal_engine was added.
-    The validation already filters noise; the probability gate can be
-    stricter again to ensure only high-quality setups execute.
+  • SCAN_CYCLE_SLEEP (bot_engine): informational note only — moved to
+    bot_engine.py where it is defined (1 s, down from 2 s).
 
-  • SYNTHETIC_LOSS_COOLDOWN_SECONDS: 120 → 90.
-    With improved signal quality, 90 seconds is sufficient for synthetics.
-
-  • WIN_STREAK_STAKE_FACTOR / MAX_WIN_STREAK_MULT: unchanged (0.30 / 4.0).
+  All other values unchanged from v9.
 """
 
 import os
@@ -56,48 +54,38 @@ MAX_STAKE             = 500.0  # hard cap per trade
 MAX_CONCURRENT_TRADES = 20     # slots available for simultaneous trades
 
 # ─── Win-Streak Stake Scaling ─────────────────────────────────────────────────
-# Win streak  → stake = base × (1.0 + streak × WIN_STREAK_STAKE_FACTOR),
-#               capped at base × MAX_WIN_STREAK_MULT.
-# Loss streak → stake forced to MIN_STAKE (quality gate kicks in at -3).
 WIN_STREAK_STAKE_FACTOR = 0.30   # +30% of base per consecutive win
 MAX_WIN_STREAK_MULT     = 4.0    # hard cap at 4× base stake
 
 # ─── Symbol Cooldown After Loss ───────────────────────────────────────────────
-SYMBOL_LOSS_COOLDOWN_SECONDS     = 180   # 3 minutes for forex/non-synthetic
-SYNTHETIC_LOSS_COOLDOWN_SECONDS  = 90    # 1.5 minutes — tightened from 120
+SYMBOL_LOSS_COOLDOWN_SECONDS     = 120   # 2 min for forex/non-synthetic (was 180)
+SYNTHETIC_LOSS_COOLDOWN_SECONDS  = 60    # 1 min for synthetics (was 90)
 
 # ─── Signal Quality Gate ──────────────────────────────────────────────────────
 # Composite probability score = module strength (0–3) + ATR-quality bonus (0–0.5).
-# Raised back to 2.0 now that self-validation filters signal noise.
-MIN_SIGNAL_PROBABILITY     = 2.0   # raised from 1.8 — validation handles noise
+# Lowered to 1.8 to capture good 2/3-module signals after SMC fallback improvements.
+MIN_SIGNAL_PROBABILITY     = 1.8   # lowered from 2.0 — more trades with SMC fallbacks
 MIN_STRENGTH_REPEAT_SYMBOL = 3     # full 3/3 required for a second trade on same symbol
 
 # ─── Strategy ────────────────────────────────────────────────────────────────
 MIN_MODULES_FOR_SIGNAL  = 2
 MIN_INDICATOR_VOTES     = 3    # matches signal_engine default
 OB_EXPIRY_BARS          = 50   # zones must survive long enough to be hit
-ATR_ZONE_FACTOR         = 2.0  # widened tolerance for synthetic instruments
+ATR_ZONE_FACTOR         = 3.0  # BUG 3 FIX: widened from 2.0 → 3.0 for synthetics
 NEWS_BLOCK_MINUTES      = 30
 DIVERGENCE_STRENGTH_MIN = 0.3
 
 # ─── Trade Execution ─────────────────────────────────────────────────────────
-# Priority 4: raised from 3 → 5 minutes so the signal structure can play out.
-# The 5-min window covers at least 5 LTF (1-min) bars after entry, giving
-# the momentum shift identified by the three modules time to materialise.
-TRADE_DURATION      = 5    # minutes — raised from 3
+# 5 minutes so the signal structure can play out (at least 5 LTF bars).
+TRADE_DURATION      = 5    # minutes
 TRADE_DURATION_UNIT = "m"
 
-# Priority 4: BOOM/CRASH instruments use tick-based contracts.
+# BOOM/CRASH instruments use tick-based contracts.
 # deriv_client.py auto-detects BOOM/CRASH and overrides to these values.
-# 10 ticks is typically resolved in < 30 seconds on volatile synthetics.
 BOOM_CRASH_TICK_DURATION = 10    # number of ticks for tick contracts
 BOOM_CRASH_DURATION_UNIT = "t"  # "t" = ticks (Deriv API duration_unit)
 
 # ─── Loss-Streak Quality Gate ─────────────────────────────────────────────────
-# When the loss streak reaches this threshold, the RiskManager activates a
-# quality gate that blocks trades unless signal_strength == 3 (all 3 modules
-# confirm).  Streak resets on next win and gate deactivates automatically.
-# bot_engine should call risk.can_trade(signal_strength=sig.strength) to use this.
 LOSS_STREAK_QUALITY_GATE  = -3   # activate quality gate at streak <= -3
 QUALITY_GATE_TIMEOUT_SECS = 60   # force-clear gate after N seconds as a safety valve
 
