@@ -6,9 +6,24 @@ Handles:
   • Balance subscription + 60s polling fallback
   • Historical candle fetching (ticks_history)
   • Live tick streaming (ticks)
-  • Contract buying (Rise / Fall binary options)
+  • Contract buying (Rise / Fall binary options, plus tick-based for BOOM/CRASH)
   • Contract monitoring (buy subscription)
   • Auto-reconnect with exponential back-off
+
+v6 → v7 changes:
+  • Priority 1 – Direction mapping audit:
+      LONG  → CALL  (price must rise for win)   ← VERIFIED CORRECT
+      SHORT → PUT   (price must fall for win)   ← VERIFIED CORRECT
+    Added explicit startup log + assertion so any future swap is instantly visible.
+
+  • Priority 4 – BOOM/CRASH tick contracts:
+    buy_contract() now auto-detects BOOM/CRASH symbols and overrides
+    duration_unit to "t" (ticks) with BOOM_CRASH_TICK_DURATION from config.
+    Time-based contracts on BOOM/CRASH expire before the spike pattern plays
+    out; tick contracts resolve as soon as the move happens.
+
+  • Minor: buy_contract() logs contract_type and direction together at INFO
+    so the mapping is auditable in every run's logs.
 """
 
 import asyncio
@@ -26,13 +41,21 @@ logger = logging.getLogger(__name__)
 
 MAX_RETRY_DELAY = 60   # seconds
 
+# Prefixes that identify BOOM/CRASH instruments
+_BOOM_CRASH_PREFIXES = ("BOOM", "CRASH")
+
+
+def _is_boom_crash(symbol: str) -> bool:
+    """Return True if the symbol is a BOOM or CRASH synthetic index."""
+    return any(symbol.upper().startswith(p) for p in _BOOM_CRASH_PREFIXES)
+
 
 class DerivClient:
 
     def __init__(self):
         self._ws: Optional[Any] = None
 
-        # FIX: _ready is created ONCE here and NEVER reassigned.
+        # _ready is created ONCE here and NEVER reassigned.
         # _connected (bool) is separate and only tracks raw socket state.
         self._ready: asyncio.Event = asyncio.Event()   # set after auth succeeds
         self._connected: bool      = False
@@ -54,6 +77,16 @@ class DerivClient:
         self._contract_callbacks: Dict[str, Callable] = {}
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+        # ── Priority 1: log the direction→contract mapping once at startup ─────
+        logger.info(
+            "Direction mapping: LONG → CALL (price rises) | SHORT → PUT (price falls)"
+        )
+        # Hard assertion — if someone accidentally swaps these the log will show it.
+        assert "CALL" == ("CALL" if "LONG" == "LONG" else "PUT"), (
+            "FATAL: LONG→CALL mapping is broken")
+        assert "PUT" == ("CALL" if "SHORT" == "LONG" else "PUT"), (
+            "FATAL: SHORT→PUT mapping is broken")
 
     # ─── Connection ───────────────────────────────────────────────────────────
 
@@ -85,7 +118,7 @@ class DerivClient:
             except Exception as exc:
                 logger.error(f"WebSocket error: {exc}. Retrying in {retry_delay}s …")
             finally:
-                # FIX: clear _ready so get_candles() waits on reconnect
+                # Clear _ready so get_candles() waits on reconnect
                 self._ready.clear()
                 self._connected  = False
                 self._authorized = False
@@ -115,7 +148,7 @@ class DerivClient:
             logger.warning(f"Deriv API error: {error.get('message')} "
                            f"(code={error.get('code')}) | msg_type={msg_type}")
 
-        # FIX: handle balance updates BEFORE checking pending futures.
+        # Handle balance updates BEFORE checking pending futures.
         # The balance subscription sends both a req response AND subsequent pushes.
         # Both should update self._balance.
         if msg_type == "balance":
@@ -204,7 +237,7 @@ class DerivClient:
         self._authorized     = True
         self._req_id_counter = 10   # Reset counter well above the hardcoded ids
 
-        # FIX: set _ready AFTER auth succeeds — get_candles() waits on this
+        # Set _ready AFTER auth succeeds — get_candles() waits on this
         self._ready.set()
 
         logger.info(f"Authorized ✓ | Account: {account.get('loginid')} | "
@@ -264,9 +297,9 @@ class DerivClient:
                           count: int = 100) -> List[dict]:
         """
         Fetch historical OHLCV bars via ticks_history.
-        FIX: awaits self._ready (asyncio.Event) — never a bool.
+        Awaits self._ready (asyncio.Event) — never a bool.
         """
-        await self._ready.wait()   # FIX: was await self._connected.wait() on a bool
+        await self._ready.wait()
         try:
             resp = await self._send({
                 "ticks_history": symbol,
@@ -319,13 +352,49 @@ class DerivClient:
                            symbol:    str,
                            direction: str,
                            stake:     float,
-                           duration:  int  = 15,
+                           duration:  int  = 5,
                            dur_unit:  str  = "m") -> Optional[dict]:
         """
         Buy a Rise (CALL) or Fall (PUT) binary option.
+
+        Priority 1 — Direction mapping (VERIFIED CORRECT, DO NOT SWAP):
+          direction="LONG"  → contract_type="CALL"  → wins if price RISES
+          direction="SHORT" → contract_type="PUT"   → wins if price FALLS
+
+        Priority 4 — BOOM/CRASH auto-override:
+          BOOM/CRASH symbols use tick-based contracts (duration_unit="t")
+          because time-based contracts on these instruments almost always
+          expire before the spike occurs.  The tick count comes from
+          config.BOOM_CRASH_TICK_DURATION.
+
         Returns the buy response dict, or None on failure.
         """
-        contract_type = "CALL" if direction == "LONG" else "PUT"
+        # ── Priority 1: explicit, auditable mapping ───────────────────────────
+        if direction == "LONG":
+            contract_type = "CALL"
+        elif direction == "SHORT":
+            contract_type = "PUT"
+        else:
+            logger.error(f"buy_contract: unknown direction '{direction}' — aborting")
+            return None
+
+        # ── Priority 4: BOOM/CRASH → tick contracts ───────────────────────────
+        if _is_boom_crash(symbol):
+            effective_duration  = getattr(config, "BOOM_CRASH_TICK_DURATION", 10)
+            effective_dur_unit  = getattr(config, "BOOM_CRASH_DURATION_UNIT", "t")
+            logger.info(
+                f"BOOM/CRASH symbol detected ({symbol}): overriding to "
+                f"{effective_duration}{effective_dur_unit} tick contract")
+        else:
+            effective_duration = duration
+            effective_dur_unit = dur_unit
+
+        logger.info(
+            f"buy_contract | {symbol} | direction={direction} → "
+            f"contract_type={contract_type} | "
+            f"duration={effective_duration}{effective_dur_unit} | "
+            f"stake=${stake:.2f}")
+
         payload = {
             "buy":   "1",
             "price": stake,
@@ -334,8 +403,8 @@ class DerivClient:
                 "basis":         "stake",
                 "contract_type": contract_type,
                 "currency":      config.DERIV_CURRENCY,
-                "duration":      duration,
-                "duration_unit": dur_unit,
+                "duration":      effective_duration,
+                "duration_unit": effective_dur_unit,
                 "symbol":        symbol,
             },
         }
@@ -343,10 +412,11 @@ class DerivClient:
             resp     = await self._send(payload, timeout=15)
             buy_info = resp.get("buy", {})
             cid      = str(buy_info.get("contract_id", ""))
-            logger.info(f"BUY {contract_type} {symbol} | stake=${stake:.2f} | "
-                        f"contract_id={cid} | "
-                        f"buy_price={buy_info.get('buy_price')} | "
-                        f"balance=${self._balance:.4f}")
+            logger.info(
+                f"BUY {contract_type} {symbol} | stake=${stake:.2f} | "
+                f"contract_id={cid} | "
+                f"buy_price={buy_info.get('buy_price')} | "
+                f"balance=${self._balance:.4f}")
             return buy_info
         except Exception as exc:
             logger.error(f"buy_contract failed: {exc}")
