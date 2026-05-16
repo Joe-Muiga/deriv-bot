@@ -1,9 +1,22 @@
 """
 risk_manager.py – Phase C risk overlay for the SIFM bot.
 
-v7 → v8 changes:
+v8 → v9 changes:
 
-  WIN-STREAK STAKE + CONCURRENT SCALING:
+  REMOVED — Tiered loss-streak quality gate:
+    All loss-streak pause/abort/quality-gate tier logic is gone.
+    _streak_tier(), requires_full_confirmation, _update_quality_gate(),
+    pause_cycles_remaining, consume_pause_cycle(), _quality_gate_active,
+    _pause_cycles_remaining have all been removed.
+
+  STREAK TRACKING — wins only:
+    _current_streak is now a non-negative counter:
+      • Win  → _current_streak += 1
+      • Loss → _current_streak  = 0  (reset, never goes negative)
+    There is no loss-streak counter. Per-symbol suspension is handled
+    exclusively by SymbolManager.
+
+  WIN-STREAK STAKE + CONCURRENT SCALING (unchanged from v8):
     +3 streak  → 1.5× stake,  +0 extra concurrent slots
     +4 streak  → 2.0× stake,  +2 extra concurrent slots
     +6 streak  → 3.0× stake,  +4 extra concurrent slots
@@ -13,15 +26,12 @@ v7 → v8 changes:
     Hard cap: stake ≤ MAX_STAKE; concurrent ≤ MAX_CONCURRENT_TRADES.
     Any single loss instantly resets stake and concurrent bonus to base.
 
-  TIERED LOSS-STREAK QUALITY GATE:
-    streak ≤ -2  → require signal strength=3 (was -3)
-    streak ≤ -4  → pause 1 scan cycle + strength=3
-    streak ≤ -6  → pause 3 scan cycles + strength=3 + confidence≥6
+  can_trade() — simplified:
+    Checks daily-loss pause, negative balance, and concurrent slot limit only.
+    Base confidence gate (MIN_CONFIDENCE_NORMAL) and base strength gate
+    (MIN_MODULES_FOR_SIGNAL) still applied — fixed, not tier-dependent.
 
-  min_required_strength() and can_trade() updated to honour all tiers.
-  pause_cycles_remaining property exposed for bot_engine cycle skip.
-
-  All v7 startup-race and balance-init fixes preserved unchanged.
+  All v7/v8 startup-race and balance-init fixes preserved unchanged.
 """
 
 import time
@@ -68,15 +78,8 @@ class RiskManager:
         self._open_trade_count:  int   = 0
         self._trades:            list  = []
 
-        # Streak: positive = consecutive wins, negative = consecutive losses
+        # Win-only streak counter (non-negative; reset to 0 on any loss)
         self._current_streak: int = 0
-
-        # ── Loss-streak pause cycle counter ───────────────────────────────────
-        self._pause_cycles_remaining: int = 0
-
-        # ── Legacy quality-gate fields (kept for compatibility) ───────────────
-        self._quality_gate_active: bool  = False
-        self._quality_gate_since:  float = 0.0
 
         # Session stats
         self.total_trades: int   = 0
@@ -93,8 +96,6 @@ class RiskManager:
             self._day_tag = today
             self._paused  = False
             self._current_streak = 0
-            self._quality_gate_active = False
-            self._pause_cycles_remaining = 0
             logger.info(f"New trading day {today} | Starting balance: ${balance:.4f}")
 
         self._current_balance = balance
@@ -128,18 +129,6 @@ class RiskManager:
     def current_streak(self) -> int:
         return self._current_streak
 
-    @property
-    def pause_cycles_remaining(self) -> int:
-        """Number of scan cycles to skip due to a severe loss streak."""
-        return self._pause_cycles_remaining
-
-    def consume_pause_cycle(self):
-        """Called by bot_engine each time it skips a cycle due to streak pause."""
-        if self._pause_cycles_remaining > 0:
-            self._pause_cycles_remaining -= 1
-            logger.info(
-                f"Loss-streak pause: {self._pause_cycles_remaining} cycle(s) remaining")
-
     # ── Loss limit check ──────────────────────────────────────────────────────
 
     def _check_loss_limit(self):
@@ -163,7 +152,7 @@ class RiskManager:
     def _win_streak_concurrent_bonus(self) -> int:
         """
         Extra concurrent trade slots granted by current win streak.
-        Returns 0 on any loss streak (bonus already reset).
+        Returns 0 when streak is 0 (no bonus at base).
         Hard-capped so total never exceeds max_concurrent.
         """
         if self._current_streak <= 0:
@@ -184,81 +173,17 @@ class RiskManager:
         ceiling = getattr(config, "MAX_CONCURRENT_TRADES", self.max_concurrent)
         return min(self.max_concurrent + self._win_streak_concurrent_bonus(), ceiling)
 
-    # ── Tiered loss-streak quality gate ───────────────────────────────────────
-
-    def _streak_tier(self) -> int:
-        """
-        Returns the active loss-streak tier:
-          0 → normal
-          2 → require strength=3            (streak ≤ -2)
-          4 → pause 1 cycle + strength=3    (streak ≤ -4)
-          6 → pause 3 cycles + strength=3 + confidence≥6  (streak ≤ -6)
-        """
-        s = self._current_streak
-        abort   = getattr(config, "LOSS_STREAK_ABORT_THRESHOLD",  -6)
-        pause   = getattr(config, "LOSS_STREAK_PAUSE_THRESHOLD",  -4)
-        quality = getattr(config, "LOSS_STREAK_QUALITY_GATE",     -2)
-        if s <= abort:
-            return 6
-        if s <= pause:
-            return 4
-        if s <= quality:
-            return 2
-        return 0
-
-    @property
-    def requires_full_confirmation(self) -> bool:
-        """True when any loss-streak gate is active (tier ≥ 2)."""
-        return self._streak_tier() >= 2
+    # ── Gate helpers (base, non-tiered) ──────────────────────────────────────
 
     def min_required_strength(self) -> int:
-        """Minimum signal module strength required to execute a trade."""
-        if self._streak_tier() >= 2:
-            return 3
+        """Minimum signal module strength required to execute a trade (base only)."""
         return getattr(config, "MIN_MODULES_FOR_SIGNAL", 2)
 
     def min_required_confidence(self) -> int:
-        """
-        Minimum indicator-agreement confidence required to execute a trade.
-        Normal → MIN_CONFIDENCE_NORMAL (default 5)
-        Tier-2/4 → MIN_CONFIDENCE_STRICT (default 6)
-        Tier-6   → MIN_CONFIDENCE_RECOVERY (default 7)
-        """
-        tier = self._streak_tier()
-        if tier >= 6:
-            return getattr(config, "MIN_CONFIDENCE_RECOVERY", 7)
-        if tier >= 2:
-            return getattr(config, "MIN_CONFIDENCE_STRICT", 6)
+        """Minimum indicator-agreement confidence required (base, always normal tier)."""
         return getattr(config, "MIN_CONFIDENCE_NORMAL", 5)
 
-    def _update_quality_gate(self):
-        """
-        Update pause-cycle counter and legacy quality-gate flag after every close.
-        """
-        tier = self._streak_tier()
-        # Legacy flag (kept for summary/logging compatibility)
-        self._quality_gate_active = tier >= 2
-
-        if tier >= 6 and self._pause_cycles_remaining < 3:
-            self._pause_cycles_remaining = 3
-            logger.warning(
-                f"⚠ Severe loss streak tier-6 (streak={self._current_streak}): "
-                f"3-cycle pause + strength=3 + confidence≥"
-                f"{self.min_required_confidence()}")
-        elif tier >= 4 and self._pause_cycles_remaining < 1:
-            self._pause_cycles_remaining = 1
-            logger.warning(
-                f"⚠ Loss streak tier-4 (streak={self._current_streak}): "
-                f"1-cycle pause + strength=3")
-        elif tier >= 2 and self._pause_cycles_remaining == 0:
-            logger.warning(
-                f"⚠ Loss streak tier-2 (streak={self._current_streak}): "
-                f"strength=3 required")
-        elif tier == 0 and self._quality_gate_active:
-            # Just deactivated
-            self._pause_cycles_remaining = 0
-            logger.info(
-                f"Loss-streak gate CLEARED (streak={self._current_streak})")
+    # ── Trade gate ────────────────────────────────────────────────────────────
 
     def can_trade(self, signal_strength: int = 0,
                   confidence: int = 0) -> bool:
@@ -271,6 +196,7 @@ class RiskManager:
         confidence      : int   Number of M3 indicators agreeing with direction (0–7).
 
         Returns True if a trade may proceed, False otherwise.
+        Loss-streak gates removed; per-symbol suspension is handled by SymbolManager.
         """
         if self._paused:
             logger.debug("can_trade: daily loss limit paused")
@@ -286,27 +212,18 @@ class RiskManager:
                 f"({self._open_trade_count}/{self.effective_max_concurrent})")
             return False
 
-        # ── Loss-streak cycle pause ───────────────────────────────────────────
-        if self._pause_cycles_remaining > 0:
-            logger.debug(
-                f"can_trade: loss-streak pause, "
-                f"{self._pause_cycles_remaining} cycle(s) remaining")
-            return False
-
-        # ── Strength gate ─────────────────────────────────────────────────────
+        # ── Base strength gate ────────────────────────────────────────────────
         min_str = self.min_required_strength()
         if signal_strength < min_str:
             logger.debug(
-                f"can_trade: strength gate (streak={self._current_streak}) "
-                f"— need strength={min_str}, got {signal_strength}")
+                f"can_trade: strength gate — need strength={min_str}, got {signal_strength}")
             return False
 
-        # ── Confidence gate ───────────────────────────────────────────────────
+        # ── Base confidence gate ──────────────────────────────────────────────
         min_conf = self.min_required_confidence()
         if confidence < min_conf:
             logger.debug(
-                f"can_trade: confidence gate (tier={self._streak_tier()}) "
-                f"— need confidence={min_conf}, got {confidence}")
+                f"can_trade: confidence gate — need confidence={min_conf}, got {confidence}")
             return False
 
         return True
@@ -320,8 +237,9 @@ class RiskManager:
           streak ≥ 6 → 3.0× base
           streak ≥ 4 → 2.0× base
           streak ≥ 3 → 1.5× base
-          streak > 0 but < 3 → 1.0× base
-        Any loss streak → MIN_STAKE immediately.
+          streak 1–2 → 1.0× base
+          streak  0  → 1.0× base (normal)
+        Any loss resets streak to 0 → 1.0× base immediately.
         Stake always capped at MAX_STAKE.
         """
         if self._current_balance <= 0:
@@ -329,13 +247,8 @@ class RiskManager:
 
         base = self._current_balance * self.risk_per_trade
 
-        if self._current_streak < 0:
-            raw = self.min_stake
-            logger.debug(
-                f"Loss streak {self._current_streak} → "
-                f"min stake ${self.min_stake:.2f}")
-        elif self._current_streak > 0:
-            thresholds: List[int]   = getattr(
+        if self._current_streak > 0:
+            thresholds: List[int]    = getattr(
                 config, "WIN_STREAK_SCALE_THRESHOLDS",   [3, 4, 6, 8])
             multipliers: List[float] = getattr(
                 config, "WIN_STREAK_STAKE_MULTIPLIERS", [1.5, 2.0, 3.0, 4.0])
@@ -365,8 +278,7 @@ class RiskManager:
             f"Trade OPEN  | {symbol} {direction} | "
             f"stake=${stake:.2f} | price={entry_price} | "
             f"streak={self._current_streak} | "
-            f"effective_max_concurrent={self.effective_max_concurrent} | "
-            f"quality_gate={self._quality_gate_active}")
+            f"effective_max_concurrent={self.effective_max_concurrent}")
         return rec
 
     def register_close(self, rec: TradeRecord, exit_price: float, pnl: float):
@@ -378,21 +290,15 @@ class RiskManager:
 
         if rec.won:
             self.wins            += 1
-            self._current_streak  = max(0, self._current_streak) + 1
-            # Win resets pause cycles immediately
-            self._pause_cycles_remaining = 0
+            self._current_streak += 1
         else:
             self.losses          += 1
-            self._current_streak  = min(0, self._current_streak) - 1
-
-        # Update quality gate AFTER streak changes
-        self._update_quality_gate()
+            self._current_streak  = 0   # reset to 0; no negative loss counter
 
         logger.info(
             f"Trade CLOSE | {rec.symbol} {rec.direction} | "
             f"pnl=${pnl:+.4f} | {'WIN' if rec.won else 'LOSS'} | "
             f"streak={self._current_streak} | "
-            f"tier={self._streak_tier()} | "
             f"effective_max_concurrent={self.effective_max_concurrent} | "
             f"balance=${self._current_balance:.4f}")
 
@@ -411,22 +317,19 @@ class RiskManager:
     def summary(self) -> dict:
         total = self.wins + self.losses
         return {
-            "current_balance":         round(self._current_balance, 4),
-            "day_start_balance":       round(self._day_start_balance, 4),
-            "daily_pnl":               round(self.daily_pnl, 4),
-            "daily_pnl_pct":           round(self.daily_pnl_pct * 100, 2),
-            "total_trades":            self.total_trades,
-            "wins":                    self.wins,
-            "losses":                  self.losses,
-            "win_rate":                round(self.wins / total * 100, 1) if total else 0,
-            "total_pnl":               round(self.total_pnl, 4),
-            "paused":                  self._paused,
-            "open_trades":             self._open_trade_count,
-            "streak":                  self._current_streak,
-            "streak_tier":             self._streak_tier(),
-            "quality_gate":            self._quality_gate_active,
-            "pause_cycles_remaining":  self._pause_cycles_remaining,
+            "current_balance":          round(self._current_balance, 4),
+            "day_start_balance":        round(self._day_start_balance, 4),
+            "daily_pnl":                round(self.daily_pnl, 4),
+            "daily_pnl_pct":            round(self.daily_pnl_pct * 100, 2),
+            "total_trades":             self.total_trades,
+            "wins":                     self.wins,
+            "losses":                   self.losses,
+            "win_rate":                 round(self.wins / total * 100, 1) if total else 0,
+            "total_pnl":                round(self.total_pnl, 4),
+            "paused":                   self._paused,
+            "open_trades":              self._open_trade_count,
+            "streak":                   self._current_streak,
             "effective_max_concurrent": self.effective_max_concurrent,
-            "min_required_strength":   self.min_required_strength(),
-            "min_required_confidence": self.min_required_confidence(),
+            "min_required_strength":    self.min_required_strength(),
+            "min_required_confidence":  self.min_required_confidence(),
         }
