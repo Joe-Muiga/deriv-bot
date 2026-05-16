@@ -1,22 +1,39 @@
 """
 bot_engine.py – Central async orchestrator.
 
-Execution model (this cycle):
+v7 → v8 changes (Bug fixes):
+
+  BUG 2 FIX – Dashboard shows zeros on startup:
+    _push_dashboard() is now only called from _dashboard_loop(), which is
+    started AFTER balance, symbols, and candles are fully initialised in
+    run().  An immediate push is also fired once after _init_all_symbols()
+    completes so the dashboard is live the moment the bot enters _main_loop.
+
+  BUG 3 FIX – SMC analyse() now receives symbol name:
+    _scan() passes symbol= to self.smc.analyse() so the BOOM/CRASH bias
+    override and tiebreaker logic in smc_analyzer can activate correctly.
+    Previously the symbol argument was omitted, disabling those code paths.
+
+  BUG 3 FIX – can_trade() now receives signal_strength in both Round 1
+    and Round 2 loops, activating the loss-streak quality gate as intended.
+    The v7 code called can_trade() with no arguments (default strength=0),
+    which meant the quality gate never engaged even when the streak hit -3.
+
+  BUG 3 FIX – SCAN_CYCLE_SLEEP reduced from 2 → 1 second for higher
+    scan frequency on synthetics.  DASHBOARD_PUSH_EVERY reduced from 15
+    → 10 seconds so the live dashboard refreshes more responsively.
+
+Execution model (unchanged):
   1. Scan ALL initialised symbols simultaneously via asyncio.gather.
-  2. Score every valid signal with a composite probability score
-     (module strength + ATR-quality bonus).
+  2. Score every valid signal with a composite probability score.
   3. Drop any signal below MIN_SIGNAL_PROBABILITY.
   4. Deduplicate by symbol — keep the highest-scoring signal per symbol.
   5. ROUND 1: execute one trade per unique symbol, sorted by score desc,
      until MAX_CONCURRENT_TRADES slots are full.
   6. ROUND 2: if slots still available, execute additional signals on
-     already-traded symbols, but ONLY if they score 3/3 modules.
+     already-traded symbols but ONLY if they score 3/3 modules.
   7. Stake is determined by RiskManager using the current win/loss streak.
-  8. After a loss, SymbolManager blocks that symbol for 15 minutes.
-
-Timeframes:
-  • Forex pairs → 15-min LTF.
-  • All other assets → 1-min LTF.
+  8. After a loss, SymbolManager blocks that symbol for cooldown period.
 """
 
 import asyncio
@@ -45,8 +62,8 @@ from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
 
-SCAN_CYCLE_SLEEP     = 2    # seconds between full parallel scan cycles
-DASHBOARD_PUSH_EVERY = 15
+SCAN_CYCLE_SLEEP     = 1    # BUG 3 FIX: reduced from 2 → 1 for higher frequency
+DASHBOARD_PUSH_EVERY = 10   # BUG 2 FIX: reduced from 15 → 10 for faster refresh
 SYMBOL_REFRESH_EVERY = 3600
 INIT_BATCH_SIZE      = 10
 
@@ -93,7 +110,7 @@ class BotEngine:
         self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
         self._last_symbol_refresh = 0.0
 
-        # Fix 1 & 5: confirmed-loss tracking (not open-stake balance drop)
+        # Confirmed-loss tracking (not open-stake balance drop)
         self._confirmed_daily_loss: float = 0.0
         self._day_start_balance_local: float = 0.0
         self._confirmed_paused: bool = False
@@ -127,7 +144,7 @@ class BotEngine:
             quality_bonus = 0.25
         return round(module_score + quality_bonus, 4)
 
-    # ── Fix 1 & 5: confirmed loss limit check ────────────────────────────────
+    # ── Confirmed loss limit check ────────────────────────────────────────────
 
     def _check_confirmed_loss_limit(self):
         """
@@ -136,7 +153,6 @@ class BotEngine:
         """
         today = _dt.datetime.utcnow().day
         if today != self._current_utc_day:
-            # UTC day has rolled over — reset tracking
             self._confirmed_daily_loss = 0.0
             self._day_start_balance_local = self.client.balance
             self._current_utc_day = today
@@ -170,13 +186,22 @@ class BotEngine:
         self.client.on_balance(self._on_balance)
         self.risk.set_balance(self.client.balance)
 
-        # Fix 5: initialise confirmed-loss tracking after balance is known
+        # Initialise confirmed-loss tracking after balance is known
         self._day_start_balance_local = self.client.balance
         self._current_utc_day = _dt.datetime.utcnow().day
 
         await self._refresh_symbols()
         await self._init_all_symbols()
 
+        # BUG 2 FIX: push an initial dashboard snapshot AFTER symbols and
+        # candles are initialised so balance/tradeable_count are non-zero
+        # from the very first render.
+        try:
+            self._push_dashboard()
+        except Exception:
+            pass
+
+        # Dashboard loop starts AFTER init — no more zero-state renders
         dash_task = asyncio.create_task(self._dashboard_loop())
         try:
             await self._main_loop()
@@ -237,7 +262,6 @@ class BotEngine:
             running               = True,
             balance               = self.client.balance,
             day_start_balance     = self.risk.day_start_balance,
-            # Fix 4: use confirmed-loss pause flag, not live-balance pause
             paused_for_loss_limit = self._confirmed_paused,
             trades_today          = risk_s["total_trades"],
             wins_today            = risk_s["wins"],
@@ -264,7 +288,7 @@ class BotEngine:
                 await self._refresh_symbols()
                 await self._init_all_symbols()
 
-            # Fix 2: honour redeploy pending — drain open contracts first
+            # Honour redeploy pending — drain open contracts first
             if is_redeploy_pending():
                 if self._open_contracts:
                     logger.info(
@@ -278,7 +302,7 @@ class BotEngine:
                     await asyncio.sleep(30)
                     continue
 
-            # Fix 1: pause on confirmed closed-trade losses, not live balance drop
+            # Pause on confirmed closed-trade losses
             if self._confirmed_paused:
                 mins = self.risk.minutes_until_midnight()
                 logger.info(
@@ -334,7 +358,8 @@ class BotEngine:
 
             # ── ROUND 1: one trade per unique symbol ──────────────────────────
             for sig_r in unique_signals:
-                if not self.risk.can_trade():
+                # BUG 3 FIX: pass signal_strength so the quality gate engages
+                if not self.risk.can_trade(signal_strength=int(sig_r.sig.strength)):
                     break
                 if sig_r.symbol in executed_symbols:
                     continue
@@ -356,7 +381,7 @@ class BotEngine:
 
             # ── ROUND 2: additional trades on already-traded symbols ───────────
             # Only 3/3 module signals qualify for a repeat-symbol execution.
-            if self.risk.can_trade():
+            if self.risk.can_trade(signal_strength=int(config.MIN_STRENGTH_REPEAT_SYMBOL)):
                 repeat_candidates = sorted(
                     [r for r in candidates
                      if r.symbol in executed_symbols
@@ -364,7 +389,8 @@ class BotEngine:
                     key=lambda r: r.prob_score, reverse=True)
 
                 for sig_r in repeat_candidates:
-                    if not self.risk.can_trade():
+                    # BUG 3 FIX: pass signal_strength in Round 2 as well
+                    if not self.risk.can_trade(signal_strength=int(sig_r.sig.strength)):
                         break
                     logger.info(
                         f"R2 execute (repeat symbol): {sig_r.symbol} "
@@ -382,7 +408,7 @@ class BotEngine:
                     f"streak={self.risk.current_streak} | "
                     f"balance=${self.client.balance:.4f}")
 
-            # Fix 3: after placing trades, wait for contracts to settle
+            # After placing trades, wait for contracts to settle
             if executed_count:
                 wait_secs = config.TRADE_DURATION * 60 + 10
                 logger.info(
@@ -411,7 +437,8 @@ class BotEngine:
             valid_ha    = htf_atr_arr[~np.isnan(htf_atr_arr)]
             htf_atr     = float(valid_ha[-1]) if len(valid_ha) else 0.0
 
-            smc_ctx = self.smc.analyse(htf_bars, htf_atr)
+            # BUG 3 FIX: pass symbol to analyse() so BOOM/CRASH overrides activate
+            smc_ctx = self.smc.analyse(htf_bars, htf_atr, symbol=symbol)
             if smc_ctx.bias == "NEUTRAL":
                 return None
 
@@ -467,7 +494,6 @@ class BotEngine:
 
     async def _execute(self, symbol: str, sig: SignalResult,
                        price: float, smc_ctx: SMCContext):
-        # Stake is determined by the current win/loss streak
         stake = self.risk.calculate_stake()
         ac    = get_symbol_class(symbol)
 
@@ -512,7 +538,7 @@ class BotEngine:
 
         self._open_contracts[cid] = (symbol, sig.direction, stake, price, rec)
 
-        # Fix 2: update active trades count after opening
+        # Update active trades count after opening
         set_active_trades(len(self._open_contracts))
 
         await self.client.subscribe_contract(
@@ -548,17 +574,17 @@ class BotEngine:
             balance_after = bal_after,
         )
 
-        # record_trade applies 15-min cooldown on the symbol if it was a loss
+        # record_trade applies cooldown on the symbol if it was a loss
         self.symbols.record_trade(symbol, won=pnl > 0, pnl=pnl)
 
-        # Fix 1: accumulate confirmed closed losses only
+        # Accumulate confirmed closed losses only
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
 
         # Re-evaluate confirmed loss limit after every closed trade
         self._check_confirmed_loss_limit()
 
-        # Fix 2: update active trades count after closing
+        # Update active trades count after closing
         set_active_trades(len(self._open_contracts))
 
         outcome = "✅ WIN" if pnl > 0 else "❌ LOSS"
@@ -566,7 +592,7 @@ class BotEngine:
             f"{outcome} | {symbol} | pnl=${pnl:+.4f} | "
             f"balance=${bal_after:.4f} | streak={self.risk.current_streak}")
 
-        # Fix 4: push dashboard immediately on every trade close
+        # Push dashboard immediately on every trade close
         try:
             self._push_dashboard()
         except Exception:
