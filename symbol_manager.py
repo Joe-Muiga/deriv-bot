@@ -1,11 +1,21 @@
 """
 symbol_manager.py – Symbol rotation with per-loss cooldown.
 
-After ANY losing trade on a symbol, that symbol is excluded from the scan
-queue for SYMBOL_LOSS_COOLDOWN_SECONDS (15 minutes).  Winning trades never
-trigger a cooldown.  Consecutive-loss suppression (the old logic) is gone;
-only individual-loss cooldowns exist.  The score field is for dashboard
-display and queue ordering only — it never permanently blocks a symbol.
+v2 → v3 changes:
+  • Synthetic instruments (R_10, R_25, R_50, R_75, R_100, BOOM, CRASH, etc.)
+    now use SYNTHETIC_LOSS_COOLDOWN_SECONDS (120 s = 2 min) instead of
+    SYMBOL_LOSS_COOLDOWN_SECONDS (180 s = 3 min).
+    Reasoning: 1-min chart synthetic symbols can reverse or continue in a new
+    direction within 2–3 bars — a 15-minute (old) or even 3-minute cooldown on
+    a 1-min chart is far too long and kills re-entry opportunities.
+
+  • record_trade() detects whether a symbol is synthetic via
+    sym_module.SYNTHETIC membership and applies the shorter cooldown.
+
+  • Consecutive-loss suppression is still absent; only individual-loss
+    cooldowns exist (carried over from v2).
+
+  • Score and queue ordering unchanged.
 """
 
 import time
@@ -45,7 +55,10 @@ SYMBOL_SESSION: Dict[str, List[str]] = {
     "cryETHUSD": [],
 }
 for s in sym_module.SYNTHETIC:
-    SYMBOL_SESSION[s] = []
+    SYMBOL_SESSION[s] = []   # synthetics trade 24/7
+
+# Build a fast-lookup set of synthetic symbol names
+_SYNTHETIC_SET: Set[str] = set(sym_module.SYNTHETIC)
 
 
 @dataclass
@@ -89,7 +102,7 @@ class SymbolManager:
     # ── Active symbol list ────────────────────────────────────────────────────
 
     def update_active(self, active_symbols_from_api: List[str]):
-        self._active      = set(active_symbols_from_api) | set(sym_module.SYNTHETIC)
+        self._active       = set(active_symbols_from_api) | set(sym_module.SYNTHETIC)
         self._last_refresh = time.time()
         logger.info(f"SymbolManager: {len(self._active)} active symbols")
 
@@ -102,7 +115,8 @@ class SymbolManager:
         sessions = SYMBOL_SESSION.get(symbol, None)
         if sessions is None or sessions == []:
             return True
-        now_min = datetime.datetime.utcnow().hour * 60 + datetime.datetime.utcnow().minute
+        now_utc = datetime.datetime.utcnow()
+        now_min = now_utc.hour * 60 + now_utc.minute
         for sess_name in sessions:
             oh, om, ch, cm = SESSIONS[sess_name]
             open_min  = oh * 60 + om
@@ -128,17 +142,21 @@ class SymbolManager:
         st.last_trade_ts = time.time()
 
         if not won:
-            # Apply 15-minute cooldown on this symbol after any loss
-            st.cooldown_until = time.time() + config.SYMBOL_LOSS_COOLDOWN_SECONDS
+            # Synthetics: 2-minute cooldown.  All other instruments: 3 minutes.
+            if symbol in _SYNTHETIC_SET:
+                cooldown_secs = config.SYNTHETIC_LOSS_COOLDOWN_SECONDS
+            else:
+                cooldown_secs = config.SYMBOL_LOSS_COOLDOWN_SECONDS
+
+            st.cooldown_until = time.time() + cooldown_secs
             logger.info(
-                f"SymbolManager: {symbol} on 15-min cooldown after LOSS "
+                f"SymbolManager: {symbol} on {cooldown_secs}s cooldown after LOSS "
                 f"(pnl=${pnl:+.4f})")
-        # No cooldown on wins — symbol immediately eligible for the next cycle
+        # Wins never trigger a cooldown
 
     # ── Cooldown status (public, used by bot_engine) ──────────────────────────
 
     def is_in_cooldown(self, symbol: str) -> bool:
-        """Returns True if this symbol must not be traded right now."""
         st = self._stats.get(symbol)
         return st.in_cooldown() if st else False
 
@@ -151,8 +169,7 @@ class SymbolManager:
     def get_queue(self, max_symbols: int = 200) -> List[str]:
         """
         Return active symbols sorted by (session-open first, score desc).
-        Symbols currently in their 15-min loss cooldown are excluded.
-        This is called every scan cycle so cooldowns apply in real time.
+        Symbols currently in their loss cooldown are excluded.
         """
         candidates = []
         for sym in sym_module.ALL_SYMBOLS:
@@ -160,7 +177,7 @@ class SymbolManager:
                 continue
             st = self._stats.get(sym)
             if st and st.in_cooldown():
-                continue           # blocked — lost on this symbol recently
+                continue
             in_sess = self._in_session(sym)
             score   = st.score if st else 0.5
             candidates.append((sym, in_sess, score))
@@ -168,8 +185,11 @@ class SymbolManager:
         candidates.sort(key=lambda x: (not x[1], -x[2]))
         queue = [c[0] for c in candidates[:max_symbols]]
 
-        if not any(s in sym_module.SYNTHETIC for s in queue):
-            queue = list(sym_module.SYNTHETIC[:3]) + queue
+        # Always ensure at least 3 synthetics are at the front of the queue
+        synth_in_q = [s for s in queue if s in _SYNTHETIC_SET]
+        if len(synth_in_q) < 3:
+            extras = [s for s in sym_module.SYNTHETIC[:3] if s not in queue]
+            queue  = extras + queue
 
         return queue
 
@@ -200,7 +220,8 @@ class SymbolManager:
     @property
     def current_session(self) -> str:
         active  = []
-        now_min = datetime.datetime.utcnow().hour * 60 + datetime.datetime.utcnow().minute
+        now_utc = datetime.datetime.utcnow()
+        now_min = now_utc.hour * 60 + now_utc.minute
         for name, (oh, om, ch, cm) in SESSIONS.items():
             open_min  = oh * 60 + om
             close_min = ch * 60 + cm
