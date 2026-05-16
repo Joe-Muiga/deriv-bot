@@ -1,21 +1,28 @@
 """
-symbol_manager.py – Symbol rotation with per-loss cooldown.
+symbol_manager.py – Symbol rotation with per-loss cooldown + cycle-based suspension.
 
-v2 → v3 changes:
-  • Synthetic instruments (R_10, R_25, R_50, R_75, R_100, BOOM, CRASH, etc.)
-    now use SYNTHETIC_LOSS_COOLDOWN_SECONDS (120 s = 2 min) instead of
-    SYMBOL_LOSS_COOLDOWN_SECONDS (180 s = 3 min).
-    Reasoning: 1-min chart synthetic symbols can reverse or continue in a new
-    direction within 2–3 bars — a 15-minute (old) or even 3-minute cooldown on
-    a 1-min chart is far too long and kills re-entry opportunities.
+v3 → v4 changes:
+  • Per-symbol cycle-based suspension replaces all loss-streak logic:
+      - suspend(symbol, cycles=2) : suspend a symbol for N full trading cycles.
+        Called by bot_engine on every confirmed loss.
+      - decrement_suspensions()   : called by bot_engine at the START of each
+        cycle, before scanning. Decrements every active counter by 1 and lifts
+        the suspension when it reaches 0.
+      - is_suspended(symbol)      : returns True while suspend_cycles_remaining > 0.
+      - clear_suspension(symbol)  : resets counter to 0 immediately on a WIN.
+      - suspended_symbols()       : returns list of currently suspended symbols
+        (used by bot_engine for Render log visibility).
 
-  • record_trade() detects whether a symbol is synthetic via
-    sym_module.SYNTHETIC membership and applies the shorter cooldown.
+  • All other symbols continue trading normally while any symbol is suspended —
+    there is no global pause, no tier, no quality-gate.
 
-  • Consecutive-loss suppression is still absent; only individual-loss
-    cooldowns exist (carried over from v2).
+  • Time-based per-loss cooldown from v3 is preserved unchanged
+    (synthetic: SYNTHETIC_LOSS_COOLDOWN_SECONDS, others: SYMBOL_LOSS_COOLDOWN_SECONDS).
+    Both mechanisms operate independently.
 
-  • Score and queue ordering unchanged.
+  • A trading cycle = TRADE_DURATION * 60 + 10 seconds (defined in config /
+    bot_engine).  symbol_manager does not need to know the wall-clock length;
+    it simply counts how many times decrement_suspensions() has been called.
 """
 
 import time
@@ -68,7 +75,7 @@ class SymbolStats:
     wins:           int   = 0
     total_pnl:      float = 0.0
     last_trade_ts:  float = 0.0
-    # Epoch until which this symbol is blocked after a loss
+    # Epoch until which this symbol is blocked after a loss (time-based)
     cooldown_until: float = 0.0
 
     @property
@@ -95,6 +102,10 @@ class SymbolManager:
         self._stats:        Dict[str, SymbolStats] = {}
         self._active:       Set[str] = set(sym_module.SYNTHETIC)
         self._last_refresh: float    = 0.0
+
+        # ── Cycle-based suspension counter ─────────────────────────────────────
+        # Key: symbol str  Value: number of cycles remaining before re-entry
+        self._suspend_cycles: Dict[str, int] = {}
 
         for sym in sym_module.ALL_SYMBOLS:
             self._stats[sym] = SymbolStats(symbol=sym)
@@ -129,6 +140,60 @@ class SymbolManager:
                     return True
         return False
 
+    # ── Cycle-based suspension API ────────────────────────────────────────────
+
+    def suspend(self, symbol: str, cycles: int = 2):
+        """
+        Suspend *symbol* for *cycles* full trading cycles.
+        If the symbol is already suspended, the counter is reset to *cycles*
+        (a fresh loss restarts the penalty, not stacks it).
+        Called by bot_engine immediately after a confirmed loss is closed.
+        """
+        cycles = max(1, cycles)
+        self._suspend_cycles[symbol] = cycles
+        logger.info(
+            f"SymbolManager: {symbol} SUSPENDED for {cycles} cycle(s) after loss")
+
+    def clear_suspension(self, symbol: str):
+        """
+        Immediately lift the suspension for *symbol* (called on a WIN).
+        No-op if the symbol is not suspended.
+        """
+        if symbol in self._suspend_cycles and self._suspend_cycles[symbol] > 0:
+            self._suspend_cycles.pop(symbol, None)
+            logger.info(
+                f"SymbolManager: {symbol} suspension CLEARED after win")
+
+    def is_suspended(self, symbol: str) -> bool:
+        """Return True while the symbol has cycles_remaining > 0."""
+        return self._suspend_cycles.get(symbol, 0) > 0
+
+    def decrement_suspensions(self):
+        """
+        Called by bot_engine at the START of each new trading cycle, before
+        scanning.  Decrements every active counter by 1 and removes any
+        counter that reaches zero (symbol re-enters the pool immediately).
+        """
+        to_clear = []
+        for sym, remaining in list(self._suspend_cycles.items()):
+            new_val = remaining - 1
+            if new_val <= 0:
+                to_clear.append(sym)
+            else:
+                self._suspend_cycles[sym] = new_val
+        for sym in to_clear:
+            self._suspend_cycles.pop(sym, None)
+            logger.info(
+                f"SymbolManager: {sym} suspension expired – re-entering pool")
+
+    def suspended_symbols(self) -> List[str]:
+        """Return list of currently suspended symbols (for Render log visibility)."""
+        return [sym for sym, rem in self._suspend_cycles.items() if rem > 0]
+
+    def suspension_cycles_remaining(self, symbol: str) -> int:
+        """Return how many cycles *symbol* is still suspended for (0 = not suspended)."""
+        return self._suspend_cycles.get(symbol, 0)
+
     # ── Trade outcome recording ───────────────────────────────────────────────
 
     def record_trade(self, symbol: str, won: bool, pnl: float):
@@ -142,7 +207,7 @@ class SymbolManager:
         st.last_trade_ts = time.time()
 
         if not won:
-            # Synthetics: 2-minute cooldown.  All other instruments: 3 minutes.
+            # Time-based cooldown (unchanged from v3)
             if symbol in _SYNTHETIC_SET:
                 cooldown_secs = config.SYNTHETIC_LOSS_COOLDOWN_SECONDS
             else:
@@ -150,11 +215,11 @@ class SymbolManager:
 
             st.cooldown_until = time.time() + cooldown_secs
             logger.info(
-                f"SymbolManager: {symbol} on {cooldown_secs}s cooldown after LOSS "
+                f"SymbolManager: {symbol} on {cooldown_secs}s time-cooldown after LOSS "
                 f"(pnl=${pnl:+.4f})")
-        # Wins never trigger a cooldown
+        # Wins never trigger a time-based cooldown
 
-    # ── Cooldown status (public, used by bot_engine) ──────────────────────────
+    # ── Cooldown status (time-based, public, used by bot_engine) ─────────────
 
     def is_in_cooldown(self, symbol: str) -> bool:
         st = self._stats.get(symbol)
@@ -169,7 +234,9 @@ class SymbolManager:
     def get_queue(self, max_symbols: int = 200) -> List[str]:
         """
         Return active symbols sorted by (session-open first, score desc).
-        Symbols currently in their loss cooldown are excluded.
+        Symbols currently in their time-based loss cooldown are excluded.
+        Cycle-suspended symbols are NOT excluded here — bot_engine filters
+        them out via is_suspended() before scanning.
         """
         candidates = []
         for sym in sym_module.ALL_SYMBOLS:
@@ -204,7 +271,8 @@ class SymbolManager:
              "win_rate": round(st.win_rate * 100, 1),
              "pnl": round(st.total_pnl, 4),
              "score": round(st.score, 3),
-             "cooldown_secs": round(st.cooldown_remaining_secs(), 0)}
+             "cooldown_secs": round(st.cooldown_remaining_secs(), 0),
+             "suspend_cycles": self._suspend_cycles.get(s, 0)}
             for s, st in scored[:n]
         ]
 
@@ -213,7 +281,8 @@ class SymbolManager:
             s: {"trades": st.trades, "wins": st.wins,
                 "win_rate": round(st.win_rate * 100, 1),
                 "pnl": round(st.total_pnl, 4),
-                "cooldown": st.in_cooldown()}
+                "cooldown": st.in_cooldown(),
+                "suspended_cycles": self._suspend_cycles.get(s, 0)}
             for s, st in self._stats.items() if st.trades > 0
         }
 
