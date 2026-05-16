@@ -2,33 +2,32 @@
 config.py – Centralised configuration for the SIFM Deriv Trading Bot.
 All secrets are loaded from environment variables; defaults are safe fallbacks.
 
-v10 → v11 changes (Change 5):
+v11 → v12 changes:
 
-  NEW — Win-streak scaling constants:
-    WIN_STREAK_SCALE_THRESHOLDS    : streak thresholds that trigger scaling
-    WIN_STREAK_STAKE_MULTIPLIERS   : stake multipliers at each threshold
-    WIN_STREAK_CONCURRENT_BONUS    : extra concurrent slots at each threshold
+  REMOVED — Loss-streak gate constants:
+    LOSS_STREAK_PAUSE_THRESHOLD  (was -4: 1-cycle global pause)
+    LOSS_STREAK_ABORT_THRESHOLD  (was -6: 3-cycle global pause + confidence≥7)
+    These constants and the global-pause mechanism they drove are gone.
+    Per-symbol suspension (cycle-based, isolated) replaces them.
 
-  NEW — Tiered loss-streak gate constants:
-    LOSS_STREAK_PAUSE_THRESHOLD    : streak ≤ this → 1-cycle pause + strength=3
-    LOSS_STREAK_ABORT_THRESHOLD    : streak ≤ this → 3-cycle pause + strength=3 + conf≥7
+  NEW — Per-symbol suspension:
+    SYMBOL_SUSPENSION_CYCLES = 2
+      When a symbol loses, it is suspended for this many full trading cycles.
+      A trading cycle = TRADE_DURATION * 60 + 10 seconds.
+      All other symbols continue trading normally.
+      A win immediately clears the suspension counter for that symbol.
 
-  NEW — Confidence gate constants (count of M3 indicators agreeing):
-    MIN_CONFIDENCE_NORMAL          : required for normal trading
-    MIN_CONFIDENCE_STRICT          : required when streak ≤ LOSS_STREAK_QUALITY_GATE
-    MIN_CONFIDENCE_RECOVERY        : required when streak ≤ LOSS_STREAK_ABORT_THRESHOLD
-
-  NEW — Module strength constants:
-    MIN_MODULE_STRENGTH_NORMAL     : min modules confirming under normal conditions
-    MIN_MODULE_STRENGTH_STRICT     : min modules confirming under quality gate
-
-  NEW — Signal score threshold:
-    MIN_SIGNAL_SCORE               : replaces / supplements MIN_SIGNAL_PROBABILITY
-                                     for the new 3-component score formula
-
-  CHANGED — TRADE_DURATION minimum enforced at 5 minutes (unchanged value, now doc'd).
-
-  All v10 values (cooldowns, ATR_ZONE_FACTOR, etc.) preserved unchanged.
+  KEPT UNCHANGED:
+    LOSS_STREAK_QUALITY_GATE      – still present (tier-2 strength gate referenced
+                                    by risk_manager v9 min_required_strength;
+                                    no longer used but preserved for smooth rollout).
+    WIN_STREAK_SCALE_THRESHOLDS   – unchanged
+    WIN_STREAK_STAKE_MULTIPLIERS  – unchanged
+    WIN_STREAK_CONCURRENT_BONUS   – unchanged
+    MIN_CONFIDENCE_NORMAL         – unchanged (base confidence gate)
+    MIN_CONFIDENCE_STRICT         – kept for reference / future use
+    MIN_CONFIDENCE_RECOVERY       – kept for reference / future use
+    All other v11 values preserved unchanged.
 """
 
 import os
@@ -67,9 +66,15 @@ WIN_STREAK_CONCURRENT_BONUS  = [0,   2,   4,   6]    # extra concurrent slots
 WIN_STREAK_STAKE_FACTOR = 0.30
 MAX_WIN_STREAK_MULT     = 4.0
 
-# ─── Symbol Cooldown After Loss ───────────────────────────────────────────────
+# ─── Symbol Cooldown After Loss (time-based, per symbol) ─────────────────────
 SYMBOL_LOSS_COOLDOWN_SECONDS     = 120
 SYNTHETIC_LOSS_COOLDOWN_SECONDS  = 60
+
+# ─── Per-Symbol Cycle Suspension After Loss ───────────────────────────────────
+# When a symbol loses, it is excluded from scanning for this many full
+# trading cycles.  A cycle = TRADE_DURATION * 60 + 10 seconds.
+# All other symbols trade normally.  A win clears the counter immediately.
+SYMBOL_SUSPENSION_CYCLES = 2
 
 # ─── Signal Quality Gate ──────────────────────────────────────────────────────
 # New 3-component score threshold (module strength 40% + confidence 35% + freshness 25%)
@@ -85,14 +90,15 @@ MIN_MODULE_STRENGTH_NORMAL = 2    # minimum confirming modules under normal cond
 MIN_MODULE_STRENGTH_STRICT = 3    # minimum confirming modules under quality gate
 
 # ─── Confidence Thresholds (M3 indicator agreement out of 7) ─────────────────
-MIN_CONFIDENCE_NORMAL   = 5    # normal trading conditions
-MIN_CONFIDENCE_STRICT   = 6    # streak ≤ LOSS_STREAK_QUALITY_GATE (tier-2/4)
-MIN_CONFIDENCE_RECOVERY = 7    # streak ≤ LOSS_STREAK_ABORT_THRESHOLD (tier-6)
+MIN_CONFIDENCE_NORMAL   = 5    # normal trading conditions (active base gate)
+MIN_CONFIDENCE_STRICT   = 6    # kept for reference / future use
+MIN_CONFIDENCE_RECOVERY = 7    # kept for reference / future use
 
 # ─── Loss-Streak Gate Thresholds ──────────────────────────────────────────────
-LOSS_STREAK_QUALITY_GATE      = -2   # tier-2: strength=3 required
-LOSS_STREAK_PAUSE_THRESHOLD   = -4   # tier-4: 1-cycle pause + strength=3
-LOSS_STREAK_ABORT_THRESHOLD   = -6   # tier-6: 3-cycle pause + strength=3 + confidence≥7
+# LOSS_STREAK_PAUSE_THRESHOLD and LOSS_STREAK_ABORT_THRESHOLD removed (v12).
+# LOSS_STREAK_QUALITY_GATE kept below for reference only — no longer drives
+# any automatic global pause or tier logic.
+LOSS_STREAK_QUALITY_GATE      = -2   # (reference only — not used in v12 runtime)
 
 # Quality-gate safety auto-clear timeout (seconds) — safety valve only
 QUALITY_GATE_TIMEOUT_SECS     = 60
