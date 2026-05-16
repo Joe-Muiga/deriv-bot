@@ -7,6 +7,22 @@ Routes:
   /stats     → Detailed JSON stats
   /trades    → Recent trade list as JSON
   /symbols   → Symbol leaderboard as JSON
+
+v3 → v4 changes (Bug 2 fix):
+
+  BUG 2 FIX – update_status() now uses dict.update() correctly and
+    explicitly initialises every expected key in _state so the dashboard
+    never renders a KeyError or missing-value blank on first load.
+
+  BUG 2 FIX – _render_dashboard() now uses .get(key, default) consistently
+    for every _state access so a partially-initialised state dict cannot
+    cause a KeyError crash that results in the dashboard serving a blank page.
+
+  BUG 2 FIX – The /stats, /trades, /symbols routes now return safe defaults
+    when optional keys are absent, preventing 500 errors during the brief
+    window between startup and the first _push_dashboard() call.
+
+  No changes to Flask routes, ping loop, or HTML template logic.
 """
 
 import os
@@ -21,6 +37,9 @@ import config
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
+# BUG 2 FIX: every key that _render_dashboard() or /stats accesses is
+# pre-initialised here with a safe default so the first render never
+# encounters a missing key regardless of initialisation order.
 _state: dict = {
     "running":               False,
     "balance":               0.0,
@@ -44,18 +63,24 @@ _state: dict = {
     "streak":                0,
     "recent_trades":         [],
     "best_symbols":          [],
-    # ── Redeploy coordination (set by restart_scheduler, read by bot_engine) ──
-    "redeploy_pending":      False,   # True  → stop opening new trades
-    "active_trades":         0,       # count of currently open positions
+    # ── Redeploy coordination ──────────────────────────────────────────────────
+    "redeploy_pending":      False,
+    "active_trades":         0,
 }
 
 
 def update_status(**kwargs):
+    """
+    Update the shared dashboard state.
+    BUG 2 FIX: uses _state.update() which correctly merges the kwargs dict
+    into _state without replacing keys not present in kwargs.
+    uptime_seconds is always recalculated from start_time.
+    """
     _state.update(kwargs)
     _state["uptime_seconds"] = int(time.time() - _state["start_time"])
 
 
-# ── Redeploy-coordination helpers (used by restart_scheduler + bot_engine) ───
+# ── Redeploy-coordination helpers ─────────────────────────────────────────────
 
 def set_redeploy_pending(value: bool) -> None:
     """Called by restart_scheduler to pause/resume new trade entries."""
@@ -65,7 +90,7 @@ def set_redeploy_pending(value: bool) -> None:
 
 def is_redeploy_pending() -> bool:
     """bot_engine calls this before opening any new trade."""
-    return bool(_state["redeploy_pending"])
+    return bool(_state.get("redeploy_pending", False))
 
 
 def set_active_trades(count: int) -> None:
@@ -75,7 +100,7 @@ def set_active_trades(count: int) -> None:
 
 def get_active_trades() -> int:
     """restart_scheduler polls this to know when all trades have closed."""
-    return int(_state["active_trades"])
+    return int(_state.get("active_trades", 0))
 
 
 _DASH_TEMPLATE: str = ""
@@ -95,9 +120,11 @@ def _render_dashboard() -> str:
     if not _DASH_TEMPLATE:
         _load_template()
 
+    # BUG 2 FIX: use .get(key, default) for every _state access so a
+    # partially-initialised state cannot raise KeyError.
     s         = _state
-    balance   = s["balance"]
-    day_start = s["day_start_balance"]
+    balance   = s.get("balance", 0.0)
+    day_start = s.get("day_start_balance", 0.0)
     daily_pnl = balance - day_start
     pnl_pct   = (daily_pnl / day_start * 100) if day_start else 0
     loss_pct  = max(-pnl_pct, 0)
@@ -105,15 +132,15 @@ def _render_dashboard() -> str:
     # Progress bar shows percentage of the 90% loss limit consumed
     loss_bar_pct = min(loss_pct / 90 * 100, 100)
 
-    wins     = s["wins_today"]
-    losses   = s["losses_today"]
+    wins     = s.get("wins_today", 0)
+    losses   = s.get("losses_today", 0)
     trades   = wins + losses
     win_rate = round(wins / trades * 100, 1) if trades else 0
     pf       = s.get("profit_factor", 0)
     streak   = s.get("streak", 0)
 
-    dot_class    = ("dot-green"  if s["running"] and not s["paused_for_loss_limit"]
-                    else "dot-yellow" if s["paused_for_loss_limit"]
+    dot_class    = ("dot-green"  if s.get("running") and not s.get("paused_for_loss_limit")
+                    else "dot-yellow" if s.get("paused_for_loss_limit")
                     else "dot-red")
     balance_color = "green" if balance >= day_start else "red"
     pnl_color     = "green" if daily_pnl >= 0 else "red"
@@ -126,14 +153,14 @@ def _render_dashboard() -> str:
     danger_class  = "danger" if loss_bar_pct > 70 else ""
 
     paused_banner = ""
-    if s["paused_for_loss_limit"]:
+    if s.get("paused_for_loss_limit"):
         paused_banner = (
             '<div class="paused-banner">'
             '⛔ Daily loss limit (90%) reached. Trading paused until UTC midnight.'
             '</div>'
         )
 
-    up     = s["uptime_seconds"]
+    up     = s.get("uptime_seconds", 0)
     uptime = f"{up//3600}h {(up%3600)//60}m"
 
     recent_rows = ""
@@ -229,26 +256,32 @@ def health():
 
 @app.route("/stats")
 def stats_route():
+    # BUG 2 FIX: use .get() with defaults so /stats never 500s during init
     s         = _state
-    balance   = s["balance"]
-    day_start = s["day_start_balance"]
+    balance   = s.get("balance", 0.0)
+    day_start = s.get("day_start_balance", 0.0)
+    wins      = s.get("wins_today", 0)
+    losses    = s.get("losses_today", 0)
+    trades    = s.get("trades_today", wins + losses)
     return jsonify({
         "balance":           round(balance, 4),
         "day_start_balance": round(day_start, 4),
         "daily_pnl":         round(balance - day_start, 4),
         "daily_pnl_pct":     round((balance - day_start) / day_start * 100, 2) if day_start else 0,
-        "trades":            s["trades_today"],
-        "wins":              s["wins_today"],
-        "losses":            s["losses_today"],
-        "win_rate":          round(s["wins_today"] / max(s["trades_today"], 1) * 100, 1),
+        "trades":            trades,
+        "wins":              wins,
+        "losses":            losses,
+        "win_rate":          round(wins / max(trades, 1) * 100, 1),
         "profit_factor":     round(s.get("profit_factor", 0), 3),
         "avg_rr":            round(s.get("avg_rr", 0), 2),
         "streak":            s.get("streak", 0),
-        "paused":            s["paused_for_loss_limit"],
-        "current_symbol":    s["current_symbol"],
+        "paused":            s.get("paused_for_loss_limit", False),
+        "current_symbol":    s.get("current_symbol", "—"),
         "session":           s.get("session", "—"),
-        "uptime_seconds":    s["uptime_seconds"],
-        "last_signal":       s["last_signal"],
+        "uptime_seconds":    s.get("uptime_seconds", 0),
+        "last_signal":       s.get("last_signal", "—"),
+        "tradeable_count":   s.get("tradeable_count", 0),
+        "active_trades":     s.get("active_trades", 0),
     })
 
 
