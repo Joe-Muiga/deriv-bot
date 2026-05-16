@@ -1,39 +1,38 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v7 → v8 changes (Bug fixes):
+v8 → v9 changes:
 
-  BUG 2 FIX – Dashboard shows zeros on startup:
-    _push_dashboard() is now only called from _dashboard_loop(), which is
-    started AFTER balance, symbols, and candles are fully initialised in
-    run().  An immediate push is also fired once after _init_all_symbols()
-    completes so the dashboard is live the moment the bot enters _main_loop.
+  NEW COMPOSITE SCORE FORMULA (Change 2):
+    Old: module_strength (0–3) + ATR-quality bonus (0–0.5)
+    New: three-component weighted score, range 0–4.35:
+      • Module strength          40%  → 0.0–1.2   (strength/3 × 4 × 0.40 = 0–1.2? see impl)
+        Raw: strength × (4/3) × 0.40  = strength × 0.533
+      • M3 indicator agreement   35%  → count of 7 indicators agreeing / 7 × 4 × 0.35
+        Raw: (confidence/7) × 4 × 0.35 = confidence × 0.200
+      • Zone freshness           25%  → smc_ctx.zone_freshness (0.0–1.0) × 4 × 0.25
+        Raw: freshness × 1.0
 
-  BUG 3 FIX – SMC analyse() now receives symbol name:
-    _scan() passes symbol= to self.smc.analyse() so the BOOM/CRASH bias
-    override and tiebreaker logic in smc_analyzer can activate correctly.
-    Previously the symbol argument was omitted, disabling those code paths.
+    Practical max ≈ 3 × 0.533 + 7 × 0.200 + 1.0 × 1.0 = 1.6 + 1.4 + 1.0 = 4.0
+    (minimum signal score threshold driven by config.MIN_SIGNAL_SCORE, default 2.0)
 
-  BUG 3 FIX – can_trade() now receives signal_strength in both Round 1
-    and Round 2 loops, activating the loss-streak quality gate as intended.
-    The v7 code called can_trade() with no arguments (default strength=0),
-    which meant the quality gate never engaged even when the streak hit -3.
+  RANKED SIGNAL LOGGING (Change 2):
+    Every cycle logs the full ranked candidate list (symbol, score breakdown,
+    direction, strength, confidence, freshness) before execution begins.
 
-  BUG 3 FIX – SCAN_CYCLE_SLEEP reduced from 2 → 1 second for higher
-    scan frequency on synthetics.  DASHBOARD_PUSH_EVERY reduced from 15
-    → 10 seconds so the live dashboard refreshes more responsively.
+  DEDUPLICATION RULE UPDATED (Change 2):
+    Round 2 repeats allowed only if score > 2.5 AND strength == 3 (was just strength ≥ 3).
 
-Execution model (unchanged):
-  1. Scan ALL initialised symbols simultaneously via asyncio.gather.
-  2. Score every valid signal with a composite probability score.
-  3. Drop any signal below MIN_SIGNAL_PROBABILITY.
-  4. Deduplicate by symbol — keep the highest-scoring signal per symbol.
-  5. ROUND 1: execute one trade per unique symbol, sorted by score desc,
-     until MAX_CONCURRENT_TRADES slots are full.
-  6. ROUND 2: if slots still available, execute additional signals on
-     already-traded symbols but ONLY if they score 3/3 modules.
-  7. Stake is determined by RiskManager using the current win/loss streak.
-  8. After a loss, SymbolManager blocks that symbol for cooldown period.
+  can_trade() NOW PASSES CONFIDENCE (Change 2 / 3):
+    Both R1 and R2 loops pass sig.confidence to risk.can_trade() so the
+    tiered confidence gate in risk_manager v8 engages correctly.
+
+  PAUSE-CYCLE SUPPORT (Change 1):
+    At the top of every _main_loop iteration, if risk.pause_cycles_remaining > 0,
+    the cycle is skipped and consume_pause_cycle() is called.
+
+  All v8 bug fixes preserved (symbol pass to smc.analyse, can_trade strength,
+  dashboard timing, scan sleep 1 s, confirmed-loss tracking).
 """
 
 import asyncio
@@ -62,8 +61,8 @@ from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
 
-SCAN_CYCLE_SLEEP     = 1    # BUG 3 FIX: reduced from 2 → 1 for higher frequency
-DASHBOARD_PUSH_EVERY = 10   # BUG 2 FIX: reduced from 15 → 10 for faster refresh
+SCAN_CYCLE_SLEEP     = 1
+DASHBOARD_PUSH_EVERY = 10
 SYMBOL_REFRESH_EVERY = 3600
 INIT_BATCH_SIZE      = 10
 
@@ -72,13 +71,13 @@ INIT_BATCH_SIZE      = 10
 
 @dataclass
 class ScanResult:
-    symbol:    str
-    sig:       SignalResult
-    price:     float
-    smc_ctx:   SMCContext
-    ltf_atr:   float
-    htf_atr:   float
-    prob_score: float = 0.0   # composite probability (filled after _scan)
+    symbol:      str
+    sig:         SignalResult
+    price:       float
+    smc_ctx:     SMCContext
+    ltf_atr:     float
+    htf_atr:     float
+    prob_score:  float = 0.0   # composite score (filled after _scan)
 
 
 # ─── Bot engine ───────────────────────────────────────────────────────────────
@@ -110,7 +109,6 @@ class BotEngine:
         self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
         self._last_symbol_refresh = 0.0
 
-        # Confirmed-loss tracking (not open-stake balance drop)
         self._confirmed_daily_loss: float = 0.0
         self._day_start_balance_local: float = 0.0
         self._confirmed_paused: bool = False
@@ -129,28 +127,23 @@ class BotEngine:
     @staticmethod
     def _prob_score(result: ScanResult) -> float:
         """
-        Combines module strength (0–3) with a setup-quality bonus (0–0.5).
-        Higher = higher-probability trade.
+        Three-component weighted score:
+          Module strength (0–3)   × weight 40%  → contribution 0–1.6
+          Confidence (0–7 indics) × weight 35%  → contribution 0–1.4
+          Zone freshness (0–1)    × weight 25%  → contribution 0–1.0
+        Total max ≈ 4.0
 
-        Quality bonus: reward setups where LTF ATR is small relative to HTF ATR
-        (tight, non-volatile entries near the SMC zone).
+        confidence comes from sig.confidence (added in signal_engine v9).
+        zone_freshness comes from smc_ctx.zone_freshness (added in smc_analyzer v7).
         """
-        module_score = float(result.sig.strength)          # 0 | 1 | 2 | 3
-        if result.htf_atr > 0:
-            ratio       = result.ltf_atr / result.htf_atr  # <1 = clean; >1 = noisy
-            quality     = max(0.0, 1.0 - ratio)            # 0–1
-            quality_bonus = quality * 0.5                  # scaled to 0–0.5
-        else:
-            quality_bonus = 0.25
-        return round(module_score + quality_bonus, 4)
+        strength_component   = (result.sig.strength / 3.0) * 4.0 * 0.40
+        confidence_component = (getattr(result.sig, "confidence", 0) / 7.0) * 4.0 * 0.35
+        freshness_component  = getattr(result.smc_ctx, "zone_freshness", 0.5) * 4.0 * 0.25
+        return round(strength_component + confidence_component + freshness_component, 4)
 
     # ── Confirmed loss limit check ────────────────────────────────────────────
 
     def _check_confirmed_loss_limit(self):
-        """
-        Evaluate daily loss limit using only confirmed closed losing PnL.
-        Resets at UTC midnight.
-        """
         today = _dt.datetime.utcnow().day
         if today != self._current_utc_day:
             self._confirmed_daily_loss = 0.0
@@ -186,22 +179,17 @@ class BotEngine:
         self.client.on_balance(self._on_balance)
         self.risk.set_balance(self.client.balance)
 
-        # Initialise confirmed-loss tracking after balance is known
         self._day_start_balance_local = self.client.balance
         self._current_utc_day = _dt.datetime.utcnow().day
 
         await self._refresh_symbols()
         await self._init_all_symbols()
 
-        # BUG 2 FIX: push an initial dashboard snapshot AFTER symbols and
-        # candles are initialised so balance/tradeable_count are non-zero
-        # from the very first render.
         try:
             self._push_dashboard()
         except Exception:
             pass
 
-        # Dashboard loop starts AFTER init — no more zero-state renders
         dash_task = asyncio.create_task(self._dashboard_loop())
         try:
             await self._main_loop()
@@ -288,7 +276,6 @@ class BotEngine:
                 await self._refresh_symbols()
                 await self._init_all_symbols()
 
-            # Honour redeploy pending — drain open contracts first
             if is_redeploy_pending():
                 if self._open_contracts:
                     logger.info(
@@ -302,7 +289,6 @@ class BotEngine:
                     await asyncio.sleep(30)
                     continue
 
-            # Pause on confirmed closed-trade losses
             if self._confirmed_paused:
                 mins = self.risk.minutes_until_midnight()
                 logger.info(
@@ -310,7 +296,17 @@ class BotEngine:
                 await asyncio.sleep(60)
                 continue
 
-            # ── Real-time queue: cooldowns applied every cycle ────────────────
+            # ── Loss-streak cycle pause ───────────────────────────────────────
+            if self.risk.pause_cycles_remaining > 0:
+                logger.info(
+                    f"⏸ Loss-streak pause: skipping cycle "
+                    f"({self.risk.pause_cycles_remaining} remaining) | "
+                    f"streak={self.risk.current_streak}")
+                self.risk.consume_pause_cycle()
+                await asyncio.sleep(SCAN_CYCLE_SLEEP)
+                continue
+
+            # ── Real-time queue ───────────────────────────────────────────────
             current_queue = self.symbols.get_queue(max_symbols=200)
             ready = [s for s in current_queue if s in self._htf]
 
@@ -326,15 +322,16 @@ class BotEngine:
                 return_exceptions=True)
 
             # ── Score and filter ──────────────────────────────────────────────
+            min_score = getattr(config, "MIN_SIGNAL_SCORE", config.MIN_SIGNAL_PROBABILITY)
             candidates: List[ScanResult] = []
             for r in raw:
                 if not isinstance(r, ScanResult) or r.sig.direction == "NONE":
                     continue
                 r.prob_score = self._prob_score(r)
-                if r.prob_score < config.MIN_SIGNAL_PROBABILITY:
+                if r.prob_score < min_score:
                     logger.debug(
                         f"Signal below threshold: {r.symbol} "
-                        f"score={r.prob_score:.2f} < {config.MIN_SIGNAL_PROBABILITY}")
+                        f"score={r.prob_score:.3f} < {min_score}")
                     continue
                 candidates.append(r)
 
@@ -349,23 +346,48 @@ class BotEngine:
                 if sym not in best_per_symbol or r.prob_score > best_per_symbol[sym].prob_score:
                     best_per_symbol[sym] = r
 
-            # Sort unique-symbol signals by probability descending
+            # Sort unique-symbol signals by score descending
             unique_signals = sorted(best_per_symbol.values(),
                                     key=lambda r: r.prob_score, reverse=True)
+
+            # ── Log full ranked list every cycle ─────────────────────────────
+            logger.info(
+                f"── Ranked signals this cycle ({len(unique_signals)} unique symbols, "
+                f"{len(candidates)} total candidates) ──")
+            for rank, r in enumerate(unique_signals, 1):
+                conf      = getattr(r.sig, "confidence", "?")
+                fresh     = getattr(r.smc_ctx, "zone_freshness", "?")
+                str_score = (r.sig.strength / 3.0) * 4.0 * 0.40
+                conf_score = (getattr(r.sig, "confidence", 0) / 7.0) * 4.0 * 0.35
+                fresh_score = getattr(r.smc_ctx, "zone_freshness", 0.5) * 4.0 * 0.25
+                logger.info(
+                    f"  #{rank:>3} {r.symbol:<20} {r.sig.direction:<6} "
+                    f"score={r.prob_score:.3f} "
+                    f"[str={str_score:.3f} conf={conf_score:.3f} fresh={fresh_score:.3f}] "
+                    f"strength={r.sig.strength}/3 confidence={conf}/7 "
+                    f"freshness={fresh if isinstance(fresh, str) else f'{fresh:.2f}'}")
+            logger.info(
+                f"  streak={self.risk.current_streak} "
+                f"effective_max_concurrent={self.risk.effective_max_concurrent} "
+                f"tier={self.risk._streak_tier()}")
 
             executed_symbols: set = set()
             executed_count = 0
 
             # ── ROUND 1: one trade per unique symbol ──────────────────────────
             for sig_r in unique_signals:
-                # BUG 3 FIX: pass signal_strength so the quality gate engages
-                if not self.risk.can_trade(signal_strength=int(sig_r.sig.strength)):
+                conf = getattr(sig_r.sig, "confidence", 0)
+                if not self.risk.can_trade(
+                        signal_strength=int(sig_r.sig.strength),
+                        confidence=int(conf)):
                     break
                 if sig_r.symbol in executed_symbols:
                     continue
                 logger.info(
                     f"R1 execute: {sig_r.symbol} {sig_r.sig.direction} "
-                    f"prob={sig_r.prob_score:.2f} strength={sig_r.sig.strength}/3")
+                    f"score={sig_r.prob_score:.3f} "
+                    f"strength={sig_r.sig.strength}/3 "
+                    f"confidence={conf}/7")
                 update_status(
                     current_symbol = sig_r.symbol,
                     last_signal    = (f"[{sig_r.symbol}] "
@@ -379,28 +401,31 @@ class BotEngine:
                 except Exception as exc:
                     logger.error(f"Execute error ({sig_r.symbol}): {exc}")
 
-            # ── ROUND 2: additional trades on already-traded symbols ───────────
-            # Only 3/3 module signals qualify for a repeat-symbol execution.
-            if self.risk.can_trade(signal_strength=int(config.MIN_STRENGTH_REPEAT_SYMBOL)):
-                repeat_candidates = sorted(
-                    [r for r in candidates
-                     if r.symbol in executed_symbols
-                     and r.sig.strength >= config.MIN_STRENGTH_REPEAT_SYMBOL],
-                    key=lambda r: r.prob_score, reverse=True)
+            # ── ROUND 2: additional trades on already-traded symbols ──────────
+            # Requires score > 2.5 AND strength == 3
+            repeat_min_score = 2.5
+            repeat_candidates = sorted(
+                [r for r in candidates
+                 if r.symbol in executed_symbols
+                 and r.sig.strength >= 3
+                 and r.prob_score > repeat_min_score],
+                key=lambda r: r.prob_score, reverse=True)
 
-                for sig_r in repeat_candidates:
-                    # BUG 3 FIX: pass signal_strength in Round 2 as well
-                    if not self.risk.can_trade(signal_strength=int(sig_r.sig.strength)):
-                        break
-                    logger.info(
-                        f"R2 execute (repeat symbol): {sig_r.symbol} "
-                        f"{sig_r.sig.direction} prob={sig_r.prob_score:.2f}")
-                    try:
-                        await self._execute(
-                            sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
-                        executed_count += 1
-                    except Exception as exc:
-                        logger.error(f"Execute error R2 ({sig_r.symbol}): {exc}")
+            for sig_r in repeat_candidates:
+                conf = getattr(sig_r.sig, "confidence", 0)
+                if not self.risk.can_trade(
+                        signal_strength=int(sig_r.sig.strength),
+                        confidence=int(conf)):
+                    break
+                logger.info(
+                    f"R2 execute (repeat symbol): {sig_r.symbol} "
+                    f"{sig_r.sig.direction} score={sig_r.prob_score:.3f}")
+                try:
+                    await self._execute(
+                        sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
+                    executed_count += 1
+                except Exception as exc:
+                    logger.error(f"Execute error R2 ({sig_r.symbol}): {exc}")
 
             if executed_count:
                 logger.info(
@@ -408,7 +433,6 @@ class BotEngine:
                     f"streak={self.risk.current_streak} | "
                     f"balance=${self.client.balance:.4f}")
 
-            # After placing trades, wait for contracts to settle
             if executed_count:
                 wait_secs = config.TRADE_DURATION * 60 + 10
                 logger.info(
@@ -437,7 +461,6 @@ class BotEngine:
             valid_ha    = htf_atr_arr[~np.isnan(htf_atr_arr)]
             htf_atr     = float(valid_ha[-1]) if len(valid_ha) else 0.0
 
-            # BUG 3 FIX: pass symbol to analyse() so BOOM/CRASH overrides activate
             smc_ctx = self.smc.analyse(htf_bars, htf_atr, symbol=symbol)
             if smc_ctx.bias == "NEUTRAL":
                 return None
@@ -497,9 +520,12 @@ class BotEngine:
         stake = self.risk.calculate_stake()
         ac    = get_symbol_class(symbol)
 
+        conf    = getattr(sig, "confidence", "?")
+        fresh   = getattr(smc_ctx, "zone_freshness", "?")
         logger.info(
             f"▶ {sig.direction} {symbol} | ${stake:.2f} | "
             f"struct={smc_ctx.structure} | modules={sig.strength}/3 | "
+            f"confidence={conf}/7 | freshness={fresh if isinstance(fresh, str) else f'{fresh:.2f}'} | "
             f"streak={self.risk.current_streak}")
 
         buy_resp = await self.client.buy_contract(
@@ -537,8 +563,6 @@ class BotEngine:
         )
 
         self._open_contracts[cid] = (symbol, sig.direction, stake, price, rec)
-
-        # Update active trades count after opening
         set_active_trades(len(self._open_contracts))
 
         await self.client.subscribe_contract(
@@ -563,7 +587,6 @@ class BotEngine:
             return
         symbol, direction, stake, entry_price, rec = info
 
-        # Update risk (also updates streak)
         self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
 
         self.journal.close_trade(
@@ -574,17 +597,12 @@ class BotEngine:
             balance_after = bal_after,
         )
 
-        # record_trade applies cooldown on the symbol if it was a loss
         self.symbols.record_trade(symbol, won=pnl > 0, pnl=pnl)
 
-        # Accumulate confirmed closed losses only
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
 
-        # Re-evaluate confirmed loss limit after every closed trade
         self._check_confirmed_loss_limit()
-
-        # Update active trades count after closing
         set_active_trades(len(self._open_contracts))
 
         outcome = "✅ WIN" if pnl > 0 else "❌ LOSS"
@@ -592,7 +610,6 @@ class BotEngine:
             f"{outcome} | {symbol} | pnl=${pnl:+.4f} | "
             f"balance=${bal_after:.4f} | streak={self.risk.current_streak}")
 
-        # Push dashboard immediately on every trade close
         try:
             self._push_dashboard()
         except Exception:
