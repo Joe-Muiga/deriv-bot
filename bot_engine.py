@@ -1,38 +1,33 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v8 → v9 changes:
+v10 → v11 changes:
 
-  NEW COMPOSITE SCORE FORMULA (Change 2):
-    Old: module_strength (0–3) + ATR-quality bonus (0–0.5)
-    New: three-component weighted score, range 0–4.35:
-      • Module strength          40%  → 0.0–1.2   (strength/3 × 4 × 0.40 = 0–1.2? see impl)
-        Raw: strength × (4/3) × 0.40  = strength × 0.533
-      • M3 indicator agreement   35%  → count of 7 indicators agreeing / 7 × 4 × 0.35
-        Raw: (confidence/7) × 4 × 0.35 = confidence × 0.200
-      • Zone freshness           25%  → smc_ctx.zone_freshness (0.0–1.0) × 4 × 0.25
-        Raw: freshness × 1.0
+  REMOVED — Loss-streak cycle pause:
+    The `if self.risk.pause_cycles_remaining > 0` block and all related
+    risk.consume_pause_cycle() calls have been removed.  Global pausing on
+    loss streak no longer exists.
 
-    Practical max ≈ 3 × 0.533 + 7 × 0.200 + 1.0 × 1.0 = 1.6 + 1.4 + 1.0 = 4.0
-    (minimum signal score threshold driven by config.MIN_SIGNAL_SCORE, default 2.0)
+  NEW — Per-symbol cycle suspension (integrated with SymbolManager v4):
+    At the TOP of every _main_loop iteration:
+      1. self.symbols.decrement_suspensions() is called to tick down counters.
+      2. Currently suspended symbols are logged to Render logs.
+      3. The `ready` list (symbols to scan this cycle) excludes any symbol
+         for which self.symbols.is_suspended(symbol) is True.
 
-  RANKED SIGNAL LOGGING (Change 2):
-    Every cycle logs the full ranked candidate list (symbol, score breakdown,
-    direction, strength, confidence, freshness) before execution begins.
+    On every confirmed trade close (_on_contract_result):
+      • LOSS → self.symbols.suspend(symbol, cycles=config.SYMBOL_SUSPENSION_CYCLES)
+      • WIN  → self.symbols.clear_suspension(symbol)
 
-  DEDUPLICATION RULE UPDATED (Change 2):
-    Round 2 repeats allowed only if score > 2.5 AND strength == 3 (was just strength ≥ 3).
+    All other symbols continue scanning and trading normally while any
+    individual symbol is suspended.
 
-  can_trade() NOW PASSES CONFIDENCE (Change 2 / 3):
-    Both R1 and R2 loops pass sig.confidence to risk.can_trade() so the
-    tiered confidence gate in risk_manager v8 engages correctly.
+  REMOVED — risk._streak_tier() reference from ranked-signal log line
+    (tier no longer exists in RiskManager v9).
 
-  PAUSE-CYCLE SUPPORT (Change 1):
-    At the top of every _main_loop iteration, if risk.pause_cycles_remaining > 0,
-    the cycle is skipped and consume_pause_cycle() is called.
-
-  All v8 bug fixes preserved (symbol pass to smc.analyse, can_trade strength,
-  dashboard timing, scan sleep 1 s, confirmed-loss tracking).
+  All v9/v10 composite score formula, ranked signal logging, deduplication
+  rule, confidence gate passing, SMC/signal/module logic, contract placement,
+  and scan frequency unchanged.
 """
 
 import asyncio
@@ -296,19 +291,20 @@ class BotEngine:
                 await asyncio.sleep(60)
                 continue
 
-            # ── Loss-streak cycle pause ───────────────────────────────────────
-            if self.risk.pause_cycles_remaining > 0:
+            # ── Cycle start: decrement per-symbol suspension counters ─────────
+            self.symbols.decrement_suspensions()
+            suspended_now = self.symbols.suspended_symbols()
+            if suspended_now:
                 logger.info(
-                    f"⏸ Loss-streak pause: skipping cycle "
-                    f"({self.risk.pause_cycles_remaining} remaining) | "
-                    f"streak={self.risk.current_streak}")
-                self.risk.consume_pause_cycle()
-                await asyncio.sleep(SCAN_CYCLE_SLEEP)
-                continue
+                    f"⏸ Suspended symbols this cycle ({len(suspended_now)}): "
+                    f"{', '.join(suspended_now)}")
 
-            # ── Real-time queue ───────────────────────────────────────────────
+            # ── Real-time queue – exclude suspended symbols ────────────────────
             current_queue = self.symbols.get_queue(max_symbols=200)
-            ready = [s for s in current_queue if s in self._htf]
+            ready = [
+                s for s in current_queue
+                if s in self._htf and not self.symbols.is_suspended(s)
+            ]
 
             if not ready:
                 await asyncio.sleep(5)
@@ -369,7 +365,7 @@ class BotEngine:
             logger.info(
                 f"  streak={self.risk.current_streak} "
                 f"effective_max_concurrent={self.risk.effective_max_concurrent} "
-                f"tier={self.risk._streak_tier()}")
+                f"suspended={len(suspended_now)}")
 
             executed_symbols: set = set()
             executed_count = 0
@@ -599,8 +595,13 @@ class BotEngine:
 
         self.symbols.record_trade(symbol, won=pnl > 0, pnl=pnl)
 
+        # ── Per-symbol cycle suspension ───────────────────────────────────────
+        suspension_cycles = getattr(config, "SYMBOL_SUSPENSION_CYCLES", 2)
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
+            self.symbols.suspend(symbol, cycles=suspension_cycles)
+        else:
+            self.symbols.clear_suspension(symbol)
 
         self._check_confirmed_loss_limit()
         set_active_trades(len(self._open_contracts))
@@ -608,7 +609,8 @@ class BotEngine:
         outcome = "✅ WIN" if pnl > 0 else "❌ LOSS"
         logger.info(
             f"{outcome} | {symbol} | pnl=${pnl:+.4f} | "
-            f"balance=${bal_after:.4f} | streak={self.risk.current_streak}")
+            f"balance=${bal_after:.4f} | streak={self.risk.current_streak} | "
+            f"suspended_cycles={self.symbols.suspension_cycles_remaining(symbol)}")
 
         try:
             self._push_dashboard()
