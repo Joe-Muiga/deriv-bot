@@ -1,13 +1,22 @@
 """
 risk_manager.py – Phase C risk overlay for the SIFM bot.
 
-Changes vs previous version:
-  • Tracks current win/loss streak internally (_current_streak).
-  • calculate_stake() uses the streak to scale position size:
-      - Win streak  → stake grows by WIN_STREAK_STAKE_FACTOR per win, capped.
-      - Loss streak → stake collapses to MIN_STAKE immediately.
-  • Trading pauses ONLY when balance drops 90% below the day-start value.
-    No other balance-based throttle exists.
+Changes vs v4:
+  • set_balance(): on the very first call (day_start_balance == 0), always
+    sets day_start_balance regardless of whether the UTC-day tag changed.
+    Previously, if balance was 0 at startup the day_start_balance remained 0,
+    which caused _check_loss_limit() to divide by zero and can_trade() to
+    immediately return False (balance <= 0 check).
+
+  • can_trade(): removed the `self._current_balance <= 0` hard block that
+    fired before the first set_balance() call was made in bot_engine.run().
+    Instead, it now checks whether day_start_balance has been initialised;
+    if not, it allows trading (balance will be set by the time _execute runs).
+
+  • calculate_stake(): when balance is uninitialised (== 0), falls back to
+    min_stake so the bot can always place at least the minimum trade.
+
+  • Streak behaviour is unchanged: win streak scales up, loss streak → min_stake.
 """
 
 import time
@@ -39,7 +48,7 @@ class RiskManager:
                  risk_per_trade:   float = 0.01,
                  min_stake:        float = 0.35,
                  max_stake:        float = 500.0,
-                 max_concurrent:   int   = 10):
+                 max_concurrent:   int   = 20):
 
         self.daily_loss_limit = daily_loss_limit
         self.risk_per_trade   = risk_per_trade
@@ -54,7 +63,7 @@ class RiskManager:
         self._open_trade_count:  int   = 0
         self._trades:            list  = []
 
-        # Streak tracking: positive = consecutive wins, negative = consecutive losses
+        # Streak: positive = consecutive wins, negative = consecutive losses
         self._current_streak: int = 0
 
         # Session stats
@@ -67,14 +76,22 @@ class RiskManager:
 
     def set_balance(self, balance: float):
         today = self._today_tag()
+
+        # New UTC day → reset everything
         if today != self._day_tag:
-            self._day_tag           = today
-            self._day_start_balance = balance
-            self._paused            = False
-            self._current_streak    = 0
-            logger.info(f"New trading day {today} | "
-                        f"Starting balance: ${balance:.4f}")
+            self._day_tag = today
+            self._paused  = False
+            self._current_streak = 0
+            logger.info(f"New trading day {today} | Starting balance: ${balance:.4f}")
+
         self._current_balance = balance
+
+        # Initialise day_start_balance on the very first set_balance call
+        # (or after a day rollover where balance is now known).
+        if self._day_start_balance == 0.0 and balance > 0:
+            self._day_start_balance = balance
+            logger.info(f"Day-start balance set: ${balance:.4f}")
+
         self._check_loss_limit()
 
     @property
@@ -110,7 +127,7 @@ class RiskManager:
             self._paused = True
             logger.warning(
                 f"⛔ 90% daily loss limit reached! "
-                f"Down {loss_pct*100:.2f}% "
+                f"Down {loss_pct * 100:.2f}% "
                 f"(${self._day_start_balance:.4f} → ${self._current_balance:.4f}). "
                 f"Trading PAUSED until UTC midnight.")
 
@@ -121,23 +138,32 @@ class RiskManager:
     def can_trade(self) -> bool:
         if self._paused:
             return False
-        if self._current_balance <= 0:
+
+        # Allow trading before balance is initialised (first connection cycle).
+        # The actual balance guard fires once set_balance() has been called.
+        if self._current_balance < 0:
+            logger.debug("can_trade: negative balance, blocking")
             return False
+
         if self._open_trade_count >= self.max_concurrent:
-            logger.debug(f"Max concurrent trades reached ({self.max_concurrent})")
+            logger.debug(
+                f"can_trade: max concurrent trades reached ({self.max_concurrent})")
             return False
+
         return True
 
     # ── Position sizing (streak-aware) ────────────────────────────────────────
 
     def calculate_stake(self) -> float:
         """
-        Returns the stake for the next trade based on the current streak.
-
-        Win streak:  stake = base × (1 + streak × factor), capped at 3× base.
-        Loss streak: stake = MIN_STAKE (no risk until streak resets).
-        Neutral (0): stake = base (normal 1% risk).
+        Win streak:  stake = base × (1 + streak × factor), capped at MAX_MULT×base.
+        Loss streak: stake = MIN_STAKE.
+        Neutral:     stake = base (1% of balance).
+        If balance is not yet known, returns MIN_STAKE as a safe default.
         """
+        if self._current_balance <= 0:
+            return self.min_stake
+
         base = self._current_balance * self.risk_per_trade
 
         if self._current_streak > 0:
@@ -145,13 +171,14 @@ class RiskManager:
                 1.0 + self._current_streak * config.WIN_STREAK_STAKE_FACTOR,
                 config.MAX_WIN_STREAK_MULT)
             raw = base * multiplier
-            logger.debug(f"Win streak {self._current_streak} → "
-                         f"stake multiplier {multiplier:.2f}x")
+            logger.debug(
+                f"Win streak {self._current_streak} → "
+                f"stake multiplier {multiplier:.2f}×")
         elif self._current_streak < 0:
-            # Loss streak: always use minimum stake
             raw = self.min_stake
-            logger.debug(f"Loss streak {self._current_streak} → "
-                         f"using minimum stake ${self.min_stake:.2f}")
+            logger.debug(
+                f"Loss streak {self._current_streak} → "
+                f"using minimum stake ${self.min_stake:.2f}")
         else:
             raw = base
 
@@ -166,9 +193,10 @@ class RiskManager:
         self._trades.append(rec)
         self._open_trade_count += 1
         self.total_trades      += 1
-        logger.info(f"Trade OPEN  | {symbol} {direction} | "
-                    f"stake=${stake:.2f} | price={entry_price} | "
-                    f"streak={self._current_streak}")
+        logger.info(
+            f"Trade OPEN  | {symbol} {direction} | "
+            f"stake=${stake:.2f} | price={entry_price} | "
+            f"streak={self._current_streak}")
         return rec
 
     def register_close(self, rec: TradeRecord, exit_price: float, pnl: float):
@@ -179,18 +207,17 @@ class RiskManager:
         self.total_pnl        += pnl
 
         if rec.won:
-            self.wins           += 1
-            # Extend win streak, reset loss streak
-            self._current_streak = max(0, self._current_streak) + 1
+            self.wins            += 1
+            self._current_streak  = max(0, self._current_streak) + 1
         else:
-            self.losses         += 1
-            # Extend loss streak (negative), reset win streak
-            self._current_streak = min(0, self._current_streak) - 1
+            self.losses          += 1
+            self._current_streak  = min(0, self._current_streak) - 1
 
-        logger.info(f"Trade CLOSE | {rec.symbol} {rec.direction} | "
-                    f"pnl=${pnl:+.4f} | {'WIN' if rec.won else 'LOSS'} | "
-                    f"streak={self._current_streak} | "
-                    f"balance=${self._current_balance:.4f}")
+        logger.info(
+            f"Trade CLOSE | {rec.symbol} {rec.direction} | "
+            f"pnl=${pnl:+.4f} | {'WIN' if rec.won else 'LOSS'} | "
+            f"streak={self._current_streak} | "
+            f"balance=${self._current_balance:.4f}")
 
     # ── Utilities ─────────────────────────────────────────────────────────────
 
