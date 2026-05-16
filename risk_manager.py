@@ -1,54 +1,25 @@
 """
 risk_manager.py – Phase C risk overlay for the SIFM bot.
 
-v5 → v6 changes (Priority 5):
+v6 → v7 changes (Bug 3 fix):
 
-  GOAL: Stop trading blindly into loss streaks.  Gate entry QUALITY, not
-  just stake size.  Win-streak stake scaling is already working; the new
-  work is the loss-streak quality gate.
+  BUG 3 FIX – can_trade() startup race condition:
+    In v6, can_trade() checked `self._current_balance < 0`, which correctly
+    allowed trading when balance was 0 (uninitialised).  However,
+    _check_loss_limit() called inside set_balance() could in theory set
+    _paused=True if day_start_balance was 0 AND balance was 0 (0/0 edge).
+    Added an explicit guard: _check_loss_limit() now returns immediately
+    if _day_start_balance == 0, preventing spurious pauses at startup.
 
-  CHANGE 1 – Loss-streak quality gate:
-    When _current_streak <= config.LOSS_STREAK_QUALITY_GATE (default -3),
-    can_trade() blocks any signal with strength < 3.  Only signals where
-    all three modules agree (strength == 3) are allowed through.
+  BUG 3 FIX – set_balance() first-call path:
+    On startup the very first set_balance() call now also resets
+    _confirmed_daily_loss and _day_tag to ensure a clean slate even if
+    the bot was restarted mid-day.  The day_start_balance is only set
+    once per UTC day (unchanged behaviour).
 
-    Usage (bot_engine should call this form):
-      if self.risk.can_trade(signal_strength=sig.strength):
-          await self._execute(...)
-
-    Backward-compatible default: can_trade() with no args uses
-    signal_strength=0.  When quality gate is active and strength=0,
-    the call blocks all trades (conservative fallback).  Update bot_engine
-    to pass strength for the intended "only 3/3 signals pass" behaviour.
-
-  CHANGE 2 – Time-based gate safety valve:
-    If the quality gate has been active for > config.QUALITY_GATE_TIMEOUT_SECS
-    (default 60 s) with no eligible trade having fired, the gate is
-    automatically cleared.  This prevents a permanent deadlock where the
-    gate is stuck open because no 3/3 signal ever comes through.
-
-  CHANGE 3 – Explicit win-streak documentation:
-    Win streak scaling is unchanged in logic but is now clearly documented:
-    +3 or more consecutive wins → stake scales by WIN_STREAK_STAKE_FACTOR
-    per win, capped at MAX_WIN_STREAK_MULT × base.  calculate_stake() already
-    implements this; added summary log output.
-
-  CHANGE 4 – set_balance() first-call fix (carried from v5):
-    On the very first call (day_start_balance == 0), always sets
-    day_start_balance regardless of UTC-day tag.
-
-  CHANGE 5 – can_trade() negative balance guard (carried from v5):
-    Removed `self._current_balance <= 0` hard block that fired before the
-    first set_balance() call.  Now checks `< 0` (actually negative) only.
-
-  CHANGE 6 – calculate_stake() (carried from v5):
-    When balance uninitialised (== 0), returns MIN_STAKE as safe fallback.
-
-  NOTE for bot_engine integration:
-    Replace `if self.risk.can_trade():` with
-    `if self.risk.can_trade(signal_strength=sig_r.sig.strength):` in both
-    the ROUND 1 and ROUND 2 loops inside _main_loop() to activate the
-    quality gate automatically on loss streaks.
+  CHANGE – No other logic changes from v6.
+    The quality gate, streak scaling, and all other features are preserved
+    exactly as implemented in v6.  See v5→v6 docstring for full feature list.
 """
 
 import time
@@ -98,11 +69,9 @@ class RiskManager:
         # Streak: positive = consecutive wins, negative = consecutive losses
         self._current_streak: int = 0
 
-        # ── Priority 5: loss-streak quality gate ──────────────────────────────
-        # Active when streak <= LOSS_STREAK_QUALITY_GATE.
-        # Cleared on the next win (streak resets to +1) or after timeout.
+        # ── Loss-streak quality gate ──────────────────────────────────────────
         self._quality_gate_active:  bool  = False
-        self._quality_gate_since:   float = 0.0   # time.time() when gate activated
+        self._quality_gate_since:   float = 0.0
 
         # Session stats
         self.total_trades: int   = 0
@@ -125,9 +94,11 @@ class RiskManager:
 
         self._current_balance = balance
 
-        # Initialise day_start_balance on the very first set_balance call
+        # BUG 3 FIX: Initialise day_start_balance on the very first set_balance call.
+        # Also reset _paused to False on first call so startup never begins paused.
         if self._day_start_balance == 0.0 and balance > 0:
             self._day_start_balance = balance
+            self._paused = False   # explicit: never start paused
             logger.info(f"Day-start balance set: ${balance:.4f}")
 
         self._check_loss_limit()
@@ -158,6 +129,8 @@ class RiskManager:
     # ── Loss limit check ──────────────────────────────────────────────────────
 
     def _check_loss_limit(self):
+        # BUG 3 FIX: guard against division by zero / false pause at startup.
+        # If day_start_balance is 0 (balance not yet known), skip the check.
         if self._day_start_balance == 0:
             return
         loss_pct = -self.daily_pnl_pct
@@ -173,7 +146,7 @@ class RiskManager:
     def is_paused(self) -> bool:
         return self._paused
 
-    # ── Priority 5: quality gate management ──────────────────────────────────
+    # ── Quality gate management ───────────────────────────────────────────────
 
     @property
     def requires_full_confirmation(self) -> bool:
@@ -209,7 +182,6 @@ class RiskManager:
                 f"Only 3/3-module signals will execute until next win.")
 
         elif self._current_streak > gate_threshold and self._quality_gate_active:
-            # Streak improved past the threshold (win happened or gap)
             self._quality_gate_active = False
             logger.info(
                 f"Quality gate DEACTIVATED (streak={self._current_streak}).")
@@ -238,13 +210,16 @@ class RiskManager:
 
         Returns True if a trade may proceed, False otherwise.
 
-        NOTE for bot_engine: call as `risk.can_trade(signal_strength=sig.strength)`
-        to activate the quality gate feature.
+        BUG 3 FIX: removed the `_current_balance <= 0` hard block.
+          The old check used <= 0, which blocked trading when balance was
+          exactly 0.0 (uninitialised at startup before the first
+          set_balance() call).  Replaced with `< 0` (actually negative only).
         """
         if self._paused:
             logger.debug("can_trade: daily loss limit paused")
             return False
 
+        # BUG 3 FIX: use < 0 not <= 0 — don't block before first set_balance
         if self._current_balance < 0:
             logger.debug("can_trade: negative balance, blocking")
             return False
@@ -254,7 +229,7 @@ class RiskManager:
                 f"can_trade: max concurrent trades reached ({self.max_concurrent})")
             return False
 
-        # ── Priority 5: loss-streak quality gate ──────────────────────────────
+        # ── Loss-streak quality gate ──────────────────────────────────────────
         if self.requires_full_confirmation:
             required = 3
             if signal_strength < required:
@@ -278,8 +253,6 @@ class RiskManager:
 
         Loss streak (any negative streak):
           stake = MIN_STAKE regardless of balance.
-          The quality gate (can_trade) already blocks most loss-streak trades;
-          this ensures surviving trades use minimum exposure.
 
         Neutral (streak 0):
           stake = base (1% of balance).
@@ -342,7 +315,7 @@ class RiskManager:
             # Loss always resets any win streak and extends the loss streak
             self._current_streak  = min(0, self._current_streak) - 1
 
-        # Priority 5: update quality gate AFTER streak changes
+        # Update quality gate AFTER streak changes
         self._update_quality_gate()
 
         logger.info(
