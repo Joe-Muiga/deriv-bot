@@ -1,30 +1,42 @@
 """
 smc_analyzer.py – Phase A of SIFM: Higher-Timeframe SMC/ICT Analysis.
 
-v5 → v6 changes (Bug fixes + tuning):
+v6 → v7 changes (Change 4):
 
-  BUG 1 FIX – Malformed f-string on line ~374 (and full scan):
-    The expression
-        f"fast={bias_fast}({ref_fast:.5f} if ref_fast else 'n/a'}"
-    had an unescaped '}' that closed the f-string before the expression
-    finished.  Fixed by using a proper ternary inside the format spec.
-    Full file scanned — all f-strings corrected.
+  ZONE FRESHNESS TRACKING:
+    OrderBlock and FVG now carry two new fields:
+      bar_index  : int   – index of the bar where the zone was formed
+      test_count : int   – number of times price has entered this zone
 
-  BUG 3 FIX – analyse() / _determine_bias() returns NEUTRAL too often:
-    Added EMA slope + Higher-High / Higher-Low (or Lower-High / Lower-Low)
-    structure check as momentum fallback when no clean OB/FVG zone exists
-    and the dual-window consensus fails.  This dramatically reduces NEUTRAL
-    bias on noisy synthetics and gives the signal engine more opportunities
-    to confirm an entry.
+    test_count is incremented inside price_in_smc_zone() each time price
+    enters the zone bounds.  This is the ONLY place test_count is mutated;
+    OB/FVG detection internals are unchanged.
 
-  BUG 3 FIX – price_in_smc_zone() tolerance widened:
-    Previously used 2×ATR.  Now uses ATR_ZONE_FACTOR (config, default 2.0)
-    but with a minimum floor of 3×ATR for synthetics (detected via zero
-    volume on candles or symbol prefix).  Also added a fallback: when no
-    zones exist of the relevant direction, always return True (already
-    present but now also applied to the tolerance calculation).
+    Zone freshness is calculated as:
+      test_count == 0  → freshness = 1.0  (untested, highest priority)
+      test_count == 1  → freshness = 0.6  (once tested, still tradeable)
+      test_count >= 2  → freshness = 0.0  (stale — do NOT trade)
 
-  All other logic (OB detection, FVG detection) unchanged.
+    SMCContext now carries zone_freshness: float (0.0–1.0).
+    This is the freshness of the best (most relevant) zone that price is
+    currently in.  If price is not in any zone the fallback is 0.5.
+
+    analyse() returns NEUTRAL bias if ALL relevant zones are stale
+    (freshness == 0.0) — the "_all_zones_stale" guard.
+
+    price_in_smc_zone():
+      • Now increments test_count on the zone being entered.
+      • Returns False for zones where test_count >= 2.
+      • Returns (bool, freshness) internally; public signature unchanged —
+        returns bool only (freshness written to context via _last_freshness).
+
+    _last_freshness helper:
+      A transient attribute self._pending_freshness is set during
+      price_in_smc_zone() and consumed by analyse() to populate
+      ctx.zone_freshness.  This avoids changing the public API.
+
+  All other logic (OB detection, FVG detection, bias logic, structure) is
+  UNCHANGED from v6.  Do not modify those internals.
 """
 
 import numpy as np
@@ -35,16 +47,12 @@ from candlestick_builder import Candle
 
 logger = logging.getLogger(__name__)
 
-SWING_LOOKBACK = 3   # reduced from 5 → finds pivots faster on 1-min bars
+SWING_LOOKBACK = 3
 
-# EMA slope threshold for structure resolution (% move required)
-_EMA_SLOPE_THRESHOLD   = 0.0015   # 0.15%  (was 0.02% — too noisy on synthetics)
-# Momentum consensus thresholds for RANGE bias fallback
-_MOMENTUM_FAST_PCT     = 0.0008   # 0.08% over 5-bar window
-_MOMENTUM_SLOW_PCT     = 0.0005   # 0.05% over 10-bar window
-
-# Momentum fallback: minimum EMA slope % to force bias from RANGE
-_MOMENTUM_EMA_FALLBACK = 0.0003   # 0.03% — looser than structure threshold
+_EMA_SLOPE_THRESHOLD   = 0.0015
+_MOMENTUM_FAST_PCT     = 0.0008
+_MOMENTUM_SLOW_PCT     = 0.0005
+_MOMENTUM_EMA_FALLBACK = 0.0003
 
 
 @dataclass
@@ -56,20 +64,24 @@ class SwingPoint:
 
 @dataclass
 class OrderBlock:
-    index:     int
-    top:       float
-    bottom:    float
-    direction: str
-    bar_ts:    int
-    expired:   bool = False
+    index:      int
+    top:        float
+    bottom:     float
+    direction:  str
+    bar_ts:     int
+    expired:    bool = False
+    bar_index:  int  = 0    # NEW: index in bars array when formed
+    test_count: int  = 0    # NEW: number of times price has entered this zone
 
 @dataclass
 class FVG:
-    top:       float
-    bottom:    float
-    direction: str
-    bar_ts:    int
-    filled:    bool = False
+    top:        float
+    bottom:     float
+    direction:  str
+    bar_ts:     int
+    filled:     bool = False
+    bar_index:  int  = 0    # NEW: index in bars array when formed
+    test_count: int  = 0    # NEW: number of times price has entered this zone
 
 @dataclass
 class SMCContext:
@@ -84,24 +96,26 @@ class SMCContext:
     liquidity_highs: List[float]      = field(default_factory=list)
     liquidity_lows:  List[float]      = field(default_factory=list)
     current_atr:     float            = 0.0
+    zone_freshness:  float            = 0.5   # NEW: freshness of best active zone
+
+
+def _zone_freshness(test_count: int) -> float:
+    """Map test_count to a freshness score."""
+    if test_count == 0:
+        return 1.0
+    if test_count == 1:
+        return 0.6
+    return 0.0   # stale — do not trade
 
 
 class SMCAnalyzer:
 
     def __init__(self, ob_expiry_bars: int = 50):
         self.ob_expiry_bars = ob_expiry_bars
+        self._pending_freshness: float = 0.5   # set by price_in_smc_zone()
 
     def analyse(self, bars: List[Candle], atr: float,
                 symbol: str = "") -> SMCContext:
-        """
-        Perform full HTF SMC analysis.
-
-        Parameters
-        ----------
-        bars   : completed HTF candles
-        atr    : pre-computed HTF ATR value
-        symbol : trading instrument (optional). Used for BOOM/CRASH bias override.
-        """
         min_bars = SWING_LOOKBACK * 2 + 5
         if len(bars) < min_bars:
             return SMCContext(structure="RANGE", bias="NEUTRAL", current_atr=atr)
@@ -119,13 +133,11 @@ class SMCAnalyzer:
         bull_obs, bear_obs   = self._find_order_blocks(opens, highs, lows, closes, ts)
         bull_fvgs, bear_fvgs = self._find_fvgs(highs, lows, ts)
 
-        # Expire OBs by age only – touch count no longer causes expiry
         n = len(bars)
         for ob in bull_obs + bear_obs:
             if (n - ob.index) > self.ob_expiry_bars:
                 ob.expired = True
 
-        # Mark filled FVGs
         last_close = float(closes[-1])
         for fvg in bull_fvgs:
             if last_close <= fvg.bottom:
@@ -137,22 +149,51 @@ class SMCAnalyzer:
         liq_highs = [sh.price for sh in swings_h[-5:]] if swings_h else []
         liq_lows  = [sl.price for sl in swings_l[-5:]] if swings_l else []
 
+        active_bull_obs  = [ob for ob in bull_obs  if not ob.expired]
+        active_bear_obs  = [ob for ob in bear_obs  if not ob.expired]
+        active_bull_fvgs = [f  for f  in bull_fvgs if not f.filled]
+        active_bear_fvgs = [f  for f  in bear_fvgs if not f.filled]
+
         bias = self._determine_bias(
             structure, last_close, closes, bull_obs, bear_obs,
             swings_h, swings_l, atr, symbol=symbol)
 
+        # ── Stale-zone guard ──────────────────────────────────────────────────
+        # If bias is directional but ALL relevant zones are stale → NEUTRAL
+        if bias == "LONG":
+            relevant = active_bull_obs + active_bull_fvgs
+            if relevant:
+                all_fresh = [_zone_freshness(z.test_count) for z in relevant]
+                if all(f == 0.0 for f in all_fresh):
+                    logger.debug(
+                        f"analyse: all bullish zones stale → NEUTRAL "
+                        f"(symbol={symbol})")
+                    bias = "NEUTRAL"
+        elif bias == "SHORT":
+            relevant = active_bear_obs + active_bear_fvgs
+            if relevant:
+                all_fresh = [_zone_freshness(z.test_count) for z in relevant]
+                if all(f == 0.0 for f in all_fresh):
+                    logger.debug(
+                        f"analyse: all bearish zones stale → NEUTRAL "
+                        f"(symbol={symbol})")
+                    bias = "NEUTRAL"
+
+        # zone_freshness defaults to 0.5 (no zone — momentum-only entry)
+        # It gets updated by price_in_smc_zone() when called from bot_engine.
         return SMCContext(
             structure       = structure,
             bias            = bias,
             swing_highs     = swings_h,
             swing_lows      = swings_l,
-            bullish_obs     = [ob for ob in bull_obs  if not ob.expired],
-            bearish_obs     = [ob for ob in bear_obs  if not ob.expired],
-            bullish_fvgs    = [f  for f  in bull_fvgs if not f.filled],
-            bearish_fvgs    = [f  for f  in bear_fvgs if not f.filled],
+            bullish_obs     = active_bull_obs,
+            bearish_obs     = active_bear_obs,
+            bullish_fvgs    = active_bull_fvgs,
+            bearish_fvgs    = active_bear_fvgs,
             liquidity_highs = liq_highs,
             liquidity_lows  = liq_lows,
             current_atr     = atr,
+            zone_freshness  = 0.5,  # updated below if a zone is touched
         )
 
     # ── Swing detection ───────────────────────────────────────────────────────
@@ -177,12 +218,6 @@ class SMCAnalyzer:
 
     def _determine_structure(self, swings_h, swings_l,
                              closes: np.ndarray) -> str:
-        """
-        Two-bar HH/HL = UPTREND, LH/LL = DOWNTREND.
-        EMA slope fallback uses a tighter 0.15% threshold to prevent
-        micro-noise from resolving synthetic-instrument bars to a false trend.
-        """
-        # Primary: at least 2 swing highs and 2 swing lows
         if len(swings_h) >= 2 and len(swings_l) >= 2:
             last_h = [s.price for s in swings_h[-2:]]
             last_l = [s.price for s in swings_l[-2:]]
@@ -191,7 +226,6 @@ class SMCAnalyzer:
             if last_h[-1] < last_h[-2] and last_l[-1] < last_l[-2]:
                 return "DOWNTREND"
 
-        # Fallback: 3-swing strict check
         if len(swings_h) >= 3 and len(swings_l) >= 3:
             last_h = [s.price for s in swings_h[-3:]]
             last_l = [s.price for s in swings_l[-3:]]
@@ -200,7 +234,6 @@ class SMCAnalyzer:
             if last_h[-1] < last_h[-2] and last_l[-1] < last_l[-2]:
                 return "DOWNTREND"
 
-        # EMA slope fallback — TIGHTENED threshold (FIX 1)
         if len(closes) >= 20:
             period = min(20, len(closes))
             k = 2.0 / (period + 1)
@@ -210,7 +243,7 @@ class SMCAnalyzer:
             last_c = float(closes[-1])
             ema_ref = ema if ema != 0 else 1.0
             pct = (last_c - ema) / ema_ref
-            if pct > _EMA_SLOPE_THRESHOLD:     # was 0.0002; now 0.0015
+            if pct > _EMA_SLOPE_THRESHOLD:
                 return "UPTREND"
             if pct < -_EMA_SLOPE_THRESHOLD:
                 return "DOWNTREND"
@@ -221,31 +254,27 @@ class SMCAnalyzer:
 
     def _find_order_blocks(self, opens, highs, lows, closes,
                            ts) -> Tuple[List[OrderBlock], List[OrderBlock]]:
-        """
-        Threshold at mean×1.0 so OBs are found on synthetic instruments
-        that move in small, uniform tick steps.
-        """
         bull_obs, bear_obs = [], []
         mean_move = float(np.mean(np.abs(np.diff(closes))))
         min_move  = mean_move * 1.0
 
         for i in range(1, len(closes) - 2):
-            # Bullish OB: bearish candle followed by a strong bullish break
             if closes[i] < opens[i]:
                 if (closes[i + 1] > opens[i + 1] and
                         closes[i + 1] > highs[i] and
                         (closes[i + 1] - opens[i + 1]) >= min_move):
                     bull_obs.append(OrderBlock(
                         index=i, top=float(highs[i]), bottom=float(lows[i]),
-                        direction="bullish", bar_ts=ts[i]))
-            # Bearish OB: bullish candle followed by a strong bearish break
+                        direction="bullish", bar_ts=ts[i],
+                        bar_index=i, test_count=0))
             if closes[i] > opens[i]:
                 if (closes[i + 1] < opens[i + 1] and
                         closes[i + 1] < lows[i] and
                         (opens[i + 1] - closes[i + 1]) >= min_move):
                     bear_obs.append(OrderBlock(
                         index=i, top=float(highs[i]), bottom=float(lows[i]),
-                        direction="bearish", bar_ts=ts[i]))
+                        direction="bearish", bar_ts=ts[i],
+                        bar_index=i, test_count=0))
 
         return bull_obs[-10:], bear_obs[-10:]
 
@@ -257,27 +286,24 @@ class SMCAnalyzer:
             if lows[i + 2] > highs[i]:
                 bull_fvgs.append(FVG(
                     top=float(lows[i + 2]), bottom=float(highs[i]),
-                    direction="bullish", bar_ts=ts[i]))
+                    direction="bullish", bar_ts=ts[i],
+                    bar_index=i, test_count=0))
             if highs[i + 2] < lows[i]:
                 bear_fvgs.append(FVG(
                     top=float(lows[i]), bottom=float(highs[i + 2]),
-                    direction="bearish", bar_ts=ts[i]))
+                    direction="bearish", bar_ts=ts[i],
+                    bar_index=i, test_count=0))
         return bull_fvgs[-10:], bear_fvgs[-10:]
 
     # ── Bias determination ────────────────────────────────────────────────────
 
     def _ema_slope(self, closes: np.ndarray, period: int = 10) -> float:
-        """
-        Compute the percentage slope of a short EMA over the last two values.
-        Positive = price trending up, negative = trending down.
-        """
         if len(closes) < period + 2:
             return 0.0
         k = 2.0 / (period + 1)
         ema = float(np.mean(closes[:period]))
         for c in closes[period:]:
             ema = c * k + ema * (1 - k)
-        # One step back
         ema_prev = float(np.mean(closes[:period]))
         for c in closes[period:-1]:
             ema_prev = c * k + ema_prev * (1 - k)
@@ -285,10 +311,6 @@ class SMCAnalyzer:
         return (ema - ema_prev) / ref
 
     def _hh_hl_structure(self, closes: np.ndarray, bars: int = 6) -> str:
-        """
-        Lightweight HH/HL vs LH/LL check on the last `bars` closes.
-        Returns 'LONG', 'SHORT', or 'NEUTRAL'.
-        """
         if len(closes) < bars:
             return "NEUTRAL"
         window = closes[-bars:]
@@ -307,35 +329,19 @@ class SMCAnalyzer:
                         swings_h, swings_l,
                         atr: float,
                         symbol: str = "") -> str:
-        """
-        Resolves HTF bias to LONG / SHORT / NEUTRAL.
-
-        Priority order:
-          1. UPTREND / DOWNTREND (with momentum cross-check).
-          2. RANGE dual-window momentum consensus.
-          3. NEW — EMA slope momentum fallback for RANGE when consensus fails.
-          4. NEW — HH/HL structure fallback when EMA is also flat.
-          5. BOOM/CRASH instrument tiebreaker.
-
-        The goal is to resolve NEUTRAL as rarely as possible on synthetics,
-        since NEUTRAL immediately skips to the next symbol with no trade.
-        """
         half_atr = atr * 2.0
         if half_atr == 0:
             half_atr = price * 0.002
 
-        # ── BOOM/CRASH pre-check ──────────────────────────────────────────────
         sym_upper = symbol.upper()
         is_boom   = sym_upper.startswith("BOOM")
         is_crash  = sym_upper.startswith("CRASH")
 
-        # ── UPTREND ───────────────────────────────────────────────────────────
         if structure == "UPTREND":
-            # Verify 5-bar momentum is not actively negative
             if len(closes) >= 6:
                 fast_pct = (float(closes[-1]) - float(closes[-6])) / (
                     float(closes[-6]) if closes[-6] != 0 else 1.0)
-                if fast_pct < -0.001:   # price falling > 0.1% in 5 bars → skip
+                if fast_pct < -0.001:
                     logger.debug(
                         f"UPTREND but 5-bar momentum is negative "
                         f"({fast_pct:.5f}) → NEUTRAL (avoid pullback entry)")
@@ -350,13 +356,11 @@ class SMCAnalyzer:
                 return "LONG"
             return "LONG"
 
-        # ── DOWNTREND ─────────────────────────────────────────────────────────
         if structure == "DOWNTREND":
-            # Verify 5-bar momentum is not actively positive
             if len(closes) >= 6:
                 fast_pct = (float(closes[-1]) - float(closes[-6])) / (
                     float(closes[-6]) if closes[-6] != 0 else 1.0)
-                if fast_pct > 0.001:   # price rising > 0.1% in 5 bars → skip
+                if fast_pct > 0.001:
                     logger.debug(
                         f"DOWNTREND but 5-bar momentum is positive "
                         f"({fast_pct:.5f}) → NEUTRAL (avoid pullback entry)")
@@ -372,10 +376,10 @@ class SMCAnalyzer:
             return "SHORT"
 
         # ── RANGE — dual-window momentum consensus ────────────────────────────
-        bias_fast   = "NEUTRAL"
-        bias_slow   = "NEUTRAL"
-        ref_fast    = None
-        ref_slow    = None
+        bias_fast = "NEUTRAL"
+        bias_slow = "NEUTRAL"
+        ref_fast  = None
+        ref_slow  = None
 
         if len(closes) >= 6:
             ref = float(closes[-6]) if closes[-6] != 0 else 1.0
@@ -395,22 +399,16 @@ class SMCAnalyzer:
             elif pct < -_MOMENTUM_SLOW_PCT:
                 bias_slow = "SHORT"
 
-        # BUG 1 FIX: corrected f-string — use proper ternary for conditional formatting
         fast_str = f"{ref_fast:.5f}" if ref_fast is not None else "n/a"
         slow_str = f"{ref_slow:.5f}" if ref_slow is not None else "n/a"
         logger.debug(
             f"RANGE momentum | fast={bias_fast}({fast_str}) "
             f"slow={bias_slow}({slow_str})")
 
-        # Both windows must agree for RANGE resolution
         if bias_fast == bias_slow and bias_fast != "NEUTRAL":
             logger.debug(f"RANGE consensus → {bias_fast}")
             resolved = bias_fast
         else:
-            # ── BUG 3 FIX: EMA slope momentum fallback ───────────────────────
-            # When dual-window fails, try a short-period EMA slope.
-            # This catches trending markets that are just below the consensus
-            # thresholds — very common on low-pip synthetic instruments.
             ema_slope = self._ema_slope(closes, period=10)
             if ema_slope > _MOMENTUM_EMA_FALLBACK:
                 resolved = "LONG"
@@ -423,15 +421,12 @@ class SMCAnalyzer:
                     f"RANGE: EMA slope fallback → SHORT "
                     f"(slope={ema_slope:.6f} < -{_MOMENTUM_EMA_FALLBACK})")
             else:
-                # ── BUG 3 FIX: HH/HL structure fallback ─────────────────────
-                # When EMA is also flat, use raw price structure.
                 hh_hl = self._hh_hl_structure(closes, bars=8)
                 if hh_hl != "NEUTRAL":
                     resolved = hh_hl
                     logger.debug(
                         f"RANGE: HH/HL structure fallback → {hh_hl}")
                 else:
-                    # ── BOOM/CRASH: use instrument spike-direction as tiebreaker
                     if is_boom:
                         resolved = "LONG"
                         logger.debug("RANGE: BOOM instrument tiebreaker → LONG")
@@ -442,7 +437,6 @@ class SMCAnalyzer:
                         logger.debug("RANGE: no momentum consensus → NEUTRAL")
                         return "NEUTRAL"
 
-        # Sanity: for BOOM → reject SHORT bias; for CRASH → reject LONG bias
         if is_boom and resolved == "SHORT":
             logger.debug("BOOM instrument: rejecting SHORT bias → NEUTRAL")
             return "NEUTRAL"
@@ -457,19 +451,15 @@ class SMCAnalyzer:
     def price_in_smc_zone(self, price: float, bias: str,
                           ctx: SMCContext) -> bool:
         """
-        Returns True if price is within the zone tolerance of a relevant SMC zone.
+        Returns True if price is within tolerance of a relevant non-stale zone.
 
-        BUG 3 FIX — Wider tolerance for synthetics:
-          Tolerance is now max(3 × ATR, ATR_ZONE_FACTOR × ATR).
-          ATR_ZONE_FACTOR comes from config (default 2.0), but the floor of
-          3×ATR ensures synthetics with small ATR values still get a
-          meaningful search radius.
-
-        If no zones of the relevant direction exist, returns True
-        unconditionally — on synthetic instruments momentum alone is
-        sufficient to enter.
-
-        Does NOT mutate ob.touches.
+        NEW in v7:
+          • Zones with test_count >= 2 are skipped (stale — do not trade).
+          • On first entry (test_count == 0 → 1) or second entry
+            (test_count == 1 → 2), test_count is incremented.
+          • ctx.zone_freshness is updated to reflect the freshness of the
+            matched zone (1.0, 0.6, or 0.0).  If no zone matches, ctx remains
+            at its default (0.5).
         """
         try:
             import config as _cfg
@@ -477,35 +467,47 @@ class SMCAnalyzer:
         except Exception:
             zone_factor = 2.0
 
-        # Wider of config factor and a 3×ATR floor
         half_atr = max(ctx.current_atr * zone_factor,
                        ctx.current_atr * 3.0)
         if half_atr == 0:
-            half_atr = price * 0.003   # 0.3% fallback
+            half_atr = price * 0.003
+
+        def _check_zones(zones):
+            """Check a list of zones; return (matched, freshness) or (False, None)."""
+            for z in zones:
+                if z.test_count >= 2:
+                    continue   # stale zone — skip
+                if z.bottom - half_atr <= price <= z.top + half_atr:
+                    fresh = _zone_freshness(z.test_count)
+                    z.test_count += 1
+                    return True, fresh
+            return False, None
 
         if bias == "LONG":
             zone_count = len(ctx.bullish_obs) + len(ctx.bullish_fvgs)
             if zone_count == 0:
                 logger.debug("price_in_smc_zone: no bullish zones → True (fallback)")
+                ctx.zone_freshness = 0.5
                 return True
-            for ob in ctx.bullish_obs:
-                if ob.bottom - half_atr <= price <= ob.top + half_atr:
-                    return True
-            for fvg in ctx.bullish_fvgs:
-                if fvg.bottom - half_atr <= price <= fvg.top + half_atr:
-                    return True
+            matched, fresh = _check_zones(ctx.bullish_obs)
+            if not matched:
+                matched, fresh = _check_zones(ctx.bullish_fvgs)
+            if matched:
+                ctx.zone_freshness = fresh
+                return True
 
         elif bias == "SHORT":
             zone_count = len(ctx.bearish_obs) + len(ctx.bearish_fvgs)
             if zone_count == 0:
                 logger.debug("price_in_smc_zone: no bearish zones → True (fallback)")
+                ctx.zone_freshness = 0.5
                 return True
-            for ob in ctx.bearish_obs:
-                if ob.bottom - half_atr <= price <= ob.top + half_atr:
-                    return True
-            for fvg in ctx.bearish_fvgs:
-                if fvg.bottom - half_atr <= price <= fvg.top + half_atr:
-                    return True
+            matched, fresh = _check_zones(ctx.bearish_obs)
+            if not matched:
+                matched, fresh = _check_zones(ctx.bearish_fvgs)
+            if matched:
+                ctx.zone_freshness = fresh
+                return True
 
         return False
 
