@@ -630,9 +630,18 @@ class BotEngine:
             f"confidence={conf}/7 | freshness={fresh if isinstance(fresh, str) else f'{fresh:.2f}'} | "
             f"streak={self.risk.current_streak}")
 
+        # ── Direction inversion: flip signal before placing ───────────────────
+        # Signal engine and SMC logic remain untouched and still report the
+        # original direction above.  The inversion happens here, at the last
+        # possible point, so all upstream logic is unaffected.
+        inverted_direction = "SHORT" if sig.direction == "LONG" else "LONG"
+        logger.info(
+            f"Signal: {sig.direction} → Executing: {inverted_direction}"
+        )
+
         buy_resp = await self.client.buy_contract(
             symbol    = symbol,
-            direction = sig.direction,
+            direction = inverted_direction,
             stake     = stake,
             duration  = config.TRADE_DURATION,
             dur_unit  = config.TRADE_DURATION_UNIT,
