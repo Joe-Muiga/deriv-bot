@@ -1,59 +1,38 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v11 → v12 changes:
+v8 → v9 changes:
 
-  REMOVED — Loss-streak cycle pause:
-    The `if self.risk.pause_cycles_remaining > 0` block and all related
-    risk.consume_pause_cycle() calls have been removed.  Global pausing on
-    loss streak no longer exists.
+  NEW COMPOSITE SCORE FORMULA (Change 2):
+    Old: module_strength (0–3) + ATR-quality bonus (0–0.5)
+    New: three-component weighted score, range 0–4.35:
+      • Module strength          40%  → 0.0–1.2   (strength/3 × 4 × 0.40 = 0–1.2? see impl)
+        Raw: strength × (4/3) × 0.40  = strength × 0.533
+      • M3 indicator agreement   35%  → count of 7 indicators agreeing / 7 × 4 × 0.35
+        Raw: (confidence/7) × 4 × 0.35 = confidence × 0.200
+      • Zone freshness           25%  → smc_ctx.zone_freshness (0.0–1.0) × 4 × 0.25
+        Raw: freshness × 1.0
 
-  NEW — Per-symbol cycle suspension (integrated with SymbolManager v4):
-    At the TOP of every _main_loop iteration:
-      1. self.symbols.decrement_suspensions() is called to tick down counters.
-      2. Currently suspended symbols are logged to Render logs.
-      3. The `ready` list (symbols to scan this cycle) excludes any symbol
-         for which self.symbols.is_suspended(symbol) is True.
+    Practical max ≈ 3 × 0.533 + 7 × 0.200 + 1.0 × 1.0 = 1.6 + 1.4 + 1.0 = 4.0
+    (minimum signal score threshold driven by config.MIN_SIGNAL_SCORE, default 2.0)
 
-    On every confirmed trade close (_on_contract_result):
-      • LOSS → self.symbols.suspend(symbol, cycles=config.SYMBOL_SUSPENSION_CYCLES)
-      • WIN  → self.symbols.clear_suspension(symbol)
+  RANKED SIGNAL LOGGING (Change 2):
+    Every cycle logs the full ranked candidate list (symbol, score breakdown,
+    direction, strength, confidence, freshness) before execution begins.
 
-    All other symbols continue scanning and trading normally while any
-    individual symbol is suspended.
+  DEDUPLICATION RULE UPDATED (Change 2):
+    Round 2 repeats allowed only if score > 2.5 AND strength == 3 (was just strength ≥ 3).
 
-  REMOVED — risk._streak_tier() reference from ranked-signal log line
-    (tier no longer exists in RiskManager v9).
+  can_trade() NOW PASSES CONFIDENCE (Change 2 / 3):
+    Both R1 and R2 loops pass sig.confidence to risk.can_trade() so the
+    tiered confidence gate in risk_manager v8 engages correctly.
 
-  All v9/v10 composite score formula, ranked signal logging, deduplication
-  rule, confidence gate passing, SMC/signal/module logic, contract placement,
-  and scan frequency unchanged.
+  PAUSE-CYCLE SUPPORT (Change 1):
+    At the top of every _main_loop iteration, if risk.pause_cycles_remaining > 0,
+    the cycle is skipped and consume_pause_cycle() is called.
 
-v12 → v13 changes:
-
-  CHANGE 1 — Failed trade substitution:
-    _execute() now returns bool (True = contract placed, False = placement
-    failed for any reason).  The Round-1 and Round-2 execution loops track
-    attempted_symbols separately from executed_symbols.  A None return from
-    buy_contract() is treated as a hard failure — the symbol is added to
-    attempted_symbols only, executed_count is NOT incremented, and iteration
-    continues to the next ranked signal as a substitute.  If the ranked list
-    is exhausted with no substitute, the slot is left empty and the bot
-    continues without idling.  Every failure and every substitution is logged.
-
-  CHANGE 2 — Automatic Render redeploy every 5 cycles:
-    _cycle_count (int, starts 0) is incremented at the end of every
-    completed settle-wait (i.e. every cycle in which at least one trade
-    was placed).  When _cycle_count reaches config.REDEPLOY_EVERY_N_CYCLES:
-      • set_redeploy_pending(True) is called to stop new trades.
-      • The engine drains _open_contracts to zero (polling every 10 s).
-      • keep_alive.trigger_redeploy() fires the Render Deploy Hook.
-      • asyncio.sleep(300) then _main_loop returns; the process idles until
-        Render kills and restarts it with the new deploy.
-
-  SMC logic, signal ranking, confidence gates, zone freshness, symbol
-  suspension, win-streak stake scaling, module logic, scan frequency, and
-  all other v12 behaviour are UNCHANGED.
+  All v8 bug fixes preserved (symbol pass to smc.analyse, can_trade strength,
+  dashboard timing, scan sleep 1 s, confirmed-loss tracking).
 """
 
 import asyncio
@@ -77,9 +56,7 @@ from news_filter import NewsFilter
 from trade_journal import TradeJournal
 from symbol_manager import SymbolManager
 import indicators as ind
-from keep_alive import (update_status, set_active_trades,
-                        is_redeploy_pending, set_redeploy_pending)
-import keep_alive as _keep_alive_mod
+from keep_alive import update_status, set_active_trades, is_redeploy_pending
 from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
@@ -136,10 +113,6 @@ class BotEngine:
         self._day_start_balance_local: float = 0.0
         self._confirmed_paused: bool = False
         self._current_utc_day: int = -1
-
-        # ── v13: cycle counter + redeploy state ───────────────────────────────
-        self._cycle_count: int = 0
-        self._redeploy_triggered: bool = False
 
     # ── Timeframe routing ─────────────────────────────────────────────────────
 
@@ -303,7 +276,6 @@ class BotEngine:
                 await self._refresh_symbols()
                 await self._init_all_symbols()
 
-            # ── External redeploy-pending guard (from restart_scheduler) ──────
             if is_redeploy_pending():
                 if self._open_contracts:
                     logger.info(
@@ -324,20 +296,19 @@ class BotEngine:
                 await asyncio.sleep(60)
                 continue
 
-            # ── Cycle start: decrement per-symbol suspension counters ─────────
-            self.symbols.decrement_suspensions()
-            suspended_now = self.symbols.suspended_symbols()
-            if suspended_now:
+            # ── Loss-streak cycle pause ───────────────────────────────────────
+            if self.risk.pause_cycles_remaining > 0:
                 logger.info(
-                    f"⏸ Suspended symbols this cycle ({len(suspended_now)}): "
-                    f"{', '.join(suspended_now)}")
+                    f"⏸ Loss-streak pause: skipping cycle "
+                    f"({self.risk.pause_cycles_remaining} remaining) | "
+                    f"streak={self.risk.current_streak}")
+                self.risk.consume_pause_cycle()
+                await asyncio.sleep(SCAN_CYCLE_SLEEP)
+                continue
 
-            # ── Real-time queue – exclude suspended symbols ────────────────────
+            # ── Real-time queue ───────────────────────────────────────────────
             current_queue = self.symbols.get_queue(max_symbols=200)
-            ready = [
-                s for s in current_queue
-                if s in self._htf and not self.symbols.is_suspended(s)
-            ]
+            ready = [s for s in current_queue if s in self._htf]
 
             if not ready:
                 await asyncio.sleep(5)
@@ -398,12 +369,9 @@ class BotEngine:
             logger.info(
                 f"  streak={self.risk.current_streak} "
                 f"effective_max_concurrent={self.risk.effective_max_concurrent} "
-                f"suspended={len(suspended_now)}")
+                f"tier={self.risk._streak_tier()}")
 
-            # attempted_symbols: every symbol we tried to place (success OR fail)
-            # executed_symbols:  only symbols where buy_contract confirmed a cid
-            attempted_symbols: set = set()
-            executed_symbols: set  = set()
+            executed_symbols: set = set()
             executed_count = 0
 
             # ── ROUND 1: one trade per unique symbol ──────────────────────────
@@ -415,12 +383,6 @@ class BotEngine:
                     break
                 if sig_r.symbol in executed_symbols:
                     continue
-                # Skip symbols already attempted but failed — they were counted
-                # in attempted_symbols so we don't retry the same failure
-                if sig_r.symbol in attempted_symbols:
-                    continue
-
-                attempted_symbols.add(sig_r.symbol)
                 logger.info(
                     f"R1 execute: {sig_r.symbol} {sig_r.sig.direction} "
                     f"score={sig_r.prob_score:.3f} "
@@ -432,23 +394,12 @@ class BotEngine:
                                       f"{sig_r.sig.direction} | {sig_r.sig.reason}"),
                 )
                 try:
-                    success = await self._execute(
+                    await self._execute(
                         sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
-                    if success:
-                        executed_symbols.add(sig_r.symbol)
-                        executed_count += 1
-                    else:
-                        # Placement failed — slot remains open; next ranked
-                        # signal is the automatic substitute (loop continues)
-                        logger.warning(
-                            f"PLACEMENT FAILED R1: {sig_r.symbol} — "
-                            f"slot NOT counted, next ranked signal is substitute")
+                    executed_symbols.add(sig_r.symbol)
+                    executed_count += 1
                 except Exception as exc:
-                    logger.error(
-                        f"Execute error R1 ({sig_r.symbol}): {exc}")
-                    logger.warning(
-                        f"SUBSTITUTE triggered after R1 exception on "
-                        f"{sig_r.symbol} — continuing to next ranked signal")
+                    logger.error(f"Execute error ({sig_r.symbol}): {exc}")
 
             # ── ROUND 2: additional trades on already-traded symbols ──────────
             # Requires score > 2.5 AND strength == 3
@@ -470,20 +421,11 @@ class BotEngine:
                     f"R2 execute (repeat symbol): {sig_r.symbol} "
                     f"{sig_r.sig.direction} score={sig_r.prob_score:.3f}")
                 try:
-                    success = await self._execute(
+                    await self._execute(
                         sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
-                    if success:
-                        executed_count += 1
-                    else:
-                        logger.warning(
-                            f"PLACEMENT FAILED R2: {sig_r.symbol} — "
-                            f"slot NOT counted, next R2 candidate is substitute")
+                    executed_count += 1
                 except Exception as exc:
-                    logger.error(
-                        f"Execute error R2 ({sig_r.symbol}): {exc}")
-                    logger.warning(
-                        f"SUBSTITUTE triggered after R2 exception on "
-                        f"{sig_r.symbol} — continuing to next R2 candidate")
+                    logger.error(f"Execute error R2 ({sig_r.symbol}): {exc}")
 
             if executed_count:
                 logger.info(
@@ -496,40 +438,6 @@ class BotEngine:
                 logger.info(
                     f"Trades placed – waiting {wait_secs}s for contracts to settle")
                 await asyncio.sleep(wait_secs)
-
-                # ── v13: increment completed-cycle counter ─────────────────────
-                self._cycle_count += 1
-                logger.info(
-                    f"Cycle {self._cycle_count} settled | "
-                    f"balance=${self.client.balance:.4f} | "
-                    f"streak={self.risk.current_streak}")
-
-                # ── v13: check redeploy threshold ─────────────────────────────
-                redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 5)
-                if self._cycle_count >= redeploy_every:
-                    logger.info(
-                        f"Redeploy scheduled after {self._cycle_count} completed "
-                        f"cycle(s) — draining open contracts before restart")
-                    set_redeploy_pending(True)
-                    self._redeploy_triggered = True
-
-                    drain_start = time.time()
-                    while self._open_contracts:
-                        elapsed = int(time.time() - drain_start)
-                        logger.info(
-                            f"Redeploy drain: {len(self._open_contracts)} "
-                            f"contract(s) still open ({elapsed}s elapsed) — "
-                            f"waiting for settlement")
-                        await asyncio.sleep(10)
-
-                    logger.info(
-                        "All contracts drained — triggering Render redeploy hook")
-                    _keep_alive_mod.trigger_redeploy()
-                    logger.info(
-                        "Redeploy hook fired — process sleeping 300 s then exiting. "
-                        "Render will replace this instance with the new deploy.")
-                    await asyncio.sleep(300)
-                    return  # exits _main_loop; run() cleans up tasks and returns
             else:
                 await asyncio.sleep(SCAN_CYCLE_SLEEP)
 
@@ -608,17 +516,7 @@ class BotEngine:
     # ── Execution ─────────────────────────────────────────────────────────────
 
     async def _execute(self, symbol: str, sig: SignalResult,
-                       price: float, smc_ctx: SMCContext) -> bool:
-        """
-        Place a contract for symbol/sig/price/smc_ctx.
-
-        Returns True  if the contract was successfully placed and confirmed
-                       with a valid contract_id from the Deriv API.
-        Returns False on any placement failure (None from buy_contract, missing
-                       contract_id, or unexpected exception inside this method).
-                       The caller MUST NOT increment executed_count or add the
-                       symbol to executed_symbols when False is returned.
-        """
+                       price: float, smc_ctx: SMCContext):
         stake = self.risk.calculate_stake()
         ac    = get_symbol_class(symbol)
 
@@ -630,42 +528,18 @@ class BotEngine:
             f"confidence={conf}/7 | freshness={fresh if isinstance(fresh, str) else f'{fresh:.2f}'} | "
             f"streak={self.risk.current_streak}")
 
-        # ── Direction inversion: flip signal before placing ───────────────────
-        # Signal engine and SMC logic remain untouched and still report the
-        # original direction above.  The inversion happens here, at the last
-        # possible point, so all upstream logic is unaffected.
-        # Validation in signal_engine.py already runs against the inverted
-        # direction, so validation_direction == inverted_direction.
-        inverted_direction = "SHORT" if sig.direction == "LONG" else "LONG"
-        logger.info(
-            f"Signal: {sig.direction} → Validated as: {inverted_direction} → "
-            f"Executing: {inverted_direction}"
-        )
-
         buy_resp = await self.client.buy_contract(
             symbol    = symbol,
-            direction = inverted_direction,
+            direction = sig.direction,
             stake     = stake,
             duration  = config.TRADE_DURATION,
             dur_unit  = config.TRADE_DURATION_UNIT,
         )
+        if not buy_resp:
+            logger.warning(f"Order rejected for {symbol}")
+            return
 
-        # ── v13: treat None response as hard placement failure ────────────────
-        if buy_resp is None:
-            logger.warning(
-                f"PLACEMENT FAILED: buy_contract returned None for {symbol} "
-                f"({sig.direction} ${stake:.2f}) — slot NOT counted, "
-                f"substitution will be attempted from next ranked signal")
-            return False
-
-        cid = str(buy_resp.get("contract_id", ""))
-        if not cid:
-            logger.warning(
-                f"PLACEMENT FAILED: no contract_id in buy response for {symbol} "
-                f"({sig.direction} ${stake:.2f}) — slot NOT counted, "
-                f"substitution will be attempted from next ranked signal")
-            return False
-
+        cid   = str(buy_resp.get("contract_id", ""))
         bal_b = self.client.balance
 
         rec = self.risk.register_open(
@@ -696,8 +570,6 @@ class BotEngine:
             lambda msg, _cid=cid: asyncio.create_task(
                 self._on_contract_result(_cid, msg)))
 
-        return True
-
     # ── Contract result callback ──────────────────────────────────────────────
 
     async def _on_contract_result(self, cid: str, msg: dict):
@@ -727,13 +599,8 @@ class BotEngine:
 
         self.symbols.record_trade(symbol, won=pnl > 0, pnl=pnl)
 
-        # ── Per-symbol cycle suspension ───────────────────────────────────────
-        suspension_cycles = getattr(config, "SYMBOL_SUSPENSION_CYCLES", 2)
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
-            self.symbols.suspend(symbol, cycles=suspension_cycles)
-        else:
-            self.symbols.clear_suspension(symbol)
 
         self._check_confirmed_loss_limit()
         set_active_trades(len(self._open_contracts))
@@ -741,8 +608,7 @@ class BotEngine:
         outcome = "✅ WIN" if pnl > 0 else "❌ LOSS"
         logger.info(
             f"{outcome} | {symbol} | pnl=${pnl:+.4f} | "
-            f"balance=${bal_after:.4f} | streak={self.risk.current_streak} | "
-            f"suspended_cycles={self.symbols.suspension_cycles_remaining(symbol)}")
+            f"balance=${bal_after:.4f} | streak={self.risk.current_streak}")
 
         try:
             self._push_dashboard()
