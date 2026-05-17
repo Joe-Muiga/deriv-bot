@@ -23,6 +23,19 @@ v3 → v4 changes (Bug 2 fix):
     window between startup and the first _push_dashboard() call.
 
   No changes to Flask routes, ping loop, or HTML template logic.
+
+v4 → v5 changes (Change 2 — Automatic Render redeploy):
+
+  NEW — trigger_redeploy():
+    Reads RENDER_DEPLOY_HOOK_URL from environment and sends a POST request
+    to the Render Deploy Hook.  Called by bot_engine._main_loop() after
+    every REDEPLOY_EVERY_N_CYCLES completed trading cycles, once all open
+    contracts have drained to zero.
+    Logs success (HTTP status) or failure (exception / non-2xx response).
+    If RENDER_DEPLOY_HOOK_URL is not set, logs an error and returns without
+    raising so the caller can still sleep and exit cleanly.
+
+  No other changes.
 """
 
 import os
@@ -83,7 +96,7 @@ def update_status(**kwargs):
 # ── Redeploy-coordination helpers ─────────────────────────────────────────────
 
 def set_redeploy_pending(value: bool) -> None:
-    """Called by restart_scheduler to pause/resume new trade entries."""
+    """Called by restart_scheduler or bot_engine to pause/resume new trade entries."""
     _state["redeploy_pending"] = value
     logger.info(f"redeploy_pending set to {value}")
 
@@ -101,6 +114,51 @@ def set_active_trades(count: int) -> None:
 def get_active_trades() -> int:
     """restart_scheduler polls this to know when all trades have closed."""
     return int(_state.get("active_trades", 0))
+
+
+def trigger_redeploy() -> None:
+    """
+    POST to the Render Deploy Hook URL to trigger a redeploy of the latest
+    commit.  The URL is read from the RENDER_DEPLOY_HOOK_URL environment
+    variable, which must be set in Render's environment configuration.
+
+    Called by bot_engine._main_loop() after REDEPLOY_EVERY_N_CYCLES
+    completed trading cycles, once _open_contracts is empty.
+
+    Logs success (HTTP status code) or failure (non-2xx response or
+    exception).  Never raises — the caller can always sleep and exit cleanly
+    even if the hook call fails.
+    """
+    url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
+    if not url:
+        logger.error(
+            "trigger_redeploy: RENDER_DEPLOY_HOOK_URL environment variable is "
+            "not set — cannot trigger Render redeploy.  "
+            "Set it in Render → Environment → Add Environment Variable.")
+        return
+
+    logger.info(f"trigger_redeploy: sending POST to Render deploy hook …")
+    try:
+        resp = requests.post(url, timeout=15)
+        if resp.ok:
+            logger.info(
+                f"trigger_redeploy: SUCCESS — HTTP {resp.status_code} "
+                f"— Render redeploy initiated for latest commit")
+        else:
+            logger.error(
+                f"trigger_redeploy: FAILED — unexpected HTTP {resp.status_code} "
+                f"— response body: {resp.text[:300]}")
+    except requests.exceptions.Timeout:
+        logger.error(
+            "trigger_redeploy: FAILED — request timed out after 15 s "
+            "— Render deploy hook did not respond")
+    except requests.exceptions.ConnectionError as exc:
+        logger.error(
+            f"trigger_redeploy: FAILED — connection error: {exc}")
+    except Exception as exc:
+        logger.error(
+            f"trigger_redeploy: FAILED — unexpected error: "
+            f"{type(exc).__name__}: {exc}")
 
 
 _DASH_TEMPLATE: str = ""
