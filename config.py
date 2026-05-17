@@ -62,7 +62,7 @@ HTF_BARS              = 100
 LTF_BARS              = 200
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  = 7.90
+DAILY_LOSS_LIMIT_PCT  = 0.80
 RISK_PER_TRADE_PCT    = 0.01
 MIN_STAKE             = 0.35
 MAX_STAKE             = 500.0
@@ -96,7 +96,7 @@ SYMBOL_SUSPENSION_CYCLES = 4
 #   3. POST to RENDER_DEPLOY_HOOK_URL (env var) to trigger a fresh deploy
 #   4. sleep 300 s then exit — Render replaces the process
 # Set to 0 to disable.
-REDEPLOY_EVERY_N_CYCLES = 4
+REDEPLOY_EVERY_N_CYCLES = 10
 
 # ─── Signal Quality Gate ──────────────────────────────────────────────────────
 # New 3-component score threshold (module strength 40% + confidence 35% + freshness 25%)
