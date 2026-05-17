@@ -28,6 +28,18 @@ v11 → v12 changes:
     MIN_CONFIDENCE_STRICT         – kept for reference / future use
     MIN_CONFIDENCE_RECOVERY       – kept for reference / future use
     All other v11 values preserved unchanged.
+
+v12 → v13 changes:
+
+  NEW — Automatic Render redeploy:
+    REDEPLOY_EVERY_N_CYCLES = 5
+      bot_engine increments _cycle_count at the end of every completed
+      settle-wait (a cycle where ≥ 1 trade was placed).  When _cycle_count
+      reaches this value the engine drains open contracts and fires the
+      Render Deploy Hook stored in RENDER_DEPLOY_HOOK_URL (env var).
+      Set to 0 to disable the auto-redeploy feature.
+
+  All v12 values preserved unchanged.
 """
 
 import os
@@ -75,6 +87,16 @@ SYNTHETIC_LOSS_COOLDOWN_SECONDS  = 60
 # trading cycles.  A cycle = TRADE_DURATION * 60 + 10 seconds.
 # All other symbols trade normally.  A win clears the counter immediately.
 SYMBOL_SUSPENSION_CYCLES = 2
+
+# ─── Automatic Render Redeploy ───────────────────────────────────────────────
+# After this many completed trading cycles (cycles where ≥ 1 trade was placed
+# and the settle-wait completed), bot_engine will:
+#   1. stop opening new trades
+#   2. drain all open contracts to zero
+#   3. POST to RENDER_DEPLOY_HOOK_URL (env var) to trigger a fresh deploy
+#   4. sleep 300 s then exit — Render replaces the process
+# Set to 0 to disable.
+REDEPLOY_EVERY_N_CYCLES = 5
 
 # ─── Signal Quality Gate ──────────────────────────────────────────────────────
 # New 3-component score threshold (module strength 40% + confidence 35% + freshness 25%)
