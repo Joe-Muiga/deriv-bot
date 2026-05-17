@@ -50,7 +50,7 @@ HTF_BARS              = 100
 LTF_BARS              = 200
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  = 0.90
+DAILY_LOSS_LIMIT_PCT  = 7.90
 RISK_PER_TRADE_PCT    = 0.01
 MIN_STAKE             = 0.35
 MAX_STAKE             = 500.0
