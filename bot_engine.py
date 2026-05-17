@@ -634,9 +634,12 @@ class BotEngine:
         # Signal engine and SMC logic remain untouched and still report the
         # original direction above.  The inversion happens here, at the last
         # possible point, so all upstream logic is unaffected.
+        # Validation in signal_engine.py already runs against the inverted
+        # direction, so validation_direction == inverted_direction.
         inverted_direction = "SHORT" if sig.direction == "LONG" else "LONG"
         logger.info(
-            f"Signal: {sig.direction} → Executing: {inverted_direction}"
+            f"Signal: {sig.direction} → Validated as: {inverted_direction} → "
+            f"Executing: {inverted_direction}"
         )
 
         buy_resp = await self.client.buy_contract(
