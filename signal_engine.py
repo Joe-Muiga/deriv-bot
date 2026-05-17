@@ -452,10 +452,18 @@ class SignalEngine:
 
         direction = "LONG" if htf_bias == "LONG" else "SHORT"
 
-        if not _validate_recent_price_action(ltf_bars, direction):
+        # Execution inverts direction (LONG→SHORT, SHORT→LONG) in bot_engine.py.
+        # Validate against the inverted direction so the check confirms what will
+        # actually be traded, not the original signal direction.
+        validation_direction = "SHORT" if direction == "LONG" else "LONG"
+
+        if not _validate_recent_price_action(ltf_bars, validation_direction):
             reason = (f"signal validation FAILED: recent bars contradict "
-                      f"{direction} | m1={m1} m2={m2} m3={m3}")
-            logger.info(f"Signal REJECTED by validation: {direction} | {reason}")
+                      f"execution direction {validation_direction} "
+                      f"(signal={direction}) | m1={m1} m2={m2} m3={m3}")
+            logger.info(
+                f"Signal REJECTED by validation: {direction} → "
+                f"validated as: {validation_direction} | {reason}")
             return SignalResult("NONE", confirming, m1, m2, m3,
                                 confirming, reason, confidence=0)
 
@@ -464,8 +472,10 @@ class SignalEngine:
 
         reason = (f"✓ {confirming}/3 modules | bias={htf_bias} | "
                   f"m1={m1} m2={m2} m3={m3} | "
-                  f"confidence={confidence}/7 | validation=PASS")
-        logger.info(f"Signal: {direction} | {reason}")
+                  f"confidence={confidence}/7 | validation=PASS "
+                  f"(validated as {validation_direction})")
+        logger.info(
+            f"Signal: {direction} → Validated as: {validation_direction} | {reason}")
 
         return SignalResult(direction, confirming, m1, m2, m3,
                             confirming, reason, confidence=confidence)
