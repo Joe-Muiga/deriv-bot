@@ -18,6 +18,34 @@ v8 → v9 changes (Change 6):
       grep "CONFIRM" bot.log
 
   No logic changes.  All v8 direction-mapping audit code preserved.
+
+v9 → v10 changes (Change 1 — Failed trade substitution):
+
+  DerivAPIError exception class added:
+    Carries both the Deriv error code (e.g. MarketIsClosed, InvalidSymbol)
+    and the human-readable message.  _handle() now raises DerivAPIError
+    instead of the generic RuntimeError so callers can inspect the code.
+
+  buy_contract() explicit None on every failure path:
+    • Unknown direction     → None (unchanged)
+    • Deriv API error       → categorised log + None
+      Codes recognised and logged by category:
+        MarketIsClosed, OffMarket, TradingIsNotAvailable,
+        SuspendedDueToWeekend, PublicHoliday    → "market closed / weekend"
+        InvalidSymbol, SymbolNotFound,
+        AssetPriceUnavailable, ContractBuyValidationError → "invalid/unavailable symbol"
+        RateLimit, RateLimitExceeded              → "rate limit"
+        All other codes                           → "API error (code=…)"
+    • Network timeout       → None  (logged as "network timeout")
+    • Not-connected error   → None  (logged as "connection error")
+    • Missing contract_id   → None  (logged as "empty contract_id in response")
+      This catches the rare case where the API returns a 200-style response
+      with no contract_id, which would previously have silently registered
+      an invalid open trade.
+    • Any unexpected error  → None  (logged as "unexpected error")
+
+  All v9 direction-mapping audit, BOOM/CRASH override, PLACE/CONFIRM
+  logging, candle, tick, and contract-subscription logic are UNCHANGED.
 """
 
 import asyncio
@@ -37,9 +65,44 @@ MAX_RETRY_DELAY = 60
 
 _BOOM_CRASH_PREFIXES = ("BOOM", "CRASH")
 
+# ── Error-code categories for buy_contract failure logging ────────────────────
+_MARKET_CLOSED_CODES: frozenset = frozenset({
+    "MarketIsClosed",
+    "OffMarket",
+    "TradingIsNotAvailable",
+    "SuspendedDueToWeekend",
+    "PublicHoliday",
+})
+_INVALID_SYMBOL_CODES: frozenset = frozenset({
+    "InvalidSymbol",
+    "SymbolNotFound",
+    "AssetPriceUnavailable",
+    "ContractBuyValidationError",
+})
+_RATE_LIMIT_CODES: frozenset = frozenset({
+    "RateLimit",
+    "RateLimitExceeded",
+})
+
 
 def _is_boom_crash(symbol: str) -> bool:
     return any(symbol.upper().startswith(p) for p in _BOOM_CRASH_PREFIXES)
+
+
+# ── Custom exception carrying the Deriv error code ────────────────────────────
+
+class DerivAPIError(Exception):
+    """
+    Raised by _send() when the Deriv API returns an error object.
+    Carries the machine-readable error code alongside the human message so
+    buy_contract() can categorise the failure without string-parsing.
+    """
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+    def __str__(self):
+        return f"[{self.code}] {super().__str__()}"
 
 
 class DerivClient:
@@ -146,7 +209,11 @@ class DerivClient:
             fut = self._pending.pop(req_id)
             if not fut.done():
                 if error:
-                    fut.set_exception(RuntimeError(error.get("message", "Unknown error")))
+                    # v10: raise DerivAPIError (carries code) instead of
+                    # generic RuntimeError so buy_contract can categorise
+                    code    = error.get("code", "UnknownError")
+                    message = error.get("message", "Unknown error")
+                    fut.set_exception(DerivAPIError(code, message))
                 else:
                     fut.set_result(msg)
             return
@@ -318,13 +385,21 @@ class DerivClient:
         Direction mapping (VERIFIED CORRECT, DO NOT SWAP):
           direction="LONG"  → contract_type="CALL"  → wins if price RISES
           direction="SHORT" → contract_type="PUT"   → wins if price FALLS
+
+        Returns:
+          dict  – buy info dict containing contract_id on confirmed placement.
+          None  – on any failure: unknown direction, API error, network error,
+                  market closed, symbol unavailable, weekend, or missing cid.
+                  Every None return is logged with the exact failure reason.
         """
         if direction == "LONG":
             contract_type = "CALL"
         elif direction == "SHORT":
             contract_type = "PUT"
         else:
-            logger.error(f"buy_contract: unknown direction '{direction}' — aborting")
+            logger.error(
+                f"buy_contract FAILED | symbol={symbol} | "
+                f"reason=unknown direction '{direction}' — aborting")
             return None
 
         if _is_boom_crash(symbol):
@@ -356,10 +431,21 @@ class DerivClient:
                 "symbol":        symbol,
             },
         }
+
+        # ── v10: granular exception handling with exact failure reason logging ─
         try:
             resp     = await self._send(payload, timeout=15)
             buy_info = resp.get("buy", {})
             cid      = str(buy_info.get("contract_id", ""))
+
+            # Guard: if the API returned a 200-style success but no cid,
+            # treat as placement failure so the caller never registers a ghost
+            if not cid:
+                logger.warning(
+                    f"PLACEMENT FAILED | symbol={symbol} | direction={direction} | "
+                    f"stake=${stake:.2f} | reason=empty contract_id in response "
+                    f"(buy_info={buy_info})")
+                return None
 
             # ── Post-placement confirmation log ───────────────────────────────
             logger.info(
@@ -368,10 +454,39 @@ class DerivClient:
                 f"buy_price={buy_info.get('buy_price')} | "
                 f"balance=${self._balance:.4f}")
             return buy_info
+
+        except DerivAPIError as exc:
+            # Categorise by error code for clear Render log diagnostics
+            if exc.code in _MARKET_CLOSED_CODES:
+                reason = f"market closed / weekend (code={exc.code}: {exc})"
+            elif exc.code in _INVALID_SYMBOL_CODES:
+                reason = f"invalid or unavailable symbol (code={exc.code}: {exc})"
+            elif exc.code in _RATE_LIMIT_CODES:
+                reason = f"rate limit hit (code={exc.code}: {exc})"
+            else:
+                reason = f"Deriv API error (code={exc.code}: {exc})"
+            logger.warning(
+                f"PLACEMENT FAILED | symbol={symbol} | direction={direction} | "
+                f"stake=${stake:.2f} | reason={reason}")
+            return None
+
+        except TimeoutError as exc:
+            logger.warning(
+                f"PLACEMENT FAILED | symbol={symbol} | direction={direction} | "
+                f"stake=${stake:.2f} | reason=network timeout ({exc})")
+            return None
+
+        except RuntimeError as exc:
+            # Raised by _send() when not connected
+            logger.warning(
+                f"PLACEMENT FAILED | symbol={symbol} | direction={direction} | "
+                f"stake=${stake:.2f} | reason=connection error ({exc})")
+            return None
+
         except Exception as exc:
             logger.error(
-                f"buy_contract FAILED | symbol={symbol} | direction={direction} | "
-                f"stake=${stake:.2f} | error={exc}")
+                f"PLACEMENT FAILED | symbol={symbol} | direction={direction} | "
+                f"stake=${stake:.2f} | reason=unexpected error ({type(exc).__name__}: {exc})")
             return None
 
     async def subscribe_contract(self, contract_id: str,
