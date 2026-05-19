@@ -1,141 +1,156 @@
 """
-config.py – Centralised configuration for the SIFM Deriv Trading Bot.
-All secrets are loaded from environment variables; defaults are safe fallbacks.
+restart_scheduler.py – Graceful auto-redeploy on Render.
 
-v11 → v12 changes (FIX 5):
+Cycle (repeats forever):
+  1. Sleep a random interval between MIN_INTERVAL and MAX_INTERVAL.
+  2. Signal the bot to pause new trade entries (sets redeploy_pending = True).
+  3. Wait up to DRAIN_TIMEOUT seconds for all active trades to close.
+  4. POST to RENDER_DEPLOY_HOOK_URL → Render builds a fresh instance.
+  5. The new instance starts with redeploy_pending = False (clean slate).
 
-  NEW — Symbol suspension cycle constants:
-    SYMBOL_WIN_SUSPENSION_CYCLES   : cycles to suspend a WINNING symbol (default 2)
-    SYMBOL_LOSS_SUSPENSION_CYCLES  : cycles to suspend a LOSING symbol (default 3)
+bot_engine.py integration required (two calls):
+  • Before opening any new trade:
+        from keep_alive import is_redeploy_pending
+        if is_redeploy_pending():
+            return  # skip – redeploy is imminent
 
-  NEW — Signal score weight constants:
-    SCORE_WEIGHT_MODULE_STRENGTH     : weight for module confirming count (0.50)
-    SCORE_WEIGHT_MODULE_QUALITY      : weight for module firing quality   (0.30)
-    SCORE_WEIGHT_FRESHNESS           : weight for zone freshness          (0.05)
-    SCORE_WEIGHT_INDICATOR_AGREEMENT : weight for M3 indicator agreement  (0.15)
-    Weights sum to 1.0.  Score range = 0–4.0 (max: all components at 1.0 × 4).
-
-  v12 → v13 changes (BUG FIX):
-    NEW — RENDER_DEPLOY_HOOK_URL added (was missing, crashed restart_scheduler.py).
-
-  All v11 values preserved unchanged.
+  • Whenever your open-position count changes (open OR close a trade):
+        from keep_alive import set_active_trades
+        set_active_trades(len(self.open_positions))  # or equivalent
 """
 
-import os
-from dotenv import load_dotenv
+import logging
+import random
+import threading
+import time
 
-load_dotenv()
+import requests
+import config
+from keep_alive import set_redeploy_pending, get_active_trades
 
-# ─── Deriv API ────────────────────────────────────────────────────────────────
-DERIV_APP_ID    = os.environ.get("DERIV_APP_ID", "1089")
-DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
-DERIV_WS_URL    = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
-DERIV_CURRENCY  = "USD"
+logger = logging.getLogger(__name__)
 
-# ─── Timeframes ──────────────────────────────────────────────────────────────
-HTF_GRANULARITY       = 3600
-FOREX_LTF_GRANULARITY = 900
-OTHER_LTF_GRANULARITY = 60
-LTF_GRANULARITY       = 60
-HTF_BARS              = 100
-LTF_BARS              = 200
+# ── Tuneable constants ────────────────────────────────────────────────────────
+MIN_INTERVAL  = 50 * 60   # 50 min in seconds
+MAX_INTERVAL  = 90 * 60   # 90 min in seconds
+DRAIN_TIMEOUT = 10 * 60   # wait at most 10 min for open trades to close
+DRAIN_POLL    = 5         # poll active-trade count every 5 seconds
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  = 0.90
-RISK_PER_TRADE_PCT    = 0.01
-MIN_STAKE             = 0.35
-MAX_STAKE             = 500.0
-MAX_CONCURRENT_TRADES = 20
 
-# ─── Win-Streak Stake Scaling ─────────────────────────────────────────────────
-# Each element corresponds: streak ≥ threshold[i] → multiplier[i] × base stake
-WIN_STREAK_SCALE_THRESHOLDS  = [3, 4, 6, 8]          # streak levels
-WIN_STREAK_STAKE_MULTIPLIERS = [1.5, 2.0, 3.0, 4.0]  # stake multiplier at level
-WIN_STREAK_CONCURRENT_BONUS  = [0,   2,   4,   6]    # extra concurrent slots
+def _scheduler_loop() -> None:
+    # BUG 3 FIX: wrap config attribute access in try/except so a missing or
+    # mis-typed config value never crashes the background scheduler thread.
+    try:
+        url = config.RENDER_DEPLOY_HOOK_URL
+    except AttributeError:
+        logger.warning(
+            "restart_scheduler: config.RENDER_DEPLOY_HOOK_URL is not defined – "
+            "auto-redeploy scheduler is disabled. "
+            "Add RENDER_DEPLOY_HOOK_URL to config.py or as a Render env var."
+        )
+        return
 
-# Legacy fields (still used in some places — kept for backward compat)
-WIN_STREAK_STAKE_FACTOR = 0.30
-MAX_WIN_STREAK_MULT     = 4.0
+    if not url:
+        logger.warning(
+            "RENDER_DEPLOY_HOOK_URL is not set – "
+            "auto-redeploy scheduler is disabled. "
+            "Add the env var in Render → Environment to enable it."
+        )
+        return
 
-# ─── Symbol Cooldown After Loss ───────────────────────────────────────────────
-SYMBOL_LOSS_COOLDOWN_SECONDS     = 120
-SYNTHETIC_LOSS_COOLDOWN_SECONDS  = 60
+    logger.info(
+        f"Restart scheduler started "
+        f"(random interval {MIN_INTERVAL // 60}–{MAX_INTERVAL // 60} min, "
+        f"drain timeout {DRAIN_TIMEOUT // 60} min)."
+    )
 
-# ─── Symbol Cycle-Based Suspension (FIX 3 / FIX 5) ───────────────────────────
-# Number of full trading cycles a symbol is suspended after a WIN or LOSS.
-# Decrement_suspensions() is called once per cycle by bot_engine.
-SYMBOL_WIN_SUSPENSION_CYCLES  = 2   # suspend winner for 2 cycles
-SYMBOL_LOSS_SUSPENSION_CYCLES = 3   # suspend loser  for 3 cycles
+    while True:
+        # ── 1. Random sleep ──────────────────────────────────────────────────
+        interval = random.randint(MIN_INTERVAL, MAX_INTERVAL)
+        logger.info(
+            f"Restart scheduler: next redeploy in "
+            f"{interval // 60}m {interval % 60}s."
+        )
+        time.sleep(interval)
 
-# ─── Signal Score Weights (FIX 4 / FIX 5) ────────────────────────────────────
-# Four-component weighted score.  Weights MUST sum to 1.0.
-# Score range: 0.0 – 4.0  (max when all normalised components = 1.0)
-#
-# Priority hierarchy:
-#   1. Module strength  (50%) — how many of m1/m2/m3 confirmed
-#   2. Module quality   (30%) — how strongly each module fired
-#   3. Indicator agree  (15%) — M3 indicators agreeing (lowest individual weight)
-#   4. Zone freshness   ( 5%) — OB/FVG freshness
-#
-# Individual M3 indicators (RSI, StochRSI, MACD, BB, ADX, ATR, structure) feed
-# only into SCORE_WEIGHT_INDICATOR_AGREEMENT — they never override module decisions.
-SCORE_WEIGHT_MODULE_STRENGTH     = 0.50
-SCORE_WEIGHT_MODULE_QUALITY      = 0.30
-SCORE_WEIGHT_FRESHNESS           = 0.05
-SCORE_WEIGHT_INDICATOR_AGREEMENT = 0.15
+        # ── 2. Pause new trade entries ────────────────────────────────────────
+        logger.info(
+            "Restart scheduler: signalling bot to pause new trade entries …"
+        )
+        set_redeploy_pending(True)
 
-# ─── Signal Quality Gate ──────────────────────────────────────────────────────
-# New 4-component score threshold
-MIN_SIGNAL_SCORE           = 2.0   # minimum composite score to pass to execution
+        # ── 3. Drain open trades ──────────────────────────────────────────────
+        deadline = time.time() + DRAIN_TIMEOUT
+        while time.time() < deadline:
+            active = get_active_trades()
+            if active == 0:
+                logger.info(
+                    "Restart scheduler: all trades closed – proceeding to deploy."
+                )
+                break
+            logger.info(
+                f"Restart scheduler: {active} open trade(s) remaining, "
+                f"waiting …"
+            )
+            time.sleep(DRAIN_POLL)
+        else:
+            logger.warning(
+                f"Restart scheduler: drain timeout – "
+                f"{get_active_trades()} trade(s) still open. Deploying anyway."
+            )
 
-# Legacy threshold — kept for fallback in bot_engine if MIN_SIGNAL_SCORE absent
-MIN_SIGNAL_PROBABILITY     = 1.8
+        # ── 4. Trigger Render redeploy ────────────────────────────────────────
+        logger.info("Restart scheduler: POSTing to Render deploy hook …")
+        try:
+            # Re-read URL defensively in case config was patched at runtime
+            try:
+                url = config.RENDER_DEPLOY_HOOK_URL
+            except AttributeError:
+                logger.error(
+                    "Restart scheduler: config.RENDER_DEPLOY_HOOK_URL disappeared – "
+                    "clearing pause flag and skipping this redeploy cycle."
+                )
+                set_redeploy_pending(False)
+                continue
 
-MIN_STRENGTH_REPEAT_SYMBOL = 3     # full 3/3 required for Round-2 repeat-symbol trades
+            if not url:
+                logger.warning(
+                    "Restart scheduler: RENDER_DEPLOY_HOOK_URL is empty – "
+                    "skipping redeploy, clearing pause flag."
+                )
+                set_redeploy_pending(False)
+                continue
 
-# ─── Module Strength Thresholds ───────────────────────────────────────────────
-MIN_MODULE_STRENGTH_NORMAL = 2    # minimum confirming modules under normal conditions
-MIN_MODULE_STRENGTH_STRICT = 3    # minimum confirming modules under quality gate
+            r = requests.post(url, timeout=15)
+            if r.ok:
+                logger.info(
+                    f"Restart scheduler: deploy triggered ✓ (HTTP {r.status_code}). "
+                    "Render is building a fresh instance."
+                )
+                # Leave redeploy_pending = True – the dying process won't open
+                # any more trades and the new process starts clean (False).
+            else:
+                logger.error(
+                    f"Restart scheduler: deploy hook returned "
+                    f"HTTP {r.status_code}: {r.text[:200]} – "
+                    "clearing pause flag; will retry next cycle."
+                )
+                set_redeploy_pending(False)
+        except requests.RequestException as exc:
+            logger.error(
+                f"Restart scheduler: POST failed – {exc}. "
+                "Clearing pause flag; will retry next cycle."
+            )
+            set_redeploy_pending(False)
 
-# ─── Confidence Thresholds (M3 indicator agreement out of 7) ─────────────────
-MIN_CONFIDENCE_NORMAL   = 5    # normal trading conditions
-MIN_CONFIDENCE_STRICT   = 6    # streak ≤ LOSS_STREAK_QUALITY_GATE (tier-2/4)
-MIN_CONFIDENCE_RECOVERY = 7    # streak ≤ LOSS_STREAK_ABORT_THRESHOLD (tier-6)
 
-# ─── Loss-Streak Gate Thresholds ──────────────────────────────────────────────
-LOSS_STREAK_QUALITY_GATE      = -2   # tier-2: strength=3 required
-LOSS_STREAK_PAUSE_THRESHOLD   = -4   # tier-4: 1-cycle pause + strength=3
-LOSS_STREAK_ABORT_THRESHOLD   = -6   # tier-6: 3-cycle pause + strength=3 + confidence≥7
-
-# Quality-gate safety auto-clear timeout (seconds) — safety valve only
-QUALITY_GATE_TIMEOUT_SECS     = 60
-
-# ─── Strategy ────────────────────────────────────────────────────────────────
-MIN_MODULES_FOR_SIGNAL  = 2
-MIN_INDICATOR_VOTES     = 3
-OB_EXPIRY_BARS          = 50
-ATR_ZONE_FACTOR         = 3.0
-NEWS_BLOCK_MINUTES      = 30
-DIVERGENCE_STRENGTH_MIN = 0.3
-
-# ─── Trade Execution ─────────────────────────────────────────────────────────
-# Minimum 5 minutes so the signal structure can play out (at least 5 LTF bars).
-TRADE_DURATION      = 5    # minutes — DO NOT set below 5
-TRADE_DURATION_UNIT = "m"
-
-BOOM_CRASH_TICK_DURATION = 10
-BOOM_CRASH_DURATION_UNIT = "t"
-
-# ─── Render keep-alive ───────────────────────────────────────────────────────
-PORT                = int(os.environ.get("PORT", 8080))
-SELF_URL            = os.environ.get("RENDER_EXTERNAL_URL",
-                                     f"http://localhost:{PORT}")
-KEEP_ALIVE_INTERVAL = 40
-
-# ─── Render auto-redeploy (restart_scheduler.py) ─────────────────────────────
-# Set this env var in Render → Environment → RENDER_DEPLOY_HOOK_URL.
-# Leave blank to disable the auto-restart scheduler safely.
-RENDER_DEPLOY_HOOK_URL = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
-
-# ─── Logging ─────────────────────────────────────────────────────────────────
-LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+def start_restart_scheduler() -> None:
+    """Spawn the scheduler as a background daemon thread."""
+    t = threading.Thread(
+        target=_scheduler_loop,
+        name="restart-scheduler",
+        daemon=True,
+    )
+    t.start()
+    logger.info("Restart scheduler thread started ✓")
