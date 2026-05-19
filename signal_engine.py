@@ -1,18 +1,29 @@
 """
 signal_engine.py – Phase B of SIFM: Lower-Timeframe Entry Scan.
 
-v9 → v10 changes (FIX 2):
+v10 → v11 changes (BUG 1 — signal gate overhaul):
 
-  VALIDATION RESTORED TO ORIGINAL DIRECTION:
-    _validate_recent_price_action() now validates against the ACTUAL signal
-    direction ("LONG" or "SHORT") — never against an inverted direction.
-    Any previous workaround that passed an inverted direction string to
-    this function has been removed.  The function is unchanged in logic;
-    only the caller (evaluate()) is confirmed to pass direction directly.
+  EMISSION RULES SIMPLIFIED:
+    strength = 3/3  →  ALWAYS emit.  No validation check.  No confidence gate.
+                        No bar-history gate.  No score threshold.  Unconditional.
+    strength = 2/3  →  Emit ONLY if module3_confidence() ≥ MIN_CONFIDENCE_FOR_PARTIAL
+                        (default 5/7).  All other secondary gates removed.
+    strength < 2/3  →  Always reject.
 
-  NO OTHER CHANGES:
-    All v9 logic preserved: module functions, confidence counter,
-    vote panel, module3_confidence(), SignalResult dataclass.
+  VALIDATION GATE REMOVED:
+    _validate_recent_price_action() is kept as a utility but is NO LONGER called
+    from evaluate().  It was blocking valid 3/3 signals and is redundant once
+    three independent modules have confirmed a direction.
+
+  LOGGING:
+    Every emitted signal:  SIGNAL EMITTED: <symbol> <CALL|PUT> strength=N/3
+    Every rejection:       REJECTED: <symbol> strength=N/3 [reason]
+    Partial rejections:    REJECTED: <symbol> strength=2/3 confidence=X/7 below threshold
+
+  symbol parameter added to evaluate() for log context.
+
+  All v10 module logic preserved exactly: module1_mtfa_rsi, module2_candlestick,
+  module3_vote, module3_confidence — no strategy changes.
 """
 
 import numpy as np
@@ -22,6 +33,7 @@ from typing import List
 from candlestick_builder import Candle
 import indicators as ind
 from smc_analyzer import SMCContext
+import config as _config
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +54,7 @@ class SignalResult:
     confidence: int = 0   # 0–7: how many of 7 M3 indicators agree with direction
 
 
-# ─── Signal self-validation ───────────────────────────────────────────────────
+# ─── Signal self-validation (utility — no longer called from evaluate) ────────
 
 def _validate_recent_price_action(ltf_bars: List[Candle],
                                   direction: str,
@@ -51,6 +63,11 @@ def _validate_recent_price_action(ltf_bars: List[Candle],
     Validates that recent price action is consistent with *direction*.
     direction must be "LONG" or "SHORT" — the actual signal direction,
     never an inverted version.
+
+    NOTE (v11): This function is retained as a utility but is NOT called from
+    evaluate().  Calling it after 3/3 modules have confirmed is redundant and
+    caused too many valid signals to be discarded.  Re-enable at call-site only
+    if you need an extra gate for 2/3 signals under specific conditions.
     """
     if len(ltf_bars) < lookback + 1:
         return True
@@ -412,17 +429,28 @@ class SignalEngine:
         self.min_votes   = min_votes
 
     def evaluate(self, ltf_bars: List[Candle], htf_bias: str,
-                 smc_ctx: SMCContext, in_zone: bool) -> SignalResult:
+                 smc_ctx: SMCContext, in_zone: bool,
+                 symbol: str = "") -> SignalResult:
         """
         Evaluate all three modules and return a directional signal.
 
-        FIX 2: Direction is derived directly from htf_bias — NEVER inverted.
-          htf_bias == "LONG"  → direction = "LONG"
-          htf_bias == "SHORT" → direction = "SHORT"
+        v11 EMISSION RULES (BUG 1 fix):
+          ┌──────────────┬────────────────────────────────────────────────────┐
+          │ confirming   │ action                                             │
+          ├──────────────┼────────────────────────────────────────────────────┤
+          │ 3/3          │ ALWAYS emit — no further gate of any kind          │
+          │ 2/3          │ emit only if confidence ≥ MIN_CONFIDENCE_FOR_PARTIAL│
+          │ < 2          │ always reject                                      │
+          └──────────────┴────────────────────────────────────────────────────┘
 
-        Validation checks the ACTUAL direction (not an inverted version).
-        Confidence is computed for the ACTUAL direction.
+        Validation (_validate_recent_price_action) is NOT called — it is
+        redundant once ≥ 2 independent modules have confirmed and was blocking
+        too many valid signals.
+
+        Direction follows htf_bias directly — NEVER inverted.
         """
+        _sym = symbol or htf_bias   # fallback label for log lines
+
         if htf_bias == "NEUTRAL" or not in_zone:
             return SignalResult("NONE", 0, 0, 0, 0, 0,
                                 f"htf_bias={htf_bias}, in_zone={in_zone}",
@@ -436,33 +464,50 @@ class SignalEngine:
         confirming = sum(1 for m in [m1, m2, m3] if m == expected)
 
         logger.debug(
-            f"SignalEngine | bias={htf_bias} expected={expected:+d} "
-            f"m1={m1} m2={m2} m3={m3} confirming={confirming}/{self.min_modules}")
+            f"SignalEngine [{_sym}] | bias={htf_bias} expected={expected:+d} "
+            f"m1={m1} m2={m2} m3={m3} confirming={confirming}/3")
 
-        if confirming < self.min_modules:
-            reason = (f"only {confirming}/{self.min_modules} modules confirmed "
+        # ── Reject 0/3 or 1/3 ────────────────────────────────────────────────
+        if confirming < 2:
+            reason = (f"only {confirming}/3 modules confirmed "
                       f"(m1={m1}, m2={m2}, m3={m3})")
+            logger.info(f"REJECTED: {_sym} strength={confirming}/3 — {reason}")
             return SignalResult("NONE", confirming, m1, m2, m3,
                                 confirming, reason, confidence=0)
 
-        # FIX 2: direction follows htf_bias directly — no inversion
+        # Direction follows htf_bias directly — NEVER inverted
         direction = "LONG" if htf_bias == "LONG" else "SHORT"
+        dir_label = "CALL" if direction == "LONG" else "PUT"
 
-        # Validate against ACTUAL direction (never inverted)
-        if not _validate_recent_price_action(ltf_bars, direction):
-            reason = (f"signal validation FAILED: recent bars contradict "
-                      f"{direction} | m1={m1} m2={m2} m3={m3}")
-            logger.info(f"Signal REJECTED by validation: {direction} | {reason}")
+        # ── 3/3: unconditional emission ───────────────────────────────────────
+        if confirming == 3:
+            confidence = module3_confidence(ltf_bars, direction)
+            reason = (f"✓ 3/3 modules | bias={htf_bias} | "
+                      f"m1={m1} m2={m2} m3={m3} | confidence={confidence}/7")
+            logger.info(
+                f"SIGNAL EMITTED: {_sym} {dir_label} strength=3/3 "
+                f"confidence={confidence}/7")
+            return SignalResult(direction, confirming, m1, m2, m3,
+                                confirming, reason, confidence=confidence)
+
+        # ── 2/3: emit only if confidence ≥ threshold ──────────────────────────
+        confidence  = module3_confidence(ltf_bars, direction)
+        min_conf    = getattr(_config, "MIN_CONFIDENCE_FOR_PARTIAL", 5)
+
+        if confidence < min_conf:
+            reason = (f"strength=2/3 confidence={confidence}/7 "
+                      f"below threshold {min_conf}/7 "
+                      f"(m1={m1}, m2={m2}, m3={m3})")
+            logger.info(
+                f"REJECTED: {_sym} strength=2/3 "
+                f"confidence={confidence}/7 below threshold")
             return SignalResult("NONE", confirming, m1, m2, m3,
-                                confirming, reason, confidence=0)
+                                confirming, reason, confidence=confidence)
 
-        # Compute confidence for the ACTUAL direction
-        confidence = module3_confidence(ltf_bars, direction)
-
-        reason = (f"✓ {confirming}/3 modules | bias={htf_bias} | "
-                  f"m1={m1} m2={m2} m3={m3} | "
-                  f"confidence={confidence}/7 | validation=PASS")
-        logger.info(f"Signal: {direction} | {reason}")
-
+        reason = (f"✓ 2/3 modules | confidence={confidence}/7 ≥ {min_conf}/7 | "
+                  f"bias={htf_bias} | m1={m1} m2={m2} m3={m3}")
+        logger.info(
+            f"SIGNAL EMITTED: {_sym} {dir_label} strength=2/3 "
+            f"confidence={confidence}/7")
         return SignalResult(direction, confirming, m1, m2, m3,
                             confirming, reason, confidence=confidence)
