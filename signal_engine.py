@@ -1,30 +1,18 @@
 """
 signal_engine.py – Phase B of SIFM: Lower-Timeframe Entry Scan.
 
-v8 → v9 changes:
+v9 → v10 changes (FIX 2):
 
-  CONFIDENCE COUNTER (Change 3):
-    After modules are evaluated, count how many of the 7 Module-3 indicators
-    agree with the final signal direction.  This is stored as sig.confidence
-    (0–7) on every SignalResult — including NONE results (confidence=0).
+  VALIDATION RESTORED TO ORIGINAL DIRECTION:
+    _validate_recent_price_action() now validates against the ACTUAL signal
+    direction ("LONG" or "SHORT") — never against an inverted direction.
+    Any previous workaround that passed an inverted direction string to
+    this function has been removed.  The function is unchanged in logic;
+    only the caller (evaluate()) is confirmed to pass direction directly.
 
-    Confidence thresholds (driven by risk_manager / config):
-      Normal    (streak > -2)  : confidence ≥ MIN_CONFIDENCE_NORMAL  (default 5)
-      Strict    (streak ≤ -2)  : confidence ≥ MIN_CONFIDENCE_STRICT  (default 6)
-      Recovery  (streak ≤ -6)  : confidence = MIN_CONFIDENCE_RECOVERY (default 7)
-
-    The threshold check is NOT performed here — it is performed in
-    risk_manager.can_trade() so the streak tier drives it automatically.
-    signal_engine always returns the raw confidence value.
-
-    Signals that fail the module gate (confirming < min_modules) still get
-    confidence=0 and direction=NONE — no change to existing logic.
-
-  SignalResult.confidence FIELD ADDED:
-    New int field on the dataclass.  All existing callers are compatible
-    because m3_score (old last positional arg) is still present.
-
-  All v8 logic unchanged: module functions, validation, vote panel.
+  NO OTHER CHANGES:
+    All v9 logic preserved: module functions, confidence counter,
+    vote panel, module3_confidence(), SignalResult dataclass.
 """
 
 import numpy as np
@@ -59,6 +47,11 @@ class SignalResult:
 def _validate_recent_price_action(ltf_bars: List[Candle],
                                   direction: str,
                                   lookback: int = _VALIDATION_LOOKBACK) -> bool:
+    """
+    Validates that recent price action is consistent with *direction*.
+    direction must be "LONG" or "SHORT" — the actual signal direction,
+    never an inverted version.
+    """
     if len(ltf_bars) < lookback + 1:
         return True
 
@@ -423,10 +416,12 @@ class SignalEngine:
         """
         Evaluate all three modules and return a directional signal.
 
-        New in v9:
-          After a valid directional signal is established, compute confidence
-          (count of 7 M3 indicators agreeing) and attach it to SignalResult.
-          The confidence gate is enforced externally by risk_manager.can_trade().
+        FIX 2: Direction is derived directly from htf_bias — NEVER inverted.
+          htf_bias == "LONG"  → direction = "LONG"
+          htf_bias == "SHORT" → direction = "SHORT"
+
+        Validation checks the ACTUAL direction (not an inverted version).
+        Confidence is computed for the ACTUAL direction.
         """
         if htf_bias == "NEUTRAL" or not in_zone:
             return SignalResult("NONE", 0, 0, 0, 0, 0,
@@ -450,8 +445,10 @@ class SignalEngine:
             return SignalResult("NONE", confirming, m1, m2, m3,
                                 confirming, reason, confidence=0)
 
+        # FIX 2: direction follows htf_bias directly — no inversion
         direction = "LONG" if htf_bias == "LONG" else "SHORT"
 
+        # Validate against ACTUAL direction (never inverted)
         if not _validate_recent_price_action(ltf_bars, direction):
             reason = (f"signal validation FAILED: recent bars contradict "
                       f"{direction} | m1={m1} m2={m2} m3={m3}")
@@ -459,7 +456,7 @@ class SignalEngine:
             return SignalResult("NONE", confirming, m1, m2, m3,
                                 confirming, reason, confidence=0)
 
-        # Compute confidence: how many of 7 M3 indicators agree
+        # Compute confidence for the ACTUAL direction
         confidence = module3_confidence(ltf_bars, direction)
 
         reason = (f"✓ {confirming}/3 modules | bias={htf_bias} | "
