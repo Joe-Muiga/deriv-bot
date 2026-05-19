@@ -331,7 +331,7 @@ class BotEngine:
                 if self._open_contracts:
                     logger.info(
                         f"Redeploy pending – waiting for "
-                        f"{len(self._open_contracts)} open trade(s)}")
+                        f"{len(self._open_contracts)} open trade(s)")
                     await asyncio.sleep(10)
                     continue
                 else:
@@ -551,6 +551,7 @@ class BotEngine:
             ltf_bars_list = ltf.completed_bars
             if not ltf_bars_list:
                 return None
+
             current_price = float(ltf_bars_list[-1].close)
 
             in_zone = self.smc.price_in_smc_zone(current_price, smc_ctx.bias, smc_ctx)
