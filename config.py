@@ -2,20 +2,21 @@
 config.py – Centralised configuration for the SIFM Deriv Trading Bot.
 All secrets are loaded from environment variables; defaults are safe fallbacks.
 
-v11 → v12 changes (FIX 5):
+v12 → v13 changes (BUG 3 + BUG 4 additions):
 
-  NEW — Symbol suspension cycle constants:
-    SYMBOL_WIN_SUSPENSION_CYCLES   : cycles to suspend a WINNING symbol (default 2)
-    SYMBOL_LOSS_SUSPENSION_CYCLES  : cycles to suspend a LOSING symbol (default 3)
+  UPDATED:
+    MAX_CONCURRENT_TRADES   : 20 → 10  (more controlled parallel execution)
 
-  NEW — Signal score weight constants:
-    SCORE_WEIGHT_MODULE_STRENGTH     : weight for module confirming count (0.50)
-    SCORE_WEIGHT_MODULE_QUALITY      : weight for module firing quality   (0.30)
-    SCORE_WEIGHT_FRESHNESS           : weight for zone freshness          (0.05)
-    SCORE_WEIGHT_INDICATOR_AGREEMENT : weight for M3 indicator agreement  (0.15)
-    Weights sum to 1.0.  Score range = 0–4.0 (max: all components at 1.0 × 4).
+  NEW — Execution aggressiveness constants:
+    MIN_MODULE_STRENGTH       : 3  (unconditional emission threshold)
+    MIN_CONFIDENCE_FOR_PARTIAL: 5  (confidence gate for 2/3 strength signals)
+    REDEPLOY_EVERY_N_CYCLES   : 6  (trigger redeploy after N complete cycles)
+    SCAN_CYCLE_SLEEP          : 1  (seconds between idle scan cycles; moved from bot_engine)
 
-  All v11 values preserved unchanged.
+  NEW — Render redeploy integration:
+    RENDER_DEPLOY_HOOK_URL    : read from environment (empty string if unset)
+
+  All v12 values preserved unchanged.
 """
 
 import os
@@ -42,7 +43,7 @@ DAILY_LOSS_LIMIT_PCT  = 0.90
 RISK_PER_TRADE_PCT    = 0.01
 MIN_STAKE             = 0.35
 MAX_STAKE             = 500.0
-MAX_CONCURRENT_TRADES = 20
+MAX_CONCURRENT_TRADES = 10   # updated: 20 → 10
 
 # ─── Win-Streak Stake Scaling ─────────────────────────────────────────────────
 # Each element corresponds: streak ≥ threshold[i] → multiplier[i] × base stake
@@ -94,6 +95,10 @@ MIN_STRENGTH_REPEAT_SYMBOL = 3     # full 3/3 required for Round-2 repeat-symbol
 MIN_MODULE_STRENGTH_NORMAL = 2    # minimum confirming modules under normal conditions
 MIN_MODULE_STRENGTH_STRICT = 3    # minimum confirming modules under quality gate
 
+# NEW (BUG 3): canonical threshold constants used by signal_engine
+MIN_MODULE_STRENGTH      = 3    # unconditional signal emission requires 3/3 modules
+MIN_CONFIDENCE_FOR_PARTIAL = 5  # 2/3 signals require at least 5/7 indicators to agree
+
 # ─── Confidence Thresholds (M3 indicator agreement out of 7) ─────────────────
 MIN_CONFIDENCE_NORMAL   = 5    # normal trading conditions
 MIN_CONFIDENCE_STRICT   = 6    # streak ≤ LOSS_STREAK_QUALITY_GATE (tier-2/4)
@@ -122,6 +127,21 @@ TRADE_DURATION_UNIT = "m"
 
 BOOM_CRASH_TICK_DURATION = 10
 BOOM_CRASH_DURATION_UNIT = "t"
+
+# ─── Scan cycle timing ────────────────────────────────────────────────────────
+# How long (seconds) to sleep between idle scan cycles (no trades placed).
+# Moved from bot_engine local constant so it is centrally tuneable.
+SCAN_CYCLE_SLEEP = 1
+
+# ─── Auto-redeploy cycle budget ───────────────────────────────────────────────
+# After this many completed settle-wait cycles, bot_engine will drain open
+# contracts and POST to RENDER_DEPLOY_HOOK_URL to trigger a fresh deployment.
+REDEPLOY_EVERY_N_CYCLES = 6
+
+# ─── Render deploy hook ───────────────────────────────────────────────────────
+# Set RENDER_DEPLOY_HOOK_URL as a Render environment variable.
+# Leave empty to disable cycle-based auto-redeploy (bot continues running).
+RENDER_DEPLOY_HOOK_URL = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
 
 # ─── Render keep-alive ───────────────────────────────────────────────────────
 PORT                = int(os.environ.get("PORT", 8080))
