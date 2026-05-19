@@ -1,28 +1,29 @@
 """
 symbol_manager.py – Symbol rotation with per-loss cooldown + cycle-based suspension.
 
-v3 → v4 changes:
-  • Per-symbol cycle-based suspension replaces all loss-streak logic:
-      - suspend(symbol, cycles=2) : suspend a symbol for N full trading cycles.
-        Called by bot_engine on every confirmed loss.
-      - decrement_suspensions()   : called by bot_engine at the START of each
-        cycle, before scanning. Decrements every active counter by 1 and lifts
-        the suspension when it reaches 0.
-      - is_suspended(symbol)      : returns True while suspend_cycles_remaining > 0.
-      - clear_suspension(symbol)  : resets counter to 0 immediately on a WIN.
-      - suspended_symbols()       : returns list of currently suspended symbols
-        (used by bot_engine for Render log visibility).
+v4 → v5 changes (FIX 3):
+  • Win suspension added:
+      - suspend_win(symbol)  : suspend a symbol for SYMBOL_WIN_SUSPENSION_CYCLES
+        (default 2) full trading cycles after a confirmed WIN.
+      - suspend_loss(symbol) : suspend a symbol for SYMBOL_LOSS_SUSPENSION_CYCLES
+        (default 3) full trading cycles after a confirmed LOSS.
+        (replaces the old suspend(symbol, cycles=2) API which only handled losses)
+      - Public suspend(symbol, cycles) still available for direct use.
+      - record_trade() now calls suspend_win() on WIN and suspend_loss() on LOSS
+        automatically, in addition to the existing time-based cooldown.
 
-  • All other symbols continue trading normally while any symbol is suspended —
-    there is no global pause, no tier, no quality-gate.
+  • Never trade the same symbol twice in the same cycle:
+      - get_queue() now honours a _used_this_cycle set.
+      - mark_used(symbol)  : called by bot_engine after executing a trade.
+      - reset_cycle_used() : called by bot_engine at the start of each new cycle.
+        Symbols in _used_this_cycle are excluded from the queue entirely
+        for the remainder of that cycle, even if slots are unfilled.
 
-  • Time-based per-loss cooldown from v3 is preserved unchanged
-    (synthetic: SYNTHETIC_LOSS_COOLDOWN_SECONDS, others: SYMBOL_LOSS_COOLDOWN_SECONDS).
-    Both mechanisms operate independently.
+  • decrement_suspensions() logs all currently suspended symbols at call time
+    (satisfies "Log suspended symbols at start of every cycle").
 
-  • A trading cycle = TRADE_DURATION * 60 + 10 seconds (defined in config /
-    bot_engine).  symbol_manager does not need to know the wall-clock length;
-    it simply counts how many times decrement_suspensions() has been called.
+  All v4 logic unchanged: time-based cooldown, session hours, scoring,
+  queue generation, dashboard helpers.
 """
 
 import time
@@ -107,6 +108,10 @@ class SymbolManager:
         # Key: symbol str  Value: number of cycles remaining before re-entry
         self._suspend_cycles: Dict[str, int] = {}
 
+        # ── Per-cycle deduplication ────────────────────────────────────────────
+        # Symbols traded this cycle — excluded from queue until reset_cycle_used()
+        self._used_this_cycle: Set[str] = set()
+
         for sym in sym_module.ALL_SYMBOLS:
             self._stats[sym] = SymbolStats(symbol=sym)
 
@@ -140,29 +145,72 @@ class SymbolManager:
                     return True
         return False
 
+    # ── Per-cycle deduplication API ───────────────────────────────────────────
+
+    def mark_used(self, symbol: str):
+        """
+        Mark *symbol* as traded in the current cycle.
+        Called by bot_engine immediately after a trade is executed.
+        Symbols marked used are excluded from the queue for the rest of this cycle.
+        """
+        self._used_this_cycle.add(symbol)
+        logger.debug(f"SymbolManager: {symbol} marked used this cycle")
+
+    def reset_cycle_used(self):
+        """
+        Clear the per-cycle used-symbol set.
+        Called by bot_engine at the START of each new trading cycle, before scanning.
+        """
+        if self._used_this_cycle:
+            logger.debug(
+                f"SymbolManager: resetting cycle-used set "
+                f"({len(self._used_this_cycle)} symbol(s))")
+        self._used_this_cycle.clear()
+
     # ── Cycle-based suspension API ────────────────────────────────────────────
 
     def suspend(self, symbol: str, cycles: int = 2):
         """
         Suspend *symbol* for *cycles* full trading cycles.
         If the symbol is already suspended, the counter is reset to *cycles*
-        (a fresh loss restarts the penalty, not stacks it).
-        Called by bot_engine immediately after a confirmed loss is closed.
+        (a fresh event restarts the penalty, not stacks it).
         """
         cycles = max(1, cycles)
         self._suspend_cycles[symbol] = cycles
         logger.info(
-            f"SymbolManager: {symbol} SUSPENDED for {cycles} cycle(s) after loss")
+            f"SymbolManager: {symbol} SUSPENDED for {cycles} cycle(s)")
+
+    def suspend_win(self, symbol: str):
+        """
+        Suspend *symbol* after a WIN for SYMBOL_WIN_SUSPENSION_CYCLES cycles (default 2).
+        Called automatically by record_trade() on a win.
+        """
+        cycles = getattr(config, "SYMBOL_WIN_SUSPENSION_CYCLES", 2)
+        cycles = max(1, cycles)
+        self._suspend_cycles[symbol] = cycles
+        logger.info(
+            f"SymbolManager: {symbol} SUSPENDED for {cycles} cycle(s) after WIN")
+
+    def suspend_loss(self, symbol: str):
+        """
+        Suspend *symbol* after a LOSS for SYMBOL_LOSS_SUSPENSION_CYCLES cycles (default 3).
+        Called automatically by record_trade() on a loss.
+        """
+        cycles = getattr(config, "SYMBOL_LOSS_SUSPENSION_CYCLES", 3)
+        cycles = max(1, cycles)
+        self._suspend_cycles[symbol] = cycles
+        logger.info(
+            f"SymbolManager: {symbol} SUSPENDED for {cycles} cycle(s) after LOSS")
 
     def clear_suspension(self, symbol: str):
         """
-        Immediately lift the suspension for *symbol* (called on a WIN).
+        Immediately lift the suspension for *symbol*.
         No-op if the symbol is not suspended.
         """
         if symbol in self._suspend_cycles and self._suspend_cycles[symbol] > 0:
             self._suspend_cycles.pop(symbol, None)
             logger.info(
-                f"SymbolManager: {symbol} suspension CLEARED after win")
+                f"SymbolManager: {symbol} suspension CLEARED")
 
     def is_suspended(self, symbol: str) -> bool:
         """Return True while the symbol has cycles_remaining > 0."""
@@ -173,7 +221,17 @@ class SymbolManager:
         Called by bot_engine at the START of each new trading cycle, before
         scanning.  Decrements every active counter by 1 and removes any
         counter that reaches zero (symbol re-enters the pool immediately).
+        Logs all currently suspended symbols for Render log visibility.
         """
+        # Log suspended symbols BEFORE decrementing
+        suspended = self.suspended_symbols()
+        if suspended:
+            logger.info(
+                f"SymbolManager: suspended symbols entering this cycle: "
+                f"{suspended} (will decrement counters now)")
+        else:
+            logger.info("SymbolManager: no suspended symbols this cycle")
+
         to_clear = []
         for sym, remaining in list(self._suspend_cycles.items()):
             new_val = remaining - 1
@@ -206,8 +264,11 @@ class SymbolManager:
         st.total_pnl    += pnl
         st.last_trade_ts = time.time()
 
-        if not won:
-            # Time-based cooldown (unchanged from v3)
+        if won:
+            # Suspend winning symbol for SYMBOL_WIN_SUSPENSION_CYCLES cycles
+            self.suspend_win(symbol)
+        else:
+            # Time-based cooldown (unchanged from v4)
             if symbol in _SYNTHETIC_SET:
                 cooldown_secs = config.SYNTHETIC_LOSS_COOLDOWN_SECONDS
             else:
@@ -217,7 +278,9 @@ class SymbolManager:
             logger.info(
                 f"SymbolManager: {symbol} on {cooldown_secs}s time-cooldown after LOSS "
                 f"(pnl=${pnl:+.4f})")
-        # Wins never trigger a time-based cooldown
+
+            # Suspend losing symbol for SYMBOL_LOSS_SUSPENSION_CYCLES cycles
+            self.suspend_loss(symbol)
 
     # ── Cooldown status (time-based, public, used by bot_engine) ─────────────
 
@@ -235,12 +298,17 @@ class SymbolManager:
         """
         Return active symbols sorted by (session-open first, score desc).
         Symbols currently in their time-based loss cooldown are excluded.
+        Symbols marked used this cycle (_used_this_cycle) are excluded entirely
+        — never trade the same symbol twice in the same cycle.
         Cycle-suspended symbols are NOT excluded here — bot_engine filters
         them out via is_suspended() before scanning.
         """
         candidates = []
         for sym in sym_module.ALL_SYMBOLS:
             if sym not in self._active:
+                continue
+            # Never trade the same symbol twice in the same cycle
+            if sym in self._used_this_cycle:
                 continue
             st = self._stats.get(sym)
             if st and st.in_cooldown():
@@ -255,7 +323,8 @@ class SymbolManager:
         # Always ensure at least 3 synthetics are at the front of the queue
         synth_in_q = [s for s in queue if s in _SYNTHETIC_SET]
         if len(synth_in_q) < 3:
-            extras = [s for s in sym_module.SYNTHETIC[:3] if s not in queue]
+            extras = [s for s in sym_module.SYNTHETIC[:3]
+                      if s not in queue and s not in self._used_this_cycle]
             queue  = extras + queue
 
         return queue
