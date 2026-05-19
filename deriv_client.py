@@ -17,7 +17,15 @@ v8 → v9 changes (Change 6):
       grep "PLACE" bot.log
       grep "CONFIRM" bot.log
 
-  No logic changes.  All v8 direction-mapping audit code preserved.
+  DIRECTION MAPPING (VERIFIED CORRECT — DO NOT SWAP):
+    direction="LONG"  → contract_type="CALL"  → wins if price RISES
+    direction="SHORT" → contract_type="PUT"   → wins if price FALLS
+
+  Every buy_contract() call logs:
+    Signal: LONG → Contract: CALL   (or SHORT → PUT)
+  so the mapping is always visible in Render logs.
+
+  No logic changes.  All v9 direction-mapping audit code preserved.
 """
 
 import asyncio
@@ -319,6 +327,7 @@ class DerivClient:
           direction="LONG"  → contract_type="CALL"  → wins if price RISES
           direction="SHORT" → contract_type="PUT"   → wins if price FALLS
         """
+        # ── FIX 1: LONG → CALL, SHORT → PUT (correct, no inversion) ──────────
         if direction == "LONG":
             contract_type = "CALL"
         elif direction == "SHORT":
@@ -326,6 +335,9 @@ class DerivClient:
         else:
             logger.error(f"buy_contract: unknown direction '{direction}' — aborting")
             return None
+
+        # Explicit mapping log — always visible in Render logs
+        logger.info(f"Signal: {direction} → Contract: {contract_type}")
 
         if _is_boom_crash(symbol):
             effective_duration  = getattr(config, "BOOM_CRASH_TICK_DURATION", 10)
