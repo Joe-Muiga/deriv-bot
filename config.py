@@ -2,33 +2,20 @@
 config.py – Centralised configuration for the SIFM Deriv Trading Bot.
 All secrets are loaded from environment variables; defaults are safe fallbacks.
 
-v10 → v11 changes (Change 5):
+v11 → v12 changes (FIX 5):
 
-  NEW — Win-streak scaling constants:
-    WIN_STREAK_SCALE_THRESHOLDS    : streak thresholds that trigger scaling
-    WIN_STREAK_STAKE_MULTIPLIERS   : stake multipliers at each threshold
-    WIN_STREAK_CONCURRENT_BONUS    : extra concurrent slots at each threshold
+  NEW — Symbol suspension cycle constants:
+    SYMBOL_WIN_SUSPENSION_CYCLES   : cycles to suspend a WINNING symbol (default 2)
+    SYMBOL_LOSS_SUSPENSION_CYCLES  : cycles to suspend a LOSING symbol (default 3)
 
-  NEW — Tiered loss-streak gate constants:
-    LOSS_STREAK_PAUSE_THRESHOLD    : streak ≤ this → 1-cycle pause + strength=3
-    LOSS_STREAK_ABORT_THRESHOLD    : streak ≤ this → 3-cycle pause + strength=3 + conf≥7
+  NEW — Signal score weight constants:
+    SCORE_WEIGHT_MODULE_STRENGTH     : weight for module confirming count (0.50)
+    SCORE_WEIGHT_MODULE_QUALITY      : weight for module firing quality   (0.30)
+    SCORE_WEIGHT_FRESHNESS           : weight for zone freshness          (0.05)
+    SCORE_WEIGHT_INDICATOR_AGREEMENT : weight for M3 indicator agreement  (0.15)
+    Weights sum to 1.0.  Score range = 0–4.0 (max: all components at 1.0 × 4).
 
-  NEW — Confidence gate constants (count of M3 indicators agreeing):
-    MIN_CONFIDENCE_NORMAL          : required for normal trading
-    MIN_CONFIDENCE_STRICT          : required when streak ≤ LOSS_STREAK_QUALITY_GATE
-    MIN_CONFIDENCE_RECOVERY        : required when streak ≤ LOSS_STREAK_ABORT_THRESHOLD
-
-  NEW — Module strength constants:
-    MIN_MODULE_STRENGTH_NORMAL     : min modules confirming under normal conditions
-    MIN_MODULE_STRENGTH_STRICT     : min modules confirming under quality gate
-
-  NEW — Signal score threshold:
-    MIN_SIGNAL_SCORE               : replaces / supplements MIN_SIGNAL_PROBABILITY
-                                     for the new 3-component score formula
-
-  CHANGED — TRADE_DURATION minimum enforced at 5 minutes (unchanged value, now doc'd).
-
-  All v10 values (cooldowns, ATR_ZONE_FACTOR, etc.) preserved unchanged.
+  All v11 values preserved unchanged.
 """
 
 import os
@@ -71,8 +58,31 @@ MAX_WIN_STREAK_MULT     = 4.0
 SYMBOL_LOSS_COOLDOWN_SECONDS     = 120
 SYNTHETIC_LOSS_COOLDOWN_SECONDS  = 60
 
+# ─── Symbol Cycle-Based Suspension (FIX 3 / FIX 5) ───────────────────────────
+# Number of full trading cycles a symbol is suspended after a WIN or LOSS.
+# Decrement_suspensions() is called once per cycle by bot_engine.
+SYMBOL_WIN_SUSPENSION_CYCLES  = 2   # suspend winner for 2 cycles
+SYMBOL_LOSS_SUSPENSION_CYCLES = 3   # suspend loser  for 3 cycles
+
+# ─── Signal Score Weights (FIX 4 / FIX 5) ────────────────────────────────────
+# Four-component weighted score.  Weights MUST sum to 1.0.
+# Score range: 0.0 – 4.0  (max when all normalised components = 1.0)
+#
+# Priority hierarchy:
+#   1. Module strength  (50%) — how many of m1/m2/m3 confirmed
+#   2. Module quality   (30%) — how strongly each module fired
+#   3. Indicator agree  (15%) — M3 indicators agreeing (lowest individual weight)
+#   4. Zone freshness   ( 5%) — OB/FVG freshness
+#
+# Individual M3 indicators (RSI, StochRSI, MACD, BB, ADX, ATR, structure) feed
+# only into SCORE_WEIGHT_INDICATOR_AGREEMENT — they never override module decisions.
+SCORE_WEIGHT_MODULE_STRENGTH     = 0.50
+SCORE_WEIGHT_MODULE_QUALITY      = 0.30
+SCORE_WEIGHT_FRESHNESS           = 0.05
+SCORE_WEIGHT_INDICATOR_AGREEMENT = 0.15
+
 # ─── Signal Quality Gate ──────────────────────────────────────────────────────
-# New 3-component score threshold (module strength 40% + confidence 35% + freshness 25%)
+# New 4-component score threshold
 MIN_SIGNAL_SCORE           = 2.0   # minimum composite score to pass to execution
 
 # Legacy threshold — kept for fallback in bot_engine if MIN_SIGNAL_SCORE absent
