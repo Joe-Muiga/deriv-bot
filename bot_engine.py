@@ -1,38 +1,50 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v8 → v9 changes:
+v9 → v10 changes (FIX 2, FIX 3, FIX 4):
 
-  NEW COMPOSITE SCORE FORMULA (Change 2):
-    Old: module_strength (0–3) + ATR-quality bonus (0–0.5)
-    New: three-component weighted score, range 0–4.35:
-      • Module strength          40%  → 0.0–1.2   (strength/3 × 4 × 0.40 = 0–1.2? see impl)
-        Raw: strength × (4/3) × 0.40  = strength × 0.533
-      • M3 indicator agreement   35%  → count of 7 indicators agreeing / 7 × 4 × 0.35
-        Raw: (confidence/7) × 4 × 0.35 = confidence × 0.200
-      • Zone freshness           25%  → smc_ctx.zone_freshness (0.0–1.0) × 4 × 0.25
-        Raw: freshness × 1.0
+  FIX 2 — DIRECTION INVERSION REMOVED:
+    No direction inversion exists in this file.  sig.direction is passed
+    directly to buy_contract() and register_open() without modification.
+    The old workaround lines (if sig.direction == "LONG": direction = "SHORT"
+    etc.) have been removed entirely.  The chain is:
+      smc_analyzer bias=LONG → signal_engine direction=LONG →
+      bot_engine passes LONG → deriv_client sends CALL → wins when price rises.
 
-    Practical max ≈ 3 × 0.533 + 7 × 0.200 + 1.0 × 1.0 = 1.6 + 1.4 + 1.0 = 4.0
-    (minimum signal score threshold driven by config.MIN_SIGNAL_SCORE, default 2.0)
+  FIX 3 — SYMBOL SUSPENSION + CYCLE DEDUPLICATION:
+    • At the start of each cycle: symbols.decrement_suspensions() and
+      symbols.reset_cycle_used() are called before scanning.
+    • Suspended symbols (is_suspended()) are filtered out of ready[] before
+      the scan gather — they are completely excluded.
+    • After executing a trade: symbols.mark_used(symbol) is called so the
+      symbol cannot be traded again in the same cycle.
+    • record_trade() in SymbolManager now handles win/loss suspension
+      automatically (2 cycles on win, 3 cycles on loss).
 
-  RANKED SIGNAL LOGGING (Change 2):
-    Every cycle logs the full ranked candidate list (symbol, score breakdown,
-    direction, strength, confidence, freshness) before execution begins.
+  FIX 4 — COMPOSITE SCORE FORMULA REWRITTEN:
+    New four-component weighted score (range 0–4.0):
+      • Module strength    50%  — how many modules (m1/m2/m3) confirm (0–3)
+      • Module quality     30%  — how strongly each module fired (0.0–1.0 each)
+      • Zone freshness      5%  — smc_ctx.zone_freshness (0.0–1.0)
+      • Indicator agreement 15% — M3 confidence out of 7
 
-  DEDUPLICATION RULE UPDATED (Change 2):
-    Round 2 repeats allowed only if score > 2.5 AND strength == 3 (was just strength ≥ 3).
+    Module quality is the mean of per-module quality scores (each 0.0–1.0):
+      m1_quality: 1.0 if |signal| == 1 AND it agrees with bias, else 0.0
+      m2_quality: 1.0 if |signal| == 1 AND it agrees with bias, else 0.0
+      m3_quality: (weighted_votes / max_possible_votes), normalised to 0–1.
+        Since module3_vote() returns +1/0/-1 without internal vote count,
+        module quality for m3 is approximated as confidence/7 (same data
+        already computed).  This keeps the approximation tight without
+        requiring changes to module3_vote() internals.
 
-  can_trade() NOW PASSES CONFIDENCE (Change 2 / 3):
-    Both R1 and R2 loops pass sig.confidence to risk.can_trade() so the
-    tiered confidence gate in risk_manager v8 engages correctly.
+    Individual M3 indicators (RSI, StochRSI, MACD, Bollinger, ADX, ATR,
+    structure) contribute only to the 15% indicator slice.  They never
+    override module-level decisions.  A signal with strong m1+m2 but weak
+    indicator agreement still scores higher than one with weak modules but
+    strong indicator agreement.
 
-  PAUSE-CYCLE SUPPORT (Change 1):
-    At the top of every _main_loop iteration, if risk.pause_cycles_remaining > 0,
-    the cycle is skipped and consume_pause_cycle() is called.
-
-  All v8 bug fixes preserved (symbol pass to smc.analyse, can_trade strength,
-  dashboard timing, scan sleep 1 s, confirmed-loss tracking).
+  All v9 logic preserved: ranked logging, round-1/round-2, pause-cycle
+  support, dashboard, streak logging.
 """
 
 import asyncio
@@ -127,19 +139,58 @@ class BotEngine:
     @staticmethod
     def _prob_score(result: ScanResult) -> float:
         """
-        Three-component weighted score:
-          Module strength (0–3)   × weight 40%  → contribution 0–1.6
-          Confidence (0–7 indics) × weight 35%  → contribution 0–1.4
-          Zone freshness (0–1)    × weight 25%  → contribution 0–1.0
-        Total max ≈ 4.0
+        FIX 4 — Four-component weighted score.
 
-        confidence comes from sig.confidence (added in signal_engine v9).
-        zone_freshness comes from smc_ctx.zone_freshness (added in smc_analyzer v7).
+        Weights (from config, with defaults):
+          SCORE_WEIGHT_MODULE_STRENGTH     = 0.50  → contribution 0–2.0
+          SCORE_WEIGHT_MODULE_QUALITY      = 0.30  → contribution 0–1.2
+          SCORE_WEIGHT_FRESHNESS           = 0.05  → contribution 0–0.2
+          SCORE_WEIGHT_INDICATOR_AGREEMENT = 0.15  → contribution 0–0.6
+        Total max = 4.0
+
+        Module quality approximation:
+          m1/m2: 1.0 if the module agreed with the signal direction, else 0.0
+          m3:    confidence/7  (same normalisation as indicator agreement)
+          Mean of the three = module_quality (0.0–1.0)
+
+        Individual M3 indicators contribute only to the 15% indicator slice.
+        They never override module-level decisions.
         """
-        strength_component   = (result.sig.strength / 3.0) * 4.0 * 0.40
-        confidence_component = (getattr(result.sig, "confidence", 0) / 7.0) * 4.0 * 0.35
-        freshness_component  = getattr(result.smc_ctx, "zone_freshness", 0.5) * 4.0 * 0.25
-        return round(strength_component + confidence_component + freshness_component, 4)
+        w_strength  = getattr(config, "SCORE_WEIGHT_MODULE_STRENGTH",     0.50)
+        w_quality   = getattr(config, "SCORE_WEIGHT_MODULE_QUALITY",      0.30)
+        w_fresh     = getattr(config, "SCORE_WEIGHT_FRESHNESS",           0.05)
+        w_indicator = getattr(config, "SCORE_WEIGHT_INDICATOR_AGREEMENT", 0.15)
+
+        sig     = result.sig
+        smc_ctx = result.smc_ctx
+
+        # ── Module strength (50%) ─────────────────────────────────────────────
+        # How many modules (0–3) confirmed; normalised to 0–1, scaled to max 2.0
+        strength_component = (sig.strength / 3.0) * 4.0 * w_strength
+
+        # ── Module quality (30%) ──────────────────────────────────────────────
+        # Per-module quality: did the module fire AND agree with direction?
+        expected = +1 if sig.direction == "LONG" else -1
+        m1_qual = 1.0 if sig.m1_signal == expected else 0.0
+        m2_qual = 1.0 if sig.m2_signal == expected else 0.0
+        # m3 quality: proxy via confidence / 7
+        conf = getattr(sig, "confidence", 0)
+        m3_qual = conf / 7.0
+        module_quality = (m1_qual + m2_qual + m3_qual) / 3.0  # 0.0–1.0
+        quality_component = module_quality * 4.0 * w_quality
+
+        # ── Zone freshness (5%) ───────────────────────────────────────────────
+        freshness_component = getattr(smc_ctx, "zone_freshness", 0.5) * 4.0 * w_fresh
+
+        # ── Indicator agreement (15%) ─────────────────────────────────────────
+        # M3 confidence: how many of 7 indicators agree — lowest-weight slice.
+        # Never overrides module-level decisions.
+        indicator_component = (conf / 7.0) * 4.0 * w_indicator
+
+        return round(
+            strength_component + quality_component +
+            freshness_component + indicator_component,
+            4)
 
     # ── Confirmed loss limit check ────────────────────────────────────────────
 
@@ -280,7 +331,7 @@ class BotEngine:
                 if self._open_contracts:
                     logger.info(
                         f"Redeploy pending – waiting for "
-                        f"{len(self._open_contracts)} open trade(s)")
+                        f"{len(self._open_contracts)} open trade(s)}")
                     await asyncio.sleep(10)
                     continue
                 else:
@@ -306,9 +357,20 @@ class BotEngine:
                 await asyncio.sleep(SCAN_CYCLE_SLEEP)
                 continue
 
+            # ── FIX 3: cycle bookkeeping ──────────────────────────────────────
+            # Decrement suspensions and log suspended symbols BEFORE scanning
+            self.symbols.decrement_suspensions()
+            # Reset per-cycle deduplication set
+            self.symbols.reset_cycle_used()
+
             # ── Real-time queue ───────────────────────────────────────────────
             current_queue = self.symbols.get_queue(max_symbols=200)
-            ready = [s for s in current_queue if s in self._htf]
+            # FIX 3: exclude cycle-suspended symbols entirely from this scan
+            ready = [
+                s for s in current_queue
+                if s in self._htf
+                and not self.symbols.is_suspended(s)
+            ]
 
             if not ready:
                 await asyncio.sleep(5)
@@ -355,15 +417,30 @@ class BotEngine:
                 f"── Ranked signals this cycle ({len(unique_signals)} unique symbols, "
                 f"{len(candidates)} total candidates) ──")
             for rank, r in enumerate(unique_signals, 1):
-                conf      = getattr(r.sig, "confidence", "?")
-                fresh     = getattr(r.smc_ctx, "zone_freshness", "?")
-                str_score = (r.sig.strength / 3.0) * 4.0 * 0.40
-                conf_score = (getattr(r.sig, "confidence", 0) / 7.0) * 4.0 * 0.35
-                fresh_score = getattr(r.smc_ctx, "zone_freshness", 0.5) * 4.0 * 0.25
+                conf      = getattr(r.sig, "confidence", 0)
+                fresh     = getattr(r.smc_ctx, "zone_freshness", 0.5)
+
+                w_strength  = getattr(config, "SCORE_WEIGHT_MODULE_STRENGTH",     0.50)
+                w_quality   = getattr(config, "SCORE_WEIGHT_MODULE_QUALITY",      0.30)
+                w_fresh     = getattr(config, "SCORE_WEIGHT_FRESHNESS",           0.05)
+                w_indicator = getattr(config, "SCORE_WEIGHT_INDICATOR_AGREEMENT", 0.15)
+
+                expected  = +1 if r.sig.direction == "LONG" else -1
+                m1_qual   = 1.0 if r.sig.m1_signal == expected else 0.0
+                m2_qual   = 1.0 if r.sig.m2_signal == expected else 0.0
+                m3_qual   = conf / 7.0
+                mod_qual  = (m1_qual + m2_qual + m3_qual) / 3.0
+
+                str_score   = (r.sig.strength / 3.0) * 4.0 * w_strength
+                qual_score  = mod_qual * 4.0 * w_quality
+                fresh_score = (fresh if isinstance(fresh, float) else 0.5) * 4.0 * w_fresh
+                ind_score   = (conf / 7.0) * 4.0 * w_indicator
+
                 logger.info(
                     f"  #{rank:>3} {r.symbol:<20} {r.sig.direction:<6} "
                     f"score={r.prob_score:.3f} "
-                    f"[str={str_score:.3f} conf={conf_score:.3f} fresh={fresh_score:.3f}] "
+                    f"[str={str_score:.3f} qual={qual_score:.3f} "
+                    f"fresh={fresh_score:.3f} ind={ind_score:.3f}] "
                     f"strength={r.sig.strength}/3 confidence={conf}/7 "
                     f"freshness={fresh if isinstance(fresh, str) else f'{fresh:.2f}'}")
             logger.info(
@@ -397,12 +474,17 @@ class BotEngine:
                     await self._execute(
                         sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
                     executed_symbols.add(sig_r.symbol)
+                    # FIX 3: mark used so this symbol won't trade again this cycle
+                    self.symbols.mark_used(sig_r.symbol)
                     executed_count += 1
                 except Exception as exc:
                     logger.error(f"Execute error ({sig_r.symbol}): {exc}")
 
             # ── ROUND 2: additional trades on already-traded symbols ──────────
             # Requires score > 2.5 AND strength == 3
+            # NOTE: symbols already marked_used are excluded from round 2
+            # (they are already in executed_symbols, which gates this loop).
+            # This is intentional — never trade the same symbol twice per cycle.
             repeat_min_score = 2.5
             repeat_candidates = sorted(
                 [r for r in candidates
@@ -522,15 +604,19 @@ class BotEngine:
 
         conf    = getattr(sig, "confidence", "?")
         fresh   = getattr(smc_ctx, "zone_freshness", "?")
+
+        # FIX 2: NO direction inversion — pass sig.direction directly
+        direction = sig.direction   # "LONG" or "SHORT" — NEVER inverted
+
         logger.info(
-            f"▶ {sig.direction} {symbol} | ${stake:.2f} | "
+            f"▶ {direction} {symbol} | ${stake:.2f} | "
             f"struct={smc_ctx.structure} | modules={sig.strength}/3 | "
             f"confidence={conf}/7 | freshness={fresh if isinstance(fresh, str) else f'{fresh:.2f}'} | "
             f"streak={self.risk.current_streak}")
 
         buy_resp = await self.client.buy_contract(
             symbol    = symbol,
-            direction = sig.direction,
+            direction = direction,
             stake     = stake,
             duration  = config.TRADE_DURATION,
             dur_unit  = config.TRADE_DURATION_UNIT,
@@ -543,13 +629,13 @@ class BotEngine:
         bal_b = self.client.balance
 
         rec = self.risk.register_open(
-            symbol=symbol, direction=sig.direction,
+            symbol=symbol, direction=direction,
             stake=stake, entry_price=price)
 
         self.journal.open_trade(
             contract_id    = cid,
             symbol         = symbol,
-            direction      = sig.direction,
+            direction      = direction,
             stake          = stake,
             entry_price    = price,
             balance_before = bal_b,
@@ -562,7 +648,7 @@ class BotEngine:
             modules        = sig.strength,
         )
 
-        self._open_contracts[cid] = (symbol, sig.direction, stake, price, rec)
+        self._open_contracts[cid] = (symbol, direction, stake, price, rec)
         set_active_trades(len(self._open_contracts))
 
         await self.client.subscribe_contract(
@@ -597,6 +683,7 @@ class BotEngine:
             balance_after = bal_after,
         )
 
+        # record_trade() now handles win/loss suspension automatically
         self.symbols.record_trade(symbol, won=pnl > 0, pnl=pnl)
 
         if pnl < 0:
