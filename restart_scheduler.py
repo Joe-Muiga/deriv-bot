@@ -1,6 +1,19 @@
 """
 restart_scheduler.py – Graceful auto-redeploy on Render.
 
+v1 → v2 changes (BUG 4):
+
+  NEW — trigger_redeploy():
+    A standalone function called by bot_engine when _cycle_count reaches
+    config.REDEPLOY_EVERY_N_CYCLES.  POSTs to RENDER_DEPLOY_HOOK_URL from
+    the environment.  Wrapped in try/except — logs success or failure, never
+    raises, never crashes the caller.
+
+  UNCHANGED — _scheduler_loop() / start_restart_scheduler():
+    Time-based random-interval redeploy (50–90 min) preserved as-is.
+    The two mechanisms are independent: cycle-count redeploy (BUG 4) is
+    orchestrated from bot_engine; the scheduler provides a time-based fallback.
+
 Cycle (repeats forever):
   1. Sleep a random interval between MIN_INTERVAL and MAX_INTERVAL.
   2. Signal the bot to pause new trade entries (sets redeploy_pending = True).
@@ -20,6 +33,7 @@ bot_engine.py integration required (two calls):
 """
 
 import logging
+import os
 import random
 import threading
 import time
@@ -37,6 +51,51 @@ DRAIN_TIMEOUT = 10 * 60   # wait at most 10 min for open trades to close
 DRAIN_POLL    = 5         # poll active-trade count every 5 seconds
 # ─────────────────────────────────────────────────────────────────────────────
 
+
+# ─── BUG 4: on-demand redeploy called by bot_engine ──────────────────────────
+
+def trigger_redeploy() -> None:
+    """
+    POST to the Render deploy hook URL to trigger an immediate redeploy.
+
+    Called by bot_engine._main_loop() when _cycle_count reaches
+    config.REDEPLOY_EVERY_N_CYCLES.  This function:
+      • Reads RENDER_DEPLOY_HOOK_URL from the environment (primary) or
+        config (fallback).
+      • POSTs with a 15-second timeout.
+      • Logs success or failure.
+      • NEVER raises — all exceptions are caught so bot_engine is never
+        crashed by a network hiccup or missing env var.
+    """
+    try:
+        url = (os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
+               or getattr(config, "RENDER_DEPLOY_HOOK_URL", ""))
+
+        if not url:
+            logger.warning(
+                "trigger_redeploy: RENDER_DEPLOY_HOOK_URL is not set — "
+                "skipping redeploy.  Set the env var in Render → Environment.")
+            return
+
+        logger.info("trigger_redeploy: POSTing to Render deploy hook …")
+        r = requests.post(url, timeout=15)
+
+        if r.ok:
+            logger.info(
+                f"trigger_redeploy: deploy triggered ✓ (HTTP {r.status_code}). "
+                "Render is building a fresh instance.")
+        else:
+            logger.error(
+                f"trigger_redeploy: deploy hook returned "
+                f"HTTP {r.status_code}: {r.text[:200]}")
+
+    except Exception as exc:
+        logger.error(
+            f"trigger_redeploy: POST failed — {exc}. "
+            "Bot will continue running; redeploy was not triggered.")
+
+
+# ─── Time-based scheduler loop ────────────────────────────────────────────────
 
 def _scheduler_loop() -> None:
     # BUG 3 FIX: wrap config attribute access in try/except so a missing or
