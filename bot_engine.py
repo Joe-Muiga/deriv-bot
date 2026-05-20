@@ -122,6 +122,25 @@ class ScanResult:
 class BotEngine:
 
     def __init__(self):
+        # Initialise all core attributes first — before any object that references them
+        self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
+        self._cycle_count: int = 0
+        self._running: bool = False
+        self._prescan_buffer: List[ScanResult] = []
+        self._session_start_balance: float = 0.0
+        self._open_contracts: dict = {}
+
+        self._htf: Dict[str, CandlestickBuilder] = {}
+        self._ltf: Dict[str, CandlestickBuilder] = {}
+        self._initializing: set = set()
+        self._last_symbol_refresh = 0.0
+
+        self._confirmed_daily_loss: float = 0.0
+        self._day_start_balance_local: float = 0.0
+        self._confirmed_paused: bool = False
+        self._current_utc_day: int = -1
+
+        # Now safe to instantiate objects that may reference self._queue / other attrs
         self.client  = DerivClient()
         self.risk    = RiskManager(
             risk_per_trade   = config.RISK_PER_TRADE_PCT,
@@ -131,33 +150,12 @@ class BotEngine:
         )
         self.smc     = SMCAnalyzer(ob_expiry_bars=config.OB_EXPIRY_BARS)
         self.signal  = SignalEngine(
-            symbols=self._queue,
+            symbols=self._queue,   # self._queue is now guaranteed to exist
             config=config,
         )
         self.news    = NewsFilter(block_minutes=config.NEWS_BLOCK_MINUTES)
         self.journal = TradeJournal()
         self.symbols = SymbolManager()
-
-        self._htf: Dict[str, CandlestickBuilder] = {}
-        self._ltf: Dict[str, CandlestickBuilder] = {}
-        self._initializing: set = set()
-        self._open_contracts: dict = {}
-        self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
-        self._last_symbol_refresh = 0.0
-
-        self._confirmed_daily_loss: float = 0.0
-        self._day_start_balance_local: float = 0.0
-        self._confirmed_paused: bool = False
-        self._current_utc_day: int = -1
-
-        # v12: cycle counter — incremented after every completed settle wait
-        self._cycle_count: int = 0
-
-        # v12: pre-scan buffer — filled during settle wait, seeded into next cycle
-        self._prescan_buffer: List[ScanResult] = []
-
-        # v12: session-start balance for daily loss protection
-        self._session_start_balance: float = 0.0
 
     # ── Timeframe routing ─────────────────────────────────────────────────────
 
