@@ -393,7 +393,7 @@ class BotEngine:
             all_queue       = self.symbols.get_queue(max_symbols=200)
             suspended_info  = []
             for s in all_queue:
-                cycles_rem = getattr(self.symbols, "suspension_remaining", lambda x: 0)(s)
+                cycles_rem = self.symbols.get_suspension_remaining(s)
                 if self.symbols.is_suspended(s):
                     suspended_info.append(f"{s}({cycles_rem})")
             logger.info(
