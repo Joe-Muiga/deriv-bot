@@ -43,13 +43,21 @@ v9 → v10 audit changes (full compliance pass):
   get_candles():
     - Returns list[dict] with keys: open, high, low, close, epoch
     - On failure: returns [], logs CANDLE FETCH FAILED: {symbol} gran={granularity}
+
+  CONTRACT CLOSURE GUARANTEE (v11):
+    - buy_contract() immediately subscribes the new contract via proposal_open_contract
+    - _handle() triggers callback on is_sold=1, status="sold", or is_expired=1
+    - Pending messages buffered for contracts whose callback isn't registered yet
+    - Fallback poller runs every 30s, manually queries every active contract
+    - On reconnect, all _contract_callbacks contracts are re-subscribed
+    - force_check_contract(cid) allows BotEngine to manually query a contract
 """
 
 import asyncio
 import json
 import logging
 import time
-from typing import Callable, Dict, Optional, List, Any
+from typing import Callable, Dict, Optional, List, Any, Set
 
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -66,6 +74,9 @@ _VOLATILITY_PREFIXES = ("R_", "1HZ")
 # ── Reconnect defaults (overridden by config if present) ──────────────────────
 _DEFAULT_RECONNECT_INTERVAL = 5   # seconds between retries
 _DEFAULT_MAX_RECONNECTS     = 10  # 0 = unlimited
+
+# Fallback poll interval in seconds
+_FALLBACK_POLL_INTERVAL = 30
 
 
 def _is_boom_crash(symbol: str) -> bool:
@@ -102,6 +113,12 @@ class DerivClient:
 
         self._contract_callbacks: Dict[str, Callable] = {}
 
+        # Buffer last proposal_open_contract message per cid before callback registered
+        self._pending_contract_msgs: Dict[str, dict] = {}
+
+        # Track contracts that need immediate callback flush on subscribe registration
+        self._closed_before_callback: Set[str] = set()
+
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # ── Direction→contract mapping audit ─────────────────────────────────
@@ -119,8 +136,12 @@ class DerivClient:
         """
         Outer reconnect loop.  Enforces WEBSOCKET_MAX_RECONNECTS and
         WEBSOCKET_RECONNECT_INTERVAL from config (falls back to module defaults).
+        Starts the fallback poller once before the reconnect loop begins.
         """
         self._loop = asyncio.get_event_loop()
+
+        # Start fallback poller once — persists across reconnects
+        asyncio.ensure_future(self._fallback_poll_loop())
 
         reconnect_interval = getattr(
             config, "WEBSOCKET_RECONNECT_INTERVAL", _DEFAULT_RECONNECT_INTERVAL
@@ -190,9 +211,15 @@ class DerivClient:
     # ─── Post-reconnect resubscription ───────────────────────────────────────
 
     async def _resubscribe_open_contracts(self):
-        """Re-attach proposal_open_contract subscriptions after a reconnect."""
+        """
+        Re-attach proposal_open_contract subscriptions after a reconnect.
+        Covers ALL contracts in _contract_callbacks so no contract is orphaned.
+        """
         if not self._contract_callbacks:
             return
+        logger.info(
+            f"Re-subscribing {len(self._contract_callbacks)} open contract(s) after reconnect"
+        )
         tasks = [
             self._reattach_contract(cid, cb)
             for cid, cb in list(self._contract_callbacks.items())
@@ -206,13 +233,25 @@ class DerivClient:
                 "contract_id": int(contract_id),
                 "subscribe":   1,
             })
+            poc    = resp.get("proposal_open_contract", {})
             sub_id = (
-                resp.get("proposal_open_contract", {}).get("id")
+                poc.get("id")
                 or resp.get("subscription", {}).get("id", "")
             )
             if sub_id:
                 self._subscriptions[contract_id] = sub_id
             logger.info(f"Re-subscribed contract {contract_id} (sub_id={sub_id})")
+
+            # If the contract already settled during the disconnect, fire callback now
+            if self._contract_is_closed(poc):
+                logger.info(
+                    f"Contract {contract_id} already closed on reconnect — "
+                    f"firing callback immediately"
+                )
+                try:
+                    callback(resp)
+                except Exception as exc:
+                    logger.debug(f"_reattach_contract callback error ({contract_id}): {exc}")
         except Exception as exc:
             logger.warning(f"_reattach_contract({contract_id}) failed: {exc}")
 
@@ -225,6 +264,15 @@ class DerivClient:
                 await self._handle(msg)
             except Exception as exc:
                 logger.debug(f"Dispatch error: {exc}")
+
+    @staticmethod
+    def _contract_is_closed(poc: dict) -> bool:
+        """Return True if the proposal_open_contract data indicates the contract is done."""
+        return bool(
+            poc.get("is_sold")
+            or poc.get("is_expired")
+            or poc.get("status") in ("sold", "won", "lost")
+        )
 
     async def _handle(self, msg: dict):
         logger.debug(f"RAW MSG: {msg}")
@@ -276,17 +324,105 @@ class DerivClient:
         elif msg_type in ("proposal_open_contract", "buy"):
             contract = msg.get("proposal_open_contract") or msg.get("buy", {})
             cid      = str(contract.get("contract_id", ""))
-            status   = contract.get("status", "")
+
+            if not cid:
+                return
+
+            # Always buffer the latest message for this contract
+            self._pending_contract_msgs[cid] = msg
+
+            status     = contract.get("status", "")
+            is_closed  = self._contract_is_closed(contract)
 
             # ── Auto-cleanup on contract close ───────────────────────────────
-            if status in ("sold", "won", "lost") and cid:
+            if is_closed:
                 asyncio.ensure_future(self._cleanup_contract_subscription(cid))
 
             if cid in self._contract_callbacks:
+                # Fire immediately on close signals; also pass through normal updates
+                if is_closed or msg_type == "proposal_open_contract":
+                    try:
+                        self._contract_callbacks[cid](msg)
+                    except Exception:
+                        pass
+            elif is_closed:
+                # Callback not registered yet — mark for flush when it is
+                self._closed_before_callback.add(cid)
+                logger.info(
+                    f"Contract {cid} closed before callback registered — buffered for flush"
+                )
+
+    # ─── Fallback poller ──────────────────────────────────────────────────────
+
+    async def _fallback_poll_loop(self):
+        """
+        Every 30 seconds, manually query every contract in _contract_callbacks
+        that hasn't resolved yet.  If the API reports is_sold or is_expired,
+        trigger the callback immediately.
+        """
+        while True:
+            await asyncio.sleep(_FALLBACK_POLL_INTERVAL)
+            if not self._authorized or not self._ws:
+                continue
+
+            active = list(self._contract_callbacks.items())
+            if not active:
+                continue
+
+            logger.debug(
+                f"Fallback poll: checking {len(active)} open contract(s)"
+            )
+            for cid, callback in active:
                 try:
-                    self._contract_callbacks[cid](msg)
-                except Exception:
-                    pass
+                    resp = await self._send(
+                        {
+                            "proposal_open_contract": 1,
+                            "contract_id": int(cid),
+                        },
+                        timeout=15,
+                    )
+                    poc = resp.get("proposal_open_contract", {})
+                    if self._contract_is_closed(poc):
+                        logger.info(
+                            f"Fallback poll: contract {cid} is closed — "
+                            f"triggering callback"
+                        )
+                        try:
+                            callback(resp)
+                        except Exception as exc:
+                            logger.debug(
+                                f"Fallback poll callback error ({cid}): {exc}"
+                            )
+                except Exception as exc:
+                    logger.debug(f"Fallback poll failed for {cid}: {exc}")
+
+    # ─── Force check a specific contract ─────────────────────────────────────
+
+    async def force_check_contract(self, contract_id: str) -> dict:
+        """
+        Send a proposal_open_contract request for this specific contract_id.
+        Returns the response dict or empty dict on failure.
+        Does NOT subscribe — single query only.
+        """
+        if not self._authorized or not self._ws:
+            logger.warning(
+                f"force_check_contract({contract_id}): not connected"
+            )
+            return {}
+        try:
+            resp = await self._send(
+                {
+                    "proposal_open_contract": 1,
+                    "contract_id": int(contract_id),
+                },
+                timeout=15,
+            )
+            return resp
+        except Exception as exc:
+            logger.warning(
+                f"force_check_contract({contract_id}) failed: {exc}"
+            )
+            return {}
 
     # ─── Subscription cleanup ─────────────────────────────────────────────────
 
@@ -298,6 +434,8 @@ class DerivClient:
         sub_id = self._subscriptions.pop(contract_id, None)
         symbol = self._contract_symbol_map.pop(contract_id, contract_id)
         self._contract_callbacks.pop(contract_id, None)
+        self._pending_contract_msgs.pop(contract_id, None)
+        self._closed_before_callback.discard(contract_id)
 
         if sub_id:
             try:
@@ -570,6 +708,9 @@ class DerivClient:
 
         Returns dict (buy response) on success, None on every failure path.
         Never raises.  Never increments trade counters on None return.
+
+        After a successful buy, immediately subscribes to the contract's
+        proposal_open_contract stream so settlement is never missed.
         """
         # ── 1. Direction → contract_type ─────────────────────────────────────
         if direction == "LONG":
@@ -661,6 +802,12 @@ class DerivClient:
                 f"buy_price={buy_info.get('buy_price')} | "
                 f"balance=${self._balance:.4f}"
             )
+
+            # ── Immediately subscribe to contract updates ─────────────────────
+            # Do this without blocking buy_contract return — fire and forget the
+            # subscribe handshake; the callback will be registered by subscribe_contract()
+            asyncio.ensure_future(self._eagerly_subscribe_contract(cid))
+
             return buy_info
 
         except TimeoutError:
@@ -686,6 +833,65 @@ class DerivClient:
             )
             return None
 
+    async def _eagerly_subscribe_contract(self, contract_id: str):
+        """
+        Immediately subscribe to proposal_open_contract after buy_contract().
+        Called as fire-and-forget so it doesn't block the buy response.
+        If subscribe_contract() has already registered a sub_id, skip.
+        """
+        # Short delay to let subscribe_contract() register first (it's called
+        # synchronously right after buy_contract returns in _execute)
+        await asyncio.sleep(0.5)
+
+        if contract_id in self._subscriptions:
+            # Already subscribed via subscribe_contract() — nothing to do
+            return
+
+        if not self._authorized or not self._ws:
+            logger.debug(
+                f"_eagerly_subscribe_contract({contract_id}): not connected, skipping"
+            )
+            return
+
+        try:
+            resp = await self._send(
+                {
+                    "proposal_open_contract": 1,
+                    "contract_id": int(contract_id),
+                    "subscribe":   1,
+                },
+                timeout=20,
+            )
+            poc    = resp.get("proposal_open_contract", {})
+            sub_id = (
+                poc.get("id")
+                or resp.get("subscription", {}).get("id", "")
+            )
+            if sub_id and contract_id not in self._subscriptions:
+                self._subscriptions[contract_id] = sub_id
+                logger.info(
+                    f"Eager subscription: contract {contract_id} (sub_id={sub_id})"
+                )
+
+            # Buffer the response in case callback isn't registered yet
+            self._pending_contract_msgs[contract_id] = resp
+
+            # If already closed, mark for flush
+            if self._contract_is_closed(poc):
+                self._closed_before_callback.add(contract_id)
+                logger.info(
+                    f"Eager subscribe: contract {contract_id} already closed — buffered"
+                )
+                # If callback registered by now, fire it
+                if contract_id in self._contract_callbacks:
+                    try:
+                        self._contract_callbacks[contract_id](resp)
+                    except Exception as exc:
+                        logger.debug(f"Eager subscribe callback flush error: {exc}")
+
+        except Exception as exc:
+            logger.debug(f"_eagerly_subscribe_contract({contract_id}) failed: {exc}")
+
     # ─── Contract subscription ────────────────────────────────────────────────
 
     async def subscribe_contract(
@@ -697,10 +903,35 @@ class DerivClient:
         """
         Subscribe to live updates for an open contract.
         Stores the subscription ID in self._subscriptions for later cleanup.
+
+        If _closed_before_callback contains this contract_id, the callback
+        is flushed immediately with the buffered message.
         """
         self._contract_callbacks[contract_id] = callback
         if symbol:
             self._contract_symbol_map[contract_id] = symbol
+
+        # ── Flush if contract already closed before this callback registered ─
+        if contract_id in self._closed_before_callback:
+            buffered = self._pending_contract_msgs.get(contract_id)
+            if buffered:
+                logger.info(
+                    f"subscribe_contract({contract_id}): flushing buffered close message"
+                )
+                self._closed_before_callback.discard(contract_id)
+                try:
+                    callback(buffered)
+                except Exception as exc:
+                    logger.debug(f"subscribe_contract flush callback error: {exc}")
+                return  # cleanup will handle unsubscribe
+
+        # ── If already subscribed (eager sub fired first), just register cb ─
+        if contract_id in self._subscriptions:
+            logger.info(
+                f"subscribe_contract({contract_id}): already subscribed "
+                f"(sub_id={self._subscriptions[contract_id]}), callback registered"
+            )
+            return
 
         try:
             resp = await self._send(
@@ -711,8 +942,9 @@ class DerivClient:
                 },
                 timeout=20,
             )
+            poc    = resp.get("proposal_open_contract", {})
             sub_id = (
-                resp.get("proposal_open_contract", {}).get("id")
+                poc.get("id")
                 or resp.get("subscription", {}).get("id", "")
             )
             if sub_id:
@@ -720,6 +952,19 @@ class DerivClient:
                 logger.info(
                     f"Contract subscribed: {contract_id} (sub_id={sub_id})"
                 )
+
+            # Buffer and check if already closed
+            self._pending_contract_msgs[contract_id] = resp
+            if self._contract_is_closed(poc):
+                logger.info(
+                    f"subscribe_contract({contract_id}): contract already closed — "
+                    f"firing callback immediately"
+                )
+                try:
+                    callback(resp)
+                except Exception as exc:
+                    logger.debug(f"subscribe_contract immediate close callback error: {exc}")
+
         except Exception as exc:
             logger.warning(f"subscribe_contract({contract_id}) failed: {exc}")
 
