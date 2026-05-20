@@ -79,7 +79,7 @@ HTF_BARS              : int = 100
 LTF_BARS              : int = 50    # corrected: 200 → 50 per spec
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  : float = 0.09
+DAILY_LOSS_LIMIT_PCT  : float = 2.09
 RISK_PER_TRADE_PCT    : float = 0.02   # corrected: 0.01 → 0.02 (2% of live balance)
 MIN_STAKE             : float = 0.35
 MAX_STAKE             : float = 50.0   # corrected: 500.0 → 50.0 per spec
@@ -107,8 +107,8 @@ SYNTHETIC_LOSS_COOLDOWN_SECONDS : int = 60
 # ─── Symbol Cycle-Based Suspension ────────────────────────────────────────────
 # Number of full trading cycles a symbol is suspended after a WIN or LOSS.
 # decrement_suspensions() is called once per cycle by bot_engine.
-SYMBOL_WIN_SUSPENSION_CYCLES          : int = 200   # suspend winner for 2 cycles
-SYMBOL_LOSS_SUSPENSION_CYCLES         : int = 400   # suspend loser  for 3 cycles
+SYMBOL_WIN_SUSPENSION_CYCLES          : int = 800   # suspend winner for 2 cycles
+SYMBOL_LOSS_SUSPENSION_CYCLES         : int = 1500   # suspend loser  for 3 cycles
 SYMBOL_SESSION_LOSS_BAN_THRESHOLD     : int = 2   # losses in session → session ban
 
 # ─── Signal Score Weights ─────────────────────────────────────────────────────
