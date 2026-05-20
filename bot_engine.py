@@ -131,8 +131,8 @@ class BotEngine:
         )
         self.smc     = SMCAnalyzer(ob_expiry_bars=config.OB_EXPIRY_BARS)
         self.signal  = SignalEngine(
-            min_modules = config.MIN_MODULES_FOR_SIGNAL,
-            min_votes   = config.MIN_INDICATOR_VOTES,
+            symbols=self._queue,
+            config=config,
         )
         self.news    = NewsFilter(block_minutes=config.NEWS_BLOCK_MINUTES)
         self.journal = TradeJournal()
