@@ -1,73 +1,92 @@
 """
-signal_engine.py – Phase B of SIFM: Lower-Timeframe Entry Scan.
+signal_engine.py – Deriv Trading Bot Signal Engine
+v12 — Full architectural rewrite per SIFM master prompt spec.
 
-v10 → v11 changes (BUG 1 — signal gate overhaul):
+EMISSION RULES (absolute law, enforced in strict order):
+    strength = 3/3  → ALWAYS emit.  Zero further checks of any kind.
+    strength = 2/3  → Emit ONLY if Module 3 vote ≥ 5/7 in signal direction.
+    strength ≤ 1/3  → Always reject.
 
-  EMISSION RULES SIMPLIFIED:
-    strength = 3/3  →  ALWAYS emit.  No validation check.  No confidence gate.
-                        No bar-history gate.  No score threshold.  Unconditional.
-    strength = 2/3  →  Emit ONLY if module3_confidence() ≥ MIN_CONFIDENCE_FOR_PARTIAL
-                        (default 5/7).  All other secondary gates removed.
-    strength < 2/3  →  Always reject.
+confidence (0–7) lives in SignalResult for ranking and logging ONLY.
+It NEVER gates emission under any circumstances.
 
-  VALIDATION GATE REMOVED:
-    _validate_recent_price_action() is kept as a utility but is NO LONGER called
-    from evaluate().  It was blocking valid 3/3 signals and is redundant once
-    three independent modules have confirmed a direction.
+MODULES:
+    Module 1 – Trend Alignment   : EMA50 / EMA200 price-structure alignment
+    Module 2 – Momentum          : RSI14 + Stochastic %K (both must agree)
+    Module 3 – 7-Indicator Vote  : unweighted, fires at 4/7; exposes bull/bear counts
 
-  LOGGING:
-    Every emitted signal:  SIGNAL EMITTED: <symbol> <CALL|PUT> strength=N/3
-    Every rejection:       REJECTED: <symbol> strength=N/3 [reason]
-    Partial rejections:    REJECTED: <symbol> strength=2/3 confidence=X/7 below threshold
+DELETED PERMANENTLY:
+    · confidence gates on 3/3
+    · bar-history gates
+    · score thresholds on emission
+    · _validate_recent_price_action() call from evaluate()
+    · any secondary gate that can block a 3/3 signal
 
-  symbol parameter added to evaluate() for log context.
-
-  All v10 module logic preserved exactly: module1_mtfa_rsi, module2_candlestick,
-  module3_vote, module3_confidence — no strategy changes.
+v12 changes vs v11:
+    · Module 1 replaced (EMA50/EMA200 alignment, flat-EMA guard)
+    · Module 2 replaced (RSI14 + Stochastic %K crossing, dead zone)
+    · Module 3 restructured (7 unweighted indicators, bull/bear counts returned)
+    · SignalResult fields updated (symbol, emitted, rejection_reason, timestamp,
+      bull_votes, bear_votes; legacy fields removed)
+    · evaluate() direction derived from module agreement, not htf_bias
+    · Logging format updated to master-spec exact strings
 """
 
+import time
 import numpy as np
 import logging
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
+
 from candlestick_builder import Candle
 import indicators as ind
-from smc_analyzer import SMCContext
-import config as _config
 
 logger = logging.getLogger(__name__)
+
+# ─── Tuning constants ─────────────────────────────────────────────────────────
+
+_EMA_FLAT_THRESHOLD    = 0.0001   # EMA50 abs slope below this → flat → M1 returns 0
+_M3_FIRE_THRESHOLD     = 4        # minimum votes in one direction to fire M3
+_M2_PARTIAL_MIN_VOTES  = 5        # minimum M3 directional votes to emit a 2/3 signal
+_RSI_BULL              = 55.0     # M2: RSI above this → bullish
+_RSI_BEAR              = 45.0     # M2: RSI below this → bearish
+_STOCH_CROSS_UP_LEVEL  = 0.25     # M2: [0–1] ≡ 25 on 0–100 — cross-up threshold
+_STOCH_CROSS_DN_LEVEL  = 0.75     # M2: [0–1] ≡ 75 on 0–100 — cross-down threshold
+_STOCH_M3_BULL_ZONE    = 0.30     # M3: [0–1] ≡ 30 on 0–100
+_STOCH_M3_BEAR_ZONE    = 0.70     # M3: [0–1] ≡ 70 on 0–100
+
+
+# ─── SignalResult ─────────────────────────────────────────────────────────────
+
+@dataclass
+class SignalResult:
+    symbol:           str    # instrument identifier
+    direction:        str    # "LONG" | "SHORT" | "NONE"
+    strength:         int    # 0–3 (confirming modules)
+    confidence:       int    # 0–7 (M3 directional votes — ranking / logging only)
+    bull_votes:       int    # raw M3 bull vote count
+    bear_votes:       int    # raw M3 bear vote count
+    timestamp:        float  # unix epoch of evaluation
+    emitted:          bool   # True if signal passes emission rules
+    rejection_reason: str    # "" when emitted; human-readable reason when rejected
+
+
+# ─── Signal self-validation (utility — NOT called from evaluate) ──────────────
 
 _VALIDATION_NET_TOLERANCE = 0.0010
 _VALIDATION_LOOKBACK      = 5
 _VALIDATION_MIN_AGREEMENT = 2
 
 
-@dataclass
-class SignalResult:
-    direction:  str    # "LONG" | "SHORT" | "NONE"
-    strength:   float  # 0–3 (confirming modules)
-    m1_signal:  int
-    m2_signal:  int
-    m3_signal:  int
-    m3_score:   int
-    reason:     str
-    confidence: int = 0   # 0–7: how many of 7 M3 indicators agree with direction
-
-
-# ─── Signal self-validation (utility — no longer called from evaluate) ────────
-
 def _validate_recent_price_action(ltf_bars: List[Candle],
                                   direction: str,
                                   lookback: int = _VALIDATION_LOOKBACK) -> bool:
     """
-    Validates that recent price action is consistent with *direction*.
-    direction must be "LONG" or "SHORT" — the actual signal direction,
-    never an inverted version.
-
-    NOTE (v11): This function is retained as a utility but is NOT called from
-    evaluate().  Calling it after 3/3 modules have confirmed is redundant and
-    caused too many valid signals to be discarded.  Re-enable at call-site only
-    if you need an extra gate for 2/3 signals under specific conditions.
+    Checks that recent price action is consistent with *direction*.
+    RETAINED AS UTILITY — deliberately not called from evaluate().
+    Calling it after ≥ 2 independent modules have confirmed is redundant
+    and historically blocked too many valid signals.
+    Re-enable at call-site only under specific experimental conditions.
     """
     if len(ltf_bars) < lookback + 1:
         return True
@@ -81,242 +100,287 @@ def _validate_recent_price_action(ltf_bars: List[Candle],
     ref         = start_price if start_price != 0 else 1.0
     net_pct     = (end_price - start_price) / ref
 
-    if direction == "LONG"  and net_pct < -_VALIDATION_NET_TOLERANCE:
+    if direction == "LONG" and net_pct < -_VALIDATION_NET_TOLERANCE:
         logger.debug(
-            f"Signal validation FAILED (LONG): net_pct={net_pct:.5f} < "
-            f"-{_VALIDATION_NET_TOLERANCE} — price falling over last {lookback} bars")
+            f"_validate_recent_price_action FAILED (LONG): net_pct={net_pct:.5f}")
         return False
-
     if direction == "SHORT" and net_pct > +_VALIDATION_NET_TOLERANCE:
         logger.debug(
-            f"Signal validation FAILED (SHORT): net_pct={net_pct:.5f} > "
-            f"+{_VALIDATION_NET_TOLERANCE} — price rising over last {lookback} bars")
+            f"_validate_recent_price_action FAILED (SHORT): net_pct={net_pct:.5f}")
         return False
 
-    min_agree = _VALIDATION_MIN_AGREEMENT
     if direction == "LONG":
         agreeing = sum(1 for b in recent if b.close >= b.open)
     else:
         agreeing = sum(1 for b in recent if b.close <= b.open)
 
-    if agreeing < min_agree:
+    if agreeing < _VALIDATION_MIN_AGREEMENT:
         logger.debug(
-            f"Signal validation FAILED ({direction}): only {agreeing}/{lookback} "
-            f"bars agree (need {min_agree}) — candle bodies contradict signal")
+            f"_validate_recent_price_action FAILED ({direction}): "
+            f"{agreeing}/{lookback} candles agree")
         return False
 
-    logger.debug(
-        f"Signal validation PASSED ({direction}): net_pct={net_pct:.5f}, "
-        f"agreeing={agreeing}/{lookback}")
     return True
 
 
-# ─── Module 1 – MTFA + RSI Divergence ────────────────────────────────────────
+# ─── Module 1 – Trend Alignment ───────────────────────────────────────────────
 
-def module1_mtfa_rsi(ltf_bars: List[Candle], htf_bias: str) -> int:
-    if len(ltf_bars) < 25:
-        return 0
-    closes = np.array([b.close for b in ltf_bars])
-
-    ema20 = ind.ema(closes, 20)
-    rsi14 = ind.rsi(closes, 14)
-    div   = ind.find_rsi_divergence(closes, rsi14, lookback=10)
-
-    valid_ema = ema20[~np.isnan(ema20)]
-    if len(valid_ema) < 2:
-        return 0
-    slope = valid_ema[-1] - valid_ema[-2]
-
-    slope_ok_long  = htf_bias == "LONG"  and slope > 0
-    slope_ok_short = htf_bias == "SHORT" and slope < 0
-    div_ok_long    = htf_bias == "LONG"  and div == +1
-    div_ok_short   = htf_bias == "SHORT" and div == -1
-
-    if slope_ok_long  or div_ok_long:
-        logger.debug(
-            f"M1 +1 | slope={slope:+.6f} slope_ok={slope_ok_long} div={div}")
-        return +1
-    if slope_ok_short or div_ok_short:
-        logger.debug(
-            f"M1 -1 | slope={slope:+.6f} slope_ok={slope_ok_short} div={div}")
-        return -1
-
-    logger.debug(f"M1  0 | slope={slope:+.6f} div={div} bias={htf_bias}")
-    return 0
-
-
-# ─── Module 2 – Candlestick Confluence ───────────────────────────────────────
-
-def module2_candlestick(ltf_bars: List[Candle]) -> int:
-    if len(ltf_bars) < 4:
-        return 0
-
-    last, prev, prev2 = ltf_bars[-1], ltf_bars[-2], ltf_bars[-3]
-    volumes = [b.volume for b in ltf_bars[-21:]]
-    avg_vol = float(np.mean(volumes[:-1])) if len(volumes) > 1 else 0.0
-
-    if avg_vol == 0:
-        vol_ok = True
-    else:
-        vol_ok = last.volume > 1.2 * avg_vol
-
-    def is_bull(b):       return b.close > b.open
-    def is_bear(b):       return b.close < b.open
-    def body(b):          return abs(b.close - b.open)
-    def upper_wick(b):    return b.high - max(b.open, b.close)
-    def lower_wick(b):    return min(b.open, b.close) - b.low
-    def candle_range(b):  return b.high - b.low if b.high != b.low else 1e-10
-
-    if (is_bear(prev) and is_bull(last) and
-            last.open <= prev.close and last.close >= prev.open and
-            body(last) > body(prev) and vol_ok):
-        logger.debug("M2 +1 | bullish engulfing")
-        return +1
-
-    if (is_bear(prev2) and body(prev) < body(prev2) * 0.5 and
-            is_bull(last) and last.close > (prev2.open + prev2.close) / 2 and
-            vol_ok):
-        logger.debug("M2 +1 | morning star")
-        return +1
-
-    if len(ltf_bars) >= 5:
-        c0, c1, c2, c3 = (ltf_bars[-5], ltf_bars[-4],
-                          ltf_bars[-3], ltf_bars[-2])
-        if (all(is_bear(x) for x in [c0, c1, c2, c3]) and
-                is_bull(last) and last.close >= c0.open and vol_ok):
-            logger.debug("M2 +1 | three-line strike bullish")
-            return +1
-
-    if (lower_wick(last) > 2.0 * body(last) and
-            lower_wick(last) > upper_wick(last) * 2.0 and
-            body(last) / candle_range(last) < 0.35 and vol_ok):
-        logger.debug("M2 +1 | bullish pin bar / hammer")
-        return +1
-
-    if (is_bull(prev) and is_bear(last) and
-            last.open >= prev.close and last.close <= prev.open and
-            body(last) > body(prev) and vol_ok):
-        logger.debug("M2 -1 | bearish engulfing")
-        return -1
-
-    if (is_bull(prev2) and body(prev) < body(prev2) * 0.5 and
-            is_bear(last) and last.close < (prev2.open + prev2.close) / 2 and
-            vol_ok):
-        logger.debug("M2 -1 | evening star")
-        return -1
-
-    if len(ltf_bars) >= 5:
-        c0, c1, c2, c3 = (ltf_bars[-5], ltf_bars[-4],
-                          ltf_bars[-3], ltf_bars[-2])
-        if (all(is_bull(x) for x in [c0, c1, c2, c3]) and
-                is_bear(last) and last.close <= c0.open and vol_ok):
-            logger.debug("M2 -1 | three-line strike bearish")
-            return -1
-
-    if (upper_wick(last) > 2.0 * body(last) and
-            upper_wick(last) > lower_wick(last) * 2.0 and
-            body(last) / candle_range(last) < 0.35 and vol_ok):
-        logger.debug("M2 -1 | bearish shooting star")
-        return -1
-
-    logger.debug("M2  0 | no pattern")
-    return 0
-
-
-# ─── Module 3 – Weighted 10-Vote Quantitative Panel ──────────────────────────
-
-def module3_vote(ltf_bars: List[Candle], min_votes: int = 3) -> int:
+def module1_trend_alignment(ltf_bars: List[Candle]) -> int:
     """
-    Weighted vote panel (total pool = 10 votes, 7 independent indicators).
+    EMA50 / EMA200 trend alignment using LTF closes.
 
-    Returns +1 (bull), -1 (bear), or 0.
-    Does NOT return the per-indicator breakdown — use module3_confidence() for that.
+    LONG  : close[-1] > EMA50[-1] > EMA200[-1]   (all three simultaneously)
+    SHORT : close[-1] < EMA50[-1] < EMA200[-1]   (all three simultaneously)
+
+    Returns 0 if EMA50 slope abs < _EMA_FLAT_THRESHOLD (flat market).
+    Returns +1 (LONG), -1 (SHORT), or 0.
+    """
+    if len(ltf_bars) < 205:
+        logger.debug("M1  0 | insufficient bars for EMA200")
+        return 0
+
+    closes = np.array([float(b.close) for b in ltf_bars], dtype=np.float64)
+
+    ema50  = ind.ema(closes, 50)
+    ema200 = ind.ema(closes, 200)
+
+    valid50  = ema50[~np.isnan(ema50)]
+    valid200 = ema200[~np.isnan(ema200)]
+
+    if len(valid50) < 2 or len(valid200) < 1:
+        logger.debug("M1  0 | EMA computation yielded insufficient valid values")
+        return 0
+
+    e50_curr = float(valid50[-1])
+    e50_prev = float(valid50[-2])
+    e200     = float(valid200[-1])
+    c        = float(closes[-1])
+
+    # Flat EMA guard — suppress signal in ranging / indecisive conditions
+    slope50 = abs(e50_curr - e50_prev)
+    if slope50 < _EMA_FLAT_THRESHOLD:
+        logger.debug(f"M1  0 | EMA50 flat (slope={slope50:.7f} < {_EMA_FLAT_THRESHOLD})")
+        return 0
+
+    if c > e50_curr > e200:
+        logger.debug(
+            f"M1 +1 | LONG  close={c:.5f} > EMA50={e50_curr:.5f} > EMA200={e200:.5f}")
+        return +1
+
+    if c < e50_curr < e200:
+        logger.debug(
+            f"M1 -1 | SHORT close={c:.5f} < EMA50={e50_curr:.5f} < EMA200={e200:.5f}")
+        return -1
+
+    logger.debug(
+        f"M1  0 | no alignment | close={c:.5f} EMA50={e50_curr:.5f} EMA200={e200:.5f}")
+    return 0
+
+
+# ─── Module 2 – Momentum Confirmation ────────────────────────────────────────
+
+def module2_momentum(ltf_bars: List[Candle]) -> int:
+    """
+    RSI14 and Stochastic %K must BOTH independently agree on the same direction.
+    If either is neutral or they disagree, the module returns 0.
+
+    RSI14:
+        > 55  → bullish
+        < 45  → bearish
+        45–55 → dead zone → module immediately returns 0
+
+    Stochastic %K (uses last 3 bars for crossing detection):
+        crossing UP   through 25 from below → bullish
+        crossing DOWN through 75 from above → bearish
+        otherwise                           → 0
+
+    Returns +1, -1, or 0.
+    """
+    if len(ltf_bars) < 20:
+        logger.debug("M2  0 | insufficient bars")
+        return 0
+
+    closes = np.array([float(b.close) for b in ltf_bars], dtype=np.float64)
+
+    # ── RSI14 ──────────────────────────────────────────────────────────────────
+    rsi_arr   = ind.rsi(closes, 14)
+    valid_rsi = rsi_arr[~np.isnan(rsi_arr)]
+
+    if not len(valid_rsi):
+        logger.debug("M2  0 | RSI14 unavailable")
+        return 0
+
+    rsi_val = float(valid_rsi[-1])
+
+    if rsi_val > _RSI_BULL:
+        rsi_sig = +1
+    elif rsi_val < _RSI_BEAR:
+        rsi_sig = -1
+    else:
+        logger.debug(f"M2  0 | RSI14 dead zone (rsi={rsi_val:.2f})")
+        return 0  # dead zone: 45–55 produces no signal
+
+    # ── Stochastic %K — crossing detection over last 3 bars ───────────────────
+    k_arr, _ = ind.stoch_rsi(closes, 14, 14, 3, 3)
+    valid_k  = k_arr[~np.isnan(k_arr)]
+
+    if len(valid_k) < 3:
+        logger.debug("M2  0 | Stochastic %K unavailable")
+        return 0
+
+    k_now  = float(valid_k[-1])
+    k_prev = float(valid_k[-2])
+    k_pp   = float(valid_k[-3])   # k two bars ago
+
+    # Crossing UP through 0.25 from below: one of the two prior bars was below,
+    # and the current bar is at or above the threshold.
+    crossed_up = (k_pp < _STOCH_CROSS_UP_LEVEL or k_prev < _STOCH_CROSS_UP_LEVEL) \
+                 and k_now >= _STOCH_CROSS_UP_LEVEL
+
+    # Crossing DOWN through 0.75 from above
+    crossed_dn = (k_pp > _STOCH_CROSS_DN_LEVEL or k_prev > _STOCH_CROSS_DN_LEVEL) \
+                 and k_now <= _STOCH_CROSS_DN_LEVEL
+
+    if crossed_up and not crossed_dn:
+        stoch_sig = +1
+    elif crossed_dn and not crossed_up:
+        stoch_sig = -1
+    else:
+        logger.debug(
+            f"M2  0 | no Stoch %K crossing (k={k_now:.3f} prev={k_prev:.3f} pp={k_pp:.3f})")
+        return 0
+
+    # ── Both indicators must agree ─────────────────────────────────────────────
+    if rsi_sig != stoch_sig:
+        logger.debug(
+            f"M2  0 | disagreement — RSI={rsi_sig:+d} (rsi={rsi_val:.2f}) "
+            f"Stoch={stoch_sig:+d} (k={k_now:.3f})")
+        return 0
+
+    label = "LONG" if rsi_sig == +1 else "SHORT"
+    logger.debug(
+        f"M2 {rsi_sig:+d} | {label} | RSI={rsi_val:.2f} k={k_now:.3f} "
+        f"crossed_up={crossed_up} crossed_dn={crossed_dn}")
+    return rsi_sig
+
+
+# ─── Module 3 – 7-Indicator Vote Bank ────────────────────────────────────────
+
+def module3_vote(ltf_bars: List[Candle]) -> tuple:
+    """
+    7-indicator unweighted vote bank.
+
+    Indicators and their bullish / bearish conditions:
+        #  Indicator           Bullish                 Bearish
+        1  RSI14               > 50                    < 50
+        2  MACD histogram      > 0                     < 0
+        3  Price vs BB mid     above mid               below mid
+        4  Stochastic %K zone  < 0.30 (≡ <30)          > 0.70 (≡ >70)
+        5  EMA20 slope         rising over last 3 bars  falling over last 3 bars
+        6  ATR trend           expanding + price rising expanding + price falling
+        7  Price structure     3 consec. higher highs  3 consec. lower lows
+
+    bull_votes and bear_votes counted independently.
+    Fires at 4+ in one direction.
+    If both ≥ 4 simultaneously → conflict → signal = 0.
+
+    Returns:
+        (signal: int, bull_votes: int, bear_votes: int)
+        signal ∈ {+1, -1, 0}
     """
     if len(ltf_bars) < 30:
-        return 0
+        logger.debug("M3  0 | insufficient bars")
+        return 0, 0, 0
 
-    H = np.array([b.high  for b in ltf_bars])
-    L = np.array([b.low   for b in ltf_bars])
-    C = np.array([b.close for b in ltf_bars])
+    H = np.array([float(b.high)  for b in ltf_bars], dtype=np.float64)
+    L = np.array([float(b.low)   for b in ltf_bars], dtype=np.float64)
+    C = np.array([float(b.close) for b in ltf_bars], dtype=np.float64)
 
     bull_votes = 0
     bear_votes = 0
     labels     = []
 
+    # 1. RSI14
     rsi14    = ind.rsi(C, 14)
     last_rsi = rsi14[~np.isnan(rsi14)]
     if len(last_rsi):
-        v = +1 if last_rsi[-1] > 50 else -1
+        v = +1 if float(last_rsi[-1]) > 50.0 else -1
+        bull_votes += max(0,  v)
+        bear_votes += max(0, -v)
+        labels.append(f"RSI={v:+d}")
     else:
-        v = 0
-    bull_votes += max(0,  v * 2)
-    bear_votes += max(0, -v * 2)
-    labels.append(f"RSI×2={v * 2:+d}")
+        labels.append("RSI=?")
 
+    # 2. MACD histogram
     _, _, hist = ind.macd(C, 12, 26, 9)
     last_hist  = hist[~np.isnan(hist)]
     if len(last_hist):
-        v = +1 if last_hist[-1] > 0 else -1
+        v = +1 if float(last_hist[-1]) > 0.0 else -1
+        bull_votes += max(0,  v)
+        bear_votes += max(0, -v)
+        labels.append(f"MACD={v:+d}")
     else:
-        v = 0
-    bull_votes += max(0,  v * 2)
-    bear_votes += max(0, -v * 2)
-    labels.append(f"MACD×2={v * 2:+d}")
+        labels.append("MACD=?")
 
+    # 3. Price vs Bollinger Band midline
     _, mid, _ = ind.bollinger_bands(C, 20, 2)
     last_mid  = mid[~np.isnan(mid)]
     if len(last_mid):
-        v = +1 if C[-1] > last_mid[-1] else -1
+        v = +1 if C[-1] > float(last_mid[-1]) else -1
+        bull_votes += max(0,  v)
+        bear_votes += max(0, -v)
+        labels.append(f"BBmid={v:+d}")
     else:
-        v = 0
-    bull_votes += max(0,  v * 2)
-    bear_votes += max(0, -v * 2)
-    labels.append(f"BB×2={v * 2:+d}")
+        labels.append("BBmid=?")
 
-    k, _ = ind.stoch_rsi(C, 14, 14, 3, 3)
-    last_k = k[~np.isnan(k)]
+    # 4. Stochastic %K zone
+    k_arr, _ = ind.stoch_rsi(C, 14, 14, 3, 3)
+    last_k   = k_arr[~np.isnan(k_arr)]
     if len(last_k):
-        val = last_k[-1]
-        if   val < 0.2: v = +1
-        elif val > 0.8: v = -1
-        else:           v = 0
+        val = float(last_k[-1])
+        if   val < _STOCH_M3_BULL_ZONE: v = +1
+        elif val > _STOCH_M3_BEAR_ZONE: v = -1
+        else:                            v = 0
+        bull_votes += max(0,  v)
+        bear_votes += max(0, -v)
+        labels.append(f"Stoch={v:+d}")
     else:
-        v = 0
-    bull_votes += max(0,  v)
-    bear_votes += max(0, -v)
-    labels.append(f"StochRSI={v:+d}")
+        labels.append("Stoch=?")
 
-    adx_vals, pdi, mdi = ind.adx(H, L, C, 14)
-    last_adx = adx_vals[~np.isnan(adx_vals)]
-    if len(last_adx) and last_adx[-1] > 25:
-        offset   = len(adx_vals) - len(last_adx)
-        last_pdi = pdi[offset:]
-        last_mdi = mdi[offset:]
-        v = +1 if last_pdi[-1] > last_mdi[-1] else -1
+    # 5. EMA20 slope over last 3 bars
+    ema20   = ind.ema(C, 20)
+    valid_e = ema20[~np.isnan(ema20)]
+    if len(valid_e) >= 3:
+        e1, e2, e3 = float(valid_e[-1]), float(valid_e[-2]), float(valid_e[-3])
+        if   e1 > e2 > e3: v = +1    # monotonically rising
+        elif e1 < e2 < e3: v = -1    # monotonically falling
+        else:              v = 0
+        bull_votes += max(0,  v)
+        bear_votes += max(0, -v)
+        labels.append(f"EMA20={v:+d}")
     else:
-        v = 0
-    bull_votes += max(0,  v)
-    bear_votes += max(0, -v)
-    labels.append(f"ADX={v:+d}")
+        labels.append("EMA20=?")
 
+    # 6. ATR trend — expanding volatility aligned with price direction
     atr14     = ind.atr(H, L, C, 14)
     valid_atr = atr14[~np.isnan(atr14)]
-    if len(valid_atr) >= 3 and len(C) >= 3:
-        atr_expanding = valid_atr[-1] > valid_atr[-2]
+    if len(valid_atr) >= 2 and len(C) >= 2:
+        atr_expanding = float(valid_atr[-1]) > float(valid_atr[-2])
         price_rising  = float(C[-1]) > float(C[-2])
         if atr_expanding:
             v = +1 if price_rising else -1
         else:
             v = 0
+        bull_votes += max(0,  v)
+        bear_votes += max(0, -v)
+        labels.append(f"ATR={v:+d}")
     else:
-        v = 0
-    bull_votes += max(0,  v)
-    bear_votes += max(0, -v)
-    labels.append(f"ATR_dir={v:+d}")
+        labels.append("ATR=?")
 
-    if len(H) >= 3 and all(H[-i] > H[-i - 1] for i in range(1, 3)):
+    # 7. Price structure — 3 consecutive higher highs / lower lows
+    if len(H) >= 3 and float(H[-1]) > float(H[-2]) > float(H[-3]):
         v = +1
-    elif len(L) >= 3 and all(L[-i] < L[-i - 1] for i in range(1, 3)):
+    elif len(L) >= 3 and float(L[-1]) < float(L[-2]) < float(L[-3]):
         v = -1
     else:
         v = 0
@@ -325,189 +389,134 @@ def module3_vote(ltf_bars: List[Candle], min_votes: int = 3) -> int:
     labels.append(f"Struct={v:+d}")
 
     logger.debug(
-        f"M3 votes: {' '.join(labels)} | bull={bull_votes} bear={bear_votes} "
-        f"threshold={min_votes}")
+        f"M3 votes: {' '.join(labels)} | "
+        f"bull={bull_votes}/7 bear={bear_votes}/7 threshold={_M3_FIRE_THRESHOLD}")
 
-    if   bull_votes >= min_votes: return +1
-    elif bear_votes >= min_votes: return -1
-    return 0
+    # Conflict: both sides reach threshold simultaneously → no signal
+    if bull_votes >= _M3_FIRE_THRESHOLD and bear_votes >= _M3_FIRE_THRESHOLD:
+        logger.debug(
+            f"M3  0 | conflict — bull={bull_votes} bear={bear_votes} "
+            f"both ≥ {_M3_FIRE_THRESHOLD}")
+        return 0, bull_votes, bear_votes
 
+    if   bull_votes >= _M3_FIRE_THRESHOLD:
+        return +1, bull_votes, bear_votes
+    elif bear_votes >= _M3_FIRE_THRESHOLD:
+        return -1, bull_votes, bear_votes
 
-def module3_confidence(ltf_bars: List[Candle], direction: str) -> int:
-    """
-    Count how many of the 7 individual M3 indicators agree with `direction`.
-    Each indicator contributes 1 if it agrees, 0 otherwise.
-    Returns an int in [0, 7].
-
-    This is called AFTER the signal direction is determined, so `direction`
-    is always "LONG" or "SHORT" — never "NONE".
-    """
-    if len(ltf_bars) < 30 or direction not in ("LONG", "SHORT"):
-        return 0
-
-    expected = +1 if direction == "LONG" else -1
-    H = np.array([b.high  for b in ltf_bars])
-    L = np.array([b.low   for b in ltf_bars])
-    C = np.array([b.close for b in ltf_bars])
-    count = 0
-
-    # 1. RSI
-    rsi14    = ind.rsi(C, 14)
-    last_rsi = rsi14[~np.isnan(rsi14)]
-    if len(last_rsi):
-        v = +1 if last_rsi[-1] > 50 else -1
-        if v == expected:
-            count += 1
-
-    # 2. MACD histogram
-    _, _, hist = ind.macd(C, 12, 26, 9)
-    last_hist  = hist[~np.isnan(hist)]
-    if len(last_hist):
-        v = +1 if last_hist[-1] > 0 else -1
-        if v == expected:
-            count += 1
-
-    # 3. Bollinger middle
-    _, mid, _ = ind.bollinger_bands(C, 20, 2)
-    last_mid  = mid[~np.isnan(mid)]
-    if len(last_mid):
-        v = +1 if C[-1] > last_mid[-1] else -1
-        if v == expected:
-            count += 1
-
-    # 4. StochRSI
-    k, _ = ind.stoch_rsi(C, 14, 14, 3, 3)
-    last_k = k[~np.isnan(k)]
-    if len(last_k):
-        val = last_k[-1]
-        if   val < 0.2: v = +1
-        elif val > 0.8: v = -1
-        else:           v = 0
-        if v == expected:
-            count += 1
-
-    # 5. ADX direction
-    adx_vals, pdi, mdi = ind.adx(H, L, C, 14)
-    last_adx = adx_vals[~np.isnan(adx_vals)]
-    if len(last_adx) and last_adx[-1] > 25:
-        offset   = len(adx_vals) - len(last_adx)
-        v = +1 if pdi[offset:][-1] > mdi[offset:][-1] else -1
-        if v == expected:
-            count += 1
-
-    # 6. ATR + price direction
-    atr14     = ind.atr(H, L, C, 14)
-    valid_atr = atr14[~np.isnan(atr14)]
-    if len(valid_atr) >= 3 and len(C) >= 3:
-        atr_expanding = valid_atr[-1] > valid_atr[-2]
-        price_rising  = float(C[-1]) > float(C[-2])
-        if atr_expanding:
-            v = +1 if price_rising else -1
-            if v == expected:
-                count += 1
-
-    # 7. Price structure
-    if len(H) >= 3 and all(H[-i] > H[-i - 1] for i in range(1, 3)):
-        v = +1
-    elif len(L) >= 3 and all(L[-i] < L[-i - 1] for i in range(1, 3)):
-        v = -1
-    else:
-        v = 0
-    if v == expected:
-        count += 1
-
-    logger.debug(f"M3 confidence={count}/7 for {direction}")
-    return count
+    return 0, bull_votes, bear_votes
 
 
 # ─── Signal aggregator ────────────────────────────────────────────────────────
 
 class SignalEngine:
+    """
+    Aggregates Module 1, 2, and 3 into a single directional SignalResult.
 
-    def __init__(self, min_modules: int = 2, min_votes: int = 3):
-        self.min_modules = min_modules
-        self.min_votes   = min_votes
+    Emission rules (absolute law — no override permitted):
+        3/3 confirming → ALWAYS emit
+        2/3 confirming → emit only if M3 directional votes ≥ _M2_PARTIAL_MIN_VOTES
+        ≤ 1/3          → always reject
+    """
 
-    def evaluate(self, ltf_bars: List[Candle], htf_bias: str,
-                 smc_ctx: SMCContext, in_zone: bool,
-                 symbol: str = "") -> SignalResult:
+    def evaluate(
+        self,
+        ltf_bars: List[Candle],
+        symbol:   str = "",
+        # ── Legacy parameters — retained for backward-compatible call sites.
+        # ── They are intentionally NOT used in v12 evaluation logic. ─────────
+        htf_bias: str    = "",
+        smc_ctx:  object = None,
+        in_zone:  bool   = True,
+    ) -> SignalResult:
         """
-        Evaluate all three modules and return a directional signal.
+        Evaluate all three modules and return a SignalResult.
 
-        v11 EMISSION RULES (BUG 1 fix):
-          ┌──────────────┬────────────────────────────────────────────────────┐
-          │ confirming   │ action                                             │
-          ├──────────────┼────────────────────────────────────────────────────┤
-          │ 3/3          │ ALWAYS emit — no further gate of any kind          │
-          │ 2/3          │ emit only if confidence ≥ MIN_CONFIDENCE_FOR_PARTIAL│
-          │ < 2          │ always reject                                      │
-          └──────────────┴────────────────────────────────────────────────────┘
-
-        Validation (_validate_recent_price_action) is NOT called — it is
-        redundant once ≥ 2 independent modules have confirmed and was blocking
-        too many valid signals.
-
-        Direction follows htf_bias directly — NEVER inverted.
+        Direction is derived purely from module agreement — not from htf_bias.
+        htf_bias, smc_ctx, and in_zone are accepted to avoid breaking existing
+        call sites but have no effect on signal evaluation.
         """
-        _sym = symbol or htf_bias   # fallback label for log lines
+        ts  = time.time()
+        sym = symbol or "UNKNOWN"
 
-        if htf_bias == "NEUTRAL" or not in_zone:
-            return SignalResult("NONE", 0, 0, 0, 0, 0,
-                                f"htf_bias={htf_bias}, in_zone={in_zone}",
-                                confidence=0)
+        # ── Run all three modules ──────────────────────────────────────────────
+        m1              = module1_trend_alignment(ltf_bars)
+        m2              = module2_momentum(ltf_bars)
+        m3, bull_v, bear_v = module3_vote(ltf_bars)
 
-        m1 = module1_mtfa_rsi(ltf_bars, htf_bias)
-        m2 = module2_candlestick(ltf_bars)
-        m3 = module3_vote(ltf_bars, self.min_votes)
-
-        expected   = +1 if htf_bias == "LONG" else -1
-        confirming = sum(1 for m in [m1, m2, m3] if m == expected)
+        # ── Tally directional confirmations ───────────────────────────────────
+        long_confirms  = sum(1 for m in (m1, m2, m3) if m == +1)
+        short_confirms = sum(1 for m in (m1, m2, m3) if m == -1)
 
         logger.debug(
-            f"SignalEngine [{_sym}] | bias={htf_bias} expected={expected:+d} "
-            f"m1={m1} m2={m2} m3={m3} confirming={confirming}/3")
+            f"SignalEngine [{sym}] | "
+            f"m1={m1:+d} m2={m2:+d} m3={m3:+d} "
+            f"long_confirms={long_confirms} short_confirms={short_confirms} "
+            f"M3_votes={bull_v}B/{bear_v}Be")
 
-        # ── Reject 0/3 or 1/3 ────────────────────────────────────────────────
-        if confirming < 2:
-            reason = (f"only {confirming}/3 modules confirmed "
-                      f"(m1={m1}, m2={m2}, m3={m3})")
-            logger.info(f"REJECTED: {_sym} strength={confirming}/3 — {reason}")
-            return SignalResult("NONE", confirming, m1, m2, m3,
-                                confirming, reason, confidence=0)
+        # ── Resolve direction and strength ────────────────────────────────────
+        if long_confirms > short_confirms:
+            direction = "LONG"
+            strength  = long_confirms
+            dir_votes = bull_v
+        elif short_confirms > long_confirms:
+            direction = "SHORT"
+            strength  = short_confirms
+            dir_votes = bear_v
+        else:
+            # Tie or all zeros — no directional consensus
+            reason = (f"no directional consensus "
+                      f"(m1={m1:+d} m2={m2:+d} m3={m3:+d} "
+                      f"long={long_confirms} short={short_confirms})")
+            logger.info(f"REJECTED: {sym} strength=0/3 — below minimum")
+            return SignalResult(
+                symbol=sym, direction="NONE", strength=0,
+                confidence=0, bull_votes=bull_v, bear_votes=bear_v,
+                timestamp=ts, emitted=False, rejection_reason=reason)
 
-        # Direction follows htf_bias directly — NEVER inverted
-        direction = "LONG" if htf_bias == "LONG" else "SHORT"
-        dir_label = "CALL" if direction == "LONG" else "PUT"
+        # confidence = M3 directional vote count (ranking / logging only)
+        confidence = dir_votes
 
-        # ── 3/3: unconditional emission ───────────────────────────────────────
-        if confirming == 3:
-            confidence = module3_confidence(ltf_bars, direction)
-            reason = (f"✓ 3/3 modules | bias={htf_bias} | "
-                      f"m1={m1} m2={m2} m3={m3} | confidence={confidence}/7")
+        # ── Reject ≤ 1/3 ──────────────────────────────────────────────────────
+        if strength <= 1:
+            reason = (f"only {strength}/3 modules confirmed "
+                      f"(m1={m1:+d} m2={m2:+d} m3={m3:+d})")
             logger.info(
-                f"SIGNAL EMITTED: {_sym} {dir_label} strength=3/3 "
-                f"confidence={confidence}/7")
-            return SignalResult(direction, confirming, m1, m2, m3,
-                                confirming, reason, confidence=confidence)
+                f"REJECTED: {sym} strength={strength}/3 — below minimum")
+            return SignalResult(
+                symbol=sym, direction="NONE", strength=strength,
+                confidence=confidence, bull_votes=bull_v, bear_votes=bear_v,
+                timestamp=ts, emitted=False, rejection_reason=reason)
 
-        # ── 2/3: emit only if confidence ≥ threshold ──────────────────────────
-        confidence  = module3_confidence(ltf_bars, direction)
-        min_conf    = getattr(_config, "MIN_CONFIDENCE_FOR_PARTIAL", 5)
-
-        if confidence < min_conf:
-            reason = (f"strength=2/3 confidence={confidence}/7 "
-                      f"below threshold {min_conf}/7 "
-                      f"(m1={m1}, m2={m2}, m3={m3})")
+        # ── 3/3 — unconditional emission (ZERO further checks) ────────────────
+        if strength == 3:
             logger.info(
-                f"REJECTED: {_sym} strength=2/3 "
-                f"confidence={confidence}/7 below threshold")
-            return SignalResult("NONE", confirming, m1, m2, m3,
-                                confirming, reason, confidence=confidence)
+                f"EMITTED: {sym} {direction} strength=3/3 "
+                f"confidence={confidence}/7 votes={bull_v}B/{bear_v}Be")
+            return SignalResult(
+                symbol=sym, direction=direction, strength=3,
+                confidence=confidence, bull_votes=bull_v, bear_votes=bear_v,
+                timestamp=ts, emitted=True, rejection_reason="")
 
-        reason = (f"✓ 2/3 modules | confidence={confidence}/7 ≥ {min_conf}/7 | "
-                  f"bias={htf_bias} | m1={m1} m2={m2} m3={m3}")
+        # ── 2/3 — emit only if M3 directional votes ≥ threshold ───────────────
+        if dir_votes >= _M2_PARTIAL_MIN_VOTES:
+            logger.info(
+                f"EMITTED: {sym} {direction} strength=2/3 "
+                f"confidence={confidence}/7 votes={bull_v}B/{bear_v}Be")
+            return SignalResult(
+                symbol=sym, direction=direction, strength=2,
+                confidence=confidence, bull_votes=bull_v, bear_votes=bear_v,
+                timestamp=ts, emitted=True, rejection_reason="")
+
+        # 2/3 with insufficient vote majority
+        reason = (f"strength=2/3 {direction} votes={dir_votes}/7 "
+                  f"below threshold {_M2_PARTIAL_MIN_VOTES}/7 "
+                  f"(m1={m1:+d} m2={m2:+d} m3={m3:+d})")
         logger.info(
-            f"SIGNAL EMITTED: {_sym} {dir_label} strength=2/3 "
-            f"confidence={confidence}/7")
-        return SignalResult(direction, confirming, m1, m2, m3,
-                            confirming, reason, confidence=confidence)
+            f"REJECTED: {sym} strength=2/3 "
+            f"confidence={confidence}/7 votes={bull_v}B/{bear_v}Be "
+            f"— insufficient vote majority")
+        return SignalResult(
+            symbol=sym, direction="NONE", strength=2,
+            confidence=confidence, bull_votes=bull_v, bear_votes=bear_v,
+            timestamp=ts, emitted=False, rejection_reason=reason)
