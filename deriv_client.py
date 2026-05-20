@@ -146,9 +146,17 @@ class DerivClient:
                     logger.info("WebSocket connected ✓")
 
                     await self._authorize()
-                    await self._subscribe_balance()
-                    await self._resubscribe_open_contracts()
-                    await self._dispatch_loop()
+                    dispatch_task = asyncio.ensure_future(self._dispatch_loop())
+                    try:
+                        await self._subscribe_balance()
+                        await self._resubscribe_open_contracts()
+                        await dispatch_task
+                    finally:
+                        dispatch_task.cancel()
+                        try:
+                            await dispatch_task
+                        except (asyncio.CancelledError, Exception):
+                            pass
 
             except ConnectionClosed as exc:
                 attempt += 1
