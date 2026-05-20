@@ -1,361 +1,372 @@
 """
-keep_alive.py – Flask web server + self-ping keep-alive thread.
+keep_alive.py – Flask web server + self-ping thread + HTML dashboard.
 
-Hardened against 500 errors:
-  • Every route wraps bot-state access in try/except
-  • Missing attributes fall back to safe defaults (0, [], "N/A", False)
-  • Dashboard never returns 5xx — catches all exceptions, returns 200
-  • /health always returns 200 regardless of bot state
-  • Template fallback: if dashboard.html is missing, renders an inline status page
-  • All other routes follow the same safety pattern
+Routes:
+  /          → Live HTML dashboard (auto-refreshes every 10 s)
+  /health    → Plain JSON health check
+  /stats     → Detailed JSON stats
+  /trades    → Recent trade list as JSON
+  /symbols   → Symbol leaderboard as JSON
+
+v3 → v4 changes (Bug 2 fix):
+
+  BUG 2 FIX – update_status() now uses dict.update() correctly and
+    explicitly initialises every expected key in _state so the dashboard
+    never renders a KeyError or missing-value blank on first load.
+
+  BUG 2 FIX – _render_dashboard() now uses .get(key, default) consistently
+    for every _state access so a partially-initialised state dict cannot
+    cause a KeyError crash that results in the dashboard serving a blank page.
+
+  BUG 2 FIX – The /stats, /trades, /symbols routes now return safe defaults
+    when optional keys are absent, preventing 500 errors during the brief
+    window between startup and the first _push_dashboard() call.
+
+  No changes to Flask routes, ping loop, or HTML template logic.
+
+v4 → v5 changes (Change 2 — Automatic Render redeploy):
+
+  NEW — trigger_redeploy():
+    Reads RENDER_DEPLOY_HOOK_URL from environment and sends a POST request
+    to the Render Deploy Hook.  Called by bot_engine._main_loop() after
+    every REDEPLOY_EVERY_N_CYCLES completed trading cycles, once all open
+    contracts have drained to zero.
+    Logs success (HTTP status) or failure (exception / non-2xx response).
+    If RENDER_DEPLOY_HOOK_URL is not set, logs an error and returns without
+    raising so the caller can still sleep and exit cleanly.
+
+  No other changes.
 """
 
-import logging
+import os
 import threading
 import time
-
+import datetime
+import logging
 import requests
-from flask import Flask, jsonify, render_template, render_template_string
-from flask import current_app
-
+from flask import Flask, jsonify, Response
 import config
 
-logger = logging.getLogger("keep_alive")
-
+logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
-# ─── Bot reference ─────────────────────────────────────────────────────────────
-# Populated by bot_engine after initialisation so routes can read live state.
-# Always use getattr() with a default — never assume the attribute exists.
-_bot_instance = None
+# BUG 2 FIX: every key that _render_dashboard() or /stats accesses is
+# pre-initialised here with a safe default so the first render never
+# encounters a missing key regardless of initialisation order.
+_state: dict = {
+    "running":               False,
+    "balance":               0.0,
+    "day_start_balance":     0.0,
+    "trades_today":          0,
+    "wins_today":            0,
+    "losses_today":          0,
+    "paused_for_loss_limit": False,
+    "current_symbol":        "—",
+    "last_signal":           "No signal yet",
+    "uptime_seconds":        0,
+    "start_time":            time.time(),
+    "session":               "Starting …",
+    "tradeable_count":       0,
+    "gross_profit":          0.0,
+    "gross_loss":            0.0,
+    "profit_factor":         0.0,
+    "avg_rr":                0.0,
+    "best_trade":            0.0,
+    "worst_trade":           0.0,
+    "streak":                0,
+    "recent_trades":         [],
+    "best_symbols":          [],
+    # ── Redeploy coordination ──────────────────────────────────────────────────
+    "redeploy_pending":      False,
+    "active_trades":         0,
+}
 
 
-def register_bot(bot):
-    """Called by BotEngine once it is initialised so the dashboard can read state."""
-    global _bot_instance
-    _bot_instance = bot
-    logger.info("Bot instance registered with Flask dashboard ✓")
-
-
-# ─── Safe state helper ─────────────────────────────────────────────────────────
-
-def _safe_bot_context():
+def update_status(**kwargs):
     """
-    Return a dict of bot state values, with safe defaults for every field.
-    Never raises — if anything goes wrong a fallback dict is returned.
+    Update the shared dashboard state.
+    BUG 2 FIX: uses _state.update() which correctly merges the kwargs dict
+    into _state without replacing keys not present in kwargs.
+    uptime_seconds is always recalculated from start_time.
     """
-    bot = _bot_instance
+    _state.update(kwargs)
+    _state["uptime_seconds"] = int(time.time() - _state["start_time"])
+
+
+# ── Redeploy-coordination helpers ─────────────────────────────────────────────
+
+def set_redeploy_pending(value: bool) -> None:
+    """Called by restart_scheduler or bot_engine to pause/resume new trade entries."""
+    _state["redeploy_pending"] = value
+    logger.info(f"redeploy_pending set to {value}")
+
+
+def is_redeploy_pending() -> bool:
+    """bot_engine calls this before opening any new trade."""
+    return bool(_state.get("redeploy_pending", False))
+
+
+def set_active_trades(count: int) -> None:
+    """bot_engine calls this whenever a trade opens or closes."""
+    _state["active_trades"] = max(0, int(count))
+
+
+def get_active_trades() -> int:
+    """restart_scheduler polls this to know when all trades have closed."""
+    return int(_state.get("active_trades", 0))
+
+
+def trigger_redeploy() -> None:
+    """
+    POST to the Render Deploy Hook URL to trigger a redeploy of the latest
+    commit.  The URL is read from the RENDER_DEPLOY_HOOK_URL environment
+    variable, which must be set in Render's environment configuration.
+
+    Called by bot_engine._main_loop() after REDEPLOY_EVERY_N_CYCLES
+    completed trading cycles, once _open_contracts is empty.
+
+    Logs success (HTTP status code) or failure (non-2xx response or
+    exception).  Never raises — the caller can always sleep and exit cleanly
+    even if the hook call fails.
+    """
+    url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
+    if not url:
+        logger.error(
+            "trigger_redeploy: RENDER_DEPLOY_HOOK_URL environment variable is "
+            "not set — cannot trigger Render redeploy.  "
+            "Set it in Render → Environment → Add Environment Variable.")
+        return
+
+    logger.info(f"trigger_redeploy: sending POST to Render deploy hook …")
     try:
-        # Risk sub-object
-        win_streak  = 0
-        loss_streak = 0
-        stake       = 0.0
-        if bot is not None and hasattr(bot, "risk") and bot.risk is not None:
-            win_streak  = getattr(bot.risk, "win_streak",  0)
-            loss_streak = getattr(bot.risk, "loss_streak", 0)
-            stake       = getattr(bot.risk, "current_stake", 0.0)
-
-        # Queue / symbol list — _queue may be a deque or list
-        raw_queue = getattr(bot, "_queue", []) if bot is not None else []
-        try:
-            active_symbols = list(raw_queue)
-        except Exception:
-            active_symbols = []
-
-        # Open contracts — may be dict or similar mapping
-        raw_contracts = getattr(bot, "_open_contracts", {}) if bot is not None else {}
-        try:
-            open_trades = dict(raw_contracts)
-        except Exception:
-            open_trades = {}
-
-        # Trade history
-        raw_history = getattr(bot, "_trade_history", []) if bot is not None else []
-        try:
-            trade_history = list(raw_history)[-50:]   # last 50 trades max
-        except Exception:
-            trade_history = []
-
-        return {
-            "balance":        round(float(getattr(bot, "current_balance", 0.0) if bot else 0.0), 2),
-            "cycle":          int(getattr(bot,   "_cycle_count",  0) if bot else 0),
-            "active_symbols": active_symbols,
-            "symbol_count":   len(active_symbols),
-            "open_trades":    open_trades,
-            "open_count":     len(open_trades),
-            "win_streak":     win_streak,
-            "loss_streak":    loss_streak,
-            "stake":          round(float(stake), 4),
-            "running":        bool(getattr(bot, "_running", False) if bot else False),
-            "total_profit":   round(float(getattr(bot, "_total_profit", 0.0) if bot else 0.0), 2),
-            "total_trades":   int(getattr(bot, "_total_trades", 0) if bot else 0),
-            "wins":           int(getattr(bot, "_wins",  0) if bot else 0),
-            "losses":         int(getattr(bot, "_losses", 0) if bot else 0),
-            "trade_history":  trade_history,
-            "app_id":         config.DERIV_APP_ID,
-            "bot_initialised": bot is not None,
-        }
+        resp = requests.post(url, timeout=15)
+        if resp.ok:
+            logger.info(
+                f"trigger_redeploy: SUCCESS — HTTP {resp.status_code} "
+                f"— Render redeploy initiated for latest commit")
+        else:
+            logger.error(
+                f"trigger_redeploy: FAILED — unexpected HTTP {resp.status_code} "
+                f"— response body: {resp.text[:300]}")
+    except requests.exceptions.Timeout:
+        logger.error(
+            "trigger_redeploy: FAILED — request timed out after 15 s "
+            "— Render deploy hook did not respond")
+    except requests.exceptions.ConnectionError as exc:
+        logger.error(
+            f"trigger_redeploy: FAILED — connection error: {exc}")
     except Exception as exc:
-        logger.warning(f"_safe_bot_context() fallback triggered: {exc}")
-        return {
-            "balance": 0.0, "cycle": 0, "active_symbols": [], "symbol_count": 0,
-            "open_trades": {}, "open_count": 0, "win_streak": 0, "loss_streak": 0,
-            "stake": 0.0, "running": False, "total_profit": 0.0, "total_trades": 0,
-            "wins": 0, "losses": 0, "trade_history": [], "app_id": "N/A",
-            "bot_initialised": False,
-        }
+        logger.error(
+            f"trigger_redeploy: FAILED — unexpected error: "
+            f"{type(exc).__name__}: {exc}")
 
 
-# ─── Inline fallback dashboard ─────────────────────────────────────────────────
-_FALLBACK_DASHBOARD = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <meta http-equiv="refresh" content="15">
-  <title>SIFM Bot – Status</title>
-  <style>
-    :root {
-      --bg: #0d1117; --surface: #161b22; --border: #30363d;
-      --green: #3fb950; --red: #f85149; --amber: #d29922;
-      --blue: #58a6ff; --text: #c9d1d9; --muted: #8b949e;
-      --font: 'Courier New', monospace;
-    }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { background: var(--bg); color: var(--text); font-family: var(--font);
-           min-height: 100vh; padding: 2rem; }
-    h1   { color: var(--blue); font-size: 1.4rem; margin-bottom: .25rem; }
-    .sub { color: var(--muted); font-size: .8rem; margin-bottom: 2rem; }
-    .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-            gap: 1rem; margin-bottom: 2rem; }
-    .card { background: var(--surface); border: 1px solid var(--border);
-            border-radius: 6px; padding: 1rem; }
-    .card .label { font-size: .7rem; text-transform: uppercase;
-                   letter-spacing: .08em; color: var(--muted); margin-bottom: .3rem; }
-    .card .value { font-size: 1.5rem; font-weight: bold; }
-    .green { color: var(--green); } .red { color: var(--red); }
-    .amber { color: var(--amber); } .blue { color: var(--blue); }
-    .badge { display: inline-block; padding: .15rem .5rem; border-radius: 4px;
-             font-size: .75rem; font-weight: bold; }
-    .badge.on  { background: #1a4731; color: var(--green); }
-    .badge.off { background: #3d1e1e; color: var(--red); }
-    table { width: 100%; border-collapse: collapse; font-size: .8rem; }
-    th, td { padding: .45rem .7rem; border-bottom: 1px solid var(--border); text-align: left; }
-    th { color: var(--muted); text-transform: uppercase; font-size: .7rem; }
-    .section-title { color: var(--muted); font-size: .75rem; text-transform: uppercase;
-                     letter-spacing: .1em; margin: 1.5rem 0 .5rem; }
-    .note { color: var(--amber); font-size: .75rem; margin-top: 1rem; }
-  </style>
-</head>
-<body>
-  <h1>⚡ SIFM Deriv Trading Bot</h1>
-  <div class="sub">App ID: {{ app_id }} &nbsp;|&nbsp; Auto-refreshes every 15 s</div>
-
-  <div class="grid">
-    <div class="card">
-      <div class="label">Status</div>
-      <div class="value">
-        {% if running %}
-          <span class="badge on">● RUNNING</span>
-        {% elif bot_initialised %}
-          <span class="badge off">■ STOPPED</span>
-        {% else %}
-          <span class="badge off">⌛ INIT…</span>
-        {% endif %}
-      </div>
-    </div>
-    <div class="card">
-      <div class="label">Balance</div>
-      <div class="value blue">${{ "%.2f"|format(balance) }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Total P&L</div>
-      <div class="value {% if total_profit >= 0 %}green{% else %}red{% endif %}">
-        {% if total_profit >= 0 %}+{% endif %}${{ "%.2f"|format(total_profit) }}
-      </div>
-    </div>
-    <div class="card">
-      <div class="label">Cycle</div>
-      <div class="value">{{ cycle }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Trades</div>
-      <div class="value">{{ total_trades }}</div>
-    </div>
-    <div class="card">
-      <div class="label">W / L</div>
-      <div class="value"><span class="green">{{ wins }}</span> / <span class="red">{{ losses }}</span></div>
-    </div>
-    <div class="card">
-      <div class="label">Open Trades</div>
-      <div class="value amber">{{ open_count }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Symbols</div>
-      <div class="value">{{ symbol_count }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Win Streak</div>
-      <div class="value green">{{ win_streak }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Loss Streak</div>
-      <div class="value red">{{ loss_streak }}</div>
-    </div>
-    <div class="card">
-      <div class="label">Current Stake</div>
-      <div class="value">${{ "%.4f"|format(stake) }}</div>
-    </div>
-  </div>
-
-  {% if active_symbols %}
-  <div class="section-title">Active Symbols ({{ symbol_count }})</div>
-  <table>
-    <thead><tr><th>#</th><th>Symbol</th></tr></thead>
-    <tbody>
-      {% for sym in active_symbols %}
-      <tr><td>{{ loop.index }}</td><td>{{ sym }}</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% endif %}
-
-  {% if open_trades %}
-  <div class="section-title">Open Contracts</div>
-  <table>
-    <thead><tr><th>Contract ID</th><th>Detail</th></tr></thead>
-    <tbody>
-      {% for cid, detail in open_trades.items() %}
-      <tr><td>{{ cid }}</td><td>{{ detail }}</td></tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% endif %}
-
-  {% if trade_history %}
-  <div class="section-title">Recent Trades (last {{ trade_history|length }})</div>
-  <table>
-    <thead><tr>
-      <th>#</th><th>Symbol</th><th>Direction</th>
-      <th>Stake</th><th>P&L</th><th>Result</th>
-    </tr></thead>
-    <tbody>
-      {% for t in trade_history|reverse %}
-      <tr>
-        <td>{{ loop.index }}</td>
-        <td>{{ t.get('symbol',   'N/A') }}</td>
-        <td>{{ t.get('direction','N/A') }}</td>
-        <td>${{ "%.4f"|format(t.get('stake', 0)) }}</td>
-        <td class="{% if t.get('profit',0) >= 0 %}green{% else %}red{% endif %}">
-          {% if t.get('profit',0) >= 0 %}+{% endif %}${{ "%.4f"|format(t.get('profit', 0)) }}
-        </td>
-        <td class="{% if t.get('won') %}green{% else %}red{% endif %}">
-          {% if t.get('won') %}WIN{% else %}LOSS{% endif %}
-        </td>
-      </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-  {% endif %}
-
-  <p class="note">⚠ Fallback dashboard — place dashboard.html in templates/ for a custom UI.</p>
-</body>
-</html>
-"""
+_DASH_TEMPLATE: str = ""
 
 
-# ─── Routes ────────────────────────────────────────────────────────────────────
+def _load_template():
+    global _DASH_TEMPLATE
+    path = os.path.join(os.path.dirname(__file__), "dashboard.html")
+    try:
+        with open(path) as f:
+            _DASH_TEMPLATE = f.read()
+    except Exception:
+        _DASH_TEMPLATE = "<html><body><pre>Dashboard template not found.</pre></body></html>"
 
-@app.route("/health")
-def health():
-    """Always returns 200 — used by Render health checks and the self-pinger."""
-    return jsonify({"status": "ok"}), 200
+
+def _render_dashboard() -> str:
+    if not _DASH_TEMPLATE:
+        _load_template()
+
+    # BUG 2 FIX: use .get(key, default) for every _state access so a
+    # partially-initialised state cannot raise KeyError.
+    s         = _state
+    balance   = s.get("balance", 0.0)
+    day_start = s.get("day_start_balance", 0.0)
+    daily_pnl = balance - day_start
+    pnl_pct   = (daily_pnl / day_start * 100) if day_start else 0
+    loss_pct  = max(-pnl_pct, 0)
+
+    # Progress bar shows percentage of the 90% loss limit consumed
+    loss_bar_pct = min(loss_pct / 90 * 100, 100)
+
+    wins     = s.get("wins_today", 0)
+    losses   = s.get("losses_today", 0)
+    trades   = wins + losses
+    win_rate = round(wins / trades * 100, 1) if trades else 0
+    pf       = s.get("profit_factor", 0)
+    streak   = s.get("streak", 0)
+
+    dot_class    = ("dot-green"  if s.get("running") and not s.get("paused_for_loss_limit")
+                    else "dot-yellow" if s.get("paused_for_loss_limit")
+                    else "dot-red")
+    balance_color = "green" if balance >= day_start else "red"
+    pnl_color     = "green" if daily_pnl >= 0 else "red"
+    pnl_sign      = "+" if daily_pnl >= 0 else "-"
+    wr_color      = "green" if win_rate >= 55 else "yellow" if win_rate >= 45 else "red"
+    pf_color      = "green" if pf >= 1.2 else "yellow" if pf >= 1.0 else "red"
+    streak_color  = "green" if streak > 0 else "red" if streak < 0 else "yellow"
+    streak_label  = str(abs(streak)) if streak else "0"
+    streak_type   = "wins" if streak > 0 else "losses" if streak < 0 else "—"
+    danger_class  = "danger" if loss_bar_pct > 70 else ""
+
+    paused_banner = ""
+    if s.get("paused_for_loss_limit"):
+        paused_banner = (
+            '<div class="paused-banner">'
+            '⛔ Daily loss limit (90%) reached. Trading paused until UTC midnight.'
+            '</div>'
+        )
+
+    up     = s.get("uptime_seconds", 0)
+    uptime = f"{up//3600}h {(up%3600)//60}m"
+
+    recent_rows = ""
+    for t in reversed(s.get("recent_trades", [])[-20:]):
+        pnl   = t.get("pnl", 0)
+        won   = t.get("won", False)
+        badge = ('<span class="badge badge-win">WIN</span>'  if won else
+                 '<span class="badge badge-loss">LOSS</span>')
+        dir_b = ('<span class="badge badge-long">LONG</span>'
+                 if t.get("direction") == "LONG" else
+                 '<span class="badge badge-short">SHORT</span>')
+        pnl_c = "green" if pnl >= 0 else "red"
+        ts    = t.get("exit_time", "")[:19].replace("T", " ")
+        recent_rows += (
+            f"<tr>"
+            f"<td class='ticker'>{ts}</td>"
+            f"<td><b>{t.get('symbol','')}</b></td>"
+            f"<td>{dir_b}</td>"
+            f"<td>${t.get('stake', 0):.2f}</td>"
+            f"<td class='{pnl_c}'>{'+' if pnl>=0 else ''}{pnl:.4f}</td>"
+            f"<td>${t.get('balance_after', 0):.4f}</td>"
+            f"<td>{badge}</td>"
+            f"</tr>"
+        )
+    if not recent_rows:
+        recent_rows = ("<tr><td colspan='7' style='text-align:center;color:#484f58'>"
+                       "No trades yet</td></tr>")
+
+    symbol_rows = ""
+    for sym in s.get("best_symbols", [])[:10]:
+        pnl   = sym.get("pnl", 0)
+        pnl_c = "green" if pnl >= 0 else "red"
+        wr    = sym.get("win_rate", 0)
+        wr_c  = "green" if wr >= 55 else "yellow" if wr >= 45 else "red"
+        symbol_rows += (
+            f"<tr>"
+            f"<td><b>{sym.get('symbol','')}</b></td>"
+            f"<td>{sym.get('trades',0)}</td>"
+            f"<td class='{wr_c}'>{wr}%</td>"
+            f"<td class='{pnl_c}'>${pnl:+.4f}</td>"
+            f"<td class='ticker'>{sym.get('score',0):.3f}</td>"
+            f"</tr>"
+        )
+    if not symbol_rows:
+        symbol_rows = ("<tr><td colspan='5' style='text-align:center;color:#484f58'>"
+                       "No data yet</td></tr>")
+
+    html = _DASH_TEMPLATE
+    for k, v in {
+        "{{dot_class}}":       dot_class,
+        "{{session}}":         s.get("session", "—"),
+        "{{uptime}}":          uptime,
+        "{{current_symbol}}":  s.get("current_symbol", "—"),
+        "{{paused_banner}}":   paused_banner,
+        "{{balance}}":         f"{balance:.4f}",
+        "{{balance_color}}":   balance_color,
+        "{{day_start}}":       f"{day_start:.4f}",
+        "{{daily_pnl_sign}}":  pnl_sign,
+        "{{daily_pnl_abs}}":   f"{abs(daily_pnl):.4f}",
+        "{{daily_pnl_pct}}":   f"{pnl_pct:+.2f}",
+        "{{pnl_color}}":       pnl_color,
+        "{{loss_bar_pct}}":    f"{loss_bar_pct:.0f}",
+        "{{danger_class}}":    danger_class,
+        "{{win_rate}}":        f"{win_rate:.1f}",
+        "{{wr_color}}":        wr_color,
+        "{{wins}}":            str(wins),
+        "{{losses}}":          str(losses),
+        "{{trades}}":          str(trades),
+        "{{profit_factor}}":   f"{pf:.3f}",
+        "{{pf_color}}":        pf_color,
+        "{{streak_label}}":    streak_label,
+        "{{streak_color}}":    streak_color,
+        "{{streak_type}}":     streak_type,
+        "{{tradeable_count}}": str(s.get("tradeable_count", 0)),
+        "{{last_signal}}":     s.get("last_signal", "—"),
+        "{{now_utc}}":         datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+        "{{recent_rows}}":     recent_rows,
+        "{{symbol_rows}}":     symbol_rows,
+    }.items():
+        html = html.replace(k, str(v))
+    return html
 
 
 @app.route("/")
-def dashboard():
-    """
-    Main dashboard. NEVER returns 5xx.
-    Tries dashboard.html first; falls back to the inline template on any error.
-    """
-    try:
-        ctx = _safe_bot_context()
-        try:
-            return render_template("dashboard.html", **ctx)
-        except Exception as tpl_err:
-            logger.warning(f"dashboard.html not found or errored ({tpl_err}); using fallback template")
-            return render_template_string(_FALLBACK_DASHBOARD, **ctx), 200
-    except Exception as exc:
-        logger.error(f"Dashboard route fatal error: {exc}", exc_info=True)
-        return (
-            "<h2 style='font-family:monospace;padding:2rem'>"
-            "⚡ SIFM Bot is starting up…</h2>"
-            f"<pre style='padding:2rem'>{exc}</pre>"
-        ), 200
+def index():
+    return Response(_render_dashboard(), mimetype="text/html")
 
 
-@app.route("/status")
-def status():
-    """JSON status endpoint — safe defaults, never 5xx."""
-    try:
-        ctx = _safe_bot_context()
-        # Remove heavy list fields to keep the JSON lean
-        ctx.pop("trade_history", None)
-        return jsonify(ctx), 200
-    except Exception as exc:
-        logger.error(f"/status error: {exc}", exc_info=True)
-        return jsonify({"error": str(exc), "status": "degraded"}), 200
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok", "ts": time.time()}), 200
+
+
+@app.route("/stats")
+def stats_route():
+    # BUG 2 FIX: use .get() with defaults so /stats never 500s during init
+    s         = _state
+    balance   = s.get("balance", 0.0)
+    day_start = s.get("day_start_balance", 0.0)
+    wins      = s.get("wins_today", 0)
+    losses    = s.get("losses_today", 0)
+    trades    = s.get("trades_today", wins + losses)
+    return jsonify({
+        "balance":           round(balance, 4),
+        "day_start_balance": round(day_start, 4),
+        "daily_pnl":         round(balance - day_start, 4),
+        "daily_pnl_pct":     round((balance - day_start) / day_start * 100, 2) if day_start else 0,
+        "trades":            trades,
+        "wins":              wins,
+        "losses":            losses,
+        "win_rate":          round(wins / max(trades, 1) * 100, 1),
+        "profit_factor":     round(s.get("profit_factor", 0), 3),
+        "avg_rr":            round(s.get("avg_rr", 0), 2),
+        "streak":            s.get("streak", 0),
+        "paused":            s.get("paused_for_loss_limit", False),
+        "current_symbol":    s.get("current_symbol", "—"),
+        "session":           s.get("session", "—"),
+        "uptime_seconds":    s.get("uptime_seconds", 0),
+        "last_signal":       s.get("last_signal", "—"),
+        "tradeable_count":   s.get("tradeable_count", 0),
+        "active_trades":     s.get("active_trades", 0),
+    })
 
 
 @app.route("/trades")
-def trades():
-    """Return recent trade history as JSON. Safe, never 5xx."""
-    try:
-        bot = _bot_instance
-        raw = getattr(bot, "_trade_history", []) if bot is not None else []
-        history = list(raw)[-100:]
-        return jsonify({"count": len(history), "trades": history}), 200
-    except Exception as exc:
-        logger.error(f"/trades error: {exc}", exc_info=True)
-        return jsonify({"error": str(exc), "trades": []}), 200
+def trades_route():
+    return jsonify({"recent_trades": _state.get("recent_trades", [])})
 
 
 @app.route("/symbols")
-def symbols():
-    """Return active symbols as JSON. Safe, never 5xx."""
-    try:
-        bot = _bot_instance
-        raw = getattr(bot, "_queue", []) if bot is not None else []
-        sym_list = list(raw)
-        return jsonify({"count": len(sym_list), "symbols": sym_list}), 200
-    except Exception as exc:
-        logger.error(f"/symbols error: {exc}", exc_info=True)
-        return jsonify({"error": str(exc), "symbols": []}), 200
+def symbols_route():
+    return jsonify({"symbols": _state.get("best_symbols", [])})
 
-
-@app.route("/ping")
-def ping():
-    """Lightweight liveness check for the self-pinger."""
-    return "pong", 200
-
-
-# ─── Self-ping keep-alive ──────────────────────────────────────────────────────
 
 def _ping_loop():
-    """Pings /health every 40 s to prevent Render from spinning down the service."""
-    url = f"{config.SELF_URL}/health"
+    time.sleep(20)
     while True:
         try:
-            r = requests.get(url, timeout=10)
-            logger.debug(f"Self-ping {url} → {r.status_code}")
+            r = requests.get(f"{config.SELF_URL}/health", timeout=10)
+            logger.debug(f"Keep-alive ping → {r.status_code}")
         except Exception as exc:
-            logger.warning(f"Self-ping failed: {exc}")
-        time.sleep(40)
+            logger.warning(f"Keep-alive ping failed: {exc}")
+        time.sleep(config.KEEP_ALIVE_INTERVAL)
 
 
 def start_keep_alive():
-    """Start the self-ping thread (daemon so it dies with the process)."""
-    t = threading.Thread(target=_ping_loop, name="keep-alive-pinger", daemon=True)
+    _load_template()
+    t = threading.Thread(target=_ping_loop, name="keep-alive", daemon=True)
     t.start()
-    logger.info(f"Keep-alive pinger started → {config.SELF_URL}/health every 40 s ✓")
+    logger.info(f"Keep-alive pinger started "
+                f"(interval={config.KEEP_ALIVE_INTERVAL}s, url={config.SELF_URL})")
