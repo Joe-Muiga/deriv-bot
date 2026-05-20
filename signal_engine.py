@@ -419,6 +419,10 @@ class SignalEngine:
         ≤ 1/3          → always reject
     """
 
+    def __init__(self, symbols: list = None, config=None, **kwargs):
+        self.symbols = symbols or []
+        self.config  = config
+
     def evaluate(
         self,
         ltf_bars: List[Candle],
