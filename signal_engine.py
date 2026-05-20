@@ -68,7 +68,12 @@ class SignalResult:
     bear_votes:       int    # raw M3 bear vote count
     timestamp:        float  # unix epoch of evaluation
     emitted:          bool   # True if signal passes emission rules
-    rejection_reason: str    # "" when emitted; human-readable reason when rejected
+    rejection_reason: str = ""  # "" when emitted; human-readable reason when rejected
+
+    @property
+    def reason(self) -> str:
+        """Alias for rejection_reason — backwards compatibility."""
+        return self.rejection_reason
 
 
 # ─── Signal self-validation (utility — NOT called from evaluate) ──────────────
