@@ -65,6 +65,15 @@ v11 → v12 changes (SCAN/RANK/EXECUTE rewrite per spec):
   SUSPENDED SYMBOL LOG (every cycle start):
     SUSPENDED: [{sym}({cycles_remaining}), ...] | ACTIVE: {n} symbols
 
+  CONTRACT CLOSURE GUARANTEE (v12):
+    • After every settle wait: logs "Open contracts remaining: N"
+    • For each remaining contract: calls force_check_contract(cid)
+    • If API confirms closed but callback wasn't triggered: manually calls
+      _on_contract_result(cid, msg)
+    • After 3 failed attempts: logs ORPHANED CONTRACT: {cid} and force-closes
+    • New scan cycle blocked while _open_contracts has contracts older than
+      TRADE_DURATION * 60 + 30 seconds
+
   All v11 logic preserved unchanged:
     Strategy, SMC, signal_engine, candlestick_builder, news_filter,
     trade_journal, dashboard, websocket flow, balance callback, symbol init,
@@ -103,6 +112,9 @@ DASHBOARD_PUSH_EVERY = 10
 SYMBOL_REFRESH_EVERY = 3600
 INIT_BATCH_SIZE      = 10
 
+# Max attempts to force-check an unresolved contract before declaring it orphaned
+_ORPHAN_MAX_ATTEMPTS = 3
+
 
 # ─── Result container ─────────────────────────────────────────────────────────
 
@@ -128,7 +140,8 @@ class BotEngine:
         self._running: bool = False
         self._prescan_buffer: List[ScanResult] = []
         self._session_start_balance: float = 0.0
-        self._open_contracts: dict = {}
+        self._open_contracts: dict = {}          # cid → (symbol, direction, stake, price, rec)
+        self._contract_open_times: dict = {}     # cid → time.time() when opened
 
         self._htf: Dict[str, CandlestickBuilder] = {}
         self._ltf: Dict[str, CandlestickBuilder] = {}
@@ -314,6 +327,108 @@ class BotEngine:
             best_symbols          = self.symbols.best_symbols(10),
         )
 
+    # ── Post-settle orphan resolution ─────────────────────────────────────────
+
+    async def _resolve_remaining_contracts(self):
+        """
+        Called after every settle wait.  For each contract still in
+        _open_contracts, attempts to force-check via the API.
+
+        - If API confirms closed: manually fire _on_contract_result.
+        - After _ORPHAN_MAX_ATTEMPTS failures: declare orphaned, force-remove.
+
+        Logs a summary line regardless of outcome.
+        """
+        remaining = list(self._open_contracts.keys())
+        n = len(remaining)
+        now = time.time()
+
+        if n == 0:
+            logger.info("Open contracts remaining: 0")
+            return
+
+        # Build age report
+        age_parts = []
+        for cid in remaining:
+            open_time = self._contract_open_times.get(cid, now)
+            age_secs  = int(now - open_time)
+            age_parts.append(f"{cid}({age_secs}s)")
+
+        logger.info(
+            f"Open contracts remaining: {n} — "
+            + ", ".join(age_parts)
+        )
+
+        for cid in remaining:
+            if cid not in self._open_contracts:
+                # Already resolved by callback during our loop
+                continue
+
+            resolved = False
+            for attempt in range(1, _ORPHAN_MAX_ATTEMPTS + 1):
+                try:
+                    resp = await self.client.force_check_contract(cid)
+                    poc  = resp.get("proposal_open_contract", {})
+
+                    is_closed = bool(
+                        poc.get("is_sold")
+                        or poc.get("is_expired")
+                        or poc.get("status") in ("sold", "won", "lost")
+                    )
+
+                    if is_closed:
+                        logger.info(
+                            f"force_check_contract({cid}): confirmed closed "
+                            f"(attempt {attempt}) — firing _on_contract_result"
+                        )
+                        await self._on_contract_result(cid, resp)
+                        resolved = True
+                        break
+                    else:
+                        logger.debug(
+                            f"force_check_contract({cid}): still open "
+                            f"(attempt {attempt}/{_ORPHAN_MAX_ATTEMPTS})"
+                        )
+                        # Brief wait before retry
+                        if attempt < _ORPHAN_MAX_ATTEMPTS:
+                            await asyncio.sleep(5)
+
+                except Exception as exc:
+                    logger.warning(
+                        f"force_check_contract({cid}) attempt {attempt} error: {exc}"
+                    )
+                    if attempt < _ORPHAN_MAX_ATTEMPTS:
+                        await asyncio.sleep(5)
+
+            if not resolved and cid in self._open_contracts:
+                # Retrieve last known info for logging
+                info = self._open_contracts.get(cid, ())
+                symbol    = info[0] if len(info) > 0 else "UNKNOWN"
+                stake     = info[2] if len(info) > 2 else 0.0
+                last_price = info[3] if len(info) > 3 else 0.0
+
+                logger.error(
+                    f"ORPHANED CONTRACT: {cid} — forcing close at last known price "
+                    f"({symbol} stake=${stake:.2f} last_price={last_price})"
+                )
+                self._open_contracts.pop(cid, None)
+                self._contract_open_times.pop(cid, None)
+                set_active_trades(len(self._open_contracts))
+
+    def _has_stale_contracts(self) -> bool:
+        """
+        Returns True if any open contract is older than TRADE_DURATION * 60 + 30 s.
+        Used to block the next scan cycle until stale contracts are resolved.
+        """
+        stale_threshold = config.TRADE_DURATION * 60 + 30
+        now = time.time()
+        for cid, open_time in list(self._contract_open_times.items()):
+            if cid in self._open_contracts:
+                age = now - open_time
+                if age > stale_threshold:
+                    return True
+        return False
+
     # ── Main loop (v12 rewrite) ────────────────────────────────────────────────
 
     async def _main_loop(self):
@@ -380,6 +495,21 @@ class BotEngine:
                     f"({self.risk.pause_cycles_remaining} remaining) | "
                     f"streak={self.risk.current_streak}")
                 self.risk.consume_pause_cycle()
+                await asyncio.sleep(scan_sleep)
+                continue
+
+            # ── Block cycle if stale contracts remain ─────────────────────
+            if self._has_stale_contracts():
+                stale_cids = [
+                    cid for cid in self._open_contracts
+                    if (time.time() - self._contract_open_times.get(cid, time.time()))
+                    > config.TRADE_DURATION * 60 + 30
+                ]
+                logger.warning(
+                    f"Blocking new cycle — stale contracts detected: "
+                    f"{stale_cids} — running force-check"
+                )
+                await self._resolve_remaining_contracts()
                 await asyncio.sleep(scan_sleep)
                 continue
 
@@ -493,7 +623,6 @@ class BotEngine:
                         break
                     if fb.symbol in executed_symbols:
                         continue
-                    conf = getattr(fb.sig, "confidence", 0)
                     if not self.risk.can_trade():
                         continue
                     try:
@@ -520,10 +649,9 @@ class BotEngine:
                 await asyncio.sleep(wait_secs)
                 await prescan_task   # ensure it finishes before next cycle
 
-                # ── Result collection ─────────────────────────────────────
-                # Results arrive via _on_contract_result callbacks.
-                # risk_manager and symbol_manager already updated there.
-                # Additional daily-loss check happens in that callback too.
+                # ── Post-settle orphan resolution ─────────────────────────
+                # Log open contracts remaining; force-check any unresolved ones
+                await self._resolve_remaining_contracts()
 
                 # ── Daily loss check (post-settle) ────────────────────────
                 if self._session_start_balance > 0:
@@ -751,6 +879,7 @@ class BotEngine:
         )
 
         self._open_contracts[cid] = (symbol, direction, stake, price, rec)
+        self._contract_open_times[cid] = time.time()
         set_active_trades(len(self._open_contracts))
 
         await self.client.subscribe_contract(
@@ -773,6 +902,7 @@ class BotEngine:
         bal_after  = self.client.balance
 
         info = self._open_contracts.pop(cid, None)
+        self._contract_open_times.pop(cid, None)
         if not info:
             return
         symbol, direction, stake, entry_price, rec = info
