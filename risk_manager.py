@@ -138,6 +138,12 @@ class RiskManager:
         # ── Bot state ─────────────────────────────────────────────────────────
         self._bot_state: BotState = BotState.RUNNING
 
+        # ── Pause-cycle countdown ──────────────────────────────────────────────
+        # bot_engine calls decrement_pause() / consume_pause_cycle() once per
+        # cycle; the main loop reads pause_cycles_remaining to decide whether
+        # to skip trading this cycle.
+        self._pause_cycles_remaining: int = 0
+
         # ── Session stats ─────────────────────────────────────────────────────
         self.total_trades: int   = 0
         self.wins:         int   = 0
@@ -160,6 +166,28 @@ class RiskManager:
     def tick_cycle(self) -> None:
         """Advance the internal cycle counter by one scan cycle."""
         self._current_cycle += 1
+
+    # ── Pause-cycle management ────────────────────────────────────────────────
+
+    @property
+    def pause_cycles_remaining(self) -> int:
+        """
+        Number of cycles the bot should skip trading.
+        Always returns 0 when not in a paused state — never raises, never None.
+        """
+        return self._pause_cycles_remaining
+
+    def decrement_pause(self) -> None:
+        """Called once per cycle by bot_engine to count down any active pause."""
+        if self._pause_cycles_remaining > 0:
+            self._pause_cycles_remaining -= 1
+
+    def consume_pause_cycle(self) -> None:
+        """
+        Alias for decrement_pause() — satisfies bot_engine.py line 379 which
+        calls self.risk.consume_pause_cycle() inside the pause-skip branch.
+        """
+        self.decrement_pause()
 
     # ── Balance management ────────────────────────────────────────────────────
 
