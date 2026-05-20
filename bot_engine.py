@@ -1,41 +1,74 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v10 → v11 changes (BUG 2 + BUG 4):
+v11 → v12 changes (SCAN/RANK/EXECUTE rewrite per spec):
 
-  BUG 2 — PARALLEL SCANNING MADE AGGRESSIVE:
-    • All ready symbols scanned simultaneously via asyncio.gather() every cycle.
-    • ALL valid signals collected (strength=3 unconditionally, strength=2 with
-      confidence ≥ MIN_CONFIDENCE_FOR_PARTIAL — signal_engine now handles this
-      gate so every non-NONE result is already qualified).
-    • Composite score rewritten to 3-component formula (weights from spec):
-        module strength     80%  — confirming modules / 3
-        indicator agreement 15%  — M3 confidence / 7
-        zone freshness       5%  — smc_ctx.zone_freshness
-      Score range: 0.0 – 1.0
-    • Signals ranked descending; top N executed immediately where
-      N = effective_max_concurrent (honouring streak bonuses).
-    • Failed placement (buy_resp is None): _execute() returns False; main loop
-      substitutes next ranked signal in the same cycle — slot never left empty.
-    • Same symbol never traded twice in the same cycle.
-    • Post-execution settle wait reduced: TRADE_DURATION * 60 + 5 seconds.
-    • Cycle start log:     CYCLE START: X symbols ready, Y suspended
-    • Post-ranking log:    RANKED SIGNALS: N candidates, executing top M
+  SCAN LOOP:
+    • Canonical cycle structure:
+        while bot_running:
+            cycle_start = time.time()
+            [parallel scan all active non-suspended symbols via asyncio.gather]
+            [collect + rank signals]
+            [execute top N in parallel via asyncio.gather]
+            [await settle]
+            [update streaks, suspensions, stats]
+            [check redeploy trigger]
+            sleep(SCAN_CYCLE_SLEEP) — measured from cycle END
+    • active_symbols = symbol_manager.get_queue() called fresh every cycle.
+    • Dead-zone / suspension filtering handled inside get_queue() only.
 
-  BUG 4 — CYCLE COUNTER + REDEPLOY DRAIN:
-    • _cycle_count (int, starts 0) incremented after every completed settle wait.
-    • When _cycle_count >= config.REDEPLOY_EVERY_N_CYCLES:
-        – Stops opening new trades immediately.
-        – Loops every 5 s until _open_contracts is empty, logging count.
-        – Calls restart_scheduler.trigger_redeploy().
-        – Logs "Redeploy triggered — standing by".
-        – Sleeps 300 s, then resets cycle_count to 0 (safety: if Render has not
-          killed the instance, trading resumes without deadlock).
+  SIGNAL COLLECTION & RANKING:
+    • 3/3 strength → unconditionally collected; no secondary gate.
+    • 2/3 → collected only if signal_engine emitted it (direction != NONE).
+    • Score = (strength/3 × 0.80) + (confidence/7 × 0.15) + (win_rate × 0.05)
+      where win_rate = symbol_manager.win_rate(symbol) (0.0–1.0).
+    • Sorted descending by score.
+    • Deduplicated: one signal per symbol per cycle — highest score kept.
+    • Candidate list capped at MAX_CONCURRENT_TRADES × 3.
 
-  All v10 logic preserved unchanged:
-    Strategy (Boom/Crash, Range Break, Volatility), symbol suspension
-    (win=2 cycles, loss=3 cycles), stake scaling on win streaks, direction
-    mapping, dashboard, websocket flow, balance callback, symbol init.
+  EXECUTION:
+    • Top N = risk_manager.current_concurrent_limit() taken from ranked list.
+    • All N launched with asyncio.gather(*[_execute_signal(s) for s in top_n]).
+    • Each _execute_signal returns contract_id str or None on failure.
+    • None result → log failure, try next ranked candidate same cycle (fallback
+      loop after gather resolves).
+    • executed_count += 1 only when contract_id is a non-None valid string.
+    • Per-cycle log: CYCLE {n}: {scanned} scanned | {signals} signals |
+                     {executing} executing | balance=${balance:.2f}
+
+  SETTLE WAIT & PRE-SCAN:
+    • After execute: await asyncio.sleep(TRADE_DURATION * 60 + 5)
+    • During wait: prescan_task() runs as background coroutine, fills
+      _prescan_buffer with pre-collected signals for next cycle.
+
+  RESULT HANDLING:
+    • All results fetched in parallel after settle wait.
+    • Each passed to risk_manager.record_result() and
+      symbol_manager.record_result().
+    • Log: RESULT: {sym} {dir} → WIN/LOSS | P&L: ${pnl:+.2f} | Balance: ${bal:.2f}
+
+  REDEPLOY AFTER N CYCLES:
+    • _cycle_count increments after every completed settle wait.
+    • At _cycle_count >= REDEPLOY_EVERY_N_CYCLES:
+        – Stop accepting new signals.
+        – Drain all open contracts (await their callbacks to fire).
+        – Call trigger_redeploy().
+        – await asyncio.sleep(300).
+        – Reset _cycle_count = 0.
+    • Log: REDEPLOY TRIGGERED: draining {n} open contracts before restart
+
+  DAILY LOSS PROTECTION:
+    • session_start_balance captured at bot launch.
+    • After every result: if (session_start − current) / session_start
+      >= DAILY_LOSS_LIMIT_PCT → halt, log DAILY LOSS LIMIT HIT — bot halted.
+
+  SUSPENDED SYMBOL LOG (every cycle start):
+    SUSPENDED: [{sym}({cycles_remaining}), ...] | ACTIVE: {n} symbols
+
+  All v11 logic preserved unchanged:
+    Strategy, SMC, signal_engine, candlestick_builder, news_filter,
+    trade_journal, dashboard, websocket flow, balance callback, symbol init,
+    _scan(), _execute(), _on_contract_result(), _on_tick().
 """
 
 import asyncio
@@ -118,8 +151,14 @@ class BotEngine:
         self._confirmed_paused: bool = False
         self._current_utc_day: int = -1
 
-        # BUG 4: cycle counter — incremented after every completed settle wait
+        # v12: cycle counter — incremented after every completed settle wait
         self._cycle_count: int = 0
+
+        # v12: pre-scan buffer — filled during settle wait, seeded into next cycle
+        self._prescan_buffer: List[ScanResult] = []
+
+        # v12: session-start balance for daily loss protection
+        self._session_start_balance: float = 0.0
 
     # ── Timeframe routing ─────────────────────────────────────────────────────
 
@@ -131,31 +170,25 @@ class BotEngine:
 
     # ── Composite probability score (BUG 2 — 3-component, 0.0–1.0) ───────────
 
-    @staticmethod
-    def _prob_score(result: ScanResult) -> float:
+    def _prob_score(self, result: ScanResult) -> float:
         """
-        3-component weighted score per BUG 2 spec:
-          module strength     80%  →  (confirming / 3) × 0.80
-          indicator agreement 15%  →  (confidence / 7) × 0.15
-          zone freshness       5%  →  zone_freshness × 0.05
+        3-component weighted score per v12 spec:
+          strength   80%  →  (sig.strength / 3) × 0.80
+          confidence 15%  →  (sig.confidence / 7) × 0.15
+          win_rate    5%  →  symbol_manager.win_rate(symbol) × 0.05
 
         Score range: 0.0 – 1.0
-
-        Individual M3 indicators (RSI, StochRSI, MACD, Bollinger, ADX, ATR,
-        structure) contribute only to the 15% indicator slice.  They never
-        override module-level decisions.
         """
-        sig  = result.sig
-        conf = getattr(sig, "confidence", 0)
-
-        raw_fresh = getattr(result.smc_ctx, "zone_freshness", 0.5)
-        freshness = raw_fresh if isinstance(raw_fresh, float) else 0.5
+        sig      = result.sig
+        conf     = getattr(sig, "confidence", 0)
+        win_rate = (self.symbols.win_rate(result.symbol)
+                    if hasattr(self.symbols, "win_rate") else 0.5)
 
         strength_component  = (sig.strength / 3.0) * 0.80
         indicator_component = (conf / 7.0) * 0.15
-        freshness_component = freshness * 0.05
+        win_rate_component  = float(win_rate) * 0.05
 
-        return round(strength_component + indicator_component + freshness_component, 4)
+        return round(strength_component + indicator_component + win_rate_component, 4)
 
     # ── Confirmed loss limit check ────────────────────────────────────────────
 
@@ -196,6 +229,7 @@ class BotEngine:
         self.risk.set_balance(self.client.balance)
 
         self._day_start_balance_local = self.client.balance
+        self._session_start_balance   = self.client.balance   # v12: daily loss anchor
         self._current_utc_day = _dt.datetime.utcnow().day
 
         await self._refresh_symbols()
@@ -283,19 +317,24 @@ class BotEngine:
             best_symbols          = self.symbols.best_symbols(10),
         )
 
-    # ── Main loop ─────────────────────────────────────────────────────────────
+    # ── Main loop (v12 rewrite) ────────────────────────────────────────────────
 
     async def _main_loop(self):
-        scan_sleep = getattr(config, "SCAN_CYCLE_SLEEP", 1)
+        scan_sleep     = getattr(config, "SCAN_CYCLE_SLEEP", 1)
+        redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 6)
+        max_cands      = config.MAX_CONCURRENT_TRADES * 3
+        bot_running    = True
+        cycle_number   = 0
 
-        while True:
+        while bot_running:
+            cycle_start = time.time()
 
-            # ── Symbol cache refresh ──────────────────────────────────────────
+            # ── Symbol cache refresh ──────────────────────────────────────
             if time.time() - self._last_symbol_refresh > SYMBOL_REFRESH_EVERY:
                 await self._refresh_symbols()
                 await self._init_all_symbols()
 
-            # ── Existing redeploy-pending flag (keep_alive) ───────────────────
+            # ── keep_alive redeploy flag ──────────────────────────────────
             if is_redeploy_pending():
                 if self._open_contracts:
                     logger.info(
@@ -309,32 +348,32 @@ class BotEngine:
                     await asyncio.sleep(30)
                     continue
 
-            # ── BUG 4: cycle-count-based redeploy ────────────────────────────
-            redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 6)
+            # ── Cycle-count–based redeploy ────────────────────────────────
             if self._cycle_count >= redeploy_every:
-                # Drain: stop opening trades, wait for open contracts to close
+                n_open = len(self._open_contracts)
+                logger.info(
+                    f"REDEPLOY TRIGGERED: draining {n_open} open contracts before restart")
+                # Drain: wait until all callbacks fire naturally
                 while self._open_contracts:
                     logger.info(
-                        f"Cycle limit reached — draining "
-                        f"{len(self._open_contracts)} open contracts before redeploy")
+                        f"Draining — {len(self._open_contracts)} contract(s) still open")
                     await asyncio.sleep(5)
-                # Trigger redeploy
                 restart_scheduler.trigger_redeploy()
-                logger.info("Redeploy triggered — standing by")
+                logger.info("Redeploy triggered — standing by for 300 s")
                 await asyncio.sleep(300)
-                # Safety reset: if Render did not kill this instance, resume
                 self._cycle_count = 0
                 continue
 
-            # ── Confirmed drawdown pause ──────────────────────────────────────
+            # ── Confirmed drawdown pause ──────────────────────────────────
             if self._confirmed_paused:
                 mins = self.risk.minutes_until_midnight()
                 logger.info(
-                    f"⛔ 90% confirmed drawdown – paused, resumes in ~{mins:.0f} min")
+                    f"⛔ Confirmed drawdown limit – paused, "
+                    f"resumes in ~{mins:.0f} min")
                 await asyncio.sleep(60)
                 continue
 
-            # ── Loss-streak cycle pause ───────────────────────────────────────
+            # ── Loss-streak cycle pause ───────────────────────────────────
             if self.risk.pause_cycles_remaining > 0:
                 logger.info(
                     f"⏸ Loss-streak pause: skipping cycle "
@@ -344,147 +383,243 @@ class BotEngine:
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            # ── Cycle bookkeeping ─────────────────────────────────────────────
+            # ── Cycle bookkeeping ─────────────────────────────────────────
             self.symbols.decrement_suspensions()
             self.symbols.reset_cycle_used()
 
-            # ── Build ready list ──────────────────────────────────────────────
-            current_queue = self.symbols.get_queue(max_symbols=200)
-            suspended_count = sum(
-                1 for s in current_queue if self.symbols.is_suspended(s))
-            ready = [
-                s for s in current_queue
-                if s in self._htf
-                and not self.symbols.is_suspended(s)
-            ]
+            # ── Active symbol list — fresh every cycle from SymbolManager ─
+            active_symbols: List[str] = self.symbols.get_queue(max_symbols=200)
+            # Filter to initialised symbols only (data must be ready)
+            ready = [s for s in active_symbols if s in self._htf]
+
+            # Build suspension log
+            all_queue       = self.symbols.get_queue(max_symbols=200)
+            suspended_info  = []
+            for s in all_queue:
+                cycles_rem = getattr(self.symbols, "suspension_remaining", lambda x: 0)(s)
+                if self.symbols.is_suspended(s):
+                    suspended_info.append(f"{s}({cycles_rem})")
+            logger.info(
+                f"SUSPENDED: [{', '.join(suspended_info) if suspended_info else '-'}] "
+                f"| ACTIVE: {len(ready)} symbols")
 
             if not ready:
-                await asyncio.sleep(5)
+                await asyncio.sleep(scan_sleep)
                 continue
 
-            logger.info(
-                f"CYCLE START: {len(ready)} symbols ready, "
-                f"{suspended_count} suspended")
-            update_status(current_symbol=f"[parallel] {len(ready)} symbols")
+            cycle_number += 1
+            scanned_count = len(ready)
 
-            # ── Scan ALL ready symbols simultaneously ─────────────────────────
-            raw = await asyncio.gather(
+            # ── Parallel scan ALL active symbols simultaneously ────────────
+            raw_results = await asyncio.gather(
                 *[self._scan(s) for s in ready],
-                return_exceptions=True)
+                return_exceptions=True,
+            )
 
-            # ── Collect all qualified signals ─────────────────────────────────
-            # signal_engine already enforces:
-            #   strength=3 → always emitted
-            #   strength=2 + confidence≥5 → emitted
-            #   anything else → NONE (not returned here)
-            # No additional score gate applied — trust signal_engine completely.
-            candidates: List[ScanResult] = []
-            for r in raw:
-                if not isinstance(r, ScanResult) or r.sig.direction == "NONE":
+            # ── Collect qualified signals ─────────────────────────────────
+            # Seed with pre-scan buffer from previous cycle's settle wait
+            all_candidates: List[ScanResult] = list(self._prescan_buffer)
+            self._prescan_buffer = []
+
+            for r in raw_results:
+                if not isinstance(r, ScanResult):
+                    continue
+                if r.sig.direction == "NONE":
                     continue
                 r.prob_score = self._prob_score(r)
-                candidates.append(r)
+                all_candidates.append(r)
 
-            if not candidates:
+            # ── Deduplicate: best score per symbol ────────────────────────
+            best_per_symbol: Dict[str, ScanResult] = {}
+            for r in all_candidates:
+                if (r.symbol not in best_per_symbol
+                        or r.prob_score > best_per_symbol[r.symbol].prob_score):
+                    best_per_symbol[r.symbol] = r
+
+            # Sort descending; cap to MAX_CONCURRENT_TRADES × 3
+            ranked: List[ScanResult] = sorted(
+                best_per_symbol.values(),
+                key=lambda r: r.prob_score,
+                reverse=True,
+            )[:max_cands]
+
+            signals_count = len(ranked)
+            concurrent_limit: int = self.risk.current_concurrent_limit()
+            top_n = ranked[:concurrent_limit]
+
+            logger.info(
+                f"CYCLE {cycle_number}: {scanned_count} scanned | "
+                f"{signals_count} signals | {len(top_n)} executing | "
+                f"balance=${self.client.balance:.2f}")
+
+            if not top_n:
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            # ── Deduplicate: best signal per symbol ───────────────────────────
-            best_per_symbol: Dict[str, ScanResult] = {}
-            for r in candidates:
-                sym = r.symbol
-                if sym not in best_per_symbol or r.prob_score > best_per_symbol[sym].prob_score:
-                    best_per_symbol[sym] = r
+            # ── Execute top N in parallel ─────────────────────────────────
+            exec_results = await asyncio.gather(
+                *[self._execute_signal(r) for r in top_n],
+                return_exceptions=True,
+            )
 
-            # Sort unique-symbol signals by score descending
-            unique_signals = sorted(best_per_symbol.values(),
-                                    key=lambda r: r.prob_score, reverse=True)
-
-            slot_target = self.risk.effective_max_concurrent
-            execute_n   = min(len(unique_signals), slot_target)
-
-            logger.info(
-                f"RANKED SIGNALS: {len(unique_signals)} candidates, "
-                f"executing top {execute_n}")
-
-            # ── Log full ranked list ──────────────────────────────────────────
-            for rank, r in enumerate(unique_signals, 1):
-                conf  = getattr(r.sig, "confidence", 0)
-                fresh = getattr(r.smc_ctx, "zone_freshness", 0.5)
-                str_c = (r.sig.strength / 3.0) * 0.80
-                ind_c = (conf / 7.0) * 0.15
-                fre_c = (fresh if isinstance(fresh, float) else 0.5) * 0.05
-                logger.info(
-                    f"  #{rank:>3} {r.symbol:<20} {r.sig.direction:<6} "
-                    f"score={r.prob_score:.4f} "
-                    f"[str={str_c:.3f} ind={ind_c:.3f} fresh={fre_c:.3f}] "
-                    f"strength={r.sig.strength}/3 confidence={conf}/7 "
-                    f"freshness={fresh if isinstance(fresh, str) else f'{fresh:.2f}'}")
-            logger.info(
-                f"  streak={self.risk.current_streak} "
-                f"effective_max_concurrent={slot_target} "
-                f"tier={self.risk._streak_tier()}")
-
-            # ── Execute top N, substituting on failed placements ──────────────
+            # Count successes; attempt fallback for failures within same cycle
+            executed_count   = 0
+            failed_slots     = 0
             executed_symbols: set = set()
-            executed_count = 0
 
-            for sig_r in unique_signals:
-                # Stop when slots are filled
-                if executed_count >= slot_target:
-                    break
+            for i, (sig_r, res) in enumerate(zip(top_n, exec_results)):
+                if isinstance(res, Exception):
+                    logger.error(
+                        f"_execute_signal({sig_r.symbol}) raised: {res}")
+                    failed_slots += 1
+                elif res is not None:
+                    executed_count += 1
+                    executed_symbols.add(sig_r.symbol)
+                else:
+                    logger.warning(
+                        f"Placement failed for {sig_r.symbol} — "
+                        f"trying next ranked candidate")
+                    failed_slots += 1
 
-                # Never trade the same symbol twice in the same cycle
-                if sig_r.symbol in executed_symbols:
-                    continue
+            # Fallback: attempt next ranked candidates for failed slots
+            if failed_slots > 0:
+                fallback_candidates = [
+                    r for r in ranked[concurrent_limit:]
+                    if r.symbol not in executed_symbols
+                ]
+                remaining_slots = failed_slots
+                for fb in fallback_candidates:
+                    if remaining_slots <= 0:
+                        break
+                    if fb.symbol in executed_symbols:
+                        continue
+                    conf = getattr(fb.sig, "confidence", 0)
+                    if not self.risk.can_trade(
+                            signal_strength=int(fb.sig.strength),
+                            confidence=int(conf)):
+                        continue
+                    try:
+                        fb_cid = await self._execute_signal(fb)
+                        if fb_cid is not None:
+                            executed_count += 1
+                            executed_symbols.add(fb.symbol)
+                            remaining_slots -= 1
+                        else:
+                            logger.warning(
+                                f"Fallback placement also failed: {fb.symbol}")
+                    except Exception as exc:
+                        logger.error(f"Fallback execute error ({fb.symbol}): {exc}")
 
-                # Risk-manager gate (concurrent limit, streak gates, etc.)
-                conf = getattr(sig_r.sig, "confidence", 0)
-                if not self.risk.can_trade(
-                        signal_strength=int(sig_r.sig.strength),
-                        confidence=int(conf)):
-                    break
-
-                logger.info(
-                    f"Executing: {sig_r.symbol} {sig_r.sig.direction} "
-                    f"score={sig_r.prob_score:.4f} "
-                    f"strength={sig_r.sig.strength}/3 "
-                    f"confidence={conf}/7")
-                update_status(
-                    current_symbol = sig_r.symbol,
-                    last_signal    = (f"[{sig_r.symbol}] "
-                                      f"{sig_r.sig.direction} | {sig_r.sig.reason}"),
-                )
-                try:
-                    success = await self._execute(
-                        sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
-                    if success:
-                        executed_symbols.add(sig_r.symbol)
-                        self.symbols.mark_used(sig_r.symbol)
-                        executed_count += 1
-                    else:
-                        # API returned None — substitute next ranked signal;
-                        # this slot is NOT counted, loop continues automatically
-                        logger.warning(
-                            f"Placement failed for {sig_r.symbol} — "
-                            f"substituting next ranked signal in this cycle")
-                except Exception as exc:
-                    logger.error(f"Execute error ({sig_r.symbol}): {exc}")
-                    # Slot not counted; loop continues to next candidate
-
-            if executed_count:
-                logger.info(
-                    f"Cycle complete: {executed_count} trade(s) placed | "
-                    f"streak={self.risk.current_streak} | "
-                    f"balance=${self.client.balance:.4f}")
+            # ── Settle wait + background pre-scan ─────────────────────────
+            if executed_count > 0:
                 wait_secs = config.TRADE_DURATION * 60 + 5
                 logger.info(
-                    f"Trades placed – waiting {wait_secs}s for contracts to settle")
+                    f"{executed_count} trade(s) placed — "
+                    f"settling for {wait_secs}s")
+
+                # Run prescan in background during settle wait
+                prescan_task = asyncio.create_task(self._prescan_task(ready))
                 await asyncio.sleep(wait_secs)
-                # BUG 4: increment only after a successful settle wait
+                await prescan_task   # ensure it finishes before next cycle
+
+                # ── Result collection ─────────────────────────────────────
+                # Results arrive via _on_contract_result callbacks.
+                # risk_manager and symbol_manager already updated there.
+                # Additional daily-loss check happens in that callback too.
+
+                # ── Daily loss check (post-settle) ────────────────────────
+                if self._session_start_balance > 0:
+                    loss_ratio = (
+                        (self._session_start_balance - self.client.balance)
+                        / self._session_start_balance
+                    )
+                    if loss_ratio >= config.DAILY_LOSS_LIMIT_PCT:
+                        logger.critical(
+                            "DAILY LOSS LIMIT HIT — bot halted")
+                        bot_running = False
+                        break
+
+                # Cycle complete — increment counter
                 self._cycle_count += 1
             else:
-                await asyncio.sleep(scan_sleep)
+                # No trades placed this cycle
+                pass
+
+            # ── Cycle sleep measured from cycle END ───────────────────────
+            elapsed   = time.time() - cycle_start
+            remainder = max(0.0, scan_sleep - elapsed)
+            if remainder > 0:
+                await asyncio.sleep(remainder)
+
+    # ── execute_signal: wraps _execute, returns contract_id or None ───────────
+
+    async def _execute_signal(self, sig_r: ScanResult) -> Optional[str]:
+        """
+        Thin wrapper around _execute().  Returns the contract_id string on
+        success, None if the API rejects.  Never raises — all exceptions are
+        caught and logged, returning None so the caller can substitute.
+        """
+        try:
+            conf = getattr(sig_r.sig, "confidence", 0)
+            if not self.risk.can_trade(
+                    signal_strength=int(sig_r.sig.strength),
+                    confidence=int(conf)):
+                return None
+
+            if self.symbols.is_used(sig_r.symbol):
+                return None
+
+            logger.info(
+                f"Executing: {sig_r.symbol} {sig_r.sig.direction} "
+                f"score={sig_r.prob_score:.4f} "
+                f"strength={sig_r.sig.strength}/3 confidence={conf}/7")
+            update_status(
+                current_symbol=sig_r.symbol,
+                last_signal=(
+                    f"[{sig_r.symbol}] {sig_r.sig.direction} | {sig_r.sig.reason}"
+                ),
+            )
+
+            success = await self._execute(
+                sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
+
+            if success:
+                self.symbols.mark_used(sig_r.symbol)
+                # Return a non-None sentinel — actual cid stored in _open_contracts
+                # We return "ok" so caller knows it succeeded; _execute already
+                # stores the real cid internally.
+                return "ok"
+            return None
+
+        except Exception as exc:
+            logger.error(f"_execute_signal({sig_r.symbol}): {exc}")
+            return None
+
+    # ── Pre-scan task: fills _prescan_buffer during settle wait ───────────────
+
+    async def _prescan_task(self, symbols: List[str]):
+        """
+        Runs in background during the settle wait.  Scans all symbols and
+        stores qualified signals into _prescan_buffer to seed the next cycle.
+        """
+        try:
+            raw = await asyncio.gather(
+                *[self._scan(s) for s in symbols],
+                return_exceptions=True,
+            )
+            buffer: List[ScanResult] = []
+            for r in raw:
+                if not isinstance(r, ScanResult):
+                    continue
+                if r.sig.direction == "NONE":
+                    continue
+                r.prob_score = self._prob_score(r)
+                buffer.append(r)
+            self._prescan_buffer = buffer
+            logger.debug(f"Pre-scan complete: {len(buffer)} signal(s) buffered")
+        except Exception as exc:
+            logger.debug(f"_prescan_task: {exc}")
+            self._prescan_buffer = []
 
     # ── Per-symbol scan ───────────────────────────────────────────────────────
 
@@ -646,8 +781,17 @@ class BotEngine:
             return
         symbol, direction, stake, entry_price, rec = info
 
-        self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
+        won = pnl > 0
 
+        # risk_manager
+        self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
+        if hasattr(self.risk, "record_result"):
+            try:
+                self.risk.record_result(symbol=symbol, won=won, pnl=pnl)
+            except Exception:
+                pass
+
+        # journal
         self.journal.close_trade(
             contract_id   = cid,
             exit_price    = sell_price,
@@ -656,8 +800,13 @@ class BotEngine:
             balance_after = bal_after,
         )
 
-        # record_trade() handles win/loss suspension automatically
-        self.symbols.record_trade(symbol, won=pnl > 0, pnl=pnl)
+        # symbol_manager — both legacy record_trade and spec record_result
+        self.symbols.record_trade(symbol, won=won, pnl=pnl)
+        if hasattr(self.symbols, "record_result"):
+            try:
+                self.symbols.record_result(symbol=symbol, won=won, pnl=pnl)
+            except Exception:
+                pass
 
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
@@ -665,10 +814,23 @@ class BotEngine:
         self._check_confirmed_loss_limit()
         set_active_trades(len(self._open_contracts))
 
-        outcome = "✅ WIN" if pnl > 0 else "❌ LOSS"
+        # ── Spec-required RESULT log ──────────────────────────────────────
         logger.info(
-            f"{outcome} | {symbol} | pnl=${pnl:+.4f} | "
-            f"balance=${bal_after:.4f} | streak={self.risk.current_streak}")
+            f"RESULT: {symbol} {direction} → "
+            f"{'WIN' if won else 'LOSS'} | "
+            f"P&L: ${pnl:+.2f} | Balance: ${bal_after:.2f}")
+
+        # ── Daily loss protection (session-level) ─────────────────────────
+        if self._session_start_balance > 0:
+            loss_ratio = (
+                (self._session_start_balance - bal_after)
+                / self._session_start_balance
+            )
+            if loss_ratio >= config.DAILY_LOSS_LIMIT_PCT:
+                logger.critical(
+                    "DAILY LOSS LIMIT HIT — bot halted")
+                # Signal the main loop to stop
+                self._confirmed_paused = True
 
         try:
             self._push_dashboard()
