@@ -149,6 +149,9 @@ class SymbolManager:
         # Background midnight-reset task (None until start_midnight_reset_task())
         self._reset_task: Optional[asyncio.Task] = None
 
+        # Per-cycle 'used' tracking (cleared by reset_cycle_used() each cycle)
+        self._cycle_used: Set[str] = set()
+
     # ─────────────────────────────────────────────────────────────────────────
     # Suspension API
     # ─────────────────────────────────────────────────────────────────────────
@@ -388,9 +391,13 @@ class SymbolManager:
     # Queue management
     # ─────────────────────────────────────────────────────────────────────────
 
-    def get_queue(self) -> List[str]:
+    def get_queue(self, max_symbols: int = None) -> List[str]:
         """
-        Return the ordered list of eligible symbols for the current cycle.
+        Return all active, non-suspended symbols.
+        If max_symbols is provided, cap the returned list at that count.
+        Dead zone filtering applied internally.
+        Volatility indices always included regardless of dead zone.
+        Boom/Crash excluded during dead zone hours (00:00–05:00 UTC).
 
         Eligibility rules (applied unconditionally, in order):
           1. Symbol must be in the active set (_active).
@@ -433,7 +440,13 @@ class SymbolManager:
         rb_q.sort( key=lambda s: -self.get_symbol_score(s))
         bc_q.sort( key=lambda s: -self.get_symbol_score(s))
 
-        return vol_q + rb_q + bc_q
+        result: List[str] = vol_q + rb_q + bc_q
+
+        # Cap to max_symbols if provided
+        if max_symbols is not None:
+            result = result[:max_symbols]
+
+        return result
 
     def update_active(self, symbols: List[str]) -> None:
         """
@@ -584,6 +597,73 @@ class SymbolManager:
         the returned dict has no effect on internal state.
         """
         return {sym: rem for sym, rem in self._suspend_cycles.items() if rem > 0}
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Compatibility shims  (called by bot_engine.py; aliases to canonical API)
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def win_rate(self, symbol: str) -> float:
+        """
+        Alias for get_symbol_score().
+        Returns the session win rate for *symbol* as a float in [0.0, 1.0].
+        Neutral 0.5 when no session trades have been recorded.
+        """
+        return self.get_symbol_score(symbol)
+
+    @property
+    def current_session(self) -> str:
+        """
+        Return a human-readable session label based on the current UTC hour.
+        Used by the dashboard; does not affect trading logic.
+        """
+        hour = datetime.datetime.utcnow().hour
+        if 0 <= hour < 5:
+            return "DEAD_ZONE"
+        if 5 <= hour < 9:
+            return "ASIA"
+        if 9 <= hour < 13:
+            return "LONDON"
+        if 13 <= hour < 17:
+            return "NEW_YORK"
+        return "OVERLAP"
+
+    def decrement_suspensions(self) -> None:
+        """
+        Alias for decrement_all().
+        Decrement every active suspension counter by 1.
+        Must be called exactly once per cycle, BEFORE get_queue().
+        """
+        self.decrement_all()
+
+    def reset_cycle_used(self) -> None:
+        """
+        Clear the per-cycle 'used' set so symbols can be traded again next cycle.
+        Called by bot_engine at the start of each cycle.
+        """
+        self._cycle_used: Set[str] = set()
+
+    def is_used(self, symbol: str) -> bool:
+        """
+        Return True if *symbol* has already been traded this cycle.
+        Prevents the same symbol from being executed twice in one cycle.
+        """
+        return symbol in getattr(self, "_cycle_used", set())
+
+    def mark_used(self, symbol: str) -> None:
+        """
+        Mark *symbol* as used for the current cycle.
+        Subsequent is_used() calls will return True until reset_cycle_used().
+        """
+        if not hasattr(self, "_cycle_used"):
+            self._cycle_used: Set[str] = set()
+        self._cycle_used.add(symbol)
+
+    def record_trade(self, symbol: str, won: bool, pnl: float = 0.0) -> None:
+        """
+        Legacy alias for record_result().
+        Accepts an optional *pnl* kwarg (ignored; kept for call-site compatibility).
+        """
+        self.record_result(symbol=symbol, won=won)
 
     def all_session_stats(self) -> Dict[str, dict]:
         """
