@@ -744,9 +744,9 @@ class BotEngine:
             asset_class    = ac,
             htf_bias       = smc_ctx.bias,
             smc_structure  = smc_ctx.structure,
-            m1             = sig.m1_signal,
-            m2             = sig.m2_signal,
-            m3             = sig.m3_signal,
+            m1             = getattr(sig, "m1_signal", 0),
+            m2             = getattr(sig, "m2_signal", 0),
+            m3             = getattr(sig, "m3_signal", sig.strength),
             modules        = sig.strength,
         )
 
