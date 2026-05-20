@@ -124,7 +124,6 @@ class BotEngine:
     def __init__(self):
         self.client  = DerivClient()
         self.risk    = RiskManager(
-            daily_loss_limit = config.DAILY_LOSS_LIMIT_PCT,
             risk_per_trade   = config.RISK_PER_TRADE_PCT,
             min_stake        = config.MIN_STAKE,
             max_stake        = config.MAX_STAKE,
