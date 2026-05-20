@@ -79,7 +79,7 @@ HTF_BARS              : int = 100
 LTF_BARS              : int = 50    # corrected: 200 → 50 per spec
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  : float = 0.90
+DAILY_LOSS_LIMIT_PCT  : float = 0.09
 RISK_PER_TRADE_PCT    : float = 0.02   # corrected: 0.01 → 0.02 (2% of live balance)
 MIN_STAKE             : float = 0.35
 MAX_STAKE             : float = 50.0   # corrected: 500.0 → 50.0 per spec
@@ -89,7 +89,7 @@ MAX_CONCURRENT_TRADES : int   = 10
 # Each element corresponds: streak ≥ threshold[i] → multiplier[i] × base stake
 
 # Canonical names (used by all new code)
-WIN_STREAK_THRESHOLDS   : List[int]   = [3, 4, 6, 8]
+WIN_STREAK_THRESHOLDS   : List[int]   = [2, 3, 4, 6]
 WIN_STREAK_MULTIPLIERS  : List[float] = [1.5, 2.0, 3.0, 4.0]
 WIN_STREAK_EXTRA_SLOTS  : List[int]   = [0, 2, 4, 6]
 
@@ -107,9 +107,9 @@ SYNTHETIC_LOSS_COOLDOWN_SECONDS : int = 60
 # ─── Symbol Cycle-Based Suspension ────────────────────────────────────────────
 # Number of full trading cycles a symbol is suspended after a WIN or LOSS.
 # decrement_suspensions() is called once per cycle by bot_engine.
-SYMBOL_WIN_SUSPENSION_CYCLES          : int = 2   # suspend winner for 2 cycles
-SYMBOL_LOSS_SUSPENSION_CYCLES         : int = 3   # suspend loser  for 3 cycles
-SYMBOL_SESSION_LOSS_BAN_THRESHOLD     : int = 3   # losses in session → session ban
+SYMBOL_WIN_SUSPENSION_CYCLES          : int = 200   # suspend winner for 2 cycles
+SYMBOL_LOSS_SUSPENSION_CYCLES         : int = 400   # suspend loser  for 3 cycles
+SYMBOL_SESSION_LOSS_BAN_THRESHOLD     : int = 2   # losses in session → session ban
 
 # ─── Signal Score Weights ─────────────────────────────────────────────────────
 # Four-component weighted score.  Weights MUST sum to 1.0.
