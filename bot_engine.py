@@ -326,6 +326,9 @@ class BotEngine:
         while bot_running:
             cycle_start = time.time()
 
+            # ── Decrement any active loss-streak pause (once per cycle) ───
+            self.risk.decrement_pause()
+
             # ── Symbol cache refresh ──────────────────────────────────────
             if time.time() - self._last_symbol_refresh > SYMBOL_REFRESH_EVERY:
                 await self._refresh_symbols()
@@ -441,7 +444,7 @@ class BotEngine:
             )[:max_cands]
 
             signals_count = len(ranked)
-            concurrent_limit: int = self.risk.current_concurrent_limit()
+            concurrent_limit: int = self.risk.current_concurrent_limit
             top_n = ranked[:concurrent_limit]
 
             logger.info(
@@ -491,9 +494,7 @@ class BotEngine:
                     if fb.symbol in executed_symbols:
                         continue
                     conf = getattr(fb.sig, "confidence", 0)
-                    if not self.risk.can_trade(
-                            signal_strength=int(fb.sig.strength),
-                            confidence=int(conf)):
+                    if not self.risk.can_trade():
                         continue
                     try:
                         fb_cid = await self._execute_signal(fb)
@@ -558,9 +559,7 @@ class BotEngine:
         """
         try:
             conf = getattr(sig_r.sig, "confidence", 0)
-            if not self.risk.can_trade(
-                    signal_strength=int(sig_r.sig.strength),
-                    confidence=int(conf)):
+            if not self.risk.can_trade():
                 return None
 
             if self.symbols.is_used(sig_r.symbol):
@@ -701,7 +700,7 @@ class BotEngine:
         rejects (buy_resp is None).  Raises on unexpected errors so the caller
         can log them and substitute the next ranked signal.
         """
-        stake = self.risk.calculate_stake()
+        stake = await self.risk.calculate_stake()
         ac    = get_symbol_class(symbol)
 
         conf    = getattr(sig, "confidence", "?")
@@ -782,11 +781,9 @@ class BotEngine:
 
         # risk_manager
         self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
-        if hasattr(self.risk, "record_result"):
-            try:
-                self.risk.record_result(symbol=symbol, won=won, pnl=pnl)
-            except Exception:
-                pass
+        # NOTE: register_close() already calls record_result() internally.
+        # The duplicate explicit call below has been removed to prevent
+        # double-counting streaks/wins/losses.
 
         # journal
         self.journal.close_trade(
