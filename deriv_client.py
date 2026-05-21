@@ -104,6 +104,8 @@ class DerivClient:
 
         # contract_id → proposal subscription_id  (audit requirement)
         self._subscriptions: Dict[str, str] = {}
+        # tracks every contract_id that has an active subscription — prevents double-subscribe
+        self._subscribed_contracts: Set[str] = set()
         # contract_id → symbol  (needed for UNSUBSCRIBED log)
         self._contract_symbol_map: Dict[str, str] = {}
 
@@ -213,20 +215,22 @@ class DerivClient:
     async def _resubscribe_open_contracts(self):
         """
         Re-attach proposal_open_contract subscriptions after a reconnect.
-        Covers ALL contracts in _contract_callbacks so no contract is orphaned.
+        Iterates _subscribed_contracts so every previously-subscribed contract
+        is restored — not just those that still have a live callback.
         """
-        if not self._contract_callbacks:
+        targets = self._subscribed_contracts.copy()
+        if not targets:
             return
         logger.info(
-            f"Re-subscribing {len(self._contract_callbacks)} open contract(s) after reconnect"
+            f"Re-subscribing {len(targets)} open contract(s) after reconnect"
         )
         tasks = [
-            self._reattach_contract(cid, cb)
-            for cid, cb in list(self._contract_callbacks.items())
+            self._reattach_contract(cid, self._contract_callbacks.get(cid))
+            for cid in targets
         ]
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _reattach_contract(self, contract_id: str, callback: Callable):
+    async def _reattach_contract(self, contract_id: str, callback: Optional[Callable]):
         try:
             resp = await self._send({
                 "proposal_open_contract": 1,
@@ -240,10 +244,11 @@ class DerivClient:
             )
             if sub_id:
                 self._subscriptions[contract_id] = sub_id
+            self._subscribed_contracts.add(contract_id)
             logger.info(f"Re-subscribed contract {contract_id} (sub_id={sub_id})")
 
             # If the contract already settled during the disconnect, fire callback now
-            if self._contract_is_closed(poc):
+            if self._contract_is_closed(poc) and callback is not None:
                 logger.info(
                     f"Contract {contract_id} already closed on reconnect — "
                     f"firing callback immediately"
@@ -399,29 +404,17 @@ class DerivClient:
     # ─── Force check a specific contract ─────────────────────────────────────
 
     async def force_check_contract(self, contract_id: str) -> dict:
-        """
-        Send a proposal_open_contract request for this specific contract_id.
-        Returns the response dict or empty dict on failure.
-        Does NOT subscribe — single query only.
-        """
-        if not self._authorized or not self._ws:
-            logger.warning(
-                f"force_check_contract({contract_id}): not connected"
-            )
-            return {}
         try:
-            resp = await self._send(
-                {
-                    "proposal_open_contract": 1,
-                    "contract_id": int(contract_id),
-                },
-                timeout=15,
-            )
-            return resp
-        except Exception as exc:
-            logger.warning(
-                f"force_check_contract({contract_id}) failed: {exc}"
-            )
+            resp = await self._send({
+                "proposal_open_contract": 1,
+                "contract_id": contract_id
+            })
+            poc = resp.get("proposal_open_contract", {})
+            if poc.get("is_sold") or poc.get("is_expired"):
+                return poc
+            return poc
+        except Exception as e:
+            logger.error(f"force_check_contract({contract_id}): {e}")
             return {}
 
     # ─── Subscription cleanup ─────────────────────────────────────────────────
@@ -436,6 +429,7 @@ class DerivClient:
         self._contract_callbacks.pop(contract_id, None)
         self._pending_contract_msgs.pop(contract_id, None)
         self._closed_before_callback.discard(contract_id)
+        self._subscribed_contracts.discard(contract_id)
 
         if sub_id:
             try:
@@ -843,7 +837,7 @@ class DerivClient:
         # synchronously right after buy_contract returns in _execute)
         await asyncio.sleep(0.5)
 
-        if contract_id in self._subscriptions:
+        if contract_id in self._subscriptions or contract_id in self._subscribed_contracts:
             # Already subscribed via subscribe_contract() — nothing to do
             return
 
@@ -869,6 +863,7 @@ class DerivClient:
             )
             if sub_id and contract_id not in self._subscriptions:
                 self._subscriptions[contract_id] = sub_id
+                self._subscribed_contracts.add(contract_id)
                 logger.info(
                     f"Eager subscription: contract {contract_id} (sub_id={sub_id})"
                 )
@@ -925,11 +920,11 @@ class DerivClient:
                     logger.debug(f"subscribe_contract flush callback error: {exc}")
                 return  # cleanup will handle unsubscribe
 
-        # ── If already subscribed (eager sub fired first), just register cb ─
-        if contract_id in self._subscriptions:
+        # ── Guard: never double-subscribe ────────────────────────────────────
+        if contract_id in self._subscribed_contracts or contract_id in self._subscriptions:
             logger.info(
                 f"subscribe_contract({contract_id}): already subscribed "
-                f"(sub_id={self._subscriptions[contract_id]}), callback registered"
+                f"(sub_id={self._subscriptions.get(contract_id, 'eager')}), callback registered"
             )
             return
 
@@ -952,6 +947,7 @@ class DerivClient:
                 logger.info(
                     f"Contract subscribed: {contract_id} (sub_id={sub_id})"
                 )
+            self._subscribed_contracts.add(contract_id)
 
             # Buffer and check if already closed
             self._pending_contract_msgs[contract_id] = resp
