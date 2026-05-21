@@ -82,7 +82,7 @@ HTF_BARS              : int = 100
 LTF_BARS              : int = 50    # corrected: 200 → 50 per spec
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  : float = 0.20  # 20% max daily loss then stop trading
+DAILY_LOSS_LIMIT_PCT  : float = 3.20  # 20% max daily loss then stop trading
 RISK_PER_TRADE_PCT    : float = 0.02   # corrected: 0.01 → 0.02 (2% of live balance)
 MIN_STAKE             : float = 0.35
 MAX_STAKE             : float = 50.0   # corrected: 500.0 → 50.0 per spec
