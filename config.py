@@ -52,17 +52,20 @@ WEBSOCKET_MAX_RECONNECTS     : int = 5
 VOLATILITY_SYMBOLS  : List[str] = [
     "R_10", "R_25", "R_50", "R_75", "R_100",
     "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+    "R_10_1HZ", "R_25_1HZ", "R_50_1HZ", "R_75_1HZ", "R_100_1HZ",
 ]
 
 BOOM_CRASH_SYMBOLS  : List[str] = [
-    "BOOM500", "CRASH500", "BOOM1000", "CRASH1000",
-    "BOOM300", "CRASH300", "BOOM150", "CRASH150",
+    "BOOM500", "BOOM300", "BOOM150", "BOOM1000",
+    "CRASH500", "CRASH300", "CRASH150", "CRASH1000",
 ]
 
-RANGE_BREAK_SYMBOLS : List[str] = ["RDBULL", "RDBEAR"]
+RANGE_BREAK_SYMBOLS : List[str] = ["RDBULL", "RDBEAR", "RB100", "RB200"]
 
-# Canonical scan order: Volatility (highest freq) → Boom/Crash → Range Break
-ALL_SYMBOLS : List[str] = VOLATILITY_SYMBOLS + BOOM_CRASH_SYMBOLS + RANGE_BREAK_SYMBOLS
+STEP_INDEX_SYMBOLS  : List[str] = ["stpRNG"]
+
+# Canonical scan order
+ALL_SYMBOLS : List[str] = BOOM_CRASH_SYMBOLS + VOLATILITY_SYMBOLS + RANGE_BREAK_SYMBOLS + STEP_INDEX_SYMBOLS
 
 # ─── Session / Dead Zone (UTC hours) ─────────────────────────────────────────
 DEAD_ZONE_START_UTC  : int = 0    # Boom/Crash excluded 00:00–05:00 UTC
@@ -79,7 +82,7 @@ HTF_BARS              : int = 100
 LTF_BARS              : int = 50    # corrected: 200 → 50 per spec
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  : float = 2.09
+DAILY_LOSS_LIMIT_PCT  : float = 0.20  # 20% max daily loss then stop trading
 RISK_PER_TRADE_PCT    : float = 0.02   # corrected: 0.01 → 0.02 (2% of live balance)
 MIN_STAKE             : float = 0.35
 MAX_STAKE             : float = 50.0   # corrected: 500.0 → 50.0 per spec
@@ -104,11 +107,12 @@ MAX_WIN_STREAK_MULT          : float = 4.0
 SYMBOL_LOSS_COOLDOWN_SECONDS    : int = 120
 SYNTHETIC_LOSS_COOLDOWN_SECONDS : int = 60
 
-# ─── Symbol Cycle-Based Suspension ────────────────────────────────────────────
-# Number of full trading cycles a symbol is suspended after a WIN or LOSS.
-# decrement_suspensions() is called once per cycle by bot_engine.
-SYMBOL_WIN_SUSPENSION_CYCLES          : int = 800   # suspend winner for 2 cycles
-SYMBOL_LOSS_SUSPENSION_CYCLES         : int = 1500   # suspend loser  for 3 cycles
+# ─── Symbol Time-Based Suspension ────────────────────────────────────────────
+# Minutes a symbol is suspended after a WIN or LOSS, and minimum gap between
+# any two trades on the same symbol.
+SYMBOL_WIN_SUSPENSION_MINUTES         : int = 7
+SYMBOL_LOSS_SUSPENSION_MINUTES        : int = 17
+SYMBOL_MIN_GAP_MINUTES                : int = 7   # minimum pause between any two trades on same symbol
 SYMBOL_SESSION_LOSS_BAN_THRESHOLD     : int = 2   # losses in session → session ban
 
 # ─── Signal Score Weights ─────────────────────────────────────────────────────
@@ -188,6 +192,10 @@ PORT                : int = int(os.environ.get("PORT", 8080))
 SELF_URL            : str = os.environ.get("RENDER_EXTERNAL_URL",
                                             f"http://localhost:{PORT}")
 KEEP_ALIVE_INTERVAL : int = 40
+
+# ─── Contract Force-Close Timeout ────────────────────────────────────────────
+CONTRACT_MAX_AGE_SECONDS          : int = TRADE_DURATION * 60 + 45
+CONTRACT_FORCE_CLOSE_AFTER_SECONDS: int = TRADE_DURATION * 60 + 90
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 LOG_LEVEL : str = os.environ.get("LOG_LEVEL", "INFO")
