@@ -142,6 +142,7 @@ class BotEngine:
         self._session_start_balance: float = 0.0
         self._open_contracts: dict = {}          # cid → (symbol, direction, stake, price, rec)
         self._contract_open_times: dict = {}     # cid → time.time() when opened
+        self._active_symbols: set = set()        # symbols with an open contract right now
 
         self._htf: Dict[str, CandlestickBuilder] = {}
         self._ltf: Dict[str, CandlestickBuilder] = {}
@@ -604,6 +605,18 @@ class BotEngine:
 
             signals_count = len(ranked)
             concurrent_limit: int = self.risk.current_concurrent_limit
+
+            # ── Triple-check gate at rank time: filter out suspended / in-gap /
+            #    already-active symbols BEFORE selecting top_n.
+            #    This is the second of three gates (get_queue is first;
+            #    _execute is third).
+            ranked = [
+                r for r in ranked
+                if not self.symbols.is_suspended(r.symbol)
+                and self.symbols.can_trade_now(r.symbol)
+                and r.symbol not in self._active_symbols
+            ]
+
             top_n = ranked[:concurrent_limit]
 
             logger.info(
@@ -857,6 +870,17 @@ class BotEngine:
         rejects (buy_resp is None).  Raises on unexpected errors so the caller
         can log them and substitute the next ranked signal.
         """
+        # ── Hard suspension gate (3rd check; get_queue + rank-filter are 1st and 2nd) ──
+        if self.symbols.is_suspended(symbol):
+            logger.info(f"EXECUTION BLOCKED: {symbol} is suspended — skipping")
+            return False
+        if not self.symbols.can_trade_now(symbol):
+            logger.info(f"EXECUTION BLOCKED: {symbol} within minimum gap — skipping")
+            return False
+        if symbol in self._active_symbols:
+            logger.info(f"EXECUTION BLOCKED: {symbol} already has open contract — skipping")
+            return False
+
         stake = await self.risk.calculate_stake()
         ac    = get_symbol_class(symbol)
 
@@ -909,6 +933,9 @@ class BotEngine:
 
         self._open_contracts[cid] = (symbol, direction, stake, price, rec)
         self._contract_open_times[cid] = time.time()
+        # Record placement for gap enforcement + mark symbol as actively trading
+        self.symbols.record_trade_placed(symbol)
+        self._active_symbols.add(symbol)
         set_active_trades(len(self._open_contracts))
 
         await self.client.subscribe_contract(
@@ -938,6 +965,9 @@ class BotEngine:
 
         won = pnl > 0
 
+        # Release symbol from active set and fire suspension via record_result
+        self._active_symbols.discard(symbol)
+
         # risk_manager
         self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
         # NOTE: register_close() already calls record_result() internally.
@@ -953,13 +983,8 @@ class BotEngine:
             balance_after = bal_after,
         )
 
-        # symbol_manager — both legacy record_trade and spec record_result
-        self.symbols.record_trade(symbol, won=won, pnl=pnl)
-        if hasattr(self.symbols, "record_result"):
-            try:
-                self.symbols.record_result(symbol=symbol, won=won, pnl=pnl)
-            except Exception:
-                pass
+        # symbol_manager — record_result applies suspension immediately
+        self.symbols.record_result(symbol=symbol, won=won)
 
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
