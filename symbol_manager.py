@@ -19,9 +19,6 @@ Cycle lifecycle (caller must invoke in this exact order each cycle):
     sm.record_trade_placed(symbol)    # record when trade was placed (gap enforcement)
     sm.record_result(symbol, won)     # atomically: update session stats + suspend
 
-NOTE: decrement_all() is REMOVED — suspension is now time-based (datetime.utcnow()).
-      Callers that previously called sm.decrement_all() should remove that call.
-
 Session reset fires automatically at UTC midnight via start_midnight_reset_task().
 
 Target instruments (priority order):
@@ -30,10 +27,10 @@ Target instruments (priority order):
   Range Break:  RDBULL, RDBEAR
   Step Index:   STPIDX (Step Index)
 
-Suspension rules (time-based):
-  WIN  → suspend 7 minutes
-  LOSS → suspend 17 minutes
-  3 losses same symbol same session → suspend 59940 minutes (rest of session)
+Suspension rules (unix-timestamp-based):
+  WIN  → suspend 7 minutes  (420 seconds)
+  LOSS → suspend 17 minutes (1020 seconds)
+  3 losses same symbol same session → suspend 86400 seconds (rest of session)
 
 Same-symbol gap enforcement:
   A symbol cannot be traded again within 7 minutes of its last trade placement.
@@ -45,6 +42,7 @@ from __future__ import annotations
 import asyncio
 import datetime
 import logging
+import time
 from typing import Dict, List, Optional, Set, Tuple
 
 import symbols as sym_module  # noqa: F401 — kept for backward compat with callers
@@ -93,13 +91,13 @@ _STEP_SET:         frozenset = frozenset(STEP_SYMBOLS)
 
 _DEAD_ZONE_START:    int = getattr(config, "DEAD_ZONE_START_UTC",        0)
 _DEAD_ZONE_END:      int = getattr(config, "DEAD_ZONE_END_UTC",          5)
-_SESSION_BAN_LOSSES: int = getattr(config, "SESSION_BAN_LOSS_THRESHOLD", 3)
 
-# Time-based suspension constants (minutes)
-_WIN_SUSPEND_MINUTES:        int = 7       # suspend after a win
-_LOSS_SUSPEND_MINUTES:       int = 17      # suspend after a loss (< session ban threshold)
-_SESSION_BAN_MINUTES:        int = 59_940  # 41.625 days ≈ rest of session until midnight reset
-_MIN_TRADE_GAP_MINUTES:      int = 7       # minimum gap between trades on the same symbol
+# Unix-timestamp-based suspension constants (seconds)
+WIN_SUSPEND_SECONDS:     int = 420      # 7 minutes
+LOSS_SUSPEND_SECONDS:    int = 1020     # 17 minutes
+MIN_GAP_SECONDS:         int = 420      # 7 minute minimum gap between same symbol trades
+SESSION_BAN_LOSSES:      int = getattr(config, "SESSION_BAN_LOSS_THRESHOLD", 3)
+SESSION_BAN_SECONDS:     int = 86400    # 24 hours — covers rest of session until midnight reset
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -138,26 +136,22 @@ class _SessionStats:
 
 class SymbolManager:
     """
-    Central coordinator for symbol eligibility, time-based suspension, session
-    P&L tracking, same-symbol gap enforcement, dead-zone filtering, and trade
-    queue generation.
+    Central coordinator for symbol eligibility, unix-timestamp suspension,
+    session P&L tracking, same-symbol gap enforcement, dead-zone filtering,
+    and trade queue generation.
 
-    All public methods are synchronous and non-blocking.
-    The midnight session-reset is driven by an asyncio background task.
-
-    Suspension model: fully time-based (datetime.utcnow() comparisons).
-      • suspend(symbol, minutes) sets an expiry timestamp.
-      • is_suspended(symbol) compares utcnow() to that timestamp.
+    Suspension model: fully unix-timestamp-based (time.time() comparisons).
+      • suspend(symbol, seconds) sets an expiry unix timestamp.
+      • is_suspended(symbol) compares time.time() to that timestamp.
       • No per-cycle decrement required or performed.
+      • No datetime objects, no timedelta, no timezone issues.
 
-    Same-symbol gap: last_traded[symbol] tracks when a trade was last placed.
-      • can_trade_now(symbol) returns False within 7 minutes of last placement.
+    Same-symbol gap: _last_traded[symbol] tracks unix timestamp of last placement.
+      • can_trade_now(symbol) returns False within MIN_GAP_SECONDS of last placement.
       • record_trade_placed(symbol) records the placement time.
       • get_queue() silently excludes symbols within their minimum gap.
 
     Concurrency model: single-threaded asyncio; no locks required.
-    Parallelism for trade execution is the responsibility of the caller
-    (bot_engine), which must use asyncio.gather for all concurrent operations.
     """
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -168,14 +162,17 @@ class SymbolManager:
         # Active set — starts with all managed symbols; narrowed via update_active()
         self._active: Set[str] = set(ALL_MANAGED_SYMBOLS)
 
-        # Time-based suspension: maps symbol → expiry datetime (UTC).
-        # Absent key ≡ not suspended ≡ expiry is datetime.min (always in the past).
-        # Invariant: is_suspended(sym) == (utcnow() < suspend_until.get(sym, datetime.min))
-        self._suspend_until: Dict[str, datetime.datetime] = {}
+        # Unix-timestamp suspension: maps symbol → expiry unix timestamp.
+        # Absent key ≡ not suspended ≡ expiry is 0 (always in the past).
+        # Invariant: is_suspended(sym) == (time.time() < _suspension_until.get(sym, 0))
+        self._suspension_until: Dict[str, float] = {}
 
-        # Same-symbol gap enforcement: maps symbol → datetime of last trade placement (UTC).
-        # Absent key ≡ symbol has never been traded ≡ treated as datetime.min.
-        self._last_traded: Dict[str, datetime.datetime] = {}
+        # Same-symbol gap enforcement: maps symbol → unix timestamp of last trade placement.
+        # Absent key ≡ symbol has never been traded ≡ treated as 0.
+        self._last_traded: Dict[str, float] = {}
+
+        # Session loss counts per symbol (separate from _SessionStats for suspension logic)
+        self._session_losses: Dict[str, int] = {}
 
         # Session stats per symbol.  Pre-populated so get_symbol_score() never
         # needs to handle a missing key for a known symbol.
@@ -190,46 +187,48 @@ class SymbolManager:
         self._cycle_used: Set[str] = set()
 
     # ─────────────────────────────────────────────────────────────────────────
-    # Suspension API  (time-based)
+    # Suspension API  (unix-timestamp-based — guaranteed correct)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def suspend(self, symbol: str, minutes: int) -> None:
+    def suspend(self, symbol: str, seconds: int) -> None:
         """
-        Suspend *symbol* for *minutes* minutes from now (UTC).
+        Suspend *symbol* for *seconds* seconds from now.
 
-        Semantics
-        ---------
-        • The expiry is always computed as datetime.utcnow() + timedelta(minutes=minutes).
-        • If the symbol is already suspended the expiry is REPLACED — fresh
-          events restart the penalty at their full value, not stacked on top.
-        • The symbol will NOT appear in get_queue() until the expiry passes.
-        • minutes is clamped to a minimum of 1.
+        Uses unix timestamps (time.time()) — no datetime objects, no timezone issues.
+        If the symbol is already suspended the expiry is REPLACED — fresh
+        events restart the penalty at their full value.
+        seconds is clamped to a minimum of 1.
         """
-        minutes = max(1, int(minutes))
-        expiry = datetime.datetime.utcnow() + datetime.timedelta(minutes=minutes)
-        self._suspend_until[symbol] = expiry
+        seconds = max(1, int(seconds))
+        expiry = time.time() + seconds
+        self._suspension_until[symbol] = expiry
         logger.info(
-            f"SUSPEND: {symbol} → {minutes} minute(s) "
-            f"(until {expiry.strftime('%H:%M:%S')} UTC)"
+            f"SUSPENDED: {symbol} for {seconds}s "
+            f"(until unix={expiry:.0f}, "
+            f"~{seconds // 60}m{seconds % 60}s from now)"
         )
 
     def is_suspended(self, symbol: str) -> bool:
         """
-        Return True while the current UTC time is before the symbol's expiry.
+        Return True while the current unix time is before the symbol's expiry.
         Returns False for unknown or expired symbols.
         """
-        return datetime.datetime.utcnow() < self._suspend_until.get(
-            symbol, datetime.datetime.min
-        )
+        until = self._suspension_until.get(symbol, 0.0)
+        suspended = time.time() < until
+        if suspended:
+            remaining = until - time.time()
+            logger.debug(
+                f"BLOCKED: {symbol} suspended — {remaining:.0f}s remaining"
+            )
+        return suspended
 
     def get_suspension_remaining(self, symbol: str) -> float:
         """
         Return the number of seconds *symbol* is still suspended for.
         Returns 0.0 when not suspended or expiry has passed.
         """
-        expiry = self._suspend_until.get(symbol, datetime.datetime.min)
-        remaining = (expiry - datetime.datetime.utcnow()).total_seconds()
-        return max(0.0, remaining)
+        until = self._suspension_until.get(symbol, 0.0)
+        return max(0.0, until - time.time())
 
     def get_suspension_remaining_minutes(self, symbol: str) -> float:
         """
@@ -245,25 +244,41 @@ class SymbolManager:
     def record_trade_placed(self, symbol: str) -> None:
         """
         Record that a trade was just placed for *symbol*.
-        Sets last_traded[symbol] = datetime.utcnow().
+        Sets _last_traded[symbol] = time.time().
 
-        Must be called by the caller immediately after a trade is placed, BEFORE
-        the next get_queue() call, to ensure the gap enforcement is respected.
+        Must be called immediately after a trade is placed, BEFORE
+        the next get_queue() call.
         """
-        self._last_traded[symbol] = datetime.datetime.utcnow()
-        logger.debug(f"TRADE PLACED: {symbol} last_traded updated to {self._last_traded[symbol].strftime('%H:%M:%S')} UTC")
+        self._last_traded[symbol] = time.time()
+        logger.info(
+            f"LAST_TRADED recorded: {symbol} at {self._last_traded[symbol]:.0f}"
+        )
 
     def can_trade_now(self, symbol: str) -> bool:
         """
-        Return True if *symbol* is outside its minimum same-symbol trade gap.
+        Return True if *symbol* is outside its minimum same-symbol trade gap
+        AND is not suspended.
 
-        The minimum gap is _MIN_TRADE_GAP_MINUTES (7 minutes).
-        Returns True for symbols that have never been traded (absent from last_traded).
-        Returns False if the gap since last placement is < 7 minutes.
+        The minimum gap is MIN_GAP_SECONDS (420 seconds / 7 minutes).
+        Returns True for symbols that have never been traded.
+        Returns False if:
+          - gap since last placement is < MIN_GAP_SECONDS, OR
+          - symbol is currently suspended.
         """
-        last = self._last_traded.get(symbol, datetime.datetime.min)
-        elapsed = datetime.datetime.utcnow() - last
-        return elapsed >= datetime.timedelta(minutes=_MIN_TRADE_GAP_MINUTES)
+        # Check suspension first
+        if self.is_suspended(symbol):
+            return False
+
+        # Check minimum trade gap
+        last = self._last_traded.get(symbol, 0.0)
+        elapsed = time.time() - last
+        gap_ok = elapsed >= MIN_GAP_SECONDS
+        if not gap_ok:
+            remaining = MIN_GAP_SECONDS - elapsed
+            logger.info(
+                f"BLOCKED: {symbol} min gap — {remaining:.0f}s remaining"
+            )
+        return gap_ok
 
     def time_since_last_trade(self, symbol: str) -> float:
         """
@@ -273,45 +288,43 @@ class SymbolManager:
         last = self._last_traded.get(symbol)
         if last is None:
             return float("inf")
-        return (datetime.datetime.utcnow() - last).total_seconds()
+        return time.time() - last
 
     def gap_remaining_seconds(self, symbol: str) -> float:
         """
         Return the number of seconds remaining in the minimum same-symbol gap.
         Returns 0.0 if the gap has elapsed or the symbol has never been traded.
         """
-        last = self._last_traded.get(symbol, datetime.datetime.min)
-        gap_end = last + datetime.timedelta(minutes=_MIN_TRADE_GAP_MINUTES)
-        remaining = (gap_end - datetime.datetime.utcnow()).total_seconds()
-        return max(0.0, remaining)
+        last = self._last_traded.get(symbol, 0.0)
+        gap_end = last + MIN_GAP_SECONDS
+        return max(0.0, gap_end - time.time())
 
     # ─────────────────────────────────────────────────────────────────────────
     # Session result tracking  (reset at UTC midnight)
     # ─────────────────────────────────────────────────────────────────────────
 
-    def record_result(self, symbol: str, won: bool) -> None:
+    def record_result(self, symbol: str, won: bool, pnl: float = 0.0) -> None:
         """
-        Atomically record a trade result and apply the corresponding time-based
-        suspension.
+        Atomically record a trade result and apply the corresponding
+        unix-timestamp-based suspension.
 
         WIN path
         --------
-        • session_wins  += 1
-        • suspend(symbol, 7)  — 7 minutes
+        • session_wins += 1
+        • suspend(symbol, WIN_SUSPEND_SECONDS)  — 420s / 7 minutes
 
         LOSS path
         ---------
         • session_losses += 1
-        • If session_losses < SESSION_BAN_LOSS_THRESHOLD (default 3):
-            suspend(symbol, 17)  — 17 minutes
-        • If session_losses >= SESSION_BAN_LOSS_THRESHOLD:
-            suspend(symbol, 59940)  — rest of session (≈ 41.6 days; expires at/past next midnight)
+        • If session_losses < SESSION_BAN_LOSSES:
+            suspend(symbol, LOSS_SUSPEND_SECONDS)  — 1020s / 17 minutes
+        • If session_losses >= SESSION_BAN_LOSSES:
+            suspend(symbol, SESSION_BAN_SECONDS)   — 86400s / rest of session
 
         Atomicity guarantee
         -------------------
         The session stats update and the suspension application occur in the
         same synchronous call body with no await points in between.
-        No partial state is externally observable.
         """
         if symbol not in self._session:
             self._session[symbol] = _SessionStats()
@@ -320,30 +333,33 @@ class SymbolManager:
 
         if won:
             st.wins += 1
-            self.suspend(symbol, _WIN_SUSPEND_MINUTES)
+            self.suspend(symbol, WIN_SUSPEND_SECONDS)
             logger.info(
                 f"RESULT WIN:  {symbol} | "
                 f"Session {st.wins}W/{st.losses}L | "
-                f"Suspended {_WIN_SUSPEND_MINUTES} minute(s)"
+                f"Suspended {WIN_SUSPEND_SECONDS}s ({WIN_SUSPEND_SECONDS // 60}m)"
             )
         else:
             st.losses += 1
-            if st.losses >= _SESSION_BAN_LOSSES:
-                # Third (or subsequent) loss on same symbol this session → session ban
-                self.suspend(symbol, _SESSION_BAN_MINUTES)
+            # Update unix-timestamp session loss counter
+            self._session_losses[symbol] = self._session_losses.get(symbol, 0) + 1
+            session_loss_count = self._session_losses[symbol]
+
+            if session_loss_count >= SESSION_BAN_LOSSES:
+                self.suspend(symbol, SESSION_BAN_SECONDS)
                 logger.warning(
                     f"RESULT LOSS: {symbol} | "
                     f"Session {st.wins}W/{st.losses}L | "
-                    f"*** SESSION BAN: {_SESSION_BAN_MINUTES} minutes "
-                    f"(loss #{st.losses} this session) ***"
+                    f"*** SESSION BAN: {SESSION_BAN_SECONDS}s "
+                    f"(loss #{session_loss_count} this session) ***"
                 )
             else:
-                self.suspend(symbol, _LOSS_SUSPEND_MINUTES)
+                self.suspend(symbol, LOSS_SUSPEND_SECONDS)
                 logger.info(
                     f"RESULT LOSS: {symbol} | "
                     f"Session {st.wins}W/{st.losses}L | "
-                    f"Suspended {_LOSS_SUSPEND_MINUTES} minute(s) "
-                    f"({_SESSION_BAN_LOSSES - st.losses} loss(es) until session ban)"
+                    f"Suspended {LOSS_SUSPEND_SECONDS}s ({LOSS_SUSPEND_SECONDS // 60}m) "
+                    f"({SESSION_BAN_LOSSES - session_loss_count} loss(es) until session ban)"
                 )
 
     def get_session_losses(self, symbol: str) -> int:
@@ -362,21 +378,23 @@ class SymbolManager:
         --------
         • Active suspension timestamps ARE cleared — a session-banned symbol
           re-enters the pool immediately after the midnight reset.
-        • last_traded timestamps are cleared so gap enforcement resets cleanly.
-        • Emits SESSION STATS log lines for every symbol with ≥ 1 trade
-          BEFORE clearing, so the session's performance is preserved in logs.
+        • _last_traded timestamps are cleared so gap enforcement resets cleanly.
+        • _session_losses counts are cleared for the new session.
+        • Emits SESSION STATS log lines BEFORE clearing.
         • Safe to call at any time; idempotent if no trades have occurred.
         """
         self._log_session_stats()
         for st in self._session.values():
             st.reset()
-        # Clear time-based suspension state for the new session
-        self._suspend_until.clear()
+        # Clear unix-timestamp suspension state for the new session
+        self._suspension_until.clear()
         # Clear last_traded so the new session starts without gap carry-over
         self._last_traded.clear()
+        # Clear session loss counts
+        self._session_losses.clear()
         logger.info(
             "SESSION RESET: all session win/loss counts, suspension timestamps, "
-            "and last_traded records cleared"
+            "session_losses, and last_traded records cleared"
         )
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -399,7 +417,7 @@ class SymbolManager:
 
         Tie-breaking (equal win rate):
           1. More trades this session ranks higher (larger sample = more confidence).
-          2. Symbols with 0 trades (score 0.5) rank below any symbol with ≥ 1 trade.
+          2. Symbols with 0 trades (score 0.5) rank below any symbol with >= 1 trade.
 
         Returns a List[str] of symbol names only (not dicts).
         """
@@ -425,7 +443,7 @@ class SymbolManager:
         Return True if the current UTC hour falls within the dead zone:
             DEAD_ZONE_START_UTC <= hour < DEAD_ZONE_END_UTC
 
-        Default range: [0, 5)  →  00:00 UTC (inclusive) to 05:00 UTC (exclusive).
+        Default range: [0, 5)  ->  00:00 UTC (inclusive) to 05:00 UTC (exclusive).
 
         During the dead zone:
           • Boom/Crash symbols are excluded from get_queue().
@@ -447,15 +465,15 @@ class SymbolManager:
 
         Eligibility rules (applied unconditionally, in order):
           1. Symbol must be in the active set (_active).
-          2. Symbol must NOT be suspended — is_suspended() evaluated here (time-based).
+          2. Symbol must NOT be suspended — is_suspended() evaluated here (unix-timestamp).
              A suspended symbol is NEVER returned under any circumstance.
           3. Symbol must pass same-symbol gap — can_trade_now() evaluated here.
              A symbol within its 7-minute minimum gap is NEVER returned.
           4. Dead zone filter — is_dead_zone() is called internally:
-               • Boom/Crash symbols  → EXCLUDED during dead zone.
-               • Volatility indices  → ALWAYS INCLUDED; dead zone has no effect.
-               • Range Break symbols → INCLUDED during dead zone (secondary priority).
-               • Step Index          → INCLUDED during dead zone (no gate).
+               • Boom/Crash symbols  -> EXCLUDED during dead zone.
+               • Volatility indices  -> ALWAYS INCLUDED; dead zone has no effect.
+               • Range Break symbols -> INCLUDED during dead zone (secondary priority).
+               • Step Index          -> INCLUDED during dead zone (no gate).
 
         Priority ordering of the returned list:
           Priority 1 — Volatility indices   (R_*, 1HZ*V)        24/7, highest frequency
@@ -463,14 +481,12 @@ class SymbolManager:
           Priority 3 — Step Index           (STPIDX)             tertiary
           Priority 4 — Boom/Crash           (BOOM*, CRASH*)      session-gated only
 
-        Within each priority group, symbols are sorted by DESCENDING session win rate
-        (get_symbol_score), so the historically better-performing symbol leads.
+        Within each priority group, symbols are sorted by DESCENDING session win rate.
 
         Mandatory log line (emitted on every call):
             Queue: N symbols available | Suspended: [sym, ...] | In gap: [sym, ...]
         """
         dead_zone: bool = self.is_dead_zone()
-        now = datetime.datetime.utcnow()
 
         # Build diagnostic lists for logging
         suspended_syms: List[str] = []
@@ -480,10 +496,15 @@ class SymbolManager:
             if sym not in self._active:
                 return False
             if self.is_suspended(sym):
-                suspended_syms.append(sym)
+                if sym not in suspended_syms:
+                    suspended_syms.append(sym)
                 return False
-            if not self.can_trade_now(sym):
-                in_gap_syms.append(sym)
+            # can_trade_now checks both gap AND suspension; suspension already checked above
+            last = self._last_traded.get(sym, 0.0)
+            elapsed = time.time() - last
+            if elapsed < MIN_GAP_SECONDS:
+                if sym not in in_gap_syms:
+                    in_gap_syms.append(sym)
                 return False
             if dead_zone and sym in _BOOM_CRASH_SET:
                 return False                        # Boom/Crash blocked during dead zone
@@ -544,8 +565,6 @@ class SymbolManager:
             SESSION STATS: {symbol} W:{wins} L:{losses} Rate:{rate:.1%}
 
         Lines are ordered by descending session win rate.
-        Emitted automatically by reset_session(); also callable on demand via
-        log_session_stats().
         """
         traded: List[Tuple[str, _SessionStats]] = [
             (sym, st)
@@ -570,10 +589,7 @@ class SymbolManager:
     def log_session_stats(self) -> None:
         """
         Public on-demand session stats dump.
-
-        Emits one SESSION STATS log line for every symbol with ≥ 1 trade this
-        session (spec-defined format).  Safe to call at any time; does not
-        modify any state.
+        Safe to call at any time; does not modify any state.
         """
         self._log_session_stats()
 
@@ -585,11 +601,6 @@ class SymbolManager:
         """
         Asyncio coroutine: sleeps until the next UTC midnight, fires
         reset_session(), then loops indefinitely.
-
-        Error handling (silent-exit principle):
-          • asyncio.CancelledError is caught and exits the loop cleanly.
-          • Any other exception is logged and the loop backs off 60 s before retry.
-            The bot is never crashed by a reset failure.
         """
         while True:
             try:
@@ -608,9 +619,9 @@ class SymbolManager:
 
             except asyncio.CancelledError:
                 logger.info("Midnight-reset task: cancelled cleanly")
-                return                            # silent exit; do not re-raise
+                return
 
-            except Exception as exc:              # never let this crash the bot
+            except Exception as exc:
                 logger.error(
                     f"Midnight-reset task non-fatal error: {exc!r} — "
                     f"retrying in 60s"
@@ -623,17 +634,7 @@ class SymbolManager:
     ) -> asyncio.Task:
         """
         Schedule the midnight session-reset coroutine on the event loop.
-
-        Must be called after the asyncio event loop is running (e.g. inside an
-        async main() or from bot_engine during startup).
-
-        Args:
-            loop: target event loop.  Defaults to the currently running loop
-                  (asyncio.get_event_loop()).
-
-        Returns:
-            asyncio.Task — retain a reference and call stop_midnight_reset_task()
-            (or task.cancel()) during graceful shutdown.
+        Must be called after the asyncio event loop is running.
         """
         if loop is None:
             loop = asyncio.get_event_loop()
@@ -647,7 +648,6 @@ class SymbolManager:
     def stop_midnight_reset_task(self) -> None:
         """
         Cancel the background midnight-reset task.
-        Call this during graceful bot shutdown to avoid dangling tasks.
         No-op if the task is already done or was never started.
         """
         if self._reset_task and not self._reset_task.done():
@@ -661,13 +661,13 @@ class SymbolManager:
     def all_suspension_status(self) -> Dict[str, float]:
         """
         Return {symbol: minutes_remaining} for every currently suspended symbol.
-        Empty dict when nothing is suspended.  Read-only snapshot; modifying
-        the returned dict has no effect on internal state.
+        Empty dict when nothing is suspended.
         """
+        now = time.time()
         return {
-            sym: self.get_suspension_remaining_minutes(sym)
-            for sym, expiry in self._suspend_until.items()
-            if datetime.datetime.utcnow() < expiry
+            sym: (until - now) / 60.0
+            for sym, until in self._suspension_until.items()
+            if now < until
         }
 
     # ─────────────────────────────────────────────────────────────────────────
@@ -702,13 +702,10 @@ class SymbolManager:
     def decrement_all(self) -> None:
         """
         NO-OP — retained for backward compatibility only.
-
-        Suspension is now time-based (datetime.utcnow() comparisons).
-        There are no per-cycle counters to decrement.
-        Callers should remove calls to this method; it is harmless but unnecessary.
+        Suspension is now unix-timestamp-based; no per-cycle counters exist.
         """
         logger.debug(
-            "decrement_all() called but is a no-op (suspension is now time-based)"
+            "decrement_all() called but is a no-op (suspension is now unix-timestamp-based)"
         )
 
     def decrement_suspensions(self) -> None:
@@ -750,19 +747,10 @@ class SymbolManager:
 
     def all_session_stats(self) -> Dict[str, dict]:
         """
-        Return a dict of session stats for all symbols with ≥ 1 trade this session.
+        Return a dict of session stats for all symbols with >= 1 trade this session.
         Suitable for API endpoints, dashboards, and test assertions.
-
-        Schema per entry:
-            {
-                "wins":                int,
-                "losses":              int,
-                "trades":              int,
-                "win_rate":            float  (4 d.p.),
-                "suspended":           bool,
-                "minutes_remaining":   float  (minutes left in suspension, 0.0 if none),
-            }
         """
+        now = time.time()
         return {
             sym: {
                 "wins":              st.wins,
