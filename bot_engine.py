@@ -1,83 +1,38 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v11 → v12 changes (SCAN/RANK/EXECUTE rewrite per spec):
+v13 — Maximum concurrent aggressive execution rewrite per spec.
 
-  SCAN LOOP:
-    • Canonical cycle structure:
-        while bot_running:
-            cycle_start = time.time()
-            [parallel scan all active non-suspended symbols via asyncio.gather]
-            [collect + rank signals]
-            [execute top N in parallel via asyncio.gather]
-            [await settle]
-            [update streaks, suspensions, stats]
-            [check redeploy trigger]
-            sleep(SCAN_CYCLE_SLEEP) — measured from cycle END
-    • active_symbols = symbol_manager.get_queue() called fresh every cycle.
-    • Dead-zone / suspension filtering handled inside get_queue() only.
+KEY CHANGES vs v12
+──────────────────
+CONTINUOUS SCANNING:
+  • Scanning and settling run independently.
+  • After executing trades, scanning continues immediately — do NOT block
+    on settlement.  Settlement is handled by a background asyncio.Task.
+  • Scan loop runs every SCAN_CYCLE_SLEEP seconds regardless of open contracts.
+  • Only gate on execution: do not place new trades if concurrent slots full.
 
-  SIGNAL COLLECTION & RANKING:
-    • 3/3 strength → unconditionally collected; no secondary gate.
-    • 2/3 → collected only if signal_engine emitted it (direction != NONE).
-    • Score = (strength/3 × 0.80) + (confidence/7 × 0.15) + (win_rate × 0.05)
-      where win_rate = symbol_manager.win_rate(symbol) (0.0–1.0).
-    • Sorted descending by score.
-    • Deduplicated: one signal per symbol per cycle — highest score kept.
-    • Candidate list capped at MAX_CONCURRENT_TRADES × 3.
+EXECUTION FLOW (every cycle):
+  • Scan ALL initialised symbols in parallel via asyncio.gather.
+  • Collect qualified signals, deduplicate, rank by composite score.
+  • Filter: suspended / in-gap / already-active symbols removed.
+  • Execute top N = current_concurrent_limit in parallel.
+  • Immediately start next scan — no settle wait blocking the scan loop.
+  • Settlement callbacks fire asynchronously and free slots naturally.
 
-  EXECUTION:
-    • Top N = risk_manager.current_concurrent_limit() taken from ranked list.
-    • All N launched with asyncio.gather(*[_execute_signal(s) for s in top_n]).
-    • Each _execute_signal returns contract_id str or None on failure.
-    • None result → log failure, try next ranked candidate same cycle (fallback
-      loop after gather resolves).
-    • executed_count += 1 only when contract_id is a non-None valid string.
-    • Per-cycle log: CYCLE {n}: {scanned} scanned | {signals} signals |
-                     {executing} executing | balance=${balance:.2f}
+CYCLE LOG:
+  CYCLE X | Scanned: N | Signals: M | Executing: K | Open: J | Streak: +S | Balance: $B
 
-  SETTLE WAIT & PRE-SCAN:
-    • After execute: await asyncio.sleep(TRADE_DURATION * 60 + 5)
-    • During wait: prescan_task() runs as background coroutine, fills
-      _prescan_buffer with pre-collected signals for next cycle.
+PRESERVED (unchanged):
+  Symbol suspension timing, orphan contract handling, dead zone logic,
+  websocket connection, dashboard serving, Render redeploy mechanism,
+  daily loss protection, pre-scan buffer, redeploy cycle budget.
 
-  RESULT HANDLING:
-    • All results fetched in parallel after settle wait.
-    • Each passed to risk_manager.record_result() and
-      symbol_manager.record_result().
-    • Log: RESULT: {sym} {dir} → WIN/LOSS | P&L: ${pnl:+.2f} | Balance: ${bal:.2f}
-
-  REDEPLOY AFTER N CYCLES:
-    • _cycle_count increments after every completed settle wait.
-    • At _cycle_count >= REDEPLOY_EVERY_N_CYCLES:
-        – Stop accepting new signals.
-        – Drain all open contracts (await their callbacks to fire).
-        – Call trigger_redeploy().
-        – await asyncio.sleep(300).
-        – Reset _cycle_count = 0.
-    • Log: REDEPLOY TRIGGERED: draining {n} open contracts before restart
-
-  DAILY LOSS PROTECTION:
-    • session_start_balance captured at bot launch.
-    • After every result: if (session_start − current) / session_start
-      >= DAILY_LOSS_LIMIT_PCT → halt, log DAILY LOSS LIMIT HIT — bot halted.
-
-  SUSPENDED SYMBOL LOG (every cycle start):
-    SUSPENDED: [{sym}({cycles_remaining}), ...] | ACTIVE: {n} symbols
-
-  CONTRACT CLOSURE GUARANTEE (v12):
-    • After every settle wait: logs "Open contracts remaining: N"
-    • For each remaining contract: calls force_check_contract(cid)
-    • If API confirms closed but callback wasn't triggered: manually calls
-      _on_contract_result(cid, msg)
-    • After 3 failed attempts: logs ORPHANED CONTRACT: {cid} and force-closes
-    • New scan cycle blocked while _open_contracts has contracts older than
-      TRADE_DURATION * 60 + 30 seconds
-
-  All v11 logic preserved unchanged:
-    Strategy, SMC, signal_engine, candlestick_builder, news_filter,
-    trade_journal, dashboard, websocket flow, balance callback, symbol init,
-    _scan(), _execute(), _on_contract_result(), _on_tick().
+v12 logic preserved:
+  SCAN/RANK score formula, prescan buffer, orphan resolution,
+  stale contract blocking, daily loss limit, redeploy trigger,
+  _on_contract_result, _on_tick, _init_data, _execute, _scan,
+  contract-closure guarantee.
 """
 
 import asyncio
@@ -86,7 +41,7 @@ import logging
 import time
 import traceback
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import numpy as np
 
@@ -107,12 +62,10 @@ from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
 
-# Local constants (timing/dashboard only; SCAN_CYCLE_SLEEP is now in config)
 DASHBOARD_PUSH_EVERY = 10
 SYMBOL_REFRESH_EVERY = 3600
 INIT_BATCH_SIZE      = 10
 
-# Max attempts to force-check an unresolved contract before declaring it orphaned
 _ORPHAN_MAX_ATTEMPTS = 3
 
 
@@ -126,7 +79,7 @@ class ScanResult:
     smc_ctx:     SMCContext
     ltf_atr:     float
     htf_atr:     float
-    prob_score:  float = 0.0   # composite score (filled after _scan)
+    prob_score:  float = 0.0
 
 
 # ─── Bot engine ───────────────────────────────────────────────────────────────
@@ -134,15 +87,14 @@ class ScanResult:
 class BotEngine:
 
     def __init__(self):
-        # Initialise all core attributes first — before any object that references them
         self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
         self._cycle_count: int = 0
         self._running: bool = False
         self._prescan_buffer: List[ScanResult] = []
         self._session_start_balance: float = 0.0
-        self._open_contracts: dict = {}          # cid → (symbol, direction, stake, price, rec)
-        self._contract_open_times: dict = {}     # cid → time.time() when opened
-        self._active_symbols: set = set()        # symbols with an open contract right now
+        self._open_contracts: dict = {}
+        self._contract_open_times: dict = {}
+        self._active_symbols: Set[str] = set()
 
         self._htf: Dict[str, CandlestickBuilder] = {}
         self._ltf: Dict[str, CandlestickBuilder] = {}
@@ -154,7 +106,9 @@ class BotEngine:
         self._confirmed_paused: bool = False
         self._current_utc_day: int = -1
 
-        # Now safe to instantiate objects that may reference self._queue / other attrs
+        # Background settle tasks: set of asyncio.Task
+        self._settle_tasks: Set[asyncio.Task] = set()
+
         self.client  = DerivClient()
         self.risk    = RiskManager(
             risk_per_trade   = config.RISK_PER_TRADE_PCT,
@@ -164,7 +118,7 @@ class BotEngine:
         )
         self.smc     = SMCAnalyzer(ob_expiry_bars=config.OB_EXPIRY_BARS)
         self.signal  = SignalEngine(
-            symbols=self._queue,   # self._queue is now guaranteed to exist
+            symbols=self._queue,
             config=config,
         )
         self.news    = NewsFilter(block_minutes=config.NEWS_BLOCK_MINUTES)
@@ -179,36 +133,35 @@ class BotEngine:
                 if symbol in sym_module.FOREX
                 else config.OTHER_LTF_GRANULARITY)
 
-    # ── Composite probability score (BUG 2 — 3-component, 0.0–1.0) ───────────
+    # ── Composite probability score ───────────────────────────────────────────
 
     def _prob_score(self, result: ScanResult) -> float:
         """
-        3-component weighted score per v12 spec:
+        3-component weighted score:
           strength   80%  →  (sig.strength / 3) × 0.80
           confidence 15%  →  (sig.confidence / 7) × 0.15
           win_rate    5%  →  symbol_manager.win_rate(symbol) × 0.05
-
-        Score range: 0.0 – 1.0
         """
         sig      = result.sig
         conf     = getattr(sig, "confidence", 0)
         win_rate = (self.symbols.win_rate(result.symbol)
                     if hasattr(self.symbols, "win_rate") else 0.5)
 
-        strength_component  = (sig.strength / 3.0) * 0.80
-        indicator_component = (conf / 7.0) * 0.15
-        win_rate_component  = float(win_rate) * 0.05
-
-        return round(strength_component + indicator_component + win_rate_component, 4)
+        return round(
+            (sig.strength / 3.0) * 0.80
+            + (conf / 7.0) * 0.15
+            + float(win_rate) * 0.05,
+            4,
+        )
 
     # ── Confirmed loss limit check ────────────────────────────────────────────
 
     def _check_confirmed_loss_limit(self):
         today = _dt.datetime.utcnow().day
         if today != self._current_utc_day:
-            self._confirmed_daily_loss = 0.0
+            self._confirmed_daily_loss    = 0.0
             self._day_start_balance_local = self.client.balance
-            self._current_utc_day = today
+            self._current_utc_day         = today
             logger.info(
                 f"UTC day reset — day_start_balance=${self._day_start_balance_local:.4f}")
 
@@ -240,8 +193,8 @@ class BotEngine:
         self.risk.set_balance(self.client.balance)
 
         self._day_start_balance_local = self.client.balance
-        self._session_start_balance   = self.client.balance   # v12: daily loss anchor
-        self._current_utc_day = _dt.datetime.utcnow().day
+        self._session_start_balance   = self.client.balance
+        self._current_utc_day         = _dt.datetime.utcnow().day
 
         await self._refresh_symbols()
         await self._init_all_symbols()
@@ -261,6 +214,9 @@ class BotEngine:
         finally:
             dash_task.cancel()
             ws_task.cancel()
+            # Cancel any pending settle tasks
+            for t in list(self._settle_tasks):
+                t.cancel()
 
     # ── Balance callback ──────────────────────────────────────────────────────
 
@@ -289,7 +245,7 @@ class BotEngine:
         uninit = [s for s in self._queue if s not in self._htf]
         logger.info(f"Initialising {len(uninit)} symbols …")
         for i in range(0, len(uninit), INIT_BATCH_SIZE):
-            batch = uninit[i : i + INIT_BATCH_SIZE]
+            batch = uninit[i: i + INIT_BATCH_SIZE]
             await asyncio.gather(*[self._init_data(s) for s in batch],
                                  return_exceptions=True)
         logger.info(f"{len(self._htf)} symbols ready")
@@ -328,41 +284,25 @@ class BotEngine:
             best_symbols          = self.symbols.best_symbols(10),
         )
 
-    # ── Post-settle orphan resolution ─────────────────────────────────────────
+    # ── Post-settle orphan resolution (unchanged from v12) ────────────────────
 
     async def _resolve_remaining_contracts(self):
-        """
-        Called after every settle wait.  For each contract still in
-        _open_contracts, attempts to force-check via the API.
-
-        - If API confirms closed: manually fire _on_contract_result.
-        - After _ORPHAN_MAX_ATTEMPTS failures: declare orphaned, force-remove.
-
-        Logs a summary line regardless of outcome.
-        """
         remaining = list(self._open_contracts.keys())
-        n = len(remaining)
+        n   = len(remaining)
         now = time.time()
 
         if n == 0:
             logger.info("Open contracts remaining: 0")
             return
 
-        # Build age report
         age_parts = []
         for cid in remaining:
-            open_time = self._contract_open_times.get(cid, now)
-            age_secs  = int(now - open_time)
+            age_secs = int(now - self._contract_open_times.get(cid, now))
             age_parts.append(f"{cid}({age_secs}s)")
-
-        logger.info(
-            f"Open contracts remaining: {n} — "
-            + ", ".join(age_parts)
-        )
+        logger.info(f"Open contracts remaining: {n} — " + ", ".join(age_parts))
 
         for cid in remaining:
             if cid not in self._open_contracts:
-                # Already resolved by callback during our loop
                 continue
 
             resolved = False
@@ -370,50 +310,36 @@ class BotEngine:
                 try:
                     resp = await self.client.force_check_contract(cid)
                     poc  = resp.get("proposal_open_contract", {})
-
                     is_closed = bool(
                         poc.get("is_sold")
                         or poc.get("is_expired")
                         or poc.get("status") in ("sold", "won", "lost")
                     )
-
                     if is_closed:
                         logger.info(
                             f"force_check_contract({cid}): confirmed closed "
-                            f"(attempt {attempt}) — firing _on_contract_result"
-                        )
+                            f"(attempt {attempt}) — firing _on_contract_result")
                         await self._on_contract_result(cid, resp)
                         resolved = True
                         break
                     else:
                         logger.debug(
                             f"force_check_contract({cid}): still open "
-                            f"(attempt {attempt}/{_ORPHAN_MAX_ATTEMPTS})"
-                        )
-                        # Brief wait before retry
+                            f"(attempt {attempt}/{_ORPHAN_MAX_ATTEMPTS})")
                         if attempt < _ORPHAN_MAX_ATTEMPTS:
                             await asyncio.sleep(5)
-
                 except Exception as exc:
-                    logger.warning(
-                        f"force_check_contract({cid}) attempt {attempt} error: {exc}"
-                    )
+                    logger.warning(f"force_check_contract({cid}) attempt {attempt} error: {exc}")
                     if attempt < _ORPHAN_MAX_ATTEMPTS:
                         await asyncio.sleep(5)
 
             if not resolved and cid in self._open_contracts:
-                # Retrieve last known info for logging
-                info = self._open_contracts.get(cid, ())
+                info       = self._open_contracts.get(cid, ())
                 symbol     = info[0] if len(info) > 0 else "UNKNOWN"
                 stake      = info[2] if len(info) > 2 else 0.0
-                last_price = info[3] if len(info) > 3 else 0.0
                 rec        = info[4] if len(info) > 4 else None
 
-                logger.error(
-                    f"ORPHANED: {cid} forcing close"
-                )
-
-                # Record as a confirmed loss
+                logger.error(f"ORPHANED: {cid} forcing close")
                 self.journal.close_trade(
                     contract_id   = cid,
                     exit_price    = 0,
@@ -442,24 +368,52 @@ class BotEngine:
                     pass
                 logger.error(
                     f"ORPHAN RECORDED AS LOSS: {cid} {symbol} "
-                    f"-${stake:.2f} | balance=${self.client.balance:.4f}"
-                )
+                    f"-${stake:.2f} | balance=${self.client.balance:.4f}")
 
     def _has_stale_contracts(self) -> bool:
-        """
-        Returns True if any open contract is older than TRADE_DURATION * 60 + 30 s.
-        Used to block the next scan cycle until stale contracts are resolved.
-        """
         stale_threshold = config.TRADE_DURATION * 60 + 30
         now = time.time()
         for cid, open_time in list(self._contract_open_times.items()):
             if cid in self._open_contracts:
-                age = now - open_time
-                if age > stale_threshold:
+                if now - open_time > stale_threshold:
                     return True
         return False
 
-    # ── Main loop (v12 rewrite) ────────────────────────────────────────────────
+    # ── Background settle handler ─────────────────────────────────────────────
+
+    async def _settle_and_resolve(self, wait_secs: float, ready: List[str]):
+        """
+        Runs as a background asyncio.Task.
+        Waits for settlement, resolves orphans, increments cycle count.
+        Does NOT block the main scan loop.
+        """
+        try:
+            # Pre-scan during settle wait
+            prescan_task = asyncio.create_task(self._prescan_task(ready))
+            await asyncio.sleep(wait_secs)
+            await prescan_task
+
+            await self._resolve_remaining_contracts()
+
+            # Daily loss check (session-level)
+            if self._session_start_balance > 0:
+                loss_ratio = (
+                    (self._session_start_balance - self.client.balance)
+                    / self._session_start_balance
+                )
+                if loss_ratio >= config.DAILY_LOSS_LIMIT_PCT:
+                    logger.critical("DAILY LOSS LIMIT HIT — bot halted")
+                    self._confirmed_paused = True
+
+            # Increment redeploy counter
+            self._cycle_count += 1
+
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.error(f"_settle_and_resolve error: {exc}")
+
+    # ── Main loop (v13 — continuous scanning) ────────────────────────────────
 
     async def _main_loop(self):
         scan_sleep     = getattr(config, "SCAN_CYCLE_SLEEP", 1)
@@ -471,7 +425,7 @@ class BotEngine:
         while bot_running:
             cycle_start = time.time()
 
-            # ── Decrement any active loss-streak pause (once per cycle) ───
+            # ── Decrement any active loss-streak pause ────────────────────
             self.risk.decrement_pause()
 
             # ── Symbol cache refresh ──────────────────────────────────────
@@ -498,10 +452,8 @@ class BotEngine:
                 n_open = len(self._open_contracts)
                 logger.info(
                     f"REDEPLOY TRIGGERED: draining {n_open} open contracts before restart")
-                # Drain: wait until all callbacks fire naturally
                 while self._open_contracts:
-                    logger.info(
-                        f"Draining — {len(self._open_contracts)} contract(s) still open")
+                    logger.info(f"Draining — {len(self._open_contracts)} contract(s) still open")
                     await asyncio.sleep(5)
                 restart_scheduler.trigger_redeploy()
                 logger.info("Redeploy triggered — standing by for 300 s")
@@ -528,7 +480,7 @@ class BotEngine:
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            # ── Block cycle if stale contracts remain ─────────────────────
+            # ── Block cycle only if stale contracts exist ─────────────────
             if self._has_stale_contracts():
                 stale_cids = [
                     cid for cid in self._open_contracts
@@ -536,9 +488,7 @@ class BotEngine:
                     > config.TRADE_DURATION * 60 + 30
                 ]
                 logger.warning(
-                    f"Blocking new cycle — stale contracts detected: "
-                    f"{stale_cids} — running force-check"
-                )
+                    f"Blocking new cycle — stale contracts: {stale_cids} — running force-check")
                 await self._resolve_remaining_contracts()
                 await asyncio.sleep(scan_sleep)
                 continue
@@ -547,17 +497,16 @@ class BotEngine:
             self.symbols.decrement_suspensions()
             self.symbols.reset_cycle_used()
 
-            # ── Active symbol list — fresh every cycle from SymbolManager ─
+            # ── Active symbol list — fresh every cycle ────────────────────
             active_symbols: List[str] = self.symbols.get_queue(max_symbols=200)
-            # Filter to initialised symbols only (data must be ready)
             ready = [s for s in active_symbols if s in self._htf]
 
-            # Build suspension log
-            all_queue       = self.symbols.get_queue(max_symbols=200)
-            suspended_info  = []
+            # Suspension log
+            all_queue      = self.symbols.get_queue(max_symbols=200)
+            suspended_info = []
             for s in all_queue:
-                cycles_rem = self.symbols.get_suspension_remaining(s)
                 if self.symbols.is_suspended(s):
+                    cycles_rem = self.symbols.get_suspension_remaining(s)
                     suspended_info.append(f"{s}({cycles_rem})")
             logger.info(
                 f"SUSPENDED: [{', '.join(suspended_info) if suspended_info else '-'}] "
@@ -570,14 +519,13 @@ class BotEngine:
             cycle_number += 1
             scanned_count = len(ready)
 
-            # ── Parallel scan ALL active symbols simultaneously ────────────
+            # ── Parallel scan ALL active symbols ──────────────────────────
             raw_results = await asyncio.gather(
                 *[self._scan(s) for s in ready],
                 return_exceptions=True,
             )
 
-            # ── Collect qualified signals ─────────────────────────────────
-            # Seed with pre-scan buffer from previous cycle's settle wait
+            # ── Collect qualified signals (seed from prescan buffer) ──────
             all_candidates: List[ScanResult] = list(self._prescan_buffer)
             self._prescan_buffer = []
 
@@ -596,20 +544,16 @@ class BotEngine:
                         or r.prob_score > best_per_symbol[r.symbol].prob_score):
                     best_per_symbol[r.symbol] = r
 
-            # Sort descending; cap to MAX_CONCURRENT_TRADES × 3
             ranked: List[ScanResult] = sorted(
                 best_per_symbol.values(),
                 key=lambda r: r.prob_score,
                 reverse=True,
             )[:max_cands]
 
-            signals_count = len(ranked)
-            concurrent_limit: int = self.risk.current_concurrent_limit
+            signals_count    = len(ranked)
+            concurrent_limit = self.risk.current_concurrent_limit
 
-            # ── Triple-check gate at rank time: filter out suspended / in-gap /
-            #    already-active symbols BEFORE selecting top_n.
-            #    This is the second of three gates (get_queue is first;
-            #    _execute is third).
+            # ── Triple gate: filter suspended / in-gap / already-active ───
             ranked = [
                 r for r in ranked
                 if not self.symbols.is_suspended(r.symbol)
@@ -619,13 +563,22 @@ class BotEngine:
 
             top_n = ranked[:concurrent_limit]
 
+            open_count = len(self._open_contracts)
             logger.info(
-                f"CYCLE {cycle_number}: {scanned_count} scanned | "
-                f"{signals_count} signals | {len(top_n)} executing | "
-                f"balance=${self.client.balance:.2f}")
+                f"CYCLE {cycle_number} | "
+                f"Scanned: {scanned_count} | "
+                f"Signals: {signals_count} | "
+                f"Executing: {len(top_n)} | "
+                f"Open: {open_count} | "
+                f"Streak: {'+' if self.risk.current_streak >= 0 else ''}{self.risk.current_streak} | "
+                f"Balance: ${self.client.balance:.2f}")
 
             if not top_n:
-                await asyncio.sleep(scan_sleep)
+                # Nothing to execute this cycle — keep scanning
+                elapsed   = time.time() - cycle_start
+                remainder = max(0.0, scan_sleep - elapsed)
+                if remainder > 0:
+                    await asyncio.sleep(remainder)
                 continue
 
             # ── Execute top N in parallel ─────────────────────────────────
@@ -634,26 +587,23 @@ class BotEngine:
                 return_exceptions=True,
             )
 
-            # Count successes; attempt fallback for failures within same cycle
             executed_count   = 0
             failed_slots     = 0
-            executed_symbols: set = set()
+            executed_symbols: Set[str] = set()
 
             for i, (sig_r, res) in enumerate(zip(top_n, exec_results)):
                 if isinstance(res, Exception):
-                    logger.error(
-                        f"_execute_signal({sig_r.symbol}) raised: {res}")
+                    logger.error(f"_execute_signal({sig_r.symbol}) raised: {res}")
                     failed_slots += 1
                 elif res is not None:
                     executed_count += 1
                     executed_symbols.add(sig_r.symbol)
                 else:
                     logger.warning(
-                        f"Placement failed for {sig_r.symbol} — "
-                        f"trying next ranked candidate")
+                        f"Placement failed for {sig_r.symbol} — trying next ranked candidate")
                     failed_slots += 1
 
-            # Fallback: attempt next ranked candidates for failed slots
+            # Fallback for failed slots
             if failed_slots > 0:
                 fallback_candidates = [
                     r for r in ranked[concurrent_limit:]
@@ -674,67 +624,39 @@ class BotEngine:
                             executed_symbols.add(fb.symbol)
                             remaining_slots -= 1
                         else:
-                            logger.warning(
-                                f"Fallback placement also failed: {fb.symbol}")
+                            logger.warning(f"Fallback placement also failed: {fb.symbol}")
                     except Exception as exc:
                         logger.error(f"Fallback execute error ({fb.symbol}): {exc}")
 
-            # ── Settle wait + background pre-scan ─────────────────────────
+            # ── Launch background settle task — DO NOT block scan loop ────
             if executed_count > 0:
                 wait_secs = config.TRADE_DURATION * 60 + 5
                 logger.info(
                     f"{executed_count} trade(s) placed — "
-                    f"settling for {wait_secs}s")
+                    f"settle task launched ({wait_secs}s), scanning continues")
 
-                # Run prescan in background during settle wait
-                prescan_task = asyncio.create_task(self._prescan_task(ready))
-                await asyncio.sleep(wait_secs)
-                await prescan_task   # ensure it finishes before next cycle
+                settle_task = asyncio.create_task(
+                    self._settle_and_resolve(wait_secs, list(ready))
+                )
+                self._settle_tasks.add(settle_task)
+                settle_task.add_done_callback(self._settle_tasks.discard)
 
-                # ── Post-settle orphan resolution ─────────────────────────
-                # Log open contracts remaining; force-check any unresolved ones
-                await self._resolve_remaining_contracts()
-
-                # ── Daily loss check (post-settle) ────────────────────────
-                if self._session_start_balance > 0:
-                    loss_ratio = (
-                        (self._session_start_balance - self.client.balance)
-                        / self._session_start_balance
-                    )
-                    if loss_ratio >= config.DAILY_LOSS_LIMIT_PCT:
-                        logger.critical(
-                            "DAILY LOSS LIMIT HIT — bot halted")
-                        bot_running = False
-                        break
-
-                # Cycle complete — increment counter
-                self._cycle_count += 1
-            else:
-                # No trades placed this cycle
-                pass
-
-            # ── Cycle sleep measured from cycle END ───────────────────────
+            # ── Cycle sleep measured from cycle END — always runs ─────────
             elapsed   = time.time() - cycle_start
             remainder = max(0.0, scan_sleep - elapsed)
             if remainder > 0:
                 await asyncio.sleep(remainder)
 
-    # ── execute_signal: wraps _execute, returns contract_id or None ───────────
+    # ── execute_signal ────────────────────────────────────────────────────────
 
     async def _execute_signal(self, sig_r: ScanResult) -> Optional[str]:
-        """
-        Thin wrapper around _execute().  Returns the contract_id string on
-        success, None if the API rejects.  Never raises — all exceptions are
-        caught and logged, returning None so the caller can substitute.
-        """
         try:
-            conf = getattr(sig_r.sig, "confidence", 0)
             if not self.risk.can_trade():
                 return None
-
             if self.symbols.is_used(sig_r.symbol):
                 return None
 
+            conf = getattr(sig_r.sig, "confidence", 0)
             logger.info(
                 f"Executing: {sig_r.symbol} {sig_r.sig.direction} "
                 f"score={sig_r.prob_score:.4f} "
@@ -751,9 +673,6 @@ class BotEngine:
 
             if success:
                 self.symbols.mark_used(sig_r.symbol)
-                # Return a non-None sentinel — actual cid stored in _open_contracts
-                # We return "ok" so caller knows it succeeded; _execute already
-                # stores the real cid internally.
                 return "ok"
             return None
 
@@ -761,13 +680,9 @@ class BotEngine:
             logger.error(f"_execute_signal({sig_r.symbol}): {exc}")
             return None
 
-    # ── Pre-scan task: fills _prescan_buffer during settle wait ───────────────
+    # ── Pre-scan task ─────────────────────────────────────────────────────────
 
     async def _prescan_task(self, symbols: List[str]):
-        """
-        Runs in background during the settle wait.  Scans all symbols and
-        stores qualified signals into _prescan_buffer to seed the next cycle.
-        """
         try:
             raw = await asyncio.gather(
                 *[self._scan(s) for s in symbols],
@@ -798,7 +713,6 @@ class BotEngine:
             if htf.count < 20 or ltf.count < 30:
                 return None
 
-            # Phase A – HTF SMC
             htf_bars    = htf.completed_bars
             H = np.array([b.high  for b in htf_bars])
             L = np.array([b.low   for b in htf_bars])
@@ -811,18 +725,15 @@ class BotEngine:
             if smc_ctx.bias == "NEUTRAL":
                 return None
 
-            # Phase B.1 – Price in SMC zone?
             ltf_bars_list = ltf.completed_bars
             if not ltf_bars_list:
                 return None
 
             current_price = float(ltf_bars_list[-1].close)
-
             in_zone = self.smc.price_in_smc_zone(current_price, smc_ctx.bias, smc_ctx)
             if not in_zone:
                 return None
 
-            # Phase B.2–B.3 – Modules
             sig = self.signal.evaluate(
                 ltf_bars = ltf_bars_list,
                 htf_bias = smc_ctx.bias,
@@ -833,11 +744,9 @@ class BotEngine:
             if sig.direction == "NONE":
                 return None
 
-            # News filter
             if self.news.is_blocked(symbol):
                 return None
 
-            # Volatility filter
             ltf_H = np.array([b.high  for b in ltf_bars_list])
             ltf_L = np.array([b.low   for b in ltf_bars_list])
             ltf_C = np.array([b.close for b in ltf_bars_list])
@@ -865,12 +774,6 @@ class BotEngine:
 
     async def _execute(self, symbol: str, sig: SignalResult,
                        price: float, smc_ctx: SMCContext) -> bool:
-        """
-        Place a trade.  Returns True on successful placement, False if the API
-        rejects (buy_resp is None).  Raises on unexpected errors so the caller
-        can log them and substitute the next ranked signal.
-        """
-        # ── Hard suspension gate (3rd check; get_queue + rank-filter are 1st and 2nd) ──
         if self.symbols.is_suspended(symbol):
             logger.info(f"EXECUTION BLOCKED: {symbol} is suspended — skipping")
             return False
@@ -881,14 +784,11 @@ class BotEngine:
             logger.info(f"EXECUTION BLOCKED: {symbol} already has open contract — skipping")
             return False
 
-        stake = await self.risk.calculate_stake()
-        ac    = get_symbol_class(symbol)
-
-        conf    = getattr(sig, "confidence", "?")
-        fresh   = getattr(smc_ctx, "zone_freshness", "?")
-
-        # Direction follows sig.direction directly — NEVER inverted
-        direction = sig.direction   # "LONG" or "SHORT"
+        stake     = await self.risk.calculate_stake()
+        ac        = get_symbol_class(symbol)
+        conf      = getattr(sig, "confidence", "?")
+        fresh     = getattr(smc_ctx, "zone_freshness", "?")
+        direction = sig.direction
 
         logger.info(
             f"▶ {direction} {symbol} | ${stake:.2f} | "
@@ -931,9 +831,8 @@ class BotEngine:
             modules        = sig.strength,
         )
 
-        self._open_contracts[cid] = (symbol, direction, stake, price, rec)
-        self._contract_open_times[cid] = time.time()
-        # Record placement for gap enforcement + mark symbol as actively trading
+        self._open_contracts[cid]       = (symbol, direction, stake, price, rec)
+        self._contract_open_times[cid]  = time.time()
         self.symbols.record_trade_placed(symbol)
         self._active_symbols.add(symbol)
         set_active_trades(len(self._open_contracts))
@@ -965,16 +864,11 @@ class BotEngine:
 
         won = pnl > 0
 
-        # Release symbol from active set and fire suspension via record_result
+        # Free the symbol slot immediately — next scan can pick it up
         self._active_symbols.discard(symbol)
 
-        # risk_manager
         self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
-        # NOTE: register_close() already calls record_result() internally.
-        # The duplicate explicit call below has been removed to prevent
-        # double-counting streaks/wins/losses.
 
-        # journal
         self.journal.close_trade(
             contract_id   = cid,
             exit_price    = sell_price,
@@ -983,7 +877,6 @@ class BotEngine:
             balance_after = bal_after,
         )
 
-        # symbol_manager — record_result applies suspension immediately
         self.symbols.record_result(symbol=symbol, won=won)
 
         if pnl < 0:
@@ -992,22 +885,19 @@ class BotEngine:
         self._check_confirmed_loss_limit()
         set_active_trades(len(self._open_contracts))
 
-        # ── Spec-required RESULT log ──────────────────────────────────────
         logger.info(
             f"RESULT: {symbol} {direction} → "
             f"{'WIN' if won else 'LOSS'} | "
             f"P&L: ${pnl:+.2f} | Balance: ${bal_after:.2f}")
 
-        # ── Daily loss protection (session-level) ─────────────────────────
+        # Session-level daily loss protection
         if self._session_start_balance > 0:
             loss_ratio = (
                 (self._session_start_balance - bal_after)
                 / self._session_start_balance
             )
             if loss_ratio >= config.DAILY_LOSS_LIMIT_PCT:
-                logger.critical(
-                    "DAILY LOSS LIMIT HIT — bot halted")
-                # Signal the main loop to stop
+                logger.critical("DAILY LOSS LIMIT HIT — bot halted")
                 self._confirmed_paused = True
 
         try:
