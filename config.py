@@ -70,7 +70,7 @@ HTF_BARS              : int = 100
 LTF_BARS              : int = 50
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT  : float = 0.15   # 15% max daily loss then stop trading
+DAILY_LOSS_LIMIT_PCT  : float = 2.15   # 15% max daily loss then stop trading
 BASE_STAKE_PCT        : float = 0.01   # 1% of current balance = base stake
 RISK_PER_TRADE_PCT    : float = 0.01   # alias for BASE_STAKE_PCT (backwards compat)
 MIN_STAKE             : float = 0.35
