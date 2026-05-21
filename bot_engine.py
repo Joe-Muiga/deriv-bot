@@ -135,14 +135,13 @@ class BotEngine:
 
     def __init__(self):
         # Initialise all core attributes first — before any object that references them
-        self._queue: List[str] = list(getattr(config, "ALL_SYMBOLS", []))
+        self._queue: List[str] = list(sym_module.SYNTHETIC[:5])
         self._cycle_count: int = 0
         self._running: bool = False
         self._prescan_buffer: List[ScanResult] = []
         self._session_start_balance: float = 0.0
         self._open_contracts: dict = {}          # cid → (symbol, direction, stake, price, rec)
         self._contract_open_times: dict = {}     # cid → time.time() when opened
-        self._active_symbols: set = set()        # symbols with currently open trades
 
         self._htf: Dict[str, CandlestickBuilder] = {}
         self._ltf: Dict[str, CandlestickBuilder] = {}
@@ -209,17 +208,12 @@ class BotEngine:
             self._confirmed_daily_loss = 0.0
             self._day_start_balance_local = self.client.balance
             self._current_utc_day = today
-            self._confirmed_paused = False
             logger.info(
                 f"UTC day reset — day_start_balance=${self._day_start_balance_local:.4f}")
 
         if self._day_start_balance_local > 0:
             loss_ratio = self._confirmed_daily_loss / self._day_start_balance_local
-            was_paused = self._confirmed_paused
             self._confirmed_paused = loss_ratio >= config.DAILY_LOSS_LIMIT_PCT
-            if self._confirmed_paused and not was_paused:
-                logger.warning(
-                    "DAILY DRAWDOWN LIMIT HIT — trading paused until midnight UTC")
         else:
             self._confirmed_paused = False
 
@@ -291,9 +285,8 @@ class BotEngine:
     # ── Bulk init ─────────────────────────────────────────────────────────────
 
     async def _init_all_symbols(self):
-        all_syms = list(getattr(config, "ALL_SYMBOLS", self._queue))
-        uninit = [s for s in all_syms if s not in self._htf]
-        logger.info(f"Initialising {len(uninit)} symbols from ALL_SYMBOLS")
+        uninit = [s for s in self._queue if s not in self._htf]
+        logger.info(f"Initialising {len(uninit)} symbols …")
         for i in range(0, len(uninit), INIT_BATCH_SIZE):
             batch = uninit[i : i + INIT_BATCH_SIZE]
             await asyncio.gather(*[self._init_data(s) for s in batch],
@@ -366,86 +359,102 @@ class BotEngine:
             + ", ".join(age_parts)
         )
 
-    async def _resolve_remaining_contracts(self):
-        """
-        Called after every settle wait.  Iterates _open_contracts:
-          - age >= CONTRACT_MAX_AGE_SECONDS       → force_check_contract
-          - age >= CONTRACT_FORCE_CLOSE_AFTER_SECONDS → declare ORPHANED, force-remove
-        """
-        remaining = list(self._open_contracts.keys())
-        n = len(remaining)
-        now = time.time()
-
-        if n == 0:
-            logger.info("Open contracts remaining: 0")
-            return
-
-        age_parts = []
         for cid in remaining:
-            open_time = self._contract_open_times.get(cid, now)
-            age_secs  = int(now - open_time)
-            age_parts.append(f"{cid}({age_secs}s)")
-
-        logger.info(
-            f"Open contracts remaining: {n} — "
-            + ", ".join(age_parts)
-        )
-
-        max_age         = getattr(config, "CONTRACT_MAX_AGE_SECONDS",
-                                  config.TRADE_DURATION * 60 + 10)
-        force_close_age = getattr(config, "CONTRACT_FORCE_CLOSE_AFTER_SECONDS",
-                                  config.TRADE_DURATION * 60 + 30)
-
-        for cid in list(remaining):
             if cid not in self._open_contracts:
+                # Already resolved by callback during our loop
                 continue
-            open_time = self._contract_open_times.get(cid, now)
-            age       = now - open_time
 
-            if age >= force_close_age:
-                info   = self._open_contracts.get(cid, ())
-                symbol = info[0] if len(info) > 0 else "UNKNOWN"
-                logger.error(f"ORPHANED: {cid} forcing close")
-                self._open_contracts.pop(cid, None)
-                self._contract_open_times.pop(cid, None)
-                self._active_symbols.discard(symbol)
-                set_active_trades(len(self._open_contracts))
-
-            elif age >= max_age:
+            resolved = False
+            for attempt in range(1, _ORPHAN_MAX_ATTEMPTS + 1):
                 try:
                     resp = await self.client.force_check_contract(cid)
                     poc  = resp.get("proposal_open_contract", {})
+
                     is_closed = bool(
                         poc.get("is_sold")
                         or poc.get("is_expired")
                         or poc.get("status") in ("sold", "won", "lost")
                     )
+
                     if is_closed:
                         logger.info(
                             f"force_check_contract({cid}): confirmed closed "
-                            f"(age={age:.0f}s) — firing _on_contract_result"
+                            f"(attempt {attempt}) — firing _on_contract_result"
                         )
                         await self._on_contract_result(cid, resp)
+                        resolved = True
+                        break
                     else:
                         logger.debug(
                             f"force_check_contract({cid}): still open "
-                            f"(age={age:.0f}s)"
+                            f"(attempt {attempt}/{_ORPHAN_MAX_ATTEMPTS})"
                         )
+                        # Brief wait before retry
+                        if attempt < _ORPHAN_MAX_ATTEMPTS:
+                            await asyncio.sleep(5)
+
                 except Exception as exc:
-                    logger.warning(f"force_check_contract({cid}) error: {exc}")
+                    logger.warning(
+                        f"force_check_contract({cid}) attempt {attempt} error: {exc}"
+                    )
+                    if attempt < _ORPHAN_MAX_ATTEMPTS:
+                        await asyncio.sleep(5)
+
+            if not resolved and cid in self._open_contracts:
+                # Retrieve last known info for logging
+                info = self._open_contracts.get(cid, ())
+                symbol     = info[0] if len(info) > 0 else "UNKNOWN"
+                stake      = info[2] if len(info) > 2 else 0.0
+                last_price = info[3] if len(info) > 3 else 0.0
+                rec        = info[4] if len(info) > 4 else None
+
+                logger.error(
+                    f"ORPHANED: {cid} forcing close"
+                )
+
+                # Record as a confirmed loss
+                self.journal.close_trade(
+                    contract_id   = cid,
+                    exit_price    = 0,
+                    pnl           = -stake,
+                    payout        = 0,
+                    balance_after = self.client.balance,
+                )
+                self._confirmed_daily_loss += stake
+                self._check_confirmed_loss_limit()
+                try:
+                    self.symbols.record_result(symbol, won=False)
+                except Exception:
+                    pass
+                if rec is not None:
+                    try:
+                        self.risk.register_close(rec, exit_price=0, pnl=-stake)
+                    except Exception:
+                        pass
+
+                self._open_contracts.pop(cid, None)
+                self._contract_open_times.pop(cid, None)
+                set_active_trades(len(self._open_contracts))
+                try:
+                    self._push_dashboard()
+                except Exception:
+                    pass
+                logger.error(
+                    f"ORPHAN RECORDED AS LOSS: {cid} {symbol} "
+                    f"-${stake:.2f} | balance=${self.client.balance:.4f}"
+                )
 
     def _has_stale_contracts(self) -> bool:
         """
-        Returns True if any open contract is older than CONTRACT_FORCE_CLOSE_AFTER_SECONDS.
+        Returns True if any open contract is older than TRADE_DURATION * 60 + 30 s.
         Used to block the next scan cycle until stale contracts are resolved.
         """
-        force_close_age = getattr(config, "CONTRACT_FORCE_CLOSE_AFTER_SECONDS",
-                                  config.TRADE_DURATION * 60 + 30)
+        stale_threshold = config.TRADE_DURATION * 60 + 30
         now = time.time()
         for cid, open_time in list(self._contract_open_times.items()):
             if cid in self._open_contracts:
                 age = now - open_time
-                if age > force_close_age:
+                if age > stale_threshold:
                     return True
         return False
 
@@ -520,12 +529,10 @@ class BotEngine:
 
             # ── Block cycle if stale contracts remain ─────────────────────
             if self._has_stale_contracts():
-                force_close_age = getattr(config, "CONTRACT_FORCE_CLOSE_AFTER_SECONDS",
-                                          config.TRADE_DURATION * 60 + 30)
                 stale_cids = [
                     cid for cid in self._open_contracts
                     if (time.time() - self._contract_open_times.get(cid, time.time()))
-                    > force_close_age
+                    > config.TRADE_DURATION * 60 + 30
                 ]
                 logger.warning(
                     f"Blocking new cycle — stale contracts detected: "
@@ -710,14 +717,6 @@ class BotEngine:
         try:
             conf = getattr(sig_r.sig, "confidence", 0)
             if not self.risk.can_trade():
-                return None
-
-            # Sequential protection: skip if symbol_manager says not tradeable now
-            if not self.symbols.can_trade_now(sig_r.symbol):
-                return None
-
-            # Concurrent protection: skip if symbol already has an open trade
-            if sig_r.symbol in self._active_symbols:
                 return None
 
             if self.symbols.is_used(sig_r.symbol):
@@ -910,12 +909,6 @@ class BotEngine:
 
         self._open_contracts[cid] = (symbol, direction, stake, price, rec)
         self._contract_open_times[cid] = time.time()
-        self._active_symbols.add(symbol)
-        if hasattr(self.symbols, "record_trade_placed"):
-            try:
-                self.symbols.record_trade_placed(symbol)
-            except Exception:
-                pass
         set_active_trades(len(self._open_contracts))
 
         await self.client.subscribe_contract(
@@ -942,7 +935,6 @@ class BotEngine:
         if not info:
             return
         symbol, direction, stake, entry_price, rec = info
-        self._active_symbols.discard(symbol)
 
         won = pnl > 0
 
