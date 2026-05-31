@@ -112,7 +112,7 @@ DAILY_LOSS_LIMIT_PCT        : float = 2.15   # stop trading at 15% daily drawdow
 BASE_STAKE_PCT              : float = 0.01   # 1% of current balance = base stake
 RISK_PER_TRADE_PCT          : float = 0.1   # alias for BASE_STAKE_PCT (backwards compat)
 MIN_STAKE                   : float = 0.35
-MAX_STAKE                   : float = 50.0
+MAX_STAKE                   : float = 1000.0
 MIN_ACCOUNT_BALANCE         : float = 0.0   # suspend all trading below this USD floor
 MAX_CONCURRENT_TRADES       : int   = 15
 
