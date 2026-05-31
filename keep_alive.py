@@ -630,6 +630,25 @@ def symbols_route():
     return jsonify({"symbols": _state.get("best_symbols", [])})
 
 
+
+@app.route("/debug")
+def debug_route():
+    """Dump raw _state so we can see exactly what keys the bot engine writes."""
+    import json
+    safe = {}
+    for k, v in _state.items():
+        if isinstance(v, list):
+            safe[k] = {
+                "type": "list",
+                "length": len(v),
+                "first_item": v[0] if v else None,
+            }
+        elif isinstance(v, dict):
+            safe[k] = {"type": "dict", "keys": list(v.keys())}
+        else:
+            safe[k] = v
+    return jsonify(safe), 200
+
 # ── Keep-alive ping loop ───────────────────────────────────────────────────────
 
 def _ping_loop():
