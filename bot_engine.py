@@ -74,12 +74,14 @@ from news_filter import NewsFilter
 from trade_journal import TradeJournal
 from symbol_manager import SymbolManager
 import indicators as ind
-from keep_alive import update_status, set_active_trades, is_redeploy_pending
+from keep_alive import (update_status, set_active_trades,
+                        is_redeploy_pending, record_trade,
+                        record_signal, _status)
 from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
 
-DASHBOARD_PUSH_EVERY  = 10
+DASHBOARD_PUSH_EVERY  = 15
 SYMBOL_REFRESH_EVERY  = 3600
 INIT_BATCH_SIZE       = 10
 
@@ -329,27 +331,39 @@ class BotEngine:
             await asyncio.sleep(DASHBOARD_PUSH_EVERY)
 
     def _push_dashboard(self):
-        summary = self.journal.session_summary()
         risk_s  = self.risk.summary()
+        summary = self.journal.session_summary()
         update_status(
             running               = True,
             balance               = self.client.balance,
             day_start_balance     = self._day_start_balance,
             paused_for_loss_limit = self._confirmed_paused,
-            trades_today          = risk_s["total_trades"],
-            wins_today            = risk_s["wins"],
-            losses_today          = risk_s["losses"],
-            session               = self.symbols.current_session,
-            tradeable_count       = len(self._initialised_symbols),
+            trades_today          = risk_s.get("total_trades", 0),
+            wins_today            = risk_s.get("wins", 0),
+            losses_today          = risk_s.get("losses", 0),
+            session               = (self.symbols.current_session
+                                     if hasattr(self.symbols, "current_session")
+                                     else "Active"),
+            tradeable_count       = len([s for s in self._htf
+                                         if not self.symbols.is_suspended(s)]),
+            streak                = self.risk.current_streak,
+            recent_trades         = _status.get("recent_trades", []),
+            best_symbols          = self.symbols.best_symbols(10),
+            balance_history       = _status.get("balance_history", []),
+            suspended_symbols     = [
+                {
+                    "symbol":           s,
+                    "suspended_until":  self.symbols._suspension_until.get(s, 0),
+                }
+                for s in getattr(self.symbols, "_suspension_until", {})
+                if self.symbols.is_suspended(s)
+            ],
             gross_profit          = summary.get("gross_profit", 0),
             gross_loss            = summary.get("gross_loss", 0),
             profit_factor         = summary.get("profit_factor", 0),
             avg_rr                = summary.get("avg_rr", 0),
             best_trade            = summary.get("best_trade", 0),
             worst_trade           = summary.get("worst_trade", 0),
-            streak                = risk_s.get("streak", 0),
-            recent_trades         = self.journal.recent_trades(20),
-            best_symbols          = self.symbols.best_symbols(10),
         )
 
     # ── Main loop — continuous non-blocking ────────────────────────────────────
@@ -602,6 +616,13 @@ class BotEngine:
         direction = sig.direction
         ac        = get_symbol_class(symbol)
 
+        record_signal(
+            symbol    = symbol,
+            direction = sig.direction,
+            strategy  = getattr(sig, "strategy", "unknown"),
+            score     = getattr(sig, "score", 0.0),
+        )
+
         buy_resp = await self.client.buy_contract(
             symbol    = symbol,
             direction = direction,
@@ -669,6 +690,11 @@ class BotEngine:
             lambda msg, _cid=cid: asyncio.create_task(
                 self._on_contract_result(_cid, msg)))
 
+        try:
+            self._push_dashboard()
+        except Exception:
+            pass
+
         return True
 
     # ── Contract result callback ───────────────────────────────────────────────
@@ -723,6 +749,16 @@ class BotEngine:
             f"balance=${self.client.balance:.4f} | "
             f"streak={self.risk.current_streak} | "
             f"strategy={strategy}"
+        )
+
+        record_trade(
+            symbol        = symbol,
+            direction     = direction,
+            stake         = stake,
+            pnl           = pnl,
+            balance_after = self.client.balance,
+            won           = pnl > 0,
+            strategy      = strategy,
         )
 
         try:
