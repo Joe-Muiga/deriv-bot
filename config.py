@@ -2,21 +2,25 @@
 config.py – Centralised configuration for the SIFM Deriv Trading Bot.
 All secrets are loaded from environment variables; defaults are safe fallbacks.
 
-v15 → v16 changes:
+v16 → v17 changes:
+  CHANGED:
+    All cycle-based timing replaced with minute-based equivalents
+    SYMBOL_WIN_SUSPEND_MINS          : 5  (was 7 min)
+    SYMBOL_LOSS_SUSPEND_MINS         : 10 (was 17 min)
+    SYMBOL_MIN_GAP_MINS              : 2  (was 7 min)
+    SYMBOL_SESSION_BAN_MINS          : 480 (8 hours, new)
+    DAILY_LOSS_LIMIT_PCT             : corrected to 0.15 (was 2.15)
+    DAILY_LOSS_PAUSE_MINS            : 60 (new)
+    CONTRACT_CHECK_SECS              : 300 (5 min)
+    CONTRACT_TIMEOUT_SECS            : 420 (7 min)
+    MAX_CONCURRENT_TRADES            : 20 (was 15)
+    MAX_STAKE                        : 50.0 (was 1000.0)
+    REDEPLOY_EVERY_N_CYCLES          : removed (replaced by REDEPLOY_EVERY_N_MINS)
   ADDED:
-    DIGIT_SYMBOLS               : Digit Over/Under strategy subset (1s indices)
-    MEAN_REVERSION_SYMBOLS      : Mean Reversion subset (low-vol 1s indices)
-    STEP_SYMBOLS                : Step Index subset
-    JUMP_SYMBOLS                : Jump Index subset (JD10–JD100)
-    TRADE_SYMBOLS               : All actively-traded symbols (union)
-    Session windows             : CRASH500, BOOM/CRASH 300/1000, JUMP_PEAK_UTC
-    PLS_WIN_MULTIPLIERS/THRESHOLDS : Progressive Loss Scaling (win-side only)
-    PLS_LOSS_RESET              : Loss immediately resets stake to base
-    MIN_ACCOUNT_BALANCE         : Hard floor before trading suspends
-    Per-strategy signal params  : DIGIT_*, MR_*, RB_*, SPIKE_*, STEP_*, JUMP_*
-    SYMBOL_SESSION_BAN_LOSSES   : raised to 3
-  FIXED:
-    DAILY_LOSS_LIMIT_PCT        : corrected to 0.15 (was 2.15, comment always said 15%)
+    DRIFT_SYMBOLS                    : DSHIFT10/20/30
+    BOOM300N, CRASH300N              : to BOOM_CRASH_SYMBOLS
+    ALL_TRADE_SYMBOLS                : flat union replacing ALL_SYMBOLS + TRADE_SYMBOLS
+    REDEPLOY_EVERY_N_MINS            : minute-based redeploy cadence
 """
 
 import os
@@ -37,9 +41,10 @@ WEBSOCKET_MAX_RECONNECTS     : int = 5
 
 # ─── Symbol Groups ────────────────────────────────────────────────────────────
 
-# Digit Over/Under — 1s indices only (fastest tick resolution)
+# Digit Over/Under — all available indices
 DIGIT_SYMBOLS           : List[str] = [
-    "R_10", "R_25", "R_10_1HZ", "R_25_1HZ",
+    "R_10",  "R_25",  "R_50",  "R_75",  "R_100",
+    "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
 ]
 
 # Mean Reversion — low-volatility 1s indices
@@ -54,32 +59,43 @@ VOLATILITY_SYMBOLS      : List[str] = [
     "R_10_1HZ", "R_25_1HZ", "R_50_1HZ", "R_75_1HZ", "R_100_1HZ",
 ]
 
-# Boom / Crash — post-spike fade strategy
+# Boom / Crash — all available including N-variants
 BOOM_CRASH_SYMBOLS      : List[str] = [
-    "BOOM500", "BOOM300", "BOOM150", "BOOM1000",
-    "CRASH500", "CRASH300", "CRASH150", "CRASH1000",
+    "BOOM150","BOOM300","BOOM500","BOOM1000",
+    "CRASH150","CRASH300","CRASH500","CRASH1000",
+    "BOOM300N","CRASH300N",
 ]
 
-# Range Break — retest-entry after confirmed breakout
+# Range Break — all available
 RANGE_BREAK_SYMBOLS     : List[str] = ["RDBULL", "RDBEAR", "RB100", "RB200"]
 
-# Step Index — grid / trend-following
+# Step Index
 STEP_SYMBOLS            : List[str] = ["stpRNG"]
 
-# Jump Index — pre-jump timing
+# Jump Index — all available
 JUMP_SYMBOLS            : List[str] = ["JD10", "JD25", "JD50", "JD75", "JD100"]
 
-# All symbols scanned in canonical order
+# Drift / Shift Index — all available
+DRIFT_SYMBOLS           : List[str] = ["DSHIFT10", "DSHIFT20", "DSHIFT30"]
+
+# All symbols scanned (canonical union)
 ALL_SYMBOLS             : List[str] = (
     BOOM_CRASH_SYMBOLS + VOLATILITY_SYMBOLS + RANGE_BREAK_SYMBOLS +
-    STEP_SYMBOLS + JUMP_SYMBOLS
+    STEP_SYMBOLS + JUMP_SYMBOLS + DRIFT_SYMBOLS
 )
 
-# Actively traded (excludes broad-scan-only volatility)
-TRADE_SYMBOLS           : List[str] = (
-    DIGIT_SYMBOLS + RANGE_BREAK_SYMBOLS +
-    BOOM_CRASH_SYMBOLS + STEP_SYMBOLS + JUMP_SYMBOLS
+# Actively traded flat list (maximum available)
+ALL_TRADE_SYMBOLS       : List[str] = (
+    DIGIT_SYMBOLS +
+    BOOM_CRASH_SYMBOLS +
+    RANGE_BREAK_SYMBOLS +
+    STEP_SYMBOLS +
+    JUMP_SYMBOLS +
+    DRIFT_SYMBOLS
 )
+
+# Legacy alias
+TRADE_SYMBOLS           : List[str] = ALL_TRADE_SYMBOLS
 
 # ─── Session / Dead Zone (UTC hours) ─────────────────────────────────────────
 DEAD_ZONE_START_UTC         : int = 0
@@ -97,6 +113,8 @@ BOOM_CRASH_1000_END_UTC     : int = 20
 BOOM_CRASH_300_START_UTC    : int = 7
 BOOM_CRASH_300_END_UTC      : int = 12
 
+JUMP_START_UTC              : int = 7
+JUMP_END_UTC                : int = 20
 JUMP_PEAK_UTC               : int = 12   # JD50 activity peaks here
 
 # ─── Timeframes ──────────────────────────────────────────────────────────────
@@ -108,43 +126,70 @@ HTF_BARS                    : int = 100
 LTF_BARS                    : int = 50
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT        : float = 2.15   # stop trading at 15% daily drawdown
+DAILY_LOSS_LIMIT_PCT        : float = 0.15   # stop trading at 15% daily drawdown
+DAILY_LOSS_PAUSE_MINS       : int   = 60     # pause duration (minutes) when limit hit
 BASE_STAKE_PCT              : float = 0.01   # 1% of current balance = base stake
-RISK_PER_TRADE_PCT          : float = 0.1   # alias for BASE_STAKE_PCT (backwards compat)
+RISK_PER_TRADE_PCT          : float = 0.01   # alias for BASE_STAKE_PCT (backwards compat)
 MIN_STAKE                   : float = 0.35
-MAX_STAKE                   : float = 1000.0
-MIN_ACCOUNT_BALANCE         : float = 0.0   # suspend all trading below this USD floor
-MAX_CONCURRENT_TRADES       : int   = 15
+MAX_STAKE                   : float = 50.0
+MIN_ACCOUNT_BALANCE         : float = 0.0    # suspend all trading below this USD floor
+MAX_CONCURRENT_TRADES       : int   = 20
 
 # ─── Progressive Loss Scaling (PLS) ──────────────────────────────────────────
 # Stake scales UP with consecutive wins; any loss resets immediately to base.
-# Indexed by win-streak bucket:  0–2 wins → 1.0×, 3–4 → 1.5×, etc.
-PLS_WIN_THRESHOLDS          : List[int]   = [0,   3,   5,   8,   12 ]
-PLS_WIN_MULTIPLIERS         : List[float] = [1.0, 1.5, 2.0, 3.0, 4.0]
+PLS_WIN_THRESHOLDS          : List[int]   = [3,   5,   8,   12  ]
+PLS_WIN_MULTIPLIERS         : List[float] = [1.5, 2.0, 3.0, 4.0 ]
+PLS_WIN_EXTRA_SLOTS         : List[int]   = [2,   4,   6,   8   ]
 PLS_LOSS_RESET              : bool        = True   # loss immediately returns to 1.0×
 
 # Legacy win-streak aliases (backwards compat)
-WIN_STREAK_THRESHOLDS       : List[int]   = PLS_WIN_THRESHOLDS[1:]      # [3,5,8,12]
-WIN_STREAK_MULTIPLIERS      : List[float] = PLS_WIN_MULTIPLIERS[1:]     # [1.5,2.0,3.0,4.0]
-WIN_STREAK_EXTRA_SLOTS      : List[int]   = [2, 4, 6, 8]
+WIN_STREAK_THRESHOLDS        : List[int]   = PLS_WIN_THRESHOLDS
+WIN_STREAK_MULTIPLIERS       : List[float] = PLS_WIN_MULTIPLIERS
+WIN_STREAK_EXTRA_SLOTS       : List[int]   = PLS_WIN_EXTRA_SLOTS
 WIN_STREAK_SCALE_THRESHOLDS  = WIN_STREAK_THRESHOLDS
 WIN_STREAK_STAKE_MULTIPLIERS = WIN_STREAK_MULTIPLIERS
 WIN_STREAK_CONCURRENT_BONUS  = WIN_STREAK_EXTRA_SLOTS
-WIN_STREAK_STAKE_FACTOR     : float = 0.30
-MAX_WIN_STREAK_MULT         : float = 4.0
+WIN_STREAK_STAKE_FACTOR      : float = 0.30
+MAX_WIN_STREAK_MULT          : float = 4.0
 
 # Extra concurrent slots unlocked by win streak
-WIN_STREAK_EXTRA_SLOT_MAP   : Dict[int, int] = {3: 2, 5: 4, 8: 6, 12: 8}
+WIN_STREAK_EXTRA_SLOT_MAP    : Dict[int, int] = {3: 2, 5: 4, 8: 6, 12: 8}
 
-# ─── Symbol Cooldown After Loss ───────────────────────────────────────────────
-SYMBOL_LOSS_COOLDOWN_SECONDS    : int = 120
-SYNTHETIC_LOSS_COOLDOWN_SECONDS : int = 60
+# ─── Symbol Suspension Timing (all in minutes) ────────────────────────────────
+SYMBOL_WIN_SUSPEND_MINS           : int = 5    # suspend symbol N mins after win
+SYMBOL_LOSS_SUSPEND_MINS          : int = 10   # suspend symbol N mins after loss
+SYMBOL_MIN_GAP_MINS               : int = 2    # minimum gap between trades on same symbol
+SYMBOL_SESSION_BAN_LOSSES         : int = 3    # consecutive losses → session ban
+SYMBOL_SESSION_BAN_MINS           : int = 480  # session ban duration (8 hours)
 
-# ─── Symbol Time-Based Suspension ────────────────────────────────────────────
-SYMBOL_WIN_SUSPENSION_MINUTES     : int = 7
-SYMBOL_LOSS_SUSPENSION_MINUTES    : int = 17
-SYMBOL_MIN_GAP_MINUTES            : int = 7
-SYMBOL_SESSION_LOSS_BAN_THRESHOLD : int = 3   # raised from 2 → 3
+# Legacy second-based aliases (backwards compat)
+SYMBOL_LOSS_COOLDOWN_SECONDS      : int = SYMBOL_LOSS_SUSPEND_MINS * 60
+SYNTHETIC_LOSS_COOLDOWN_SECONDS   : int = SYMBOL_MIN_GAP_MINS * 60
+
+# Legacy naming aliases
+SYMBOL_WIN_SUSPENSION_MINUTES     : int = SYMBOL_WIN_SUSPEND_MINS
+SYMBOL_LOSS_SUSPENSION_MINUTES    : int = SYMBOL_LOSS_SUSPEND_MINS
+SYMBOL_MIN_GAP_MINUTES            : int = SYMBOL_MIN_GAP_MINS
+SYMBOL_SESSION_LOSS_BAN_THRESHOLD : int = SYMBOL_SESSION_BAN_LOSSES
+
+# ─── Trade Execution ─────────────────────────────────────────────────────────
+TRADE_DURATION                    : int = 5
+TRADE_DURATION_UNIT               : str = "m"
+
+BOOM_CRASH_TICK_DURATION          : int = 10
+BOOM_CRASH_DURATION_UNIT          : str = "t"
+
+# ─── Contract Force-Close Timeout (minutes → seconds) ────────────────────────
+CONTRACT_CHECK_SECS               : int = 300   # check contract at 5 mins
+CONTRACT_TIMEOUT_SECS             : int = 420   # force close at 7 mins
+
+# Legacy naming aliases
+CONTRACT_MAX_AGE_SECONDS          : int = CONTRACT_CHECK_SECS
+CONTRACT_FORCE_CLOSE_AFTER_SECONDS: int = CONTRACT_TIMEOUT_SECS
+
+# ─── Scan Cycle Timing ────────────────────────────────────────────────────────
+SCAN_CYCLE_SLEEP                  : int = 1      # seconds between scan cycles
+PARALLEL_SCAN                     : bool = True  # scan all symbols simultaneously
 
 # ─── Signal Score Weights ─────────────────────────────────────────────────────
 SCORE_WEIGHT_MODULE_STRENGTH      : float = 0.50
@@ -153,7 +198,8 @@ SCORE_WEIGHT_FRESHNESS            : float = 0.05
 SCORE_WEIGHT_INDICATOR_AGREEMENT  : float = 0.15
 
 # ─── Signal Quality Gate ──────────────────────────────────────────────────────
-MIN_SIGNAL_SCORE                  : float = 2.0
+MIN_SIGNAL_STRENGTH               : int   = 2
+MIN_SIGNAL_SCORE                  : float = 0.55
 MIN_SIGNAL_PROBABILITY            : float = 1.8
 MIN_STRENGTH_REPEAT_SYMBOL        : int   = 3
 
@@ -183,7 +229,7 @@ NEWS_BLOCK_MINUTES                : int   = 30
 DIVERGENCE_STRENGTH_MIN           : float = 0.3
 
 # ─── Strategy: Digit Over/Under ───────────────────────────────────────────────
-DIGIT_MIN_SCORE                   : int   = 6    # minimum score out of 8 to trade
+DIGIT_MIN_SCORE                   : int   = 6
 DIGIT_RSI_OVERSOLD                : int   = 30
 DIGIT_RSI_OVERBOUGHT              : int   = 70
 DIGIT_BB_PERIODS                  : int   = 20
@@ -197,45 +243,31 @@ MR_ROC_THRESHOLD                  : float = 0.02
 MR_MIN_SCORE                      : int   = 6
 
 # ─── Strategy: Range Break ────────────────────────────────────────────────────
-RB_CONSOLIDATION_RATIO            : float = 0.4   # current range < 0.4× 50-bar avg
+RB_CONSOLIDATION_RATIO            : float = 0.4
 RB_BREAKOUT_ATR_MULT              : float = 0.3
 RB_RSI_BULL                       : int   = 52
 RB_RSI_BEAR                       : int   = 48
-RB_MAX_AGE_BARS                   : int   = 3     # only trade fresh breakouts
-RB_RETEST_TOLERANCE_ATR           : float = 0.5   # retest within 0.5× ATR of breakout
+RB_MAX_AGE_BARS                   : int   = 3
+RB_RETEST_TOLERANCE_ATR           : float = 0.5
 
 # ─── Strategy: Boom/Crash Post-Spike Fade ────────────────────────────────────
-SPIKE_ATR_MULTIPLIER              : float = 3.0   # spike = bar moves > 3× ATR14
+SPIKE_ATR_MULTIPLIER              : float = 3.0
 SPIKE_MAX_AGE_BARS                : int   = 2
 SPIKE_COOLDOWN_BARS               : int   = 10
-SPIKE_RSI_OVERBOUGHT              : int   = 60    # required after boom spike to fade
-SPIKE_RSI_OVERSOLD                : int   = 40    # required after crash spike to fade
+SPIKE_RSI_OVERBOUGHT              : int   = 60
+SPIKE_RSI_OVERSOLD                : int   = 40
 
 # ─── Strategy: Step Index ─────────────────────────────────────────────────────
 STEP_EMA_FAST                     : int = 10
 STEP_EMA_SLOW                     : int = 30
-STEP_GRID_SIZE                    : int = 5       # grid spacing in points
+STEP_GRID_SIZE                    : int = 5
 
 # ─── Strategy: Jump Index ─────────────────────────────────────────────────────
-JUMP_INTERVAL_SECONDS             : int = 1200    # ~20 min between jumps
-JUMP_ENTRY_WINDOW_SECS            : int = 120     # enter within 2 min of expected jump
+JUMP_INTERVAL_SECONDS             : int = 1200   # ~20 min between jumps
+JUMP_ENTRY_WINDOW_SECS            : int = 120    # enter within 2 min of expected jump
 
-# ─── Trade Execution ─────────────────────────────────────────────────────────
-TRADE_DURATION                    : int = 5
-TRADE_DURATION_UNIT               : str = "m"
-
-BOOM_CRASH_TICK_DURATION          : int = 10
-BOOM_CRASH_DURATION_UNIT          : str = "t"
-
-# ─── Contract Force-Close Timeout ─────────────────────────────────────────────
-CONTRACT_MAX_AGE_SECONDS          : int = TRADE_DURATION * 60 + 45
-CONTRACT_FORCE_CLOSE_AFTER_SECONDS: int = TRADE_DURATION * 60 + 90
-
-# ─── Scan Cycle Timing ────────────────────────────────────────────────────────
-SCAN_CYCLE_SLEEP                  : int = 1
-
-# ─── Auto-Redeploy Cycle Budget ───────────────────────────────────────────────
-REDEPLOY_EVERY_N_CYCLES           : int = 6
+# ─── Auto-Redeploy ────────────────────────────────────────────────────────────
+REDEPLOY_EVERY_N_MINS             : int = 6      # minute-based redeploy cadence
 
 # ─── Render Deploy Hook ───────────────────────────────────────────────────────
 RENDER_DEPLOY_HOOK_URL            : str = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
