@@ -119,20 +119,45 @@ def trigger_redeploy() -> None:
 
 # ── SVG Balance Curve ──────────────────────────────────────────────────────────
 
+def _exit_time_to_dt(raw) -> datetime.datetime | None:
+    """Parse exit_time regardless of whether it's a Unix timestamp or ISO string."""
+    if raw is None:
+        return None
+    try:
+        # Unix timestamp (int or float)
+        f = float(raw)
+        if f > 1_000_000_000:                          # looks like epoch seconds
+            return datetime.datetime.utcfromtimestamp(f)
+    except (TypeError, ValueError):
+        pass
+    # ISO / datetime string  "2024-05-31T14:22:00" or "2024-05-31 14:22:00"
+    s = str(raw).replace("T", " ")[:19]
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+    return None
+
+
 def _build_svg_chart(recent_trades: list) -> str:
     """Build a pure inline SVG balance curve. No external dependencies."""
-    today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    today = datetime.datetime.utcnow().date()
     points = []
     for t in recent_trades:
-        ts = str(t.get("exit_time", ""))
-        if ts[:10] == today_str:
-            try:
-                bal  = float(t.get("balance_after", 0))
-                won  = bool(t.get("won", False))
-                hhmm = ts[11:16] if len(ts) >= 16 else ts
-                points.append({"t": hhmm, "bal": bal, "won": won})
-            except Exception:
-                continue
+        dt = _exit_time_to_dt(t.get("exit_time"))
+        # Accept today's trades; if timestamp is missing/unparseable include it anyway
+        if dt is not None and dt.date() != today:
+            continue
+        try:
+            bal  = float(t.get("balance_after") or t.get("balance") or 0)
+            won  = bool(t.get("won", False))
+            label = dt.strftime("%H:%M") if dt else "?"
+            if bal == 0:
+                continue                                # skip uninitialised entries
+            points.append({"t": label, "bal": bal, "won": won})
+        except Exception:
+            continue
 
     W, H = 900, 180
     PAD_L, PAD_R, PAD_T, PAD_B = 58, 12, 12, 32
@@ -278,23 +303,33 @@ def _render_dashboard() -> str:
         # ── Recent trades table ───────────────────────────────────────────────
         recent_trades_list = s.get("recent_trades", [])
         trade_rows = ""
+        bad_rows = 0
         for t in reversed(recent_trades_list[-20:]):
             try:
-                pnl   = float(t.get("pnl", 0))
-                won   = bool(t.get("won", False))
-                badge = ('<span class="badge badge-win">WIN</span>'   if won else
-                         '<span class="badge badge-loss">LOSS</span>')
-                dir_b = ('<span class="badge badge-long">LONG</span>'
-                         if t.get("direction") == "LONG" else
-                         '<span class="badge badge-short">SHORT</span>')
-                pnl_c = "green" if pnl >= 0 else "red"
-                ts    = str(t.get("exit_time", ""))[:19].replace("T", " ")
-                stake = float(t.get("stake", 0))
-                bal_a = float(t.get("balance_after", 0))
+                pnl_raw = t.get("pnl") if t.get("pnl") is not None else t.get("profit", t.get("return", 0))
+                pnl   = float(pnl_raw or 0)
+                won   = bool(t.get("won", pnl > 0))
+                badge = ('<span class="badge badge-win">WIN</span>' if won
+                         else '<span class="badge badge-loss">LOSS</span>')
+                raw_dir = str(t.get("direction", t.get("contract_type", "")) or "").upper()
+                if "LONG" in raw_dir or "CALL" in raw_dir:
+                    dir_b = '<span class="badge badge-long">LONG</span>'
+                elif "SHORT" in raw_dir or "PUT" in raw_dir:
+                    dir_b = '<span class="badge badge-short">SHORT</span>'
+                else:
+                    dir_b = f'<span class="ticker">{raw_dir or "—"}</span>'
+                pnl_c  = "green" if pnl >= 0 else "red"
+                dt_obj = _exit_time_to_dt(t.get("exit_time") or t.get("close_time") or t.get("time"))
+                ts_str = dt_obj.strftime("%Y-%m-%d %H:%M:%S") if dt_obj else "—"
+                stake_raw = t.get("stake") if t.get("stake") is not None else t.get("amount", t.get("buy_price", 0))
+                stake = float(stake_raw or 0)
+                bal_raw = t.get("balance_after") if t.get("balance_after") is not None else t.get("balance", 0)
+                bal_a = float(bal_raw or 0)
+                sym   = t.get("symbol", t.get("market", ""))
                 trade_rows += (
                     f"<tr>"
-                    f"<td class='ticker'>{ts}</td>"
-                    f"<td><b>{t.get('symbol','')}</b></td>"
+                    f"<td class='ticker'>{ts_str}</td>"
+                    f"<td><b>{sym}</b></td>"
                     f"<td>{dir_b}</td>"
                     f"<td>${stake:.2f}</td>"
                     f"<td class='{pnl_c}'>{'+' if pnl >= 0 else ''}{pnl:.4f}</td>"
@@ -302,11 +337,15 @@ def _render_dashboard() -> str:
                     f"<td>{badge}</td>"
                     f"</tr>"
                 )
-            except Exception:
+            except Exception as row_err:
+                bad_rows += 1
+                logger.warning(f"trade row skipped — {row_err} — data={t}")
                 continue
         if not trade_rows:
-            trade_rows = ("<tr><td colspan='7' style='text-align:center;color:#484f58'>"
-                          "No trades yet</td></tr>")
+            detail = (f" ({len(recent_trades_list)} in state, {bad_rows} parse errors)"
+                      if recent_trades_list else "")
+            trade_rows = (f"<tr><td colspan='7' style='text-align:center;color:#484f58'>"
+                          f"No trades yet{detail}</td></tr>")
 
         # ── Suspended symbols ─────────────────────────────────────────────────
         now_ts = time.time()
