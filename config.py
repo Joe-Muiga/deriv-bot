@@ -4,9 +4,9 @@ All secrets are loaded from environment variables; defaults are safe fallbacks.
 
 v17 → v18 changes:
   CHANGED:
-    MIN_SIGNAL_STRENGTH              : 1     (was 2)
-    MIN_SIGNAL_SCORE                 : 0.3   (was 0.55)
-    SYMBOL_MIN_GAP_MINS              : 1     (was 2)
+    MIN_SIGNAL_STRENGTH              : 2     (was 2)
+    MIN_SIGNAL_SCORE                 : 0.6   (was 0.55)
+    SYMBOL_MIN_GAP_MINS              : 2     (was 2)
     DIGIT_MIN_SCORE                  : 4     (was 6)
     SPIKE_ATR_MULTIPLIER             : 1.5   (was 3.0)
     MIN_MODULE_STRENGTH              : 1     (was 2)
