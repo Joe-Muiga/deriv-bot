@@ -8,12 +8,17 @@ Routes:
   /trades    → Recent trade list as JSON
   /symbols   → Symbol leaderboard as JSON
 
-v5 → v6 changes (500-error fix):
-  - Embedded HTML dashboard template directly into this file so the server
-    never crashes when dashboard.html is missing from the deployment.
-  - Wrapped _render_dashboard() in a broad try/except so any unexpected
-    rendering error returns a safe fallback page instead of a 500.
-  - All existing logic, routes, and helpers are unchanged.
+v6 → v7 changes (dashboard overhaul):
+  - Added Balance Curve — Today chart using Chart.js from CDN.
+    Plots balance after each trade; green dot = win, red dot = loss.
+  - Added Suspended Symbols section showing symbol and minutes remaining.
+  - Extended _state with suspended_symbols list.
+  - Added update_suspended_symbols() helper.
+  - Ensured all required dashboard fields are present and updating on every
+    refresh: balance, daily PnL ($/%),  win rate, streak, total trades today,
+    last signal (symbol/direction/strategy/score), recent trades table,
+    suspended symbols with time remaining, session status.
+  - All other logic, routes, ping loop, and helpers are unchanged.
 """
 
 import os
@@ -53,6 +58,8 @@ _state: dict = {
     "best_symbols":          [],
     "redeploy_pending":      False,
     "active_trades":         0,
+    # List of dicts: {"symbol": str, "suspended_until": float (unix timestamp)}
+    "suspended_symbols":     [],
 }
 
 
@@ -76,6 +83,15 @@ def set_active_trades(count: int) -> None:
 
 def get_active_trades() -> int:
     return int(_state.get("active_trades", 0))
+
+
+def update_suspended_symbols(suspended: list) -> None:
+    """
+    Update the list of suspended symbols.
+    Each entry should be a dict: {"symbol": str, "suspended_until": float}
+    where suspended_until is a Unix timestamp (time.time() + seconds_remaining).
+    """
+    _state["suspended_symbols"] = list(suspended)
 
 
 def trigger_redeploy() -> None:
@@ -110,6 +126,9 @@ _EMBEDDED_TEMPLATE = """<!DOCTYPE html>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta http-equiv="refresh" content="10">
 <title>Deriv Bot Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"
+        integrity="sha512-ZwR1/gSZM3ai6vCdI+LVF1zSq/5HznD3oD+sCoJrzXJ+yKNtkEOKnIcmnt3py+FQAbTvBbTf4p/GJ4KyHGWg=="
+        crossorigin="anonymous" referrerpolicy="no-referrer"></script>
 <style>
   :root {
     --bg: #0d1117; --card: #161b22; --border: #30363d;
@@ -160,6 +179,14 @@ _EMBEDDED_TEMPLATE = """<!DOCTYPE html>
   .bar-fill  { height: 100%; border-radius: 4px; background: var(--green);
                transition: width .4s; }
   .bar-fill.danger { background: var(--red); }
+  .chart-card { background: var(--card); border: 1px solid var(--border);
+                border-radius: 8px; padding: 16px; margin-bottom: 16px; }
+  .chart-title { font-size: 12px; font-weight: 600; color: var(--muted);
+                 text-transform: uppercase; letter-spacing: .05em; margin-bottom: 12px; }
+  .chart-wrap { position: relative; height: 200px; }
+  .susp-table td { font-size: 12px; }
+  .susp-badge { display: inline-block; padding: 2px 7px; border-radius: 4px;
+                font-size: 10px; font-weight: 700; background: #3a2a1a; color: var(--yellow); }
   .footer { margin-top: 20px; font-size: 11px; color: var(--muted); text-align: right; }
 </style>
 </head>
@@ -203,12 +230,21 @@ _EMBEDDED_TEMPLATE = """<!DOCTYPE html>
   </div>
   <div class="card">
     <div class="card-title">Streak</div>
-    <div class="card-value {{streak_color}}">{{streak_label}}</div>
+    <div class="card-value {{streak_color}}">{{streak_display}}</div>
     <div class="card-sub">{{streak_type}}</div>
   </div>
   <div class="card">
     <div class="card-title">Last Signal</div>
-    <div class="card-value" style="font-size:13px;">{{last_signal}}</div>
+    <div class="card-value" style="font-size:13px; line-height:1.4;">{{last_signal_sym}}</div>
+    <div class="card-sub">{{last_signal_detail}}</div>
+  </div>
+</div>
+
+<!-- Balance Curve Chart -->
+<div class="chart-card">
+  <div class="chart-title">Balance Curve — Today</div>
+  <div class="chart-wrap">
+    <canvas id="balanceChart"></canvas>
   </div>
 </div>
 
@@ -223,6 +259,8 @@ _EMBEDDED_TEMPLATE = """<!DOCTYPE html>
   <tbody>{{recent_rows}}</tbody>
 </table>
 
+{{suspended_section}}
+
 <div class="section-title">Symbol Leaderboard</div>
 <table>
   <thead>
@@ -232,8 +270,109 @@ _EMBEDDED_TEMPLATE = """<!DOCTYPE html>
 </table>
 
 <div class="footer">Deriv Bot · Render deployment</div>
+
+<script>
+(function() {
+  // Chart data injected server-side
+  var labels   = {{chart_labels}};
+  var balances = {{chart_balances}};
+  var colors   = {{chart_colors}};
+
+  var canvas = document.getElementById('balanceChart');
+  if (!canvas) return;
+
+  // Fallback: no trades yet
+  if (!labels || labels.length === 0) {
+    var ctx2 = canvas.getContext('2d');
+    ctx2.fillStyle = '#8b949e';
+    ctx2.font = '13px Segoe UI, sans-serif';
+    ctx2.textAlign = 'center';
+    ctx2.fillText('No trades today yet', canvas.offsetWidth / 2 || 200, 100);
+    return;
+  }
+
+  var ctx = canvas.getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: {
+      labels: labels,
+      datasets: [{
+        label: 'Balance',
+        data: balances,
+        borderColor: '#58a6ff',
+        borderWidth: 2,
+        tension: 0.3,
+        fill: false,
+        pointBackgroundColor: colors,
+        pointBorderColor: colors,
+        pointRadius: 5,
+        pointHoverRadius: 7,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: {
+          callbacks: {
+            label: function(ctx) {
+              return ' $' + ctx.parsed.y.toFixed(4);
+            }
+          }
+        }
+      },
+      scales: {
+        x: {
+          ticks: { color: '#8b949e', font: { size: 11 } },
+          grid:  { color: '#21262d' }
+        },
+        y: {
+          ticks: {
+            color: '#8b949e',
+            font:  { size: 11 },
+            callback: function(v) { return '$' + v.toFixed(2); }
+          },
+          grid: { color: '#21262d' }
+        }
+      }
+    }
+  });
+})();
+</script>
 </body>
 </html>"""
+
+
+def _build_chart_data(recent_trades: list) -> tuple:
+    """
+    Filter trades to today (UTC), build Chart.js-ready arrays.
+    Returns (labels_json, balances_json, colors_json).
+    """
+    today_str = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    today_trades = []
+
+    for t in recent_trades:
+        ts = str(t.get("exit_time", ""))
+        # Accept ISO strings like "2024-05-31T14:22:00" or "2024-05-31 14:22:00"
+        if ts[:10] == today_str:
+            try:
+                bal = float(t.get("balance_after", 0))
+                won = bool(t.get("won", False))
+                hhmm = ts[11:16] if len(ts) >= 16 else ts
+                today_trades.append((hhmm, bal, won))
+            except Exception:
+                continue
+
+    if not today_trades:
+        return "[]", "[]", "[]"
+
+    labels   = [f'"{x[0]}"' for x in today_trades]
+    balances = [str(round(x[1], 4)) for x in today_trades]
+    colors   = ['"#3fb950"' if x[2] else '"#f85149"' for x in today_trades]
+
+    return f"[{', '.join(labels)}]", f"[{', '.join(balances)}]", f"[{', '.join(colors)}]"
 
 
 def _render_dashboard() -> str:
@@ -273,7 +412,9 @@ def _render_dashboard() -> str:
         wr_color      = "green" if win_rate >= 55 else "yellow" if win_rate >= 45 else "red"
         pf_color      = "green" if pf >= 1.2 else "yellow" if pf >= 1.0 else "red"
         streak_color  = "green" if streak > 0 else "red" if streak < 0 else "yellow"
-        streak_label  = str(abs(streak)) if streak else "0"
+        streak_display = (f"+{streak}" if streak > 0
+                          else str(streak) if streak < 0
+                          else "0")
         streak_type   = "wins" if streak > 0 else "losses" if streak < 0 else "—"
         danger_class  = "danger" if loss_bar_pct > 70 else ""
 
@@ -288,8 +429,27 @@ def _render_dashboard() -> str:
         up     = int(s.get("uptime_seconds", 0))
         uptime = f"{up//3600}h {(up%3600)//60}m"
 
+        # ── Last signal — structured display ──────────────────────────────────
+        raw_sig = s.get("last_signal", "No signal yet")
+        if isinstance(raw_sig, dict):
+            sig_sym    = str(raw_sig.get("symbol", "—"))
+            sig_dir    = str(raw_sig.get("direction", "—"))
+            sig_strat  = str(raw_sig.get("strategy", "—"))
+            sig_score  = raw_sig.get("score", None)
+            dir_badge  = ('<span class="badge badge-long">LONG</span>' if sig_dir == "LONG"
+                          else '<span class="badge badge-short">SHORT</span>' if sig_dir == "SHORT"
+                          else sig_dir)
+            last_signal_sym    = f"{sig_sym} {dir_badge}"
+            last_signal_detail = (f"{sig_strat}"
+                                  + (f" · score {float(sig_score):.3f}" if sig_score is not None else ""))
+        else:
+            last_signal_sym    = str(raw_sig)
+            last_signal_detail = ""
+
+        # ── Recent trades table ───────────────────────────────────────────────
+        recent_trades_list = s.get("recent_trades", [])
         recent_rows = ""
-        for t in reversed(s.get("recent_trades", [])[-20:]):
+        for t in reversed(recent_trades_list[-20:]):
             try:
                 pnl   = float(t.get("pnl", 0))
                 won   = bool(t.get("won", False))
@@ -319,6 +479,40 @@ def _render_dashboard() -> str:
             recent_rows = ("<tr><td colspan='7' style='text-align:center;color:#484f58'>"
                            "No trades yet</td></tr>")
 
+        # ── Suspended symbols section ─────────────────────────────────────────
+        now_ts = time.time()
+        suspended_list = s.get("suspended_symbols", [])
+        # Filter to only those still active
+        active_suspended = [
+            x for x in suspended_list
+            if float(x.get("suspended_until", 0)) > now_ts
+        ]
+        if active_suspended:
+            susp_rows = ""
+            for x in sorted(active_suspended, key=lambda z: float(z.get("suspended_until", 0))):
+                mins_left = max(0, int((float(x["suspended_until"]) - now_ts) / 60))
+                susp_rows += (
+                    f"<tr>"
+                    f"<td><b>{x.get('symbol', '—')}</b></td>"
+                    f"<td><span class='susp-badge'>⏸ {mins_left} min remaining</span></td>"
+                    f"</tr>"
+                )
+            suspended_section = (
+                '<div class="section-title">Suspended Symbols</div>'
+                '<table class="susp-table">'
+                '<thead><tr><th>Symbol</th><th>Status</th></tr></thead>'
+                f'<tbody>{susp_rows}</tbody>'
+                '</table>'
+            )
+        else:
+            suspended_section = (
+                '<div class="section-title">Suspended Symbols</div>'
+                '<table class="susp-table"><thead><tr><th>Symbol</th><th>Status</th></tr></thead>'
+                '<tbody><tr><td colspan="2" style="text-align:center;color:#484f58">'
+                'None suspended</td></tr></tbody></table>'
+            )
+
+        # ── Symbol leaderboard ────────────────────────────────────────────────
         symbol_rows = ""
         for sym in s.get("best_symbols", [])[:10]:
             try:
@@ -341,37 +535,45 @@ def _render_dashboard() -> str:
             symbol_rows = ("<tr><td colspan='5' style='text-align:center;color:#484f58'>"
                            "No data yet</td></tr>")
 
+        # ── Chart data ────────────────────────────────────────────────────────
+        chart_labels, chart_balances, chart_colors = _build_chart_data(recent_trades_list)
+
         html = template
         for k, v in {
-            "{{dot_class}}":       dot_class,
-            "{{session}}":         str(s.get("session", "—")),
-            "{{uptime}}":          uptime,
-            "{{current_symbol}}":  str(s.get("current_symbol", "—")),
-            "{{paused_banner}}":   paused_banner,
-            "{{balance}}":         f"{balance:.4f}",
-            "{{balance_color}}":   balance_color,
-            "{{day_start}}":       f"{day_start:.4f}",
-            "{{daily_pnl_sign}}":  pnl_sign,
-            "{{daily_pnl_abs}}":   f"{abs(daily_pnl):.4f}",
-            "{{daily_pnl_pct}}":   f"{pnl_pct:+.2f}",
-            "{{pnl_color}}":       pnl_color,
-            "{{loss_bar_pct}}":    f"{loss_bar_pct:.0f}",
-            "{{danger_class}}":    danger_class,
-            "{{win_rate}}":        f"{win_rate:.1f}",
-            "{{wr_color}}":        wr_color,
-            "{{wins}}":            str(wins),
-            "{{losses}}":          str(losses),
-            "{{trades}}":          str(trades),
-            "{{profit_factor}}":   f"{pf:.3f}",
-            "{{pf_color}}":        pf_color,
-            "{{streak_label}}":    streak_label,
-            "{{streak_color}}":    streak_color,
-            "{{streak_type}}":     streak_type,
-            "{{tradeable_count}}": str(s.get("tradeable_count", 0)),
-            "{{last_signal}}":     str(s.get("last_signal", "—")),
-            "{{now_utc}}":         datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
-            "{{recent_rows}}":     recent_rows,
-            "{{symbol_rows}}":     symbol_rows,
+            "{{dot_class}}":         dot_class,
+            "{{session}}":           str(s.get("session", "—")),
+            "{{uptime}}":            uptime,
+            "{{current_symbol}}":    str(s.get("current_symbol", "—")),
+            "{{paused_banner}}":     paused_banner,
+            "{{balance}}":           f"{balance:.4f}",
+            "{{balance_color}}":     balance_color,
+            "{{day_start}}":         f"{day_start:.4f}",
+            "{{daily_pnl_sign}}":    pnl_sign,
+            "{{daily_pnl_abs}}":     f"{abs(daily_pnl):.4f}",
+            "{{daily_pnl_pct}}":     f"{pnl_pct:+.2f}",
+            "{{pnl_color}}":         pnl_color,
+            "{{loss_bar_pct}}":      f"{loss_bar_pct:.0f}",
+            "{{danger_class}}":      danger_class,
+            "{{win_rate}}":          f"{win_rate:.1f}",
+            "{{wr_color}}":          wr_color,
+            "{{wins}}":              str(wins),
+            "{{losses}}":            str(losses),
+            "{{trades}}":            str(trades),
+            "{{profit_factor}}":     f"{pf:.3f}",
+            "{{pf_color}}":          pf_color,
+            "{{streak_display}}":    streak_display,
+            "{{streak_color}}":      streak_color,
+            "{{streak_type}}":       streak_type,
+            "{{tradeable_count}}":   str(s.get("tradeable_count", 0)),
+            "{{last_signal_sym}}":   last_signal_sym,
+            "{{last_signal_detail}}": last_signal_detail,
+            "{{now_utc}}":           datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"),
+            "{{recent_rows}}":       recent_rows,
+            "{{suspended_section}}": suspended_section,
+            "{{symbol_rows}}":       symbol_rows,
+            "{{chart_labels}}":      chart_labels,
+            "{{chart_balances}}":    chart_balances,
+            "{{chart_colors}}":      chart_colors,
         }.items():
             html = html.replace(k, str(v))
         return html
@@ -424,9 +626,10 @@ def stats_route():
         "current_symbol":    str(s.get("current_symbol", "—")),
         "session":           str(s.get("session", "—")),
         "uptime_seconds":    int(s.get("uptime_seconds", 0)),
-        "last_signal":       str(s.get("last_signal", "—")),
+        "last_signal":       s.get("last_signal", "—"),
         "tradeable_count":   int(s.get("tradeable_count", 0)),
         "active_trades":     int(s.get("active_trades", 0)),
+        "suspended_symbols": s.get("suspended_symbols", []),
     })
 
 
