@@ -5,7 +5,7 @@ v14 — Five independent strategy evaluators.
 All previous SMC, order block, and HTF bias logic has been removed entirely.
 
 STRATEGIES:
-    1. evaluate_digit          → config.DIGIT_SYMBOLS        (Digit Over/Under)
+    1. evaluate_digit          → config.        (Digit Over/Under)
     2. evaluate_mean_reversion → config.MEAN_REVERSION_SYMBOLS (Mean Reversion)
     3. evaluate_range_break    → config.RANGE_BREAK_SYMBOLS  (Range Break Retest)
     4. evaluate_boom_crash     → config.BOOM_CRASH_SYMBOLS   (Post-Spike Fade)
@@ -30,10 +30,6 @@ from candlestick_builder import Candle
 
 logger = logging.getLogger(__name__)
 
-# ─── Contrarian mode toggle ───────────────────────────────────────────────────
-# Set to False to disable inversion and run normally.
-CONTRARIAN_MODE = True
-
 
 # ─── SignalResult ──────────────────────────────────────────────────────────────
 
@@ -55,24 +51,6 @@ def _none(strategy: str, reason: str) -> SignalResult:
         strategy=strategy,
         reason=reason,
     )
-
-
-def _apply_contrarian(direction: str, reason: str):
-    """
-    Apply contrarian inversion to a directional signal.
-    Returns (new_direction, updated_reason).
-    Only LONG and SHORT are inverted; NONE is never touched.
-    Must be called as the absolute last operation before return.
-    """
-    if not CONTRARIAN_MODE:
-        return direction, reason
-    if direction == "LONG":
-        new_dir = "SHORT"
-        return new_dir, reason + " [CONTRARIAN: original=LONG→SHORT]"
-    elif direction == "SHORT":
-        new_dir = "LONG"
-        return new_dir, reason + " [CONTRARIAN: original=SHORT→LONG]"
-    return direction, reason
 
 
 # ─── Helpers ───────────────────────────────────────────────────────────────────
@@ -158,16 +136,12 @@ def evaluate_digit(ltf_bars: List[Candle], symbol: str) -> SignalResult:
         return _none(strategy, f"score {score:.3f} below 0.625 threshold")
 
     logger.info(f"DIGIT: {symbol} {direction} score={raw_score}/8")
-
-    reason = f"digit_score={raw_score}/8 score={score:.3f}"
-    direction, reason = _apply_contrarian(direction, reason)
-
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy=strategy,
-        reason=reason,
+        reason=f"digit_score={raw_score}/8 score={score:.3f}",
     )
 
 
@@ -268,19 +242,16 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
     score = raw / 8.0
     strength = 3 if all_met else 2
 
-    reason = (
-        f"RSI={rsi_val:.2f} close={close:.5f} "
-        f"BB_upper={bb_upper:.5f} BB_lower={bb_lower:.5f} "
-        f"ROC={roc_val:.5f} raw={raw}/8 score={score:.3f}"
-    )
-    direction, reason = _apply_contrarian(direction, reason)
-
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy=strategy,
-        reason=reason,
+        reason=(
+            f"RSI={rsi_val:.2f} close={close:.5f} "
+            f"BB_upper={bb_upper:.5f} BB_lower={bb_lower:.5f} "
+            f"ROC={roc_val:.5f} raw={raw}/8 score={score:.3f}"
+        ),
     )
 
 
@@ -433,20 +404,17 @@ def evaluate_range_break(ltf_bars: List[Candle], symbol: str) -> SignalResult:
         f"score={score:.3f} strength={strength}"
     )
 
-    reason = (
-        f"consolidation={consolidation_confirmed} breakout=True "
-        f"retest=True RSI={rsi_val:.2f} "
-        f"boundary={consol_level:.5f} ATR={atr14:.5f} "
-        f"confirmed={confirmed}/4"
-    )
-    direction, reason = _apply_contrarian(direction, reason)
-
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy=strategy,
-        reason=reason,
+        reason=(
+            f"consolidation={consolidation_confirmed} breakout=True "
+            f"retest=True RSI={rsi_val:.2f} "
+            f"boundary={consol_level:.5f} ATR={atr14:.5f} "
+            f"confirmed={confirmed}/4"
+        ),
     )
 
 
@@ -560,18 +528,15 @@ def evaluate_boom_crash(ltf_bars: List[Candle], symbol: str) -> SignalResult:
         f"score={score:.3f} strength={strength}"
     )
 
-    reason = (
-        f"{spike_type} spike bar_index={bar_index} size={spike_size:.5f} "
-        f"ATR={atr14:.5f} RSI={rsi_val:.2f} rsi_extreme={rsi_extreme}"
-    )
-    direction, reason = _apply_contrarian(direction, reason)
-
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy=strategy,
-        reason=reason,
+        reason=(
+            f"{spike_type} spike bar_index={bar_index} size={spike_size:.5f} "
+            f"ATR={atr14:.5f} RSI={rsi_val:.2f} rsi_extreme={rsi_extreme}"
+        ),
     )
 
 
@@ -671,19 +636,16 @@ def evaluate_step(ltf_bars: List[Candle], symbol: str) -> SignalResult:
         f"close={close:.5f} proximity={upper_proximity:.3f}"
     )
 
-    reason = (
-        f"EMA10={ema10_curr:.5f} EMA30={ema30_curr:.5f} "
-        f"DC_upper={dc_upper:.5f} DC_lower={dc_lower:.5f} "
-        f"proximity={upper_proximity:.3f}"
-    )
-    direction, reason = _apply_contrarian(direction, reason)
-
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy=strategy,
-        reason=reason,
+        reason=(
+            f"EMA10={ema10_curr:.5f} EMA30={ema30_curr:.5f} "
+            f"DC_upper={dc_upper:.5f} DC_lower={dc_lower:.5f} "
+            f"proximity={upper_proximity:.3f}"
+        ),
     )
 
 
