@@ -63,6 +63,10 @@ _state: dict = {
 }
 
 
+# Alias so bot_engine can import _status and reference the same dict
+_status = _state
+
+
 def update_status(**kwargs) -> None:
     _state.update(kwargs)
     _state["uptime_seconds"] = int(time.time() - _state["start_time"])
@@ -83,6 +87,62 @@ def set_active_trades(count: int) -> None:
 
 def get_active_trades() -> int:
     return int(_state.get("active_trades", 0))
+
+
+def record_trade(symbol, direction, stake, pnl,
+                 balance_after, won, strategy=""):
+    """Called directly after every trade closes."""
+    from datetime import datetime, timezone
+
+    trade = {
+        "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "symbol": symbol,
+        "direction": direction,
+        "stake": round(stake, 4),
+        "pnl": round(pnl, 4),
+        "balance_after": round(balance_after, 4),
+        "won": won,
+        "strategy": strategy,
+    }
+
+    # Add to recent trades — keep last 50
+    _status["recent_trades"].insert(0, trade)
+    _status["recent_trades"] = _status["recent_trades"][:50]
+
+    # Add to balance history for chart
+    _status["balance_history"].append({
+        "time": trade["time"],
+        "balance": balance_after,
+        "won": won,
+    })
+    _status["balance_history"] = _status["balance_history"][-100:]
+
+    # Update win/loss counts
+    if won:
+        _status["wins"] += 1
+    else:
+        _status["losses"] += 1
+    _status["total_trades"] = _status["wins"] + _status["losses"]
+
+    # Recalculate win rate
+    if _status["total_trades"] > 0:
+        _status["win_rate"] = round(
+            _status["wins"] / _status["total_trades"] * 100, 1)
+
+    # Update daily PnL
+    day_start = _status.get("day_start_balance", balance_after)
+    if day_start > 0:
+        _status["daily_pnl"] = round(balance_after - day_start, 4)
+        _status["daily_pnl_pct"] = round(
+            (_status["daily_pnl"] / day_start) * 100, 2)
+
+    _status["balance"] = balance_after
+
+
+def record_signal(symbol, direction, strategy, score):
+    _status["last_signal"] = (
+        f"{symbol} {direction} | {strategy} | score={score:.3f}"
+    )
 
 
 def update_suspended_symbols(suspended: list) -> None:
