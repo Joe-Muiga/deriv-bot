@@ -28,7 +28,7 @@ Target instruments (priority order):
 
 Suspension rules (unix-timestamp-based):
   WIN  → suspend config.SYMBOL_WIN_SUSPEND_MINS minutes
-  LOSS → suspend config.SYMBOL_LOSS_SUSPEND_MINS minutes
+  LOSS → suspend config.SYMBOL_LOSS_SUSPEND_MINS minutes (default 11m = 660s)
   config.SYMBOL_SESSION_BAN_LOSSES consecutive losses same symbol → suspend 59940s (~rest of session)
 
 Same-symbol gap enforcement:
@@ -119,7 +119,7 @@ def _win_suspend_secs() -> float:
     return getattr(config, "SYMBOL_WIN_SUSPEND_MINS", 7) * 60
 
 def _loss_suspend_secs() -> float:
-    return getattr(config, "SYMBOL_LOSS_SUSPEND_MINS", 17) * 60
+    return getattr(config, "SYMBOL_LOSS_SUSPEND_MINS", 11) * 60
 
 def _min_gap_secs() -> float:
     return getattr(config, "SYMBOL_MIN_GAP_MINS", 7) * 60
@@ -279,7 +279,7 @@ def record_result(symbol: str, won: bool) -> None:
                 f"(loss #{loss_count} — threshold {ban_threshold}) ***"
             )
         else:
-            loss_mins = getattr(config, "SYMBOL_LOSS_SUSPEND_MINS", 17)
+            loss_mins = getattr(config, "SYMBOL_LOSS_SUSPEND_MINS", 11)
             suspend(symbol, loss_mins)
             remaining_until_ban = ban_threshold - loss_count
             logger.info(
@@ -438,15 +438,16 @@ def get_queue(active_list: List[str]) -> List[str]:
         if sym not in trade_symbols:
             continue
 
+        # Exclude any symbol with an open contract regardless of suspension status
+        if sym in _active_symbols:
+            if sym not in suspended_syms:
+                suspended_syms.append(sym)
+            continue
+
         if not can_trade_now(sym):
-            # Distinguish suspension from gap/open-contract for logging
-            if is_suspended(sym) or sym in _active_symbols:
-                if sym not in suspended_syms:
-                    suspended_syms.append(sym)
-            # gap-blocked shares suspended bucket for simplicity in log line
-            else:
-                if sym not in suspended_syms:
-                    suspended_syms.append(sym)
+            # Distinguish suspension from gap-blocked for logging
+            if sym not in suspended_syms:
+                suspended_syms.append(sym)
             continue
 
         if not is_in_session(sym):
