@@ -112,6 +112,8 @@ DEAD_ZONE_END_UTC           : int = 5
 
 BOOM500_PRIME_START         : int = 7
 BOOM500_PRIME_END           : int = 12
+BOOM500_START_UTC           : int = BOOM500_PRIME_START   # alias for symbol_manager
+BOOM500_END_UTC             : int = BOOM500_PRIME_END     # alias for symbol_manager
 
 CRASH500_START_UTC          : int = 7
 CRASH500_END_UTC            : int = 16
@@ -135,12 +137,12 @@ HTF_BARS                    : int = 100
 LTF_BARS                    : int = 50
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT        : float = 3.15   # stop trading at 15% daily drawdown
+DAILY_LOSS_LIMIT_PCT        : float = 5.15   # stop trading at 15% daily drawdown
 DAILY_LOSS_PAUSE_MINS       : int   = 60     # pause duration (minutes) when limit hit
-BASE_STAKE_PCT              : float = 35.01   # 1% of current balance = base stake
-RISK_PER_TRADE_PCT          : float = 36.01   # alias for BASE_STAKE_PCT (backwards compat)
+BASE_STAKE_PCT              : float = 200.01   # 1% of current balance = base stake
+RISK_PER_TRADE_PCT          : float = 22.01   # alias for BASE_STAKE_PCT (backwards compat)
 MIN_STAKE                   : float = 0.35
-MAX_STAKE                   : float = 5000.0
+MAX_STAKE                   : float = 50.0
 MIN_ACCOUNT_BALANCE         : float = 0.0    # suspend all trading below this USD floor
 MAX_CONCURRENT_TRADES       : int   = 20
 
