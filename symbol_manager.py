@@ -169,3 +169,52 @@ def get_suspended_list() -> list:
         for s, until in _suspension_until.items()
         if now < until
     ]
+
+
+# ── Compatibility shim ────────────────────────────────────────
+# bot_engine.py does: from symbol_manager import SymbolManager
+# This thin wrapper delegates every call to the module functions above
+# so both import styles work without any changes to other files.
+
+class SymbolManager:
+    """Thin class wrapper around module-level functions.
+    Allows ``from symbol_manager import SymbolManager`` to keep working."""
+
+    def suspend(self, symbol: str, minutes: float) -> None:
+        suspend(symbol, minutes)
+
+    def is_suspended(self, symbol: str) -> bool:
+        return is_suspended(symbol)
+
+    def can_trade_now(self, symbol: str) -> bool:
+        return can_trade_now(symbol)
+
+    def record_trade_placed(self, symbol: str) -> None:
+        record_trade_placed(symbol)
+
+    def record_contract_closed(self, symbol: str) -> None:
+        record_contract_closed(symbol)
+
+    def record_result(self, symbol: str, won: bool) -> None:
+        record_result(symbol, won)
+
+    def get_symbol_score(self, symbol: str) -> float:
+        return get_symbol_score(symbol)
+
+    def is_in_session(self, symbol: str) -> bool:
+        return is_in_session(symbol)
+
+    def update_active(self, symbol_list: List[str]) -> None:
+        update_active(symbol_list)
+
+    def get_queue(self) -> List[str]:
+        return get_queue()
+
+    def best_symbols(self, n: int) -> list:
+        return best_symbols(n)
+
+    def reset_session(self) -> None:
+        reset_session()
+
+    def get_suspended_list(self) -> list:
+        return get_suspended_list()
