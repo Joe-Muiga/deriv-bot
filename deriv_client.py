@@ -8,13 +8,13 @@ v9 → v10 audit changes (full compliance pass):
     direction="SHORT" → contract_type="PUT"   → wins if price FALLS
 
   Every buy_contract() call logs BEFORE placement:
-    PLACING {contract_type} on {symbol} | stake=${stake:.2f} | duration={duration}m
+    PLACING {contract_type} on {symbol} stake=${stake:.4f} | duration={duration}m
 
   FAILURE CONTRACT (buy_contract):
-    - Network timeout  → None + log PLACEMENT FAILED: {symbol} reason=timeout
-    - API error        → None + log PLACEMENT FAILED: {symbol} reason={code}: {msg}
-    - Market closed    → None + log SKIPPED: {symbol} market_closed
-    - Proposal reject  → None + log PLACEMENT FAILED: {symbol} reason=proposal_rejected
+    - Network timeout  → None + log FAILED: {symbol} — timeout
+    - API error        → None + log FAILED: {symbol} — {code}: {msg}
+    - Market closed    → None + log FAILED: {symbol} — market_closed
+    - Proposal reject  → None + log FAILED: {symbol} — proposal_rejected
     - Never raises — always returns None on any failure path
     - Trade counters never incremented on None return (caller responsibility enforced)
 
@@ -361,23 +361,23 @@ class DerivClient:
 
     async def _fallback_poll_loop(self):
         """
-        Every 30 seconds, manually query every contract in _contract_callbacks
-        that hasn't resolved yet.  If the API reports is_sold or is_expired,
-        trigger the callback immediately.
+        Every 30 seconds, manually query every contract in _subscribed_contracts.
+        If the API reports is_sold or is_expired, trigger the callback immediately.
         """
         while True:
             await asyncio.sleep(_FALLBACK_POLL_INTERVAL)
             if not self._authorized or not self._ws:
                 continue
 
-            active = list(self._contract_callbacks.items())
-            if not active:
+            targets = list(self._subscribed_contracts)
+            if not targets:
                 continue
 
             logger.debug(
-                f"Fallback poll: checking {len(active)} open contract(s)"
+                f"Fallback poll: checking {len(targets)} open contract(s)"
             )
-            for cid, callback in active:
+            for cid in targets:
+                callback = self._contract_callbacks.get(cid)
                 try:
                     resp = await self._send(
                         {
@@ -392,12 +392,17 @@ class DerivClient:
                             f"Fallback poll: contract {cid} is closed — "
                             f"triggering callback"
                         )
-                        try:
-                            callback(resp)
-                        except Exception as exc:
-                            logger.debug(
-                                f"Fallback poll callback error ({cid}): {exc}"
-                            )
+                        if callback is not None:
+                            try:
+                                callback(resp)
+                            except Exception as exc:
+                                logger.debug(
+                                    f"Fallback poll callback error ({cid}): {exc}"
+                                )
+                        else:
+                            # No callback yet — buffer for flush
+                            self._pending_contract_msgs[cid] = resp
+                            self._closed_before_callback.add(cid)
                 except Exception as exc:
                     logger.debug(f"Fallback poll failed for {cid}: {exc}")
 
@@ -407,12 +412,9 @@ class DerivClient:
         try:
             resp = await self._send({
                 "proposal_open_contract": 1,
-                "contract_id": contract_id
+                "contract_id": int(contract_id),
             })
-            poc = resp.get("proposal_open_contract", {})
-            if poc.get("is_sold") or poc.get("is_expired"):
-                return poc
-            return poc
+            return resp.get("proposal_open_contract", {})
         except Exception as e:
             logger.error(f"force_check_contract({contract_id}): {e}")
             return {}
@@ -734,8 +736,8 @@ class DerivClient:
 
         # ── 3. Pre-placement log (mandatory, zero silent placements) ─────────
         logger.info(
-            f"PLACING {contract_type} on {symbol} | "
-            f"stake=${stake:.2f} | duration={effective_duration}{effective_dur_unit}"
+            f"PLACING {contract_type} on {symbol} stake=${stake:.4f} | "
+            f"duration={effective_duration}{effective_dur_unit}"
         )
 
         # ── 4. Market-open gate (Boom/Crash only) ────────────────────────────
@@ -746,7 +748,7 @@ class DerivClient:
                 market_open = False
 
             if not market_open:
-                logger.warning(f"SKIPPED: {symbol} market_closed")
+                logger.warning(f"FAILED: {symbol} — market_closed")
                 return None
 
         # ── 5. Send proposal + buy ────────────────────────────────────────────
@@ -775,14 +777,13 @@ class DerivClient:
                 code = error.get("code",    "unknown")
                 msg  = error.get("message", "unknown error")
                 logger.error(
-                    f"PLACEMENT FAILED: {symbol} reason={code}: {msg}"
+                    f"FAILED: {symbol} — {code}: {msg}"
                 )
                 return None
 
             if not cid:
                 logger.error(
-                    f"PLACEMENT FAILED: {symbol} reason=proposal_rejected "
-                    f"(no contract_id in response)"
+                    f"FAILED: {symbol} — proposal_rejected (no contract_id in response)"
                 )
                 return None
 
@@ -805,7 +806,7 @@ class DerivClient:
             return buy_info
 
         except TimeoutError:
-            logger.error(f"PLACEMENT FAILED: {symbol} reason=timeout")
+            logger.error(f"FAILED: {symbol} — timeout")
             return None
 
         except RuntimeError as exc:
@@ -813,17 +814,17 @@ class DerivClient:
             err_str = str(exc)
             if "ContractBuyValidationError" in err_str or "proposal" in err_str.lower():
                 logger.error(
-                    f"PLACEMENT FAILED: {symbol} reason=proposal_rejected | detail={err_str}"
+                    f"FAILED: {symbol} — proposal_rejected | detail={err_str}"
                 )
             else:
                 logger.error(
-                    f"PLACEMENT FAILED: {symbol} reason={err_str}"
+                    f"FAILED: {symbol} — {err_str}"
                 )
             return None
 
         except Exception as exc:
             logger.error(
-                f"PLACEMENT FAILED: {symbol} reason={exc}"
+                f"FAILED: {symbol} — {exc}"
             )
             return None
 
