@@ -2,6 +2,15 @@
 config.py – Centralised configuration for the SIFM Deriv Trading Bot.
 All secrets are loaded from environment variables; defaults are safe fallbacks.
 
+v17 → v18 changes:
+  CHANGED:
+    MIN_SIGNAL_STRENGTH              : 1     (was 2)
+    MIN_SIGNAL_SCORE                 : 0.3   (was 0.55)
+    SYMBOL_MIN_GAP_MINS              : 1     (was 2)
+    DIGIT_MIN_SCORE                  : 4     (was 6)
+    SPIKE_ATR_MULTIPLIER             : 1.5   (was 3.0)
+    MIN_MODULE_STRENGTH              : 1     (was 2)
+
 v16 → v17 changes:
   CHANGED:
     All cycle-based timing replaced with minute-based equivalents
@@ -126,12 +135,12 @@ HTF_BARS                    : int = 100
 LTF_BARS                    : int = 50
 
 # ─── Risk Management ─────────────────────────────────────────────────────────
-DAILY_LOSS_LIMIT_PCT        : float = 0.15   # stop trading at 15% daily drawdown
+DAILY_LOSS_LIMIT_PCT        : float = 3.15   # stop trading at 15% daily drawdown
 DAILY_LOSS_PAUSE_MINS       : int   = 60     # pause duration (minutes) when limit hit
-BASE_STAKE_PCT              : float = 0.01   # 1% of current balance = base stake
-RISK_PER_TRADE_PCT          : float = 0.01   # alias for BASE_STAKE_PCT (backwards compat)
+BASE_STAKE_PCT              : float = 35.01   # 1% of current balance = base stake
+RISK_PER_TRADE_PCT          : float = 36.01   # alias for BASE_STAKE_PCT (backwards compat)
 MIN_STAKE                   : float = 0.35
-MAX_STAKE                   : float = 50.0
+MAX_STAKE                   : float = 5000.0
 MIN_ACCOUNT_BALANCE         : float = 0.0    # suspend all trading below this USD floor
 MAX_CONCURRENT_TRADES       : int   = 20
 
@@ -158,7 +167,7 @@ WIN_STREAK_EXTRA_SLOT_MAP    : Dict[int, int] = {3: 2, 5: 4, 8: 6, 12: 8}
 # ─── Symbol Suspension Timing (all in minutes) ────────────────────────────────
 SYMBOL_WIN_SUSPEND_MINS           : int = 5    # suspend symbol N mins after win
 SYMBOL_LOSS_SUSPEND_MINS          : int = 10   # suspend symbol N mins after loss
-SYMBOL_MIN_GAP_MINS               : int = 2    # minimum gap between trades on same symbol
+SYMBOL_MIN_GAP_MINS               : int = 1    # minimum gap between trades on same symbol
 SYMBOL_SESSION_BAN_LOSSES         : int = 3    # consecutive losses → session ban
 SYMBOL_SESSION_BAN_MINS           : int = 480  # session ban duration (8 hours)
 
@@ -198,15 +207,15 @@ SCORE_WEIGHT_FRESHNESS            : float = 0.05
 SCORE_WEIGHT_INDICATOR_AGREEMENT  : float = 0.15
 
 # ─── Signal Quality Gate ──────────────────────────────────────────────────────
-MIN_SIGNAL_STRENGTH               : int   = 2
-MIN_SIGNAL_SCORE                  : float = 0.55
+MIN_SIGNAL_STRENGTH               : int   = 1
+MIN_SIGNAL_SCORE                  : float = 0.3
 MIN_SIGNAL_PROBABILITY            : float = 1.8
 MIN_STRENGTH_REPEAT_SYMBOL        : int   = 3
 
 # ─── Module Strength Thresholds ───────────────────────────────────────────────
 MIN_MODULE_STRENGTH_NORMAL        : int = 2
 MIN_MODULE_STRENGTH_STRICT        : int = 3
-MIN_MODULE_STRENGTH               : int = 2
+MIN_MODULE_STRENGTH               : int = 1
 MIN_CONFIDENCE_FOR_PARTIAL        : int = 5
 
 # ─── Confidence Thresholds ────────────────────────────────────────────────────
@@ -229,7 +238,7 @@ NEWS_BLOCK_MINUTES                : int   = 30
 DIVERGENCE_STRENGTH_MIN           : float = 0.3
 
 # ─── Strategy: Digit Over/Under ───────────────────────────────────────────────
-DIGIT_MIN_SCORE                   : int   = 6
+DIGIT_MIN_SCORE                   : int   = 4
 DIGIT_RSI_OVERSOLD                : int   = 30
 DIGIT_RSI_OVERBOUGHT              : int   = 70
 DIGIT_BB_PERIODS                  : int   = 20
@@ -251,7 +260,7 @@ RB_MAX_AGE_BARS                   : int   = 3
 RB_RETEST_TOLERANCE_ATR           : float = 0.5
 
 # ─── Strategy: Boom/Crash Post-Spike Fade ────────────────────────────────────
-SPIKE_ATR_MULTIPLIER              : float = 3.0
+SPIKE_ATR_MULTIPLIER              : float = 1.5
 SPIKE_MAX_AGE_BARS                : int   = 2
 SPIKE_COOLDOWN_BARS               : int   = 10
 SPIKE_RSI_OVERBOUGHT              : int   = 60
