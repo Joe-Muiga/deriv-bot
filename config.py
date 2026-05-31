@@ -18,11 +18,11 @@ v16 → v17 changes:
     SYMBOL_LOSS_SUSPEND_MINS         : 12 (was 17 min)
     SYMBOL_MIN_GAP_MINS              : 3  (was 7 min)
     SYMBOL_SESSION_BAN_MINS          : 480 (8 hours, new)
-    DAILY_LOSS_LIMIT_PCT             : corrected to 0.15 (was 2.15)
+    DAILY_LOSS_LIMIT_PCT             : corrected to 3.15 (was 2.15)
     DAILY_LOSS_PAUSE_MINS            : 60 (new)
     CONTRACT_CHECK_SECS              : 300 (5 min)
     CONTRACT_TIMEOUT_SECS            : 420 (7 min)
-    MAX_CONCURRENT_TRADES            : 20 (was 15)
+    MAX_CONCURRENT_TRADES            : 40 (was 15)
     MAX_STAKE                        : 5000.0 (was 1000.0)
     REDEPLOY_EVERY_N_CYCLES          : removed (replaced by REDEPLOY_EVERY_N_MINS)
   ADDED:
