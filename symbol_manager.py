@@ -218,3 +218,12 @@ class SymbolManager:
 
     def get_suspended_list(self) -> list:
         return get_suspended_list()
+
+    def decrement_suspensions(self) -> None:
+        """No-op: unix-timestamp suspensions expire automatically via time.time()
+        comparisons. This method exists solely for bot_engine.py compatibility.
+        Also prunes stale keys to keep the dict tidy."""
+        now = time.time()
+        expired = [s for s, until in list(_suspension_until.items()) if until <= now]
+        for s in expired:
+            del _suspension_until[s]
