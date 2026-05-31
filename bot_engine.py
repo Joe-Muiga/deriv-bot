@@ -224,6 +224,8 @@ class BotEngine:
         self._session_start_balance  = self.client.balance
         self._current_utc_day        = _dt.datetime.utcnow().day
 
+        asyncio.create_task(self._contract_watchdog())
+
         await self._init_trade_symbols()
 
         try:
@@ -484,12 +486,15 @@ class BotEngine:
                 reverse=True,
             )
 
+            # ── Hard block: exclude symbols with open trades ───────────────
+            candidates = [r for r in ranked if r.symbol not in self._active_symbols]
+
             # ── Concurrent slot gate ──────────────────────────────────────
             concurrent_limit = self.risk.current_concurrent_limit
             open_count       = len(self._open_contracts)
             available_slots  = max(0, concurrent_limit - open_count)
 
-            top_n = ranked[:available_slots]
+            top_n = candidates[:available_slots]
 
             streak = self.risk.current_streak
             logger.info(
@@ -637,9 +642,19 @@ class BotEngine:
             modules        = sig.strength,
         )
 
-        self._open_contracts[cid]      = (symbol, direction, stake, price, rec, sig)
-        self._contract_open_times[cid] = time.time()
+        opened_at = time.time()
+        self._open_contracts[cid] = {
+            "symbol":      symbol,
+            "direction":   direction,
+            "stake":       stake,
+            "entry_price": price,
+            "opened_at":   opened_at,
+            "rec":         rec,
+            "sig":         sig,
+        }
+        self._contract_open_times[cid] = opened_at
         self._active_symbols.add(symbol)
+        logger.info(f"ACTIVE SYMBOLS: {self._active_symbols}")
 
         self.symbols.record_trade_placed(symbol)
         self.symbols.mark_used(symbol)
@@ -673,10 +688,16 @@ class BotEngine:
         if not info:
             return
 
-        symbol, direction, stake, entry_price, rec, sig = info
+        symbol      = info["symbol"]
+        direction   = info["direction"]
+        stake       = info["stake"]
+        entry_price = info["entry_price"]
+        rec         = info["rec"]
+        sig         = info["sig"]
         won = pnl > 0
 
         self._active_symbols.discard(symbol)
+        logger.info(f"RELEASED: {symbol} | Active now: {self._active_symbols}")
         self.symbols.record_contract_closed(symbol)
         self.symbols.record_result(symbol=symbol, won=won)
         self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
@@ -696,10 +717,13 @@ class BotEngine:
         set_active_trades(len(self._open_contracts))
 
         strategy = getattr(sig, "strategy", getattr(sig, "reason", "?"))
-        streak   = self.risk.current_streak
         logger.info(
-            f"{'✅ WIN' if won else '❌ LOSS'} | {symbol} | {strategy} | "
-            f"pnl=${pnl:+.4f} | balance=${bal_after:.4f} | streak={streak}")
+            f"{'✅ WIN' if pnl > 0 else '❌ LOSS'} | "
+            f"{symbol} | pnl=${pnl:+.4f} | "
+            f"balance=${self.client.balance:.4f} | "
+            f"streak={self.risk.current_streak} | "
+            f"strategy={strategy}"
+        )
 
         try:
             self._push_dashboard()
@@ -717,14 +741,16 @@ class BotEngine:
         try:
             now = time.time()
             for cid in list(self._open_contracts.keys()):
-                open_time = self._contract_open_times.get(cid, now)
+                info = self._open_contracts.get(cid)
+                if not info:
+                    continue
+                open_time = info.get("opened_at", now)
                 age       = now - open_time
 
                 if age >= CONTRACT_FORCE_CLOSE_SECS:
-                    info = self._open_contracts.get(cid)
-                    if not info:
-                        continue
-                    symbol, direction, stake, entry_price, rec, sig = info
+                    symbol    = info["symbol"]
+                    stake     = info["stake"]
+                    rec       = info["rec"]
 
                     self._open_contracts.pop(cid, None)
                     self._contract_open_times.pop(cid, None)
@@ -785,7 +811,8 @@ class BotEngine:
 
         age_parts = []
         for cid in remaining:
-            age_secs = int(now - self._contract_open_times.get(cid, now))
+            info_r   = self._open_contracts.get(cid, {})
+            age_secs = int(now - info_r.get("opened_at", now))
             age_parts.append(f"{cid}({age_secs}s)")
         logger.info(f"Open contracts remaining: {n} — " + ", ".join(age_parts))
 
@@ -823,10 +850,10 @@ class BotEngine:
                         await asyncio.sleep(5)
 
             if not resolved and cid in self._open_contracts:
-                info   = self._open_contracts.get(cid, ())
-                symbol = info[0] if len(info) > 0 else "UNKNOWN"
-                stake  = info[2] if len(info) > 2 else 0.0
-                rec    = info[4] if len(info) > 4 else None
+                info   = self._open_contracts.get(cid, {})
+                symbol = info.get("symbol", "UNKNOWN")
+                stake  = info.get("stake", 0.0)
+                rec    = info.get("rec", None)
 
                 logger.error(f"ORPHANED: {cid} — forcing close as loss")
                 self.journal.close_trade(
@@ -862,6 +889,82 @@ class BotEngine:
                 logger.error(
                     f"ORPHAN RECORDED AS LOSS: {cid} {symbol} "
                     f"-${stake:.2f} | balance=${self.client.balance:.4f}")
+
+    # ── Contract watchdog — hard 7-minute timeout ─────────────────────────────
+
+    async def _contract_watchdog(self):
+        """
+        Runs every 15 s as a persistent background task.
+        - At 5 min (300 s): force-checks the contract via the API.
+          If the API confirms it is closed, fires _on_contract_result.
+        - At 7 min (420 s): force-closes as a confirmed loss regardless.
+        """
+        while True:
+            try:
+                await asyncio.sleep(15)
+                now = time.time()
+                for cid, info in list(self._open_contracts.items()):
+                    age = now - info["opened_at"]
+
+                    # ── 5-minute force-check ──────────────────────────────
+                    if age >= 300:
+                        logger.info(
+                            f"WATCHDOG: {cid} {info['symbol']} "
+                            f"age={age:.0f}s — force checking"
+                        )
+                        try:
+                            result = await self.client.force_check_contract(cid)
+                            if result.get("is_sold") or result.get("is_expired"):
+                                pnl = float(result.get("profit", -info["stake"]))
+                                logger.info(
+                                    f"WATCHDOG RESOLVED: {cid} "
+                                    f"pnl=${pnl:+.4f}"
+                                )
+                                await self._on_contract_result(cid, {
+                                    "proposal_open_contract": result
+                                })
+                        except Exception as exc:
+                            logger.warning(f"WATCHDOG force_check({cid}): {exc}")
+
+                    # ── 7-minute hard timeout ─────────────────────────────
+                    if age >= 420:
+                        if cid in self._open_contracts:
+                            stake  = info["stake"]
+                            symbol = info["symbol"]
+                            rec    = info["rec"]
+                            logger.warning(
+                                f"TIMEOUT LOSS: {cid} {symbol} "
+                                f"age={age:.0f}s exceeded 7min — "
+                                f"recording as loss -${stake:.4f}"
+                            )
+                            self._confirmed_daily_loss += stake
+                            self.risk.register_close(rec, exit_price=0, pnl=-stake)
+                            self.journal.close_trade(
+                                contract_id  = cid,
+                                exit_price   = 0,
+                                pnl          = -stake,
+                                payout       = 0,
+                                balance_after = self.client.balance,
+                            )
+                            self.symbols.record_result(symbol, won=False)
+                            self._open_contracts.pop(cid, None)
+                            self._contract_open_times.pop(cid, None)
+                            self._active_symbols.discard(symbol)
+                            set_active_trades(len(self._open_contracts))
+                            self._check_confirmed_loss_limit()
+                            try:
+                                self._push_dashboard()
+                            except Exception:
+                                pass
+                            logger.warning(
+                                f"TIMEOUT RECORDED: {symbol} "
+                                f"-${stake:.4f} | "
+                                f"balance=${self.client.balance:.4f}"
+                            )
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error(f"_contract_watchdog: {exc}")
 
     # ── Stale contract detection ───────────────────────────────────────────────
 
