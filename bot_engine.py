@@ -450,7 +450,6 @@ class BotEngine:
 
             # ── Cycle bookkeeping ─────────────────────────────────────────
             self.symbols.decrement_suspensions()
-            self.symbols.reset_cycle_used()
 
             # ── Build queue from initialised symbols ──────────────────────
             cycle_number += 1
