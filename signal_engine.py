@@ -368,6 +368,9 @@ def evaluate_fallback(ltf_bars, symbol: str) -> SignalResult:
 
 class SignalEngine:
 
+    def __init__(self, *args, **kwargs):
+        pass
+
     def evaluate(self, ltf_bars: List, symbol: str, **kwargs) -> SignalResult:
         """
         Route to the correct strategy and return a SignalResult.
