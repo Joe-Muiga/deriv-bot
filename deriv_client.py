@@ -123,6 +123,10 @@ class DerivClient:
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
+        # ── Rate limiting ─────────────────────────────────────────────────────
+        self._buy_semaphore  = asyncio.Semaphore(2)  # max 2 simultaneous buy requests
+        self._last_buy_time  = 0.0                   # epoch of last buy attempt
+
         # ── Direction→contract mapping audit ─────────────────────────────────
         logger.info(
             "Direction mapping: LONG → CALL (price rises) | SHORT → PUT (price falls)"
@@ -708,125 +712,164 @@ class DerivClient:
         After a successful buy, immediately subscribes to the contract's
         proposal_open_contract stream so settlement is never missed.
         """
-        # ── 1. Direction → contract_type ─────────────────────────────────────
-        if direction == "LONG":
-            contract_type = "CALL"
-        elif direction == "SHORT":
-            contract_type = "PUT"
-        else:
-            logger.error(
-                f"buy_contract: unknown direction '{direction}' on {symbol} — aborting"
-            )
-            return None
+        async with self._buy_semaphore:
+            # ── Enforce minimum gap between buy requests ──────────────────────
+            now     = time.time()
+            elapsed = now - self._last_buy_time
+            delay   = getattr(config, "BUY_REQUEST_DELAY_SECS", 0.6)
+            if elapsed < delay:
+                wait = delay - elapsed
+                logger.debug(f"Rate throttle: waiting {wait:.3f}s before buy ({symbol})")
+                await asyncio.sleep(wait)
+            self._last_buy_time = time.time()
 
-        # Always-visible mapping log
-        logger.info(f"Signal: {direction} → Contract: {contract_type}")
-
-        # ── 2. Duration override for Boom/Crash ──────────────────────────────
-        if _is_boom_crash(symbol):
-            effective_duration = getattr(config, "BOOM_CRASH_TICK_DURATION", 10)
-            effective_dur_unit = getattr(config, "BOOM_CRASH_DURATION_UNIT",  "t")
-            logger.info(
-                f"BOOM/CRASH symbol detected ({symbol}): overriding to "
-                f"{effective_duration}{effective_dur_unit} tick contract"
-            )
-        else:
-            effective_duration = duration
-            effective_dur_unit = dur_unit
-
-        # ── 3. Pre-placement log (mandatory, zero silent placements) ─────────
-        logger.info(
-            f"PLACING {contract_type} on {symbol} stake=${stake:.4f} | "
-            f"duration={effective_duration}{effective_dur_unit}"
-        )
-
-        # ── 4. Market-open gate (Boom/Crash only) ────────────────────────────
-        if _is_boom_crash(symbol):
-            try:
-                market_open = await self._check_market_open(symbol)
-            except Exception:
-                market_open = False
-
-            if not market_open:
-                logger.warning(f"FAILED: {symbol} — market_closed")
-                return None
-
-        # ── 5. Send proposal + buy ────────────────────────────────────────────
-        payload = {
-            "buy":   "1",
-            "price": stake,
-            "parameters": {
-                "amount":        stake,
-                "basis":         "stake",
-                "contract_type": contract_type,
-                "currency":      config.DERIV_CURRENCY,
-                "duration":      effective_duration,
-                "duration_unit": effective_dur_unit,
-                "symbol":        symbol,
-            },
-        }
-
-        try:
-            resp     = await self._send(payload, timeout=15)
-            buy_info = resp.get("buy", {})
-            cid      = str(buy_info.get("contract_id", ""))
-
-            # ── Check for API-level rejection inside a 200 response ──────────
-            error = resp.get("error")
-            if error:
-                code = error.get("code",    "unknown")
-                msg  = error.get("message", "unknown error")
-                logger.error(
-                    f"FAILED: {symbol} — {code}: {msg}"
-                )
-                return None
-
-            if not cid:
-                logger.error(
-                    f"FAILED: {symbol} — proposal_rejected (no contract_id in response)"
-                )
-                return None
-
-            # Track symbol for cleanup log
-            self._contract_symbol_map[cid] = symbol
-
-            # ── Post-placement confirmation log ──────────────────────────────
-            logger.info(
-                f"CONFIRM | symbol={symbol} | direction={direction} → {contract_type} | "
-                f"stake=${stake:.2f} | contract_id={cid} | "
-                f"buy_price={buy_info.get('buy_price')} | "
-                f"balance=${self._balance:.4f}"
-            )
-
-            # ── Immediately subscribe to contract updates ─────────────────────
-            # Do this without blocking buy_contract return — fire and forget the
-            # subscribe handshake; the callback will be registered by subscribe_contract()
-            asyncio.ensure_future(self._eagerly_subscribe_contract(cid))
-
-            return buy_info
-
-        except TimeoutError:
-            logger.error(f"FAILED: {symbol} — timeout")
-            return None
-
-        except RuntimeError as exc:
-            # _send raises RuntimeError(f"{code}: {message}") on API errors
-            err_str = str(exc)
-            if "ContractBuyValidationError" in err_str or "proposal" in err_str.lower():
-                logger.error(
-                    f"FAILED: {symbol} — proposal_rejected | detail={err_str}"
-                )
+            # ── 1. Direction → contract_type ──────────────────────────────────
+            if direction == "LONG":
+                contract_type = "CALL"
+            elif direction == "SHORT":
+                contract_type = "PUT"
             else:
                 logger.error(
-                    f"FAILED: {symbol} — {err_str}"
+                    f"buy_contract: unknown direction '{direction}' on {symbol} — aborting"
                 )
-            return None
+                return None
 
-        except Exception as exc:
-            logger.error(
-                f"FAILED: {symbol} — {exc}"
+            # Always-visible mapping log
+            logger.info(f"Signal: {direction} → Contract: {contract_type}")
+
+            # ── 2. Duration override for Boom/Crash ───────────────────────────
+            if _is_boom_crash(symbol):
+                effective_duration = getattr(config, "BOOM_CRASH_TICK_DURATION", 10)
+                effective_dur_unit = getattr(config, "BOOM_CRASH_DURATION_UNIT",  "t")
+                logger.info(
+                    f"BOOM/CRASH symbol detected ({symbol}): overriding to "
+                    f"{effective_duration}{effective_dur_unit} tick contract"
+                )
+            else:
+                effective_duration = duration
+                effective_dur_unit = dur_unit
+
+            # ── 3. Pre-placement log (mandatory, zero silent placements) ──────
+            logger.info(
+                f"PLACING {contract_type} on {symbol} stake=${stake:.4f} | "
+                f"duration={effective_duration}{effective_dur_unit}"
             )
-            return None
+
+            # ── 4. Market-open gate (Boom/Crash only) ─────────────────────────
+            if _is_boom_crash(symbol):
+                try:
+                    market_open = await self._check_market_open(symbol)
+                except Exception:
+                    market_open = False
+
+                if not market_open:
+                    logger.warning(f"FAILED: {symbol} — market_closed")
+                    return None
+
+            # ── 5. Build payload ───────────────────────────────────────────────
+            payload = {
+                "buy":   "1",
+                "price": stake,
+                "parameters": {
+                    "amount":        stake,
+                    "basis":         "stake",
+                    "contract_type": contract_type,
+                    "currency":      config.DERIV_CURRENCY,
+                    "duration":      effective_duration,
+                    "duration_unit": effective_dur_unit,
+                    "symbol":        symbol,
+                },
+            }
+
+            async def _do_buy() -> Optional[dict]:
+                """Inner send + parse, shared by first attempt and retry."""
+                resp     = await self._send(payload, timeout=15)
+                buy_info = resp.get("buy", {})
+                cid      = str(buy_info.get("contract_id", ""))
+
+                # Check for API-level rejection inside a 200 response
+                error = resp.get("error")
+                if error:
+                    code = error.get("code",    "unknown")
+                    msg  = error.get("message", "unknown error")
+                    if code == "RateLimit":
+                        return "RATE_LIMIT"        # sentinel — caller handles retry
+                    logger.error(f"FAILED: {symbol} — {code}: {msg}")
+                    return None
+
+                if not cid:
+                    logger.error(
+                        f"FAILED: {symbol} — proposal_rejected (no contract_id in response)"
+                    )
+                    return None
+
+                return resp
+
+            try:
+                # ── 6. First attempt ──────────────────────────────────────────
+                result = await _do_buy()
+
+                # ── 7. RateLimit retry (once, after 2 s) ─────────────────────
+                if result == "RATE_LIMIT":
+                    logger.warning(
+                        f"RATE LIMIT: {symbol} — waiting 2s then retrying"
+                    )
+                    await asyncio.sleep(2)
+                    self._last_buy_time = time.time()
+                    try:
+                        result = await _do_buy()
+                        if result == "RATE_LIMIT":
+                            logger.error(
+                                f"RETRY FAILED: {symbol} — still rate limited after retry"
+                            )
+                            return None
+                    except Exception as exc:
+                        logger.error(f"RETRY FAILED: {symbol} — {exc}")
+                        return None
+
+                if result is None:
+                    return None
+
+                # ── 8. Extract buy_info from full response ────────────────────
+                resp     = result
+                buy_info = resp.get("buy", {})
+                cid      = str(buy_info.get("contract_id", ""))
+
+                # Track symbol for cleanup log
+                self._contract_symbol_map[cid] = symbol
+
+                # ── Post-placement confirmation log ───────────────────────────
+                logger.info(
+                    f"CONFIRM | symbol={symbol} | direction={direction} → {contract_type} | "
+                    f"stake=${stake:.2f} | contract_id={cid} | "
+                    f"buy_price={buy_info.get('buy_price')} | "
+                    f"balance=${self._balance:.4f}"
+                )
+
+                # ── Immediately subscribe to contract updates ──────────────────
+                # Fire-and-forget; callback registered by subscribe_contract()
+                asyncio.ensure_future(self._eagerly_subscribe_contract(cid))
+
+                return buy_info
+
+            except TimeoutError:
+                logger.error(f"FAILED: {symbol} — timeout")
+                return None
+
+            except RuntimeError as exc:
+                # _send raises RuntimeError(f"{code}: {message}") on API errors
+                err_str = str(exc)
+                if "ContractBuyValidationError" in err_str or "proposal" in err_str.lower():
+                    logger.error(
+                        f"FAILED: {symbol} — proposal_rejected | detail={err_str}"
+                    )
+                else:
+                    logger.error(f"FAILED: {symbol} — {err_str}")
+                return None
+
+            except Exception as exc:
+                logger.error(f"FAILED: {symbol} — {exc}")
+                return None
 
     async def _eagerly_subscribe_contract(self, contract_id: str):
         """
