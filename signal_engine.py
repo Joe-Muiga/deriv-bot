@@ -9,6 +9,10 @@ Changes (v5 → v6):
   - Range Break: consolidation optional  (strength 3 vs 2)
   - Boom/Crash: spike threshold  3.0× → 1.5× ATR
   - Step Index: EMA crossover alone is enough (no Donchian gate)
+
+Changes (v6 → v7):
+  - CONTRARIAN_MODE added: every LONG/SHORT output is inverted before return
+  - Reason strings annotated with [CONTRARIAN: original=X→Y] for full traceability
 """
 
 from __future__ import annotations
@@ -28,6 +32,11 @@ import indicators as ind
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Contrarian mode toggle
+# ---------------------------------------------------------------------------
+
+CONTRARIAN_MODE = True   # Set False to disable direction inversion globally
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -48,6 +57,30 @@ class SignalResult:
     @staticmethod
     def none(reason: str = "no signal") -> "SignalResult":
         return SignalResult("NONE", 0, 0.0, 0.0, 0.0, 0.0, reason)
+
+
+# ---------------------------------------------------------------------------
+# Internal contrarian helper
+# ---------------------------------------------------------------------------
+
+def _contrarian_invert(direction: str, reason: str) -> tuple[str, str]:
+    """
+    Invert LONG↔SHORT when CONTRARIAN_MODE is True.
+    Returns (inverted_direction, annotated_reason).
+    NONE directions are never touched.
+    """
+    if not CONTRARIAN_MODE or direction == "NONE":
+        return direction, reason
+
+    if direction == "LONG":
+        inverted = "SHORT"
+    elif direction == "SHORT":
+        inverted = "LONG"
+    else:
+        return direction, reason
+
+    annotated = reason + f" [CONTRARIAN: original={direction}→{inverted}]"
+    return inverted, annotated
 
 
 # ---------------------------------------------------------------------------
@@ -95,9 +128,14 @@ def evaluate_digit(ltf_bars, symbol: str) -> SignalResult:
     rr  = tp / sl if sl else 0.0
 
     logger.info(f"DIGIT EMITTED: {symbol} {direction} score={raw_score}/8")
+
+    # Contrarian inversion — last operation before return
+    reason = f"digit {direction} score={raw_score}/8"
+    direction, reason = _contrarian_invert(direction, reason)
+
     return SignalResult(
         direction, 2, sl, tp, raw_score / 8.0, rr,
-        f"digit {direction} score={raw_score}/8"
+        reason
     )
 
 
@@ -156,9 +194,14 @@ def evaluate_mean_reversion(ltf_bars, symbol: str) -> SignalResult:
     logger.info(
         f"MR EMITTED: {symbol} {direction} conditions={conditions_met}/3"
     )
+
+    # Contrarian inversion — last operation before return
+    reason = f"mean-reversion {direction} {conditions_met}/3"
+    direction, reason = _contrarian_invert(direction, reason)
+
     return SignalResult(
         direction, 2, sl, tp, conditions_met / 3.0, rr,
-        f"mean-reversion {direction} {conditions_met}/3"
+        reason
     )
 
 
@@ -212,9 +255,14 @@ def evaluate_range_break(ltf_bars, symbol: str) -> SignalResult:
         logger.info(
             f"RB EMITTED: {symbol} {direction} strength={strength}"
         )
+
+        # Contrarian inversion — last operation before return
+        reason = f"range-break {direction} strength={strength}"
+        direction, reason = _contrarian_invert(direction, reason)
+
         return SignalResult(
             direction, strength, sl, tp, 0.8, rr,
-            f"range-break {direction} strength={strength}"
+            reason
         )
 
     logger.info(
@@ -270,9 +318,14 @@ def evaluate_boom_crash(ltf_bars, symbol: str) -> SignalResult:
         f"BOOM_CRASH EMITTED: {symbol} {direction} "
         f"bar_move={bar_move:.4f} threshold={threshold:.4f}"
     )
+
+    # Contrarian inversion — last operation before return
+    reason = f"boom/crash spike {direction}"
+    direction, reason = _contrarian_invert(direction, reason)
+
     return SignalResult(
         direction, 3, sl, tp, min(bar_move / threshold, 1.0), rr,
-        f"boom/crash spike {direction}"
+        reason
     )
 
 
@@ -320,9 +373,13 @@ def evaluate_step(ltf_bars, symbol: str) -> SignalResult:
     else:
         return SignalResult.none("step ema_fast == ema_slow")
 
+    # Contrarian inversion — last operation before return
+    reason = f"step EMA crossover {direction}"
+    direction, reason = _contrarian_invert(direction, reason)
+
     return SignalResult(
         direction, 2, sl, tp, 0.7, rr,
-        f"step EMA crossover {direction}"
+        reason
     )
 
 
@@ -356,9 +413,14 @@ def evaluate_fallback(ltf_bars, symbol: str) -> SignalResult:
         return SignalResult("NONE", 0, 0.0, 0.0, 0.0, 0.0, "no crossover")
 
     logger.info(f"FALLBACK EMITTED: {symbol} {direction}")
+
+    # Contrarian inversion — last operation before return
+    reason = f"EMA crossover {direction}"
+    direction, reason = _contrarian_invert(direction, reason)
+
     return SignalResult(
         direction, 2, 0.0, 0.0, 1.0, 0.0,
-        f"EMA crossover {direction}"
+        reason
     )
 
 
@@ -383,6 +445,9 @@ class SignalEngine:
           JUMP_SYMBOLS        → evaluate_fallback   (CHANGED: was None)
           DRIFT_SYMBOLS       → evaluate_fallback   (CHANGED: was None)
           <unrecognised>      → evaluate_fallback   (CHANGED: was NONE silent)
+
+        All non-NONE results are direction-inverted by _contrarian_invert()
+        inside each evaluate_* function when CONTRARIAN_MODE = True.
         """
         logger.info(
             f"SIGNAL EVAL START: {symbol} bars={len(ltf_bars)}"
