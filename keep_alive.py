@@ -14,6 +14,17 @@ v8 changes:
   - _state updated to match canonical field names used by update_status().
   - update_status() stores all canonical fields.
   - All other logic, routes, ping loop, and helpers are unchanged.
+
+v9 changes:
+  - Balance curve now correctly reads balance_history (populated by record_trade).
+  - _parse_hms() added to handle HH:MM:SS time strings from record_trade.
+  - record_signal() now stores a dict so the dashboard renders symbol/direction
+    badges and score separately instead of a flat string.
+  - Dashboard verified: balance, daily PnL ($+%), win rate, streak, total trades
+    today, last signal (with inverted direction badge), recent trades table,
+    suspended symbols with minutes remaining, session status — all live on
+    every 10 s refresh.
+  - _build_svg_chart() rewritten to consume balance_history directly.
 """
 
 import os
@@ -109,9 +120,9 @@ def record_trade(symbol, direction, stake, pnl,
     _status["recent_trades"].insert(0, trade)
     _status["recent_trades"] = _status["recent_trades"][:50]
 
-    # Add to balance history for chart
+    # Add to balance history for chart — keep last 100
     _status["balance_history"].append({
-        "time": trade["time"],
+        "time": trade["time"],          # "HH:MM:SS"
         "balance": balance_after,
         "won": won,
     })
@@ -140,9 +151,18 @@ def record_trade(symbol, direction, stake, pnl,
 
 
 def record_signal(symbol, direction, strategy, score):
-    _status["last_signal"] = (
-        f"{symbol} {direction} | {strategy} | score={score:.3f}"
-    )
+    """
+    Store last signal as a structured dict so the dashboard can render
+    the direction as a colour-coded badge and display score precisely.
+    The direction passed here must already be the INVERTED (placed) direction
+    — signal_engine applies contrarian inversion before returning.
+    """
+    _status["last_signal"] = {
+        "symbol":    symbol,
+        "direction": direction,
+        "strategy":  strategy,
+        "score":     round(float(score), 3),
+    }
 
 
 def update_suspended_symbols(suspended: list) -> None:
@@ -177,20 +197,18 @@ def trigger_redeploy() -> None:
         logger.error(f"trigger_redeploy: FAILED — {type(exc).__name__}: {exc}")
 
 
-# ── SVG Balance Curve ──────────────────────────────────────────────────────────
+# ── Time helpers ───────────────────────────────────────────────────────────────
 
 def _exit_time_to_dt(raw) -> datetime.datetime | None:
     """Parse exit_time regardless of whether it's a Unix timestamp or ISO string."""
     if raw is None:
         return None
     try:
-        # Unix timestamp (int or float)
         f = float(raw)
-        if f > 1_000_000_000:                          # looks like epoch seconds
+        if f > 1_000_000_000:
             return datetime.datetime.utcfromtimestamp(f)
     except (TypeError, ValueError):
         pass
-    # ISO / datetime string  "2024-05-31T14:22:00" or "2024-05-31 14:22:00"
     s = str(raw).replace("T", " ")[:19]
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
         try:
@@ -200,46 +218,84 @@ def _exit_time_to_dt(raw) -> datetime.datetime | None:
     return None
 
 
-def _build_svg_chart(recent_trades: list) -> str:
-    """Build a pure inline SVG balance curve. No external dependencies."""
-    today = datetime.datetime.utcnow().date()
+def _parse_hms(raw) -> str:
+    """
+    Extract HH:MM display label from a time value.
+    Handles:
+      - "HH:MM:SS" strings produced by record_trade  → slices to "HH:MM"
+      - Unix epoch floats / ints                      → formats as "HH:MM"
+      - ISO datetime strings                          → formats as "HH:MM"
+    Returns "?" on failure.
+    """
+    if raw is None:
+        return "?"
+    s = str(raw).strip()
+    # "HH:MM:SS" or "HH:MM" — direct time string
+    if len(s) >= 5 and s[2] == ":":
+        return s[:5]
+    # Try Unix epoch
+    try:
+        f = float(s)
+        if f > 1_000_000_000:
+            return datetime.datetime.utcfromtimestamp(f).strftime("%H:%M")
+    except (TypeError, ValueError):
+        pass
+    # Try ISO datetime
+    dt = _exit_time_to_dt(raw)
+    if dt:
+        return dt.strftime("%H:%M")
+    return "?"
+
+
+# ── SVG Balance Curve ──────────────────────────────────────────────────────────
+
+def _build_svg_chart(balance_history: list) -> str:
+    """
+    Build a pure inline SVG balance curve from balance_history entries.
+    Each entry: {"time": "HH:MM:SS", "balance": float, "won": bool}
+    Produced by record_trade() — no external dependencies.
+
+    Chart title: "Balance Curve — Today"  (rendered in caller)
+    X axis: trade timestamps as HH:MM
+    Y axis: balance after each trade
+    Green dots = winning trades, red dots = losing trades
+    Updates on every dashboard refresh (10 s).
+    """
+    W, H = 900, 180
+    PAD_L, PAD_R, PAD_T, PAD_B = 58, 12, 12, 32
+
+    # Build point list from balance_history
     points = []
-    for t in recent_trades:
-        dt = _exit_time_to_dt(t.get("exit_time"))
-        # Accept today's trades; if timestamp is missing/unparseable include it anyway
-        if dt is not None and dt.date() != today:
-            continue
+    for entry in balance_history:
         try:
-            bal  = float(t.get("balance_after") or t.get("balance") or 0)
-            won  = bool(t.get("won", False))
-            label = dt.strftime("%H:%M") if dt else "?"
+            bal  = float(entry.get("balance") or entry.get("balance_after") or 0)
             if bal == 0:
-                continue                                # skip uninitialised entries
+                continue
+            won   = bool(entry.get("won", False))
+            label = _parse_hms(entry.get("time") or entry.get("exit_time"))
             points.append({"t": label, "bal": bal, "won": won})
         except Exception:
             continue
-
-    W, H = 900, 180
-    PAD_L, PAD_R, PAD_T, PAD_B = 58, 12, 12, 32
 
     if not points:
         return (
             f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
             f'style="width:100%;height:180px;">'
-            f'<text x="{W//2}" y="{H//2}" text-anchor="middle" '
+            f'<text x="{W // 2}" y="{H // 2}" text-anchor="middle" '
             f'fill="#484f58" font-size="13" font-family="Segoe UI,sans-serif">'
-            f'No trades yet</text>'
+            f'No trades yet — chart will populate after first closed trade'
+            f'</text>'
             f'</svg>'
         )
 
-    bals    = [p["bal"] for p in points]
-    min_b   = min(bals)
-    max_b   = max(bals)
-    span    = max_b - min_b if max_b != min_b else 1.0
+    bals   = [p["bal"] for p in points]
+    min_b  = min(bals)
+    max_b  = max(bals)
+    span   = max_b - min_b if max_b != min_b else 1.0
 
-    plot_w  = W - PAD_L - PAD_R
-    plot_h  = H - PAD_T - PAD_B
-    n       = len(points)
+    plot_w = W - PAD_L - PAD_R
+    plot_h = H - PAD_T - PAD_B
+    n      = len(points)
 
     def px(i):
         return PAD_L + (i / max(n - 1, 1)) * plot_w
@@ -247,11 +303,16 @@ def _build_svg_chart(recent_trades: list) -> str:
     def py(b):
         return PAD_T + plot_h - ((b - min_b) / span) * plot_h
 
-    # Polyline path
-    coords = " ".join(f"{px(i):.1f},{py(p['bal']):.1f}" for i, p in enumerate(points))
-    line   = f'<polyline points="{coords}" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"/>'
+    # Polyline
+    coords = " ".join(
+        f"{px(i):.1f},{py(p['bal']):.1f}" for i, p in enumerate(points)
+    )
+    line = (
+        f'<polyline points="{coords}" fill="none" stroke="#58a6ff" '
+        f'stroke-width="2" stroke-linejoin="round"/>'
+    )
 
-    # Dots
+    # Coloured dots — green=win, red=loss
     dots = ""
     for i, p in enumerate(points):
         fill = "#3fb950" if p["won"] else "#f85149"
@@ -343,6 +404,7 @@ def _render_dashboard() -> str:
             )
 
         # ── Last signal ───────────────────────────────────────────────────────
+        # record_signal() now always stores a dict; handle legacy string too.
         raw_sig = s.get("last_signal", "No signal yet")
         if isinstance(raw_sig, dict):
             sig_sym   = str(raw_sig.get("symbol", "—"))
@@ -364,7 +426,7 @@ def _render_dashboard() -> str:
         recent_trades_list = s.get("recent_trades", [])
         trade_rows = ""
         bad_rows = 0
-        for t in reversed(recent_trades_list[-20:]):
+        for t in recent_trades_list[:20]:   # already newest-first from insert(0,...)
             try:
                 pnl_raw = t.get("pnl") if t.get("pnl") is not None else t.get("profit", t.get("return", 0))
                 pnl   = float(pnl_raw or 0)
@@ -379,13 +441,15 @@ def _render_dashboard() -> str:
                 else:
                     dir_b = f'<span class="ticker">{raw_dir or "—"}</span>'
                 pnl_c  = "green" if pnl >= 0 else "red"
-                dt_obj = _exit_time_to_dt(t.get("exit_time") or t.get("close_time") or t.get("time"))
-                ts_str = dt_obj.strftime("%Y-%m-%d %H:%M:%S") if dt_obj else "—"
+                # Timestamp: prefer exit_time/close_time; fall back to "time" field from record_trade
+                ts_raw = t.get("exit_time") or t.get("close_time") or t.get("time")
+                ts_str = _parse_hms(ts_raw) if ts_raw else "—"
                 stake_raw = t.get("stake") if t.get("stake") is not None else t.get("amount", t.get("buy_price", 0))
                 stake = float(stake_raw or 0)
                 bal_raw = t.get("balance_after") if t.get("balance_after") is not None else t.get("balance", 0)
                 bal_a = float(bal_raw or 0)
                 sym   = t.get("symbol", t.get("market", ""))
+                strat = t.get("strategy", "")
                 trade_rows += (
                     f"<tr>"
                     f"<td class='ticker'>{ts_str}</td>"
@@ -449,8 +513,10 @@ def _render_dashboard() -> str:
             sym_rows = ("<tr><td colspan='5' style='text-align:center;color:#484f58'>"
                         "No data yet</td></tr>")
 
-        # ── SVG balance curve ─────────────────────────────────────────────────
-        svg_chart = _build_svg_chart(recent_trades_list)
+        # ── SVG balance curve — fed from balance_history ───────────────────────
+        # balance_history is the purpose-built list populated by record_trade().
+        # Falls back to empty list (shows "No trades yet" placeholder).
+        svg_chart = _build_svg_chart(s.get("balance_history", []))
 
         # ── Session / queue info ──────────────────────────────────────────────
         session      = str(s.get("session", "Starting"))
@@ -561,7 +627,7 @@ def _render_dashboard() -> str:
   <div class="card">
     <div class="card-title">Win Rate</div>
     <div class="card-value {wr_color}">{win_rate:.1f}%</div>
-    <div class="card-sub">{wins}W / {losses}L / {trades} trades</div>
+    <div class="card-sub">{wins}W / {losses}L / {trades} trades today</div>
   </div>
 
   <div class="card">
@@ -584,9 +650,12 @@ def _render_dashboard() -> str:
 
 </div>
 
-<!-- ── Balance Curve (inline SVG) ── -->
+<!-- ── Balance Curve (inline SVG, no external deps) ── -->
 <div class="chart-card">
-  <div class="chart-title">Balance Curve — Today</div>
+  <div class="chart-title">Balance Curve — Today
+    <span style="float:right;font-weight:400;color:#3fb950">● win</span>
+    <span style="float:right;font-weight:400;color:#f85149;margin-right:10px">● loss</span>
+  </div>
   {svg_chart}
 </div>
 
@@ -690,7 +759,6 @@ def symbols_route():
     return jsonify({"symbols": _state.get("best_symbols", [])})
 
 
-
 @app.route("/debug")
 def debug_route():
     """Dump raw _state so we can see exactly what keys the bot engine writes."""
@@ -708,6 +776,7 @@ def debug_route():
         else:
             safe[k] = v
     return jsonify(safe), 200
+
 
 # ── Keep-alive ping loop ───────────────────────────────────────────────────────
 
