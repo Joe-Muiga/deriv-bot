@@ -1,18 +1,16 @@
 """
-signal_engine.py — Strategy routing + signal evaluation engine.
+signal_engine.py
+Momentum-based signal generation for Deriv
+synthetic indices using Multiplier contracts.
 
-Changes (v5 → v6):
-  - Logging added at every decision point
-  - Fallback strategy (EMA20/50 crossover) for unrecognised symbols
-  - Digit  : min score lowered  6 → 4
-  - Mean Rev: conditions OR not AND (2-of-3)
-  - Range Break: consolidation optional  (strength 3 vs 2)
-  - Boom/Crash: spike threshold  3.0× → 1.5× ATR
-  - Step Index: EMA crossover alone is enough (no Donchian gate)
-
-Changes (v6 → v7):
-  - CONTRARIAN_MODE added: every LONG/SHORT output is inverted before return
-  - Reason strings annotated with [CONTRARIAN: original=X→Y] for full traceability
+Strategy per symbol type:
+  Volatility (R_10–R_100, 1HZ): EMA momentum
+    + breakout detection
+  Boom/Crash: drift direction after spike
+  Step Index: EMA trend following
+  Jump Index: pre-jump momentum window
+  Range Break: breakout confirmation
+  Drift Switch: regime direction
 """
 
 from __future__ import annotations
@@ -33,395 +31,28 @@ import indicators as ind
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Contrarian mode toggle
-# ---------------------------------------------------------------------------
-
-CONTRARIAN_MODE = True   # Set False to disable direction inversion globally
-
-# ---------------------------------------------------------------------------
 # Result type
 # ---------------------------------------------------------------------------
 
 @dataclass
 class SignalResult:
-    """Unified signal envelope returned by every evaluate_* function."""
-
-    direction: str          # "LONG" | "SHORT" | "NONE"
-    strength: int           # 0–3
-    sl: float               # stop-loss distance (price units)
-    tp: float               # take-profit distance (price units)
-    score: float            # normalised confidence  0.0–1.0
-    risk_reward: float      # tp / sl  (0 when sl == 0)
-    reason: str             # human-readable label
-
-    @staticmethod
-    def none(reason: str = "no signal") -> "SignalResult":
-        return SignalResult("NONE", 0, 0.0, 0.0, 0.0, 0.0, reason)
+    direction:   str    # "LONG"|"SHORT"|"NONE"
+    strength:    int    # 1-3
+    score:       float  # 0.0-1.0
+    strategy:    str
+    reason:      str
+    stop_loss:   float  # dollar amount for SL
+    take_profit: float  # dollar amount for TP
+    multiplier:  int    # recommended multiplier
 
 
 # ---------------------------------------------------------------------------
-# Internal contrarian helper
+# NONE_RESULT constant
 # ---------------------------------------------------------------------------
 
-def _contrarian_invert(direction: str, reason: str) -> tuple[str, str]:
-    """
-    Invert LONG↔SHORT when CONTRARIAN_MODE is True.
-    Returns (inverted_direction, annotated_reason).
-    NONE directions are never touched.
-    """
-    if not CONTRARIAN_MODE or direction == "NONE":
-        return direction, reason
-
-    if direction == "LONG":
-        inverted = "SHORT"
-    elif direction == "SHORT":
-        inverted = "LONG"
-    else:
-        return direction, reason
-
-    annotated = reason + f" [CONTRARIAN: original={direction}→{inverted}]"
-    return inverted, annotated
-
-
-# ---------------------------------------------------------------------------
-# Digit Over/Under
-# ---------------------------------------------------------------------------
-
-def evaluate_digit(ltf_bars, symbol: str) -> SignalResult:
-    """
-    Score last 8 closes against the mid-point.
-    Fires when score >= 4  (was 6).
-    """
-    logger.info(f"EVALUATING: {symbol}")
-    closes = [b.close for b in ltf_bars[-8:]]
-    if len(closes) < 8:
-        logger.info(f"DIGIT REJECTED: {symbol} insufficient bars")
-        return SignalResult.none("insufficient bars")
-
-    mid = (max(closes) + min(closes)) / 2.0
-    over_count  = sum(1 for c in closes if c > mid)
-    under_count = sum(1 for c in closes if c < mid)
-
-    if over_count > under_count:
-        direction = "LONG"
-        raw_score = over_count
-    elif under_count > over_count:
-        direction = "SHORT"
-        raw_score = under_count
-    else:
-        raw_score = 0
-        direction = "NONE"
-
-    # ---- CHANGED: threshold lowered from 6 → 4 ----
-    if raw_score < 4:
-        logger.info(
-            f"DIGIT REJECTED: {symbol} score={raw_score}/8 below 4"
-        )
-        return SignalResult(
-            "NONE", 0, 0.0, 0.0, raw_score / 8.0, 0.0,
-            f"digit score {raw_score}/8 < 4"
-        )
-
-    atr = _atr14(ltf_bars)
-    sl  = atr * 1.5
-    tp  = atr * 2.0
-    rr  = tp / sl if sl else 0.0
-
-    logger.info(f"DIGIT EMITTED: {symbol} {direction} score={raw_score}/8")
-
-    # Contrarian inversion — last operation before return
-    reason = f"digit {direction} score={raw_score}/8"
-    direction, reason = _contrarian_invert(direction, reason)
-
-    return SignalResult(
-        direction, 2, sl, tp, raw_score / 8.0, rr,
-        reason
-    )
-
-
-# ---------------------------------------------------------------------------
-# Mean Reversion
-# ---------------------------------------------------------------------------
-
-def evaluate_mean_reversion(ltf_bars, symbol: str) -> SignalResult:
-    """
-    RSI / Bollinger / ROC mean-reversion.
-    Fires when ANY 2 of 3 conditions are met  (was: all 3).
-    """
-    logger.info(f"EVALUATING: {symbol}")
-    closes = np.array([b.close for b in ltf_bars])
-    if len(closes) < 50:
-        return SignalResult.none("insufficient bars")
-
-    rsi_val = ind.rsi(closes, 14)[-1]
-    upper_bb, lower_bb = ind.bollinger_bands(closes, 20, 2.0)
-    roc_val = ind.roc(closes, 10)[-1]
-    price   = closes[-1]
-
-    # Individual conditions (direction-agnostic here; resolved below)
-    rsi_long   = rsi_val < 30
-    rsi_short  = rsi_val > 70
-    bb_long    = price < lower_bb[-1]
-    bb_short   = price > upper_bb[-1]
-    roc_long   = roc_val < -2.0
-    roc_short  = roc_val > 2.0
-
-    long_conditions  = [rsi_long,  bb_long,  roc_long]
-    short_conditions = [rsi_short, bb_short, roc_short]
-
-    long_met  = sum(long_conditions)
-    short_met = sum(short_conditions)
-
-    # ---- CHANGED: ANY 2-of-3 is enough (was: all 3) ----
-    if long_met >= 2:
-        direction     = "LONG"
-        conditions_met = long_met
-    elif short_met >= 2:
-        direction     = "SHORT"
-        conditions_met = short_met
-    else:
-        conditions_met = max(long_met, short_met)
-        logger.info(
-            f"MR REJECTED: {symbol} conditions={conditions_met}/3"
-        )
-        return SignalResult.none(f"MR conditions={conditions_met}/3")
-
-    atr = _atr14(ltf_bars)
-    sl  = atr * 1.5
-    tp  = atr * 3.0
-    rr  = tp / sl if sl else 0.0
-
-    logger.info(
-        f"MR EMITTED: {symbol} {direction} conditions={conditions_met}/3"
-    )
-
-    # Contrarian inversion — last operation before return
-    reason = f"mean-reversion {direction} {conditions_met}/3"
-    direction, reason = _contrarian_invert(direction, reason)
-
-    return SignalResult(
-        direction, 2, sl, tp, conditions_met / 3.0, rr,
-        reason
-    )
-
-
-# ---------------------------------------------------------------------------
-# Range Break
-# ---------------------------------------------------------------------------
-
-def evaluate_range_break(ltf_bars, symbol: str) -> SignalResult:
-    """
-    Breakout + RSI confirmation.
-    consolidation now only required for strength=3  (was: always required).
-    """
-    logger.info(f"EVALUATING: {symbol}")
-    closes = np.array([b.close for b in ltf_bars])
-    highs  = np.array([b.high  for b in ltf_bars])
-    lows   = np.array([b.low   for b in ltf_bars])
-
-    if len(closes) < 30:
-        return SignalResult.none("insufficient bars")
-
-    rsi_val = ind.rsi(closes, 14)[-1]
-    recent_high = highs[-21:-1].max()
-    recent_low  = lows[-21:-1].min()
-    price       = closes[-1]
-
-    if price > recent_high:
-        direction        = "LONG"
-        breakout_confirmed = True
-        rsi_confirmed    = rsi_val > 55
-    elif price < recent_low:
-        direction        = "SHORT"
-        breakout_confirmed = True
-        rsi_confirmed    = rsi_val < 45
-    else:
-        breakout_confirmed = False
-        rsi_confirmed    = False
-        direction        = "NONE"
-
-    # Consolidation: narrow range over last 10 bars
-    range_10     = highs[-11:-1].max() - lows[-11:-1].min()
-    range_20     = highs[-21:-1].max() - lows[-21:-1].min()
-    consolidation_confirmed = range_10 < range_20 * 0.5
-
-    # ---- CHANGED: breakout + RSI alone → strength 2; add consolidation → strength 3 ----
-    if breakout_confirmed and rsi_confirmed:
-        strength = 3 if consolidation_confirmed else 2
-        atr = _atr14(ltf_bars)
-        sl  = atr * 1.5
-        tp  = atr * (3.0 if strength == 3 else 2.0)
-        rr  = tp / sl if sl else 0.0
-        logger.info(
-            f"RB EMITTED: {symbol} {direction} strength={strength}"
-        )
-
-        # Contrarian inversion — last operation before return
-        reason = f"range-break {direction} strength={strength}"
-        direction, reason = _contrarian_invert(direction, reason)
-
-        return SignalResult(
-            direction, strength, sl, tp, 0.8, rr,
-            reason
-        )
-
-    logger.info(
-        f"RB REJECTED: {symbol} "
-        f"breakout={breakout_confirmed} rsi={rsi_confirmed}"
-    )
-    return SignalResult.none(
-        f"range-break rejected breakout={breakout_confirmed} rsi={rsi_confirmed}"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Boom / Crash
-# ---------------------------------------------------------------------------
-
-SPIKE_ATR_MULTIPLIER = 1.5   # CHANGED: was 3.0
-
-
-def evaluate_boom_crash(ltf_bars, symbol: str) -> SignalResult:
-    """
-    Spike detection on Boom/Crash indices.
-    Threshold reduced from 3.0× → 1.5× ATR.
-    """
-    logger.info(f"EVALUATING: {symbol}")
-    if len(ltf_bars) < 15:
-        return SignalResult.none("insufficient bars")
-
-    atr14     = _atr14(ltf_bars)
-    last_bar  = ltf_bars[-1]
-    bar_move  = abs(last_bar.high - last_bar.low)
-    threshold = atr14 * SPIKE_ATR_MULTIPLIER
-
-    logger.info(
-        f"SPIKE CHECK: {symbol} "
-        f"bar_move={bar_move:.4f} threshold={threshold:.4f}"
-    )
-
-    if bar_move <= threshold:
-        return SignalResult.none(
-            f"boom/crash spike below threshold "
-            f"bar_move={bar_move:.4f} < {threshold:.4f}"
-        )
-
-    # Determine direction from spike body
-    body = last_bar.close - last_bar.open
-    direction = "LONG" if body > 0 else "SHORT"
-
-    sl = atr14 * 1.0
-    tp = atr14 * 2.0
-    rr = tp / sl if sl else 0.0
-
-    logger.info(
-        f"BOOM_CRASH EMITTED: {symbol} {direction} "
-        f"bar_move={bar_move:.4f} threshold={threshold:.4f}"
-    )
-
-    # Contrarian inversion — last operation before return
-    reason = f"boom/crash spike {direction}"
-    direction, reason = _contrarian_invert(direction, reason)
-
-    return SignalResult(
-        direction, 3, sl, tp, min(bar_move / threshold, 1.0), rr,
-        reason
-    )
-
-
-# ---------------------------------------------------------------------------
-# Step Index
-# ---------------------------------------------------------------------------
-
-def evaluate_step(ltf_bars, symbol: str) -> SignalResult:
-    """
-    EMA crossover signal for Step Index.
-    EMA crossover alone → strength 2  (Donchian confirmation no longer required).
-    """
-    logger.info(f"EVALUATING: {symbol}")
-    closes = np.array([b.close for b in ltf_bars])
-    if len(closes) < 55:
-        return SignalResult.none("insufficient bars")
-
-    ema_fast_arr = ind.ema(closes, 10)
-    ema_slow_arr = ind.ema(closes, 30)
-
-    if len(ema_fast_arr) < 2 or len(ema_slow_arr) < 2:
-        return SignalResult.none("insufficient EMA data")
-
-    ema_fast = ema_fast_arr[-1]
-    ema_slow = ema_slow_arr[-1]
-
-    atr = _atr14(ltf_bars)
-    sl  = atr * 1.5
-    tp  = atr * 2.5
-    rr  = tp / sl if sl else 0.0
-
-    # ---- CHANGED: EMA crossover alone is sufficient ----
-    if ema_fast > ema_slow:
-        direction = "LONG"
-        logger.info(
-            f"STEP EMITTED: {symbol} LONG "
-            f"ema_fast={ema_fast:.4f} > ema_slow={ema_slow:.4f}"
-        )
-    elif ema_fast < ema_slow:
-        direction = "SHORT"
-        logger.info(
-            f"STEP EMITTED: {symbol} SHORT "
-            f"ema_fast={ema_fast:.4f} < ema_slow={ema_slow:.4f}"
-        )
-    else:
-        return SignalResult.none("step ema_fast == ema_slow")
-
-    # Contrarian inversion — last operation before return
-    reason = f"step EMA crossover {direction}"
-    direction, reason = _contrarian_invert(direction, reason)
-
-    return SignalResult(
-        direction, 2, sl, tp, 0.7, rr,
-        reason
-    )
-
-
-# ---------------------------------------------------------------------------
-# Fallback — EMA20/50 crossover (any unrecognised symbol)
-# ---------------------------------------------------------------------------
-
-def evaluate_fallback(ltf_bars, symbol: str) -> SignalResult:
-    """
-    Simple EMA20 vs EMA50 crossover.
-    Fires on any symbol not handled by a specific strategy.
-    """
-    logger.info(f"EVALUATING: {symbol}")
-    closes = np.array([b.close for b in ltf_bars])
-    ema20 = ind.ema(closes, 20)
-    ema50 = ind.ema(closes, 50)
-
-    if len(ema20) < 2 or len(ema50) < 2:
-        logger.info(f"FALLBACK REJECTED: {symbol} insufficient data")
-        return SignalResult("NONE", 0, 0.0, 0.0, 0.0, 0.0, "insufficient data")
-
-    crossed_long  = ema20[-1] > ema50[-1] and ema20[-2] <= ema50[-2]
-    crossed_short = ema20[-1] < ema50[-1] and ema20[-2] >= ema50[-2]
-
-    if crossed_long:
-        direction = "LONG"
-    elif crossed_short:
-        direction = "SHORT"
-    else:
-        logger.info(f"FALLBACK REJECTED: {symbol} no crossover")
-        return SignalResult("NONE", 0, 0.0, 0.0, 0.0, 0.0, "no crossover")
-
-    logger.info(f"FALLBACK EMITTED: {symbol} {direction}")
-
-    # Contrarian inversion — last operation before return
-    reason = f"EMA crossover {direction}"
-    direction, reason = _contrarian_invert(direction, reason)
-
-    return SignalResult(
-        direction, 2, 0.0, 0.0, 1.0, 0.0,
-        reason
-    )
+NONE_RESULT = SignalResult(
+    "NONE", 0, 0.0, "NONE", "No signal",
+    0.0, 0.0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -433,77 +64,260 @@ class SignalEngine:
     def __init__(self, *args, **kwargs):
         pass
 
-    def evaluate(self, ltf_bars: List, symbol: str, **kwargs) -> SignalResult:
+    # -----------------------------------------------------------------------
+    # Public entry point
+    # -----------------------------------------------------------------------
+
+    def evaluate(self, ltf_bars: List, mtf_bars: List,
+                 symbol: str, stake: float = 1.0,
+                 **kwargs) -> SignalResult:
         """
-        Route to the correct strategy and return a SignalResult.
+        Route to the correct strategy by symbol type and return a SignalResult.
 
-        Strategy map:
-          DIGIT_SYMBOLS       → evaluate_digit
-          BOOM_CRASH_SYMBOLS  → evaluate_boom_crash
-          RANGE_BREAK_SYMBOLS → evaluate_range_break
-          STEP_SYMBOLS        → evaluate_step
-          JUMP_SYMBOLS        → evaluate_fallback   (CHANGED: was None)
-          DRIFT_SYMBOLS       → evaluate_fallback   (CHANGED: was None)
-          <unrecognised>      → evaluate_fallback   (CHANGED: was NONE silent)
-
-        All non-NONE results are direction-inverted by _contrarian_invert()
-        inside each evaluate_* function when CONTRARIAN_MODE = True.
+        Routing:
+          VOLATILITY_STANDARD + VOLATILITY_1S +
+          STEP + JUMP + DRIFT                  → _evaluate_volatility
+          BOOM_CRASH                           → _evaluate_boom_crash
+          RANGE_BREAK                          → _evaluate_range_break
+          <unrecognised>                       → _evaluate_volatility (fallback)
         """
         logger.info(
-            f"SIGNAL EVAL START: {symbol} bars={len(ltf_bars)}"
+            f"SIGNAL EVAL START: {symbol} "
+            f"ltf_bars={len(ltf_bars)} stake={stake}"
         )
 
-        if symbol in config.DIGIT_SYMBOLS:
-            strategy_name = "digit"
-            result = evaluate_digit(ltf_bars, symbol)
+        if len(ltf_bars) < 15:
+            logger.info(
+                f"SIGNAL EVAL REJECTED: {symbol} "
+                f"insufficient bars ({len(ltf_bars)} < 15)"
+            )
+            return NONE_RESULT
 
-        elif symbol in config.BOOM_CRASH_SYMBOLS:
-            strategy_name = "boom_crash"
-            result = evaluate_boom_crash(ltf_bars, symbol)
+        if symbol in (config.VOLATILITY_STANDARD +
+                      config.VOLATILITY_1S +
+                      config.STEP + config.JUMP +
+                      config.DRIFT):
+            result = self._evaluate_volatility(
+                ltf_bars, mtf_bars, symbol, stake)
 
-        elif symbol in config.RANGE_BREAK_SYMBOLS:
-            strategy_name = "range_break"
-            result = evaluate_range_break(ltf_bars, symbol)
+        elif symbol in config.BOOM_CRASH:
+            result = self._evaluate_boom_crash(
+                ltf_bars, symbol, stake)
 
-        elif symbol in config.STEP_SYMBOLS:
-            strategy_name = "step"
-            result = evaluate_step(ltf_bars, symbol)
-
-        elif symbol in config.JUMP_SYMBOLS:
-            strategy_name = "fallback(jump)"
-            result = evaluate_fallback(ltf_bars, symbol)
-
-        elif symbol in config.DRIFT_SYMBOLS:
-            strategy_name = "fallback(drift)"
-            result = evaluate_fallback(ltf_bars, symbol)
+        elif symbol in config.RANGE_BREAK:
+            result = self._evaluate_range_break(
+                ltf_bars, symbol, stake)
 
         else:
-            # ---- CHANGED: no longer silently returns NONE ----
-            strategy_name = "fallback(unrecognised)"
-            result = evaluate_fallback(ltf_bars, symbol)
+            logger.info(
+                f"SIGNAL EVAL: {symbol} unrecognised — "
+                f"falling back to volatility strategy"
+            )
+            result = self._evaluate_volatility(
+                ltf_bars, mtf_bars, symbol, stake)
 
-        logger.info(f"STRATEGY: {symbol} → {strategy_name}")
         logger.info(
             f"SIGNAL EVAL END: {symbol} → "
             f"{result.direction} strength={result.strength} "
-            f"score={result.score:.3f}"
+            f"score={result.score:.3f} mult={result.multiplier}x"
         )
         return result
 
+    # -----------------------------------------------------------------------
+    # Volatility indices — EMA momentum + breakout
+    # -----------------------------------------------------------------------
 
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
+    def _evaluate_volatility(self, ltf_bars: List, mtf_bars: List,
+                              symbol: str, stake: float) -> SignalResult:
+        """
+        EMA momentum + breakout detection for Volatility / Step / Jump / Drift.
 
-def _atr14(ltf_bars) -> float:
-    """True-range ATR over the last 14 bars."""
-    bars = ltf_bars[-15:]
-    trs  = []
-    for i in range(1, len(bars)):
-        high  = bars[i].high
-        low   = bars[i].low
-        prev_close = bars[i - 1].close
-        trs.append(max(high - low,
-                       abs(high - prev_close),
-                       abs(low  - prev_close)))
-    return float(np.mean(trs)) if trs else 0.0
+        1. momentum_score() → (score, direction) from LTF closes/highs/lows
+        2. detect_breakout() → breakout confirmation from ATR on LTF
+        3. detect_trend_strength() → ranging-market penalty
+        4. Combine: breakout agreement → +0.2; weak trend → ×0.7
+        5. Score filter: reject below config.MIN_SIGNAL_SCORE
+        6. SL/TP from STOP_LOSS_MAP and TAKE_PROFIT_RATIO; multiplier from
+           MULTIPLIER_MAP.
+        """
+        logger.info(f"EVALUATING VOLATILITY: {symbol}")
+
+        C = np.array([b.close for b in ltf_bars])
+        H = np.array([b.high  for b in ltf_bars])
+        L = np.array([b.low   for b in ltf_bars])
+
+        # --- Momentum score from LTF ---
+        score, direction = ind.momentum_score(
+            C, H, L,
+            fast=config.EMA_FAST,
+            slow=config.EMA_SLOW,
+            trend=config.EMA_TREND)
+
+        if direction == 0:
+            logger.info(
+                f"VOLATILITY REJECTED: {symbol} "
+                f"momentum direction=0"
+            )
+            return NONE_RESULT
+
+        # --- Breakout confirmation from LTF ATR ---
+        atr_arr = ind.atr(H, L, C, config.ATR_PERIOD)
+        valid_atr = atr_arr[~np.isnan(atr_arr)]
+        atr = float(valid_atr[-1]) if len(valid_atr) else 0.0
+
+        breakout = ind.detect_breakout(
+            C, H, L, atr_arr,
+            lookback=config.MOMENTUM_LOOKBACK,
+            mult=config.BREAKOUT_ATR_MULT)
+
+        # --- Trend strength filter ---
+        strength_val = ind.detect_trend_strength(C)
+
+        # --- Combine signals ---
+        if breakout != 0 and breakout == direction:
+            score = min(score + 0.2, 1.0)
+
+        if strength_val < 0.3:
+            score *= 0.7  # penalise ranging market
+
+        if score < config.MIN_SIGNAL_SCORE:
+            logger.info(
+                f"VOLATILITY REJECTED: {symbol} "
+                f"score={score:.3f} < "
+                f"{config.MIN_SIGNAL_SCORE}"
+            )
+            return NONE_RESULT
+
+        # --- SL / TP / multiplier ---
+        sl_pct = config.STOP_LOSS_MAP.get(
+            symbol, config.DEFAULT_STOP_LOSS_PCT)
+        sl_amt = round(stake * sl_pct / 100, 2)
+        tp_amt = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
+        mult   = config.MULTIPLIER_MAP.get(
+            symbol, config.DEFAULT_MULTIPLIER)
+
+        dir_str = "LONG" if direction > 0 else "SHORT"
+
+        logger.info(
+            f"VOLATILITY SIGNAL: {symbol} {dir_str} "
+            f"score={score:.3f} "
+            f"mult={mult}x "
+            f"SL=${sl_amt} TP=${tp_amt}"
+        )
+
+        return SignalResult(
+            direction   = dir_str,
+            strength    = 3 if score >= 0.7 else 2,
+            score       = score,
+            strategy    = "EMA_MOMENTUM",
+            reason      = (f"EMA momentum | "
+                           f"breakout={breakout} | "
+                           f"trend={strength_val:.2f}"),
+            stop_loss   = sl_amt,
+            take_profit = tp_amt,
+            multiplier  = mult,
+        )
+
+    # -----------------------------------------------------------------------
+    # Boom / Crash — drift direction after spike
+    # -----------------------------------------------------------------------
+
+    def _evaluate_boom_crash(self, ltf_bars: List,
+                              symbol: str, stake: float) -> SignalResult:
+        """
+        Detect post-spike drift direction for Boom/Crash indices.
+
+        Uses ind.boom_crash_drift() which analyses the LTF close array
+        and returns +1 (bullish drift), -1 (bearish drift), or 0 (none).
+        """
+        logger.info(f"EVALUATING BOOM/CRASH: {symbol}")
+
+        C = np.array([b.close for b in ltf_bars])
+        H = np.array([b.high  for b in ltf_bars])
+        L = np.array([b.low   for b in ltf_bars])
+
+        drift = ind.boom_crash_drift(C)
+        if drift == 0:
+            logger.info(
+                f"BOOM/CRASH REJECTED: {symbol} drift=0"
+            )
+            return NONE_RESULT
+
+        score   = 0.65
+        dir_str = "LONG" if drift > 0 else "SHORT"
+        sl_pct  = config.STOP_LOSS_MAP.get(
+            symbol, config.DEFAULT_STOP_LOSS_PCT)
+        sl_amt  = round(stake * sl_pct / 100, 2)
+        tp_amt  = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
+        mult    = config.MULTIPLIER_MAP.get(
+            symbol, config.DEFAULT_MULTIPLIER)
+
+        logger.info(
+            f"BOOM/CRASH SIGNAL: {symbol} {dir_str} "
+            f"drift score={score:.3f} "
+            f"mult={mult}x "
+            f"SL=${sl_amt} TP=${tp_amt}"
+        )
+
+        return SignalResult(
+            direction   = dir_str,
+            strength    = 2,
+            score       = score,
+            strategy    = "BOOM_CRASH_DRIFT",
+            reason      = f"Drift {dir_str} detected",
+            stop_loss   = sl_amt,
+            take_profit = tp_amt,
+            multiplier  = mult,
+        )
+
+    # -----------------------------------------------------------------------
+    # Range Break — breakout confirmation
+    # -----------------------------------------------------------------------
+
+    def _evaluate_range_break(self, ltf_bars: List,
+                               symbol: str, stake: float) -> SignalResult:
+        """
+        ATR-based breakout confirmation for Range Break indices.
+
+        Uses a 15-bar lookback and 1.0× ATR multiplier.
+        Returns LONG / SHORT at strength=3 score=0.75 on confirmed breakout.
+        """
+        logger.info(f"EVALUATING RANGE BREAK: {symbol}")
+
+        C = np.array([b.close for b in ltf_bars])
+        H = np.array([b.high  for b in ltf_bars])
+        L = np.array([b.low   for b in ltf_bars])
+
+        atr_arr  = ind.atr(H, L, C, config.ATR_PERIOD)
+        breakout = ind.detect_breakout(
+            C, H, L, atr_arr, lookback=15, mult=1.0)
+
+        if breakout == 0:
+            logger.info(
+                f"RANGE BREAK REJECTED: {symbol} breakout=0"
+            )
+            return NONE_RESULT
+
+        dir_str = "LONG" if breakout > 0 else "SHORT"
+        sl_amt  = round(
+            stake * config.DEFAULT_STOP_LOSS_PCT / 100, 2)
+        tp_amt  = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
+        mult    = config.MULTIPLIER_MAP.get(
+            symbol, config.DEFAULT_MULTIPLIER)
+
+        logger.info(
+            f"RANGE BREAK SIGNAL: {symbol} {dir_str} "
+            f"mult={mult}x "
+            f"SL=${sl_amt} TP=${tp_amt}"
+        )
+
+        return SignalResult(
+            direction   = dir_str,
+            strength    = 3,
+            score       = 0.75,
+            strategy    = "RANGE_BREAK",
+            reason      = f"Breakout {dir_str}",
+            stop_loss   = sl_amt,
+            take_profit = tp_amt,
+            multiplier  = mult,
+        )
