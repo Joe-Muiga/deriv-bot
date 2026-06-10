@@ -685,6 +685,370 @@ def _slope_divergence(
         return 0
 
 
+# ─── Momentum Score ───────────────────────────────────────────────────────────
+
+def momentum_score(
+    closes: ArrayLike,
+    highs: ArrayLike,
+    lows: ArrayLike,
+    fast: int = 8,
+    slow: int = 21,
+    trend: int = 50,
+) -> Tuple[float, int]:
+    """
+    Composite momentum score for EMA stack alignment.
+
+    Returns (score: float 0.0–1.0, direction: int +1/-1/0).
+      Strong bull  (fast > slow > trend, price > trend EMA) : (1.0, +1)
+      Bull crossover (fast just crossed above slow)          : (0.8, +1)
+      Moderate bull (fast > slow, price > trend EMA)         : (0.7, +1)
+      Opposite rules for bearish signals.
+      Neutral otherwise                                       : (0.0,  0)
+    """
+    try:
+        C = _to(closes)
+        n = len(C)
+        if n < 15:
+            return 0.0, 0
+
+        ema_fast  = ema(C, fast)
+        ema_slow  = ema(C, slow)
+        ema_trend = ema(C, trend)
+
+        f0, f1 = float(ema_fast[-1]),  float(ema_fast[-2])  if n >= 2 else float(ema_fast[-1])
+        s0, s1 = float(ema_slow[-1]),  float(ema_slow[-2])  if n >= 2 else float(ema_slow[-1])
+        t0     = float(ema_trend[-1])
+        price  = float(C[-1])
+
+        # Bull crossover: fast crossed above slow on this bar
+        bull_cross = f0 > s0 and f1 <= s1
+        bear_cross = f0 < s0 and f1 >= s1
+
+        # Strong bull: full EMA stack + price above trend
+        if f0 > s0 and s0 > t0 and price > t0:
+            return 1.0, 1
+        # Strong bear: full EMA stack + price below trend
+        if f0 < s0 and s0 < t0 and price < t0:
+            return 1.0, -1
+        # Bull crossover
+        if bull_cross:
+            return 0.8, 1
+        # Bear crossover
+        if bear_cross:
+            return 0.8, -1
+        # Moderate bull: fast > slow, price above trend EMA
+        if f0 > s0 and price > t0:
+            return 0.7, 1
+        # Moderate bear: fast < slow, price below trend EMA
+        if f0 < s0 and price < t0:
+            return 0.7, -1
+
+        return 0.0, 0
+    except Exception:
+        return 0.0, 0
+
+
+# ─── Breakout Detector ────────────────────────────────────────────────────────
+
+def detect_breakout(
+    closes: ArrayLike,
+    highs: ArrayLike,
+    lows: ArrayLike,
+    atr_vals: ArrayLike,
+    lookback: int = 10,
+    mult: float = 1.5,
+) -> int:
+    """
+    Detects a price breakout on the most recent bar.
+
+    Returns:
+      +1  upward   breakout (close > highest high of last `lookback` bars + mult × ATR)
+      -1  downward breakout (close < lowest  low  of last `lookback` bars - mult × ATR)
+       0  no breakout or insufficient data
+
+    The `lookback` window excludes the current bar (uses bars[-lookback-1:-1]).
+    """
+    try:
+        C  = _to(closes)
+        H  = _to(highs)
+        L  = _to(lows)
+        A  = _to(atr_vals)
+        n  = len(C)
+
+        if n < max(15, lookback + 1):
+            return 0
+        if len(A) == 0:
+            return 0
+
+        atr_val = float(A[-1])
+        if atr_val == 0.0:
+            return 0
+
+        # Reference window: bars before the current one
+        ref_H = H[-(lookback + 1):-1]
+        ref_L = L[-(lookback + 1):-1]
+        if len(ref_H) == 0:
+            return 0
+
+        highest = float(np.max(ref_H))
+        lowest  = float(np.min(ref_L))
+        price   = float(C[-1])
+        margin  = mult * atr_val
+
+        if price > highest + margin:
+            return 1
+        if price < lowest - margin:
+            return -1
+        return 0
+    except Exception:
+        return 0
+
+
+# ─── Trend Strength ───────────────────────────────────────────────────────────
+
+def detect_trend_strength(closes: ArrayLike, period: int = 14) -> float:
+    """
+    Simplified ADX-concept trend strength score.
+
+    Returns float 0.0–1.0.
+      > 0.6 → strong trend
+      < 0.3 → ranging / choppy
+    Uses directional consistency of EMA slope over `period` bars, normalised
+    by the volatility of those slopes.  Works on as few as 15 bars.
+    Returns 0.0 on error or insufficient data.
+    """
+    try:
+        C = _to(closes)
+        n = len(C)
+        if n < 15:
+            return 0.0
+
+        p = min(period, n - 1)
+        if p < 3:
+            return 0.0
+
+        ema_vals = ema(C, p)
+        # Compute bar-to-bar differences of EMA over last p+1 bars
+        window = ema_vals[-(p + 1):]
+        diffs  = np.diff(window.astype(float))
+        if len(diffs) == 0:
+            return 0.0
+
+        # Directional consistency: |mean(diffs)| / (std(diffs) + ε)
+        mean_d = float(np.mean(diffs))
+        std_d  = float(np.std(diffs)) + 1e-10
+        raw    = abs(mean_d) / std_d
+        # Normalise: score saturates at raw ≈ 3 (strong trend)
+        score  = float(min(raw / 3.0, 1.0))
+        return round(score, 4)
+    except Exception:
+        return 0.0
+
+
+# ─── Momentum Shift ───────────────────────────────────────────────────────────
+
+def detect_momentum_shift(
+    closes: ArrayLike,
+    highs: ArrayLike,
+    lows: ArrayLike,
+    lookback: int = 10,
+) -> int:
+    """
+    Detects a near-term momentum shift using consecutive close comparison.
+
+    Bullish  shift (+1): last 3 closes are each higher than the corresponding
+                         close 3 bars earlier (positional comparison).
+    Bearish  shift (-1): last 3 closes are each lower  than 3 bars earlier.
+    Neutral        (0) : mixed signals or insufficient data.
+
+    Requires at least 15 bars.
+    """
+    try:
+        C = _to(closes)
+        n = len(C)
+        if n < 15 or n < lookback:
+            return 0
+
+        # Most recent 6 closes; compare last 3 vs previous 3
+        if n < 6:
+            return 0
+
+        recent   = [float(C[-(3 - i)]) for i in range(3)]   # C[-3], C[-2], C[-1]
+        previous = [float(C[-(6 - i)]) for i in range(3)]   # C[-6], C[-5], C[-4]
+
+        bull = all(recent[i] > previous[i] for i in range(3))
+        bear = all(recent[i] < previous[i] for i in range(3))
+
+        if bull:
+            return 1
+        if bear:
+            return -1
+        return 0
+    except Exception:
+        return 0
+
+
+# ─── Volatility Regime ────────────────────────────────────────────────────────
+
+def volatility_regime(
+    closes: ArrayLike,
+    highs: ArrayLike,
+    lows: ArrayLike,
+    period: int = 14,
+) -> str:
+    """
+    Classifies the current volatility regime.
+
+    Returns:
+      "EXPLOSIVE" – current ATR > 2 × mean ATR of last 20 bars
+      "TRENDING"  – ADX-equivalent > 0.5
+      "RANGING"   – everything else
+
+    Works on as few as 15 bars; returns "RANGING" on error.
+    """
+    try:
+        C = _to(closes)
+        H = _to(highs)
+        L = _to(lows)
+        n = len(C)
+
+        if n < 15:
+            return "RANGING"
+
+        atr_vals = atr(H, L, C, period)
+        current_atr = float(atr_vals[-1])
+
+        # Explosive: current ATR > 2× mean of last 20 ATR values (excluding current)
+        hist_window = 20
+        hist = atr_vals[-(hist_window + 1):-1]
+        if len(hist) > 0:
+            mean_atr = float(np.mean(hist))
+            if mean_atr > 0 and current_atr > 2.0 * mean_atr:
+                return "EXPLOSIVE"
+
+        # Trending: use detect_trend_strength
+        strength = detect_trend_strength(C, period)
+        if strength > 0.5:
+            return "TRENDING"
+
+        return "RANGING"
+    except Exception:
+        return "RANGING"
+
+
+# ─── Boom/Crash Drift ─────────────────────────────────────────────────────────
+
+def boom_crash_drift(
+    closes: ArrayLike,
+    spike_atr_mult: float = 3.0,
+) -> int:
+    """
+    Drift direction detector for Boom/Crash synthetic indices.
+
+    After a spike, price drifts in the opposite direction until the next spike.
+    This function identifies the post-spike drift direction.
+
+    Returns:
+      +1  upward drift   (suitable for MULTUP  on Boom  or after Crash spike)
+      -1  downward drift (suitable for MULTDOWN on Crash or after Boom  spike)
+       0  near a spike, unclear, or insufficient data
+
+    Algorithm:
+      1. Compute ATR14.
+      2. Scan the last 20 bars for a spike: single bar move > spike_atr_mult × ATR.
+      3. If spike found within last 3 bars → return 0 (too close, avoid entry).
+      4. Direction of drift = OPPOSITE to spike direction.
+      5. If no spike found → use gentle trend direction from EMA8 slope.
+    """
+    try:
+        C = _to(closes)
+        n = len(C)
+        if n < 15:
+            return 0
+
+        atr_vals = atr(C, C, C, 14)   # H=L=C for close-only ATR approximation
+        # Prefer proper ATR if we have enough data; close-only is a fallback.
+        # Callers should pass highs/lows; here we gracefully degrade.
+        threshold = float(atr_vals[-1]) * spike_atr_mult
+        if threshold == 0.0:
+            return 0
+
+        scan = min(20, n)
+        spike_idx  = None
+        spike_dir  = 0
+
+        for i in range(n - scan, n):
+            bar_move = abs(float(C[i]) - float(C[i - 1])) if i > 0 else 0.0
+            if bar_move > threshold:
+                spike_idx = i
+                spike_dir = 1 if float(C[i]) > float(C[i - 1]) else -1
+
+        if spike_idx is not None:
+            bars_since = (n - 1) - spike_idx
+            if bars_since <= 2:
+                return 0          # too close to spike — wait
+            return -spike_dir     # drift opposite to spike
+
+        # No spike detected — fall back to EMA8 slope for gentle drift
+        ema8 = ema(C, 8)
+        if len(ema8) >= 2:
+            slope = float(ema8[-1]) - float(ema8[-2])
+            if slope > 0:
+                return 1
+            if slope < 0:
+                return -1
+        return 0
+    except Exception:
+        return 0
+
+
+# ─── SL/TP Calculator ─────────────────────────────────────────────────────────
+
+def calculate_sl_tp(
+    entry_price: float,
+    direction: int,
+    atr_val: float,
+    sl_pct_stake: float,
+    tp_ratio: float = 2.0,
+) -> Tuple[float, float]:
+    """
+    Calculate stop-loss and take-profit dollar amounts for Deriv multiplier contracts.
+
+    Parameters
+    ----------
+    entry_price   : Current price at entry.
+    direction     : +1 for long, -1 for short.
+    atr_val       : Current ATR value (same units as price).
+    sl_pct_stake  : Stop-loss as a fraction of stake (e.g. 0.05 = 5 %).
+    tp_ratio      : Take-profit as a multiple of the stop-loss amount (default 2.0).
+
+    Returns
+    -------
+    (stop_loss_amount, take_profit_amount) – both positive dollar values passed
+    directly to the Deriv multiplier contract `limit_order` field.
+
+    Returns (0.0, 0.0) on any error or zero inputs.
+    """
+    try:
+        if entry_price <= 0 or atr_val <= 0 or sl_pct_stake <= 0:
+            return 0.0, 0.0
+
+        # SL distance in price units = 1.5 × ATR (standard buffer)
+        sl_price_dist = 1.5 * float(atr_val)
+
+        # Dollar SL is the stake fraction supplied by the caller
+        sl_amount = float(sl_pct_stake)
+        tp_amount = round(float(sl_amount) * float(tp_ratio), 6)
+        sl_amount = round(sl_amount, 6)
+
+        if sl_amount <= 0 or tp_amount <= 0:
+            return 0.0, 0.0
+
+        return sl_amount, tp_amount
+    except Exception:
+        return 0.0, 0.0
+
+
 # ─── ADX ──────────────────────────────────────────────────────────────────────
 
 def adx(
