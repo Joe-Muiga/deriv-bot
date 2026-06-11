@@ -205,6 +205,9 @@ class RiskManager:
 
     def set_balance(self, balance: float) -> None:
         self._current_balance = balance
+        if self._day_start_balance == 0:
+            self._day_start_balance = balance
+        logger.info(f"BALANCE UPDATED: ${balance:.4f}")
         self._balance_cycle   = self._current_cycle
         self._handle_day_rollover(balance)
 
@@ -319,16 +322,22 @@ class RiskManager:
         Log format:
           STAKE: $X (base=$Y ×M streak=+Z)
         """
-        balance    = await self._fetch_live_balance()
-        base_stake = max(
-            balance * self.base_stake_pct if balance > 0 else self.min_stake,
-            self.min_stake,
+        balance = await self._fetch_live_balance()
+
+        # Never let base exceed 50% of balance
+        base = min(
+            self._current_balance * config.BASE_STAKE_PCT,
+            self._current_balance * 0.50,
         )
-        stake = self._compute_stake(balance)
+        base  = max(base, config.MIN_STAKE)
+        stake = round(base * self._multiplier, 2)
+        stake = min(stake, config.MAX_STAKE)
+        stake = min(stake, self._current_balance * 0.50)
+        stake = max(stake, config.MIN_STAKE)
 
         logger.info(
             f"STAKE: ${stake:.4f} "
-            f"(base=${base_stake:.4f} "
+            f"(base=${base:.4f} "
             f"×{self._multiplier:.1f} "
             f"streak={self._win_streak:+d})")
 
