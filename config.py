@@ -9,6 +9,9 @@ VERSION   = "1.0.0"
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
 DERIV_APP_ID    = os.environ.get("DERIV_APP_ID", "1089")
 
+# ── SERVER ────────────────────────────────────────────────────
+PORT = int(os.environ.get("PORT", 10000))
+
 # ── ALL DERIV SYNTHETIC INDICES ──────────────────────────────
 
 # Standard Volatility (2s tick)
