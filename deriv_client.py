@@ -100,6 +100,9 @@ _DEFAULT_MAX_RECONNECTS     = 10  # 0 = unlimited
 # Contract polling interval in seconds
 _CONTRACT_POLL_INTERVAL = 30
 
+# Minimum gap between proposal requests (rate-limit protection)
+PROPOSAL_DELAY = 2.0  # 2 seconds between proposals
+
 
 def _is_boom_crash(symbol: str) -> bool:
     return any(symbol.upper().startswith(p) for p in _BOOM_CRASH_PREFIXES)
@@ -138,7 +141,7 @@ class DerivClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # ── Rate limiting ─────────────────────────────────────────────────────
-        self._buy_semaphore  = asyncio.Semaphore(2)  # max 2 simultaneous buy requests
+        self._buy_semaphore  = asyncio.Semaphore(1)  # one at a time
         self._last_buy_time  = 0.0                   # epoch of last buy attempt
 
         # ── Direction→contract mapping audit ─────────────────────────────────
@@ -631,8 +634,8 @@ class DerivClient:
         """
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
-            if elapsed < 0.3:
-                await asyncio.sleep(0.3 - elapsed)
+            if elapsed < PROPOSAL_DELAY:
+                await asyncio.sleep(PROPOSAL_DELAY - elapsed)
             self._last_buy_time = time.time()
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
@@ -650,7 +653,18 @@ class DerivClient:
                     "duration_unit": "m",
                     "symbol":        symbol,
                 }
-                proposal = await self._send(proposal_req)
+                proposal = None
+                for attempt in range(3):
+                    proposal = await self._send(proposal_req)
+                    if not proposal:
+                        break
+                    if proposal.get("error", {}).get("code") == "RateLimit":
+                        wait = 3 * (attempt + 1)
+                        logger.warning(
+                            f"RATE LIMIT — waiting {wait}s (attempt {attempt+1}/3)")
+                        await asyncio.sleep(wait)
+                        continue
+                    break
                 logger.info(f"PROPOSAL RESPONSE: {proposal}")
                 if not proposal or proposal.get("error"):
                     err = (
