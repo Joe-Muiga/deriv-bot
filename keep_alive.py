@@ -25,6 +25,24 @@ v9 changes:
     suspended symbols with minutes remaining, session status — all live on
     every 10 s refresh.
   - _build_svg_chart() rewritten to consume balance_history directly.
+
+v10 changes:
+  - record_trade() now accepts `multiplier` and `close_reason` ("normal" | "timeout").
+  - record_trade() updates: recent_trades (last 200), all_trades (full session),
+    balance_history, hourly_pnl (by hour bucket), daily_pnl_history,
+    wins / losses / total_trades / win_rate, daily/weekly/monthly PnL + %,
+    avg_multiplier, best_trade / worst_trade, funding_fees_total
+    (sum of negative PnL on timeout closes).
+  - _check_period_resets() handles daily / weekly / monthly resets and rolls
+    the previous day's PnL into daily_pnl_history.
+  - update_open_contracts() tracks currently open multiplier contracts
+    (count + symbol list) for the dashboard.
+  - _build_svg_chart() now color-codes dots: green=win, red=loss,
+    yellow=timeout close — and draws a dashed horizontal reference line at
+    the day's starting balance.
+  - Dashboard gains cards: Avg Multiplier, Best/Worst Trade, Funding Fees,
+    Open Contracts (with symbol list), Weekly/Monthly P&L.
+  - All other logic, routes, ping loop, and helpers are unchanged.
 """
 
 import os
@@ -71,6 +89,29 @@ _state: dict = {
     "worst_trade":           0.0,
     "redeploy_pending":      False,
     "active_trades":         0,
+
+    # ── v10: full trade history / period tracking ──────────────────────────
+    "all_trades":            [],
+    "hourly_pnl":            {},
+    "daily_pnl_history":     [],
+    "weekly_pnl":            0.0,
+    "weekly_pnl_pct":        0.0,
+    "monthly_pnl":           0.0,
+    "monthly_pnl_pct":       0.0,
+    "week_start_balance":    0.0,
+    "month_start_balance":   0.0,
+    "current_day":           "",
+    "current_week":          "",
+    "current_month":         "",
+
+    # ── v10: multiplier / funding fee tracking ──────────────────────────────
+    "avg_multiplier":        0.0,
+    "multiplier_count":      0,
+    "funding_fees_total":    0.0,
+
+    # ── v10: open contracts ──────────────────────────────────────────────────
+    "open_contracts":        [],
+    "open_contracts_count":  0,
 }
 
 
@@ -100,13 +141,77 @@ def get_active_trades() -> int:
     return int(_state.get("active_trades", 0))
 
 
+# ── Period reset helper ─────────────────────────────────────────────────────────
+
+def _check_period_resets(now: "datetime.datetime", balance_after: float) -> None:
+    """
+    Detect day / ISO-week / month rollovers and reset the relevant counters.
+    Called at the top of record_trade() before any other state is updated.
+    """
+    today_str = now.strftime("%Y-%m-%d")
+    iso_year, iso_week, _ = now.isocalendar()
+    week_str = f"{iso_year}-W{iso_week:02d}"
+    month_str = now.strftime("%Y-%m")
+
+    current_balance = _status.get("balance", balance_after)
+
+    # First-run initialization
+    if not _status.get("current_day"):
+        _status["current_day"] = today_str
+        _status["day_start_balance"] = balance_after
+    if not _status.get("current_week"):
+        _status["current_week"] = week_str
+        _status["week_start_balance"] = balance_after
+    if not _status.get("current_month"):
+        _status["current_month"] = month_str
+        _status["month_start_balance"] = balance_after
+
+    # Daily reset — roll yesterday's PnL into history, reset W/L counters
+    if _status["current_day"] != today_str:
+        prev_day_start = _status.get("day_start_balance", current_balance)
+        _status["daily_pnl_history"].append({
+            "date":    _status["current_day"],
+            "pnl":     round(current_balance - prev_day_start, 4),
+            "balance": round(current_balance, 4),
+        })
+        _status["daily_pnl_history"] = _status["daily_pnl_history"][-90:]
+
+        _status["current_day"] = today_str
+        _status["day_start_balance"] = current_balance
+        _status["wins"] = 0
+        _status["losses"] = 0
+        _status["total_trades"] = 0
+        _status["win_rate"] = 0.0
+
+    # Weekly reset
+    if _status["current_week"] != week_str:
+        _status["current_week"] = week_str
+        _status["week_start_balance"] = current_balance
+
+    # Monthly reset
+    if _status["current_month"] != month_str:
+        _status["current_month"] = month_str
+        _status["month_start_balance"] = current_balance
+
+
 def record_trade(symbol, direction, stake, pnl,
-                 balance_after, won, strategy=""):
-    """Called directly after every trade closes."""
+                 balance_after, won, strategy="",
+                 multiplier=None, close_reason="normal"):
+    """
+    Called directly after every trade closes.
+
+    multiplier   : the multiplier used for this trade (e.g. 100, 200), if any.
+    close_reason : "normal" (manual/TP/SL close) or "timeout" (forced close
+                   due to expiry — used for funding-fee tracking & yellow dots).
+    """
     from datetime import datetime, timezone
 
+    now = datetime.now(timezone.utc)
+    is_timeout = (close_reason == "timeout")
+
     trade = {
-        "time": datetime.now(timezone.utc).strftime("%H:%M:%S"),
+        "time": now.strftime("%H:%M:%S"),
+        "date": now.strftime("%Y-%m-%d"),
         "symbol": symbol,
         "direction": direction,
         "stake": round(stake, 4),
@@ -114,19 +219,33 @@ def record_trade(symbol, direction, stake, pnl,
         "balance_after": round(balance_after, 4),
         "won": won,
         "strategy": strategy,
+        "multiplier": multiplier,
+        "close_reason": close_reason,
     }
 
-    # Add to recent trades — keep last 50
+    # Handle daily / weekly / monthly rollovers BEFORE updating counters
+    _check_period_resets(now, balance_after)
+
+    # Add to recent trades — keep last 200
     _status["recent_trades"].insert(0, trade)
-    _status["recent_trades"] = _status["recent_trades"][:50]
+    _status["recent_trades"] = _status["recent_trades"][:200]
+
+    # Add to full session history — unbounded
+    _status["all_trades"].append(trade)
 
     # Add to balance history for chart — keep last 100
     _status["balance_history"].append({
         "time": trade["time"],          # "HH:MM:SS"
         "balance": balance_after,
         "won": won,
+        "close_reason": close_reason,
     })
     _status["balance_history"] = _status["balance_history"][-100:]
+
+    # Hourly PnL bucket — keyed "YYYY-MM-DD HH:00"
+    hour_key = now.strftime("%Y-%m-%d %H:00")
+    _status["hourly_pnl"][hour_key] = round(
+        _status["hourly_pnl"].get(hour_key, 0.0) + pnl, 4)
 
     # Update win/loss counts
     if won:
@@ -141,13 +260,63 @@ def record_trade(symbol, direction, stake, pnl,
             _status["wins"] / _status["total_trades"] * 100, 1)
 
     # Update daily PnL
-    day_start = _status.get("day_start_balance", balance_after)
-    if day_start > 0:
-        _status["daily_pnl"] = round(balance_after - day_start, 4)
-        _status["daily_pnl_pct"] = round(
-            (_status["daily_pnl"] / day_start) * 100, 2)
+    day_start = _status.get("day_start_balance") or balance_after
+    _status["daily_pnl"] = round(balance_after - day_start, 4)
+    _status["daily_pnl_pct"] = round(
+        (_status["daily_pnl"] / day_start) * 100, 2) if day_start else 0.0
+
+    # Update weekly PnL
+    week_start = _status.get("week_start_balance") or balance_after
+    _status["weekly_pnl"] = round(balance_after - week_start, 4)
+    _status["weekly_pnl_pct"] = round(
+        (_status["weekly_pnl"] / week_start) * 100, 2) if week_start else 0.0
+
+    # Update monthly PnL
+    month_start = _status.get("month_start_balance") or balance_after
+    _status["monthly_pnl"] = round(balance_after - month_start, 4)
+    _status["monthly_pnl_pct"] = round(
+        (_status["monthly_pnl"] / month_start) * 100, 2) if month_start else 0.0
+
+    # Average multiplier (running mean)
+    if multiplier is not None:
+        try:
+            mult = float(multiplier)
+            n = int(_status.get("multiplier_count", 0))
+            avg = float(_status.get("avg_multiplier", 0.0))
+            _status["avg_multiplier"] = round((avg * n + mult) / (n + 1), 2)
+            _status["multiplier_count"] = n + 1
+        except (TypeError, ValueError):
+            pass
+
+    # Best / worst single-trade PnL
+    if pnl > _status.get("best_trade", 0.0):
+        _status["best_trade"] = round(pnl, 4)
+    if pnl < _status.get("worst_trade", 0.0):
+        _status["worst_trade"] = round(pnl, 4)
+
+    # Funding fees — negative PnL on timeout (forced expiry) closes
+    if is_timeout and pnl < 0:
+        _status["funding_fees_total"] = round(
+            _status.get("funding_fees_total", 0.0) + abs(pnl), 4)
 
     _status["balance"] = balance_after
+
+
+def update_open_contracts(contracts: list) -> None:
+    """
+    Update the list of currently-open multiplier contracts.
+
+    `contracts` may be a list of symbol strings, or a list of dicts each
+    containing at least a "symbol" key (e.g. {"symbol": "R_100", ...}).
+    """
+    normalized = []
+    for c in contracts or []:
+        if isinstance(c, dict):
+            normalized.append(str(c.get("symbol", "—")))
+        else:
+            normalized.append(str(c))
+    _status["open_contracts"] = normalized
+    _status["open_contracts_count"] = len(normalized)
 
 
 def record_signal(symbol, direction, strategy, score):
@@ -249,16 +418,21 @@ def _parse_hms(raw) -> str:
 
 # ── SVG Balance Curve ──────────────────────────────────────────────────────────
 
-def _build_svg_chart(balance_history: list) -> str:
+def _build_svg_chart(balance_history: list, start_balance: float | None = None) -> str:
     """
     Build a pure inline SVG balance curve from balance_history entries.
-    Each entry: {"time": "HH:MM:SS", "balance": float, "won": bool}
+    Each entry: {"time": "HH:MM:SS", "balance": float, "won": bool,
+                  "close_reason": "normal" | "timeout"}
     Produced by record_trade() — no external dependencies.
 
     Chart title: "Balance Curve — Today"  (rendered in caller)
     X axis: trade timestamps as HH:MM
     Y axis: balance after each trade
-    Green dots = winning trades, red dots = losing trades
+    Dot colours:
+      - Green  = winning trade
+      - Red    = losing trade
+      - Yellow = timeout / forced-expiry close
+    A dashed horizontal reference line marks the day's starting balance.
     Updates on every dashboard refresh (10 s).
     """
     W, H = 900, 180
@@ -271,9 +445,10 @@ def _build_svg_chart(balance_history: list) -> str:
             bal  = float(entry.get("balance") or entry.get("balance_after") or 0)
             if bal == 0:
                 continue
-            won   = bool(entry.get("won", False))
-            label = _parse_hms(entry.get("time") or entry.get("exit_time"))
-            points.append({"t": label, "bal": bal, "won": won})
+            won          = bool(entry.get("won", False))
+            close_reason = str(entry.get("close_reason", "normal"))
+            label        = _parse_hms(entry.get("time") or entry.get("exit_time"))
+            points.append({"t": label, "bal": bal, "won": won, "close_reason": close_reason})
         except Exception:
             continue
 
@@ -288,9 +463,16 @@ def _build_svg_chart(balance_history: list) -> str:
             f'</svg>'
         )
 
-    bals   = [p["bal"] for p in points]
-    min_b  = min(bals)
-    max_b  = max(bals)
+    bals = [p["bal"] for p in points]
+
+    # Include the start-balance reference line in the auto-range so it's
+    # always visible on the chart.
+    range_vals = list(bals)
+    if start_balance:
+        range_vals.append(float(start_balance))
+
+    min_b  = min(range_vals)
+    max_b  = max(range_vals)
     span   = max_b - min_b if max_b != min_b else 1.0
 
     plot_w = W - PAD_L - PAD_R
@@ -312,10 +494,15 @@ def _build_svg_chart(balance_history: list) -> str:
         f'stroke-width="2" stroke-linejoin="round"/>'
     )
 
-    # Coloured dots — green=win, red=loss
+    # Coloured dots — green=win, red=loss, yellow=timeout close
     dots = ""
     for i, p in enumerate(points):
-        fill = "#3fb950" if p["won"] else "#f85149"
+        if p["close_reason"] == "timeout":
+            fill = "#d29922"
+        elif p["won"]:
+            fill = "#3fb950"
+        else:
+            fill = "#f85149"
         dots += (
             f'<circle cx="{px(i):.1f}" cy="{py(p["bal"]):.1f}" r="4" '
             f'fill="{fill}" stroke="#0d1117" stroke-width="1.5">'
@@ -347,10 +534,22 @@ def _build_svg_chart(balance_history: list) -> str:
             f'{points[i]["t"]}</text>'
         )
 
+    # Dashed horizontal reference line at the day's starting balance
+    ref_line = ""
+    if start_balance:
+        y_ref = py(float(start_balance))
+        ref_line = (
+            f'<line x1="{PAD_L}" y1="{y_ref:.1f}" x2="{W - PAD_R}" y2="{y_ref:.1f}" '
+            f'stroke="#8b949e" stroke-width="1" stroke-dasharray="4,3"/>'
+            f'<text x="{W - PAD_R}" y="{y_ref - 4:.1f}" text-anchor="end" '
+            f'fill="#8b949e" font-size="10" font-family="Segoe UI,sans-serif">'
+            f'Start: ${float(start_balance):.2f}</text>'
+        )
+
     return (
         f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
         f'style="width:100%;height:180px;">'
-        f'{y_labels}{line}{dots}{x_labels}'
+        f'{y_labels}{ref_line}{line}{dots}{x_labels}'
         f'</svg>'
     )
 
@@ -377,6 +576,23 @@ def _render_dashboard() -> str:
         streak_lbl = str(s.get("streak_label", "—"))
 
         pf        = float(s.get("profit_factor", 0.0))
+
+        # ── v10: multiplier / fee / open-contract values ────────────────────────
+        avg_mult     = float(s.get("avg_multiplier", 0.0))
+        mult_count   = int(s.get("multiplier_count", 0))
+        best_trade   = float(s.get("best_trade", 0.0))
+        worst_trade  = float(s.get("worst_trade", 0.0))
+        funding_fees = float(s.get("funding_fees_total", 0.0))
+        open_list    = s.get("open_contracts", [])
+        open_count   = int(s.get("open_contracts_count", len(open_list)))
+        open_syms    = ", ".join(open_list) if open_list else "—"
+
+        weekly_pnl      = float(s.get("weekly_pnl", 0.0))
+        weekly_pnl_pct  = float(s.get("weekly_pnl_pct", 0.0))
+        monthly_pnl     = float(s.get("monthly_pnl", 0.0))
+        monthly_pnl_pct = float(s.get("monthly_pnl_pct", 0.0))
+        weekly_color    = "green" if weekly_pnl >= 0 else "red"
+        monthly_color   = "green" if monthly_pnl >= 0 else "red"
 
         dot_class     = ("dot-green"  if s.get("running") and not s.get("paused_for_loss_limit")
                          else "dot-yellow" if s.get("paused_for_loss_limit")
@@ -431,8 +647,13 @@ def _render_dashboard() -> str:
                 pnl_raw = t.get("pnl") if t.get("pnl") is not None else t.get("profit", t.get("return", 0))
                 pnl   = float(pnl_raw or 0)
                 won   = bool(t.get("won", pnl > 0))
-                badge = ('<span class="badge badge-win">WIN</span>' if won
-                         else '<span class="badge badge-loss">LOSS</span>')
+                close_reason = str(t.get("close_reason", "normal"))
+                if close_reason == "timeout":
+                    badge = '<span class="badge badge-timeout">TIMEOUT</span>'
+                elif won:
+                    badge = '<span class="badge badge-win">WIN</span>'
+                else:
+                    badge = '<span class="badge badge-loss">LOSS</span>'
                 raw_dir = str(t.get("direction", t.get("contract_type", "")) or "").upper()
                 if "LONG" in raw_dir or "CALL" in raw_dir:
                     dir_b = '<span class="badge badge-long">LONG</span>'
@@ -450,11 +671,14 @@ def _render_dashboard() -> str:
                 bal_a = float(bal_raw or 0)
                 sym   = t.get("symbol", t.get("market", ""))
                 strat = t.get("strategy", "")
+                mult  = t.get("multiplier")
+                mult_str = f"{float(mult):.0f}x" if mult not in (None, "") else "—"
                 trade_rows += (
                     f"<tr>"
                     f"<td class='ticker'>{ts_str}</td>"
                     f"<td><b>{sym}</b></td>"
                     f"<td>{dir_b}</td>"
+                    f"<td>{mult_str}</td>"
                     f"<td>${stake:.2f}</td>"
                     f"<td class='{pnl_c}'>{'+' if pnl >= 0 else ''}{pnl:.4f}</td>"
                     f"<td>${bal_a:.4f}</td>"
@@ -468,7 +692,7 @@ def _render_dashboard() -> str:
         if not trade_rows:
             detail = (f" ({len(recent_trades_list)} in state, {bad_rows} parse errors)"
                       if recent_trades_list else "")
-            trade_rows = (f"<tr><td colspan='7' style='text-align:center;color:#484f58'>"
+            trade_rows = (f"<tr><td colspan='8' style='text-align:center;color:#484f58'>"
                           f"No trades yet{detail}</td></tr>")
 
         # ── Suspended symbols ─────────────────────────────────────────────────
@@ -516,7 +740,7 @@ def _render_dashboard() -> str:
         # ── SVG balance curve — fed from balance_history ───────────────────────
         # balance_history is the purpose-built list populated by record_trade().
         # Falls back to empty list (shows "No trades yet" placeholder).
-        svg_chart = _build_svg_chart(s.get("balance_history", []))
+        svg_chart = _build_svg_chart(s.get("balance_history", []), start_balance=day_start or None)
 
         # ── Session / queue info ──────────────────────────────────────────────
         session      = str(s.get("session", "Starting"))
@@ -563,8 +787,9 @@ def _render_dashboard() -> str:
   .ticker {{ color: var(--muted); font-size: 11px; }}
   .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px;
             font-size: 10px; font-weight: 700; }}
-  .badge-win   {{ background: #1a3a1f; color: var(--green); }}
-  .badge-loss  {{ background: #3a1a1a; color: var(--red); }}
+  .badge-win     {{ background: #1a3a1f; color: var(--green); }}
+  .badge-loss    {{ background: #3a1a1a; color: var(--red); }}
+  .badge-timeout {{ background: #3a2a1a; color: var(--yellow); }}
   .badge-long  {{ background: #1a2a3a; color: var(--accent); }}
   .badge-short {{ background: #2a1a3a; color: #c084fc; }}
   .status-row {{ display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }}
@@ -648,6 +873,36 @@ def _render_dashboard() -> str:
     <div class="card-sub">{last_sig_detail}</div>
   </div>
 
+  <div class="card">
+    <div class="card-title">Avg Multiplier</div>
+    <div class="card-value">{avg_mult:.1f}x</div>
+    <div class="card-sub">Across {mult_count} trades</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Best / Worst Trade</div>
+    <div class="card-value green">${best_trade:+.4f}</div>
+    <div class="card-sub red">${worst_trade:+.4f}</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Funding Fees Paid</div>
+    <div class="card-value red">${funding_fees:.4f}</div>
+    <div class="card-sub">Sum of negative PnL on timeout closes</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Open Contracts</div>
+    <div class="card-value">{open_count}</div>
+    <div class="card-sub">{open_syms}</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Weekly / Monthly P&amp;L</div>
+    <div class="card-value {weekly_color}">${weekly_pnl:+.4f}</div>
+    <div class="card-sub {monthly_color}">{weekly_pnl_pct:+.2f}% week &nbsp;·&nbsp; ${monthly_pnl:+.4f} ({monthly_pnl_pct:+.2f}%) month</div>
+  </div>
+
 </div>
 
 <!-- ── Balance Curve (inline SVG, no external deps) ── -->
@@ -655,6 +910,7 @@ def _render_dashboard() -> str:
   <div class="chart-title">Balance Curve — Today
     <span style="float:right;font-weight:400;color:#3fb950">● win</span>
     <span style="float:right;font-weight:400;color:#f85149;margin-right:10px">● loss</span>
+    <span style="float:right;font-weight:400;color:#d29922;margin-right:10px">● timeout</span>
   </div>
   {svg_chart}
 </div>
@@ -664,7 +920,7 @@ def _render_dashboard() -> str:
 <table>
   <thead>
     <tr>
-      <th>Time (UTC)</th><th>Symbol</th><th>Dir</th>
+      <th>Time (UTC)</th><th>Symbol</th><th>Dir</th><th>Mult</th>
       <th>Stake</th><th>P&amp;L</th><th>Balance After</th><th>Result</th>
     </tr>
   </thead>
@@ -730,12 +986,23 @@ def stats_route():
         "day_start_balance": round(day_start, 4),
         "daily_pnl":         round(balance - day_start, 4),
         "daily_pnl_pct":     round((balance - day_start) / day_start * 100, 2) if day_start else 0,
+        "weekly_pnl":        round(float(s.get("weekly_pnl", 0.0)), 4),
+        "weekly_pnl_pct":    round(float(s.get("weekly_pnl_pct", 0.0)), 2),
+        "monthly_pnl":       round(float(s.get("monthly_pnl", 0.0)), 4),
+        "monthly_pnl_pct":   round(float(s.get("monthly_pnl_pct", 0.0)), 2),
         "trades":            trades,
         "wins":              wins,
         "losses":            losses,
         "win_rate":          round(wins / max(trades, 1) * 100, 1),
         "profit_factor":     round(float(s.get("profit_factor", 0)), 3),
         "avg_rr":            round(float(s.get("avg_rr", 0)), 2),
+        "avg_multiplier":    round(float(s.get("avg_multiplier", 0.0)), 2),
+        "multiplier_count":  int(s.get("multiplier_count", 0)),
+        "best_trade":        round(float(s.get("best_trade", 0.0)), 4),
+        "worst_trade":       round(float(s.get("worst_trade", 0.0)), 4),
+        "funding_fees_total": round(float(s.get("funding_fees_total", 0.0)), 4),
+        "open_contracts":    s.get("open_contracts", []),
+        "open_contracts_count": int(s.get("open_contracts_count", 0)),
         "streak":            int(s.get("streak", 0)),
         "streak_label":      str(s.get("streak_label", "—")),
         "paused":            bool(s.get("paused_for_loss_limit", False)),
@@ -746,12 +1013,18 @@ def stats_route():
         "tradeable_count":   int(s.get("tradeable_count", 0)),
         "active_trades":     int(s.get("active_trades", 0)),
         "suspended_symbols": s.get("suspended_symbols", []),
+        "hourly_pnl":        s.get("hourly_pnl", {}),
+        "daily_pnl_history": s.get("daily_pnl_history", []),
+        "all_trades_count":  len(s.get("all_trades", [])),
     })
 
 
 @app.route("/trades")
 def trades_route():
-    return jsonify({"recent_trades": _state.get("recent_trades", [])})
+    return jsonify({
+        "recent_trades": _state.get("recent_trades", []),
+        "all_trades_count": len(_state.get("all_trades", [])),
+    })
 
 
 @app.route("/symbols")
