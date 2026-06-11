@@ -153,13 +153,6 @@ class SignalEngine:
             slow=config.EMA_SLOW,
             trend=config.EMA_TREND)
 
-        if direction == 0:
-            logger.info(
-                f"VOLATILITY REJECTED: {symbol} "
-                f"momentum direction=0"
-            )
-            return NONE_RESULT
-
         # --- Breakout confirmation from LTF ATR ---
         atr_arr = ind.atr(H, L, C, config.ATR_PERIOD)
         valid_atr = atr_arr[~np.isnan(atr_arr)]
@@ -180,11 +173,10 @@ class SignalEngine:
         if strength_val < 0.3:
             score *= 0.7  # penalise ranging market
 
-        if score < config.MIN_SIGNAL_SCORE:
+        if score < 0.1:
             logger.info(
                 f"VOLATILITY REJECTED: {symbol} "
-                f"score={score:.3f} < "
-                f"{config.MIN_SIGNAL_SCORE}"
+                f"score={score:.3f} < 0.1"
             )
             return NONE_RESULT
 
@@ -204,6 +196,7 @@ class SignalEngine:
             f"mult={mult}x "
             f"SL=${sl_amt} TP=${tp_amt}"
         )
+        logger.info(f"SIGNAL EMITTED: {symbol} {dir_str}")
 
         return SignalResult(
             direction   = dir_str,
@@ -237,11 +230,6 @@ class SignalEngine:
         L = np.array([b.low   for b in ltf_bars])
 
         drift = ind.boom_crash_drift(C)
-        if drift == 0:
-            logger.info(
-                f"BOOM/CRASH REJECTED: {symbol} drift=0"
-            )
-            return NONE_RESULT
 
         score   = 0.65
         dir_str = "LONG" if drift > 0 else "SHORT"
@@ -258,6 +246,7 @@ class SignalEngine:
             f"mult={mult}x "
             f"SL=${sl_amt} TP=${tp_amt}"
         )
+        logger.info(f"SIGNAL EMITTED: {symbol} {dir_str}")
 
         return SignalResult(
             direction   = dir_str,
@@ -292,12 +281,6 @@ class SignalEngine:
         breakout = ind.detect_breakout(
             C, H, L, atr_arr, lookback=15, mult=1.0)
 
-        if breakout == 0:
-            logger.info(
-                f"RANGE BREAK REJECTED: {symbol} breakout=0"
-            )
-            return NONE_RESULT
-
         dir_str = "LONG" if breakout > 0 else "SHORT"
         sl_amt  = round(
             stake * config.DEFAULT_STOP_LOSS_PCT / 100, 2)
@@ -310,6 +293,7 @@ class SignalEngine:
             f"mult={mult}x "
             f"SL=${sl_amt} TP=${tp_amt}"
         )
+        logger.info(f"SIGNAL EMITTED: {symbol} {dir_str}")
 
         return SignalResult(
             direction   = dir_str,
