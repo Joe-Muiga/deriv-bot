@@ -10,6 +10,20 @@ v9 → v10 audit changes (full compliance pass):
   Every buy_contract() call logs BEFORE placement:
     PLACING {contract_type} on {symbol} stake=${stake:.4f} | duration={duration}m
 
+  FIX 1 — VERBOSE buy_contract() LOGGING:
+    - BUY ATTEMPT: {symbol} {contract_type} stake=${stake} mult={multiplier}
+    - PROPOSAL RESPONSE: {full resp dict} (after _send)
+    - BUY RESPONSE: {full result dict} (after success)
+    - BUY FAILED: {symbol} error={detail} (on every failure path)
+
+  FIX 2 — RISE/FALL FALLBACK:
+    If buy_contract() gets None from multiplier attempt, retries with
+    CALL (LONG) or PUT (SHORT), duration=5m, logs: FALLBACK TO RISE/FALL: {symbol}
+
+  FIX 3 — STAKE CAP:
+    If stake > balance * 0.5, caps at max(balance * 0.02, 0.35)
+    Logs: STAKE CAPPED: ${original} → ${capped}
+
   FAILURE CONTRACT (buy_contract):
     - Network timeout  → None + log FAILED: {symbol} — timeout
     - API error        → None + log FAILED: {symbol} — {code}: {msg}
@@ -725,6 +739,16 @@ class DerivClient:
                 await asyncio.sleep(wait)
             self._last_buy_time = time.time()
 
+            # ── 0. Stake cap (Fix 3) ──────────────────────────────────────────
+            _balance = self._balance
+            if stake > _balance * 0.5:
+                _capped = max(_balance * 0.02, 0.35)
+                logger.warning(
+                    f"STAKE CAPPED: ${stake:.4f} → ${_capped:.4f} "
+                    f"(balance=${_balance:.4f})"
+                )
+                stake = _capped
+
             # ── 1. Direction → contract_type ──────────────────────────────────
             if direction == "LONG":
                 contract_type = "MULTUP"
@@ -738,6 +762,11 @@ class DerivClient:
 
             # Always-visible mapping log
             logger.info(f"Signal: {direction} → Contract: {contract_type}")
+
+            # ── BUY ATTEMPT log (Fix 1) ───────────────────────────────────────
+            logger.info(
+                f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake} mult={multiplier}"
+            )
 
             # ── 2. Build proposal/buy parameters ───────────────────────────────
             params = {
@@ -792,6 +821,7 @@ class DerivClient:
             async def _do_buy() -> Optional[dict]:
                 """Inner send + parse, shared by first attempt and retry."""
                 resp     = await self._send(payload, timeout=15)
+                logger.info(f"PROPOSAL RESPONSE: {resp}")   # Fix 1
                 buy_info = resp.get("buy", {})
                 cid      = str(buy_info.get("contract_id", ""))
 
@@ -803,12 +833,14 @@ class DerivClient:
                     if code == "RateLimit":
                         return "RATE_LIMIT"        # sentinel — caller handles retry
                     logger.error(f"FAILED: {symbol} — {code}: {msg}")
+                    logger.error(f"BUY FAILED: {symbol} error={error}")   # Fix 1
                     return None
 
                 if not cid:
                     logger.error(
                         f"FAILED: {symbol} — proposal_rejected (no contract_id in response)"
                     )
+                    logger.error(f"BUY FAILED: {symbol} error=no_contract_id in response")   # Fix 1
                     return None
 
                 return resp
@@ -836,9 +868,61 @@ class DerivClient:
                         return None
 
                 if result is None:
-                    return None
+                    # ── Fix 2: Fallback to Rise/Fall (CALL/PUT) ───────────────
+                    _fb_type = "CALL" if direction == "LONG" else "PUT"
+                    logger.warning(f"FALLBACK TO RISE/FALL: {symbol}")
+                    _fb_payload = {
+                        "buy": "1",
+                        "price": stake,
+                        "parameters": {
+                            "contract_type": _fb_type,
+                            "symbol":        symbol,
+                            "amount":        stake,
+                            "basis":         "stake",
+                            "duration":      5,
+                            "duration_unit": "m",
+                            "currency":      config.DERIV_CURRENCY,
+                        },
+                    }
+                    try:
+                        _fb_resp = await self._send(_fb_payload, timeout=15)
+                        logger.info(f"BUY RESPONSE (fallback): {_fb_resp}")
+                        _fb_error = _fb_resp.get("error")
+                        if _fb_error:
+                            logger.error(
+                                f"BUY FAILED: {symbol} error={_fb_error}"
+                            )
+                            return None
+                        _fb_buy_info = _fb_resp.get("buy", {})
+                        _fb_cid = str(_fb_buy_info.get("contract_id", ""))
+                        if not _fb_cid:
+                            logger.error(
+                                f"BUY FAILED: {symbol} error=fallback no_contract_id"
+                            )
+                            return None
+                        self._contract_symbol_map[_fb_cid] = symbol
+                        logger.info(
+                            f"CONFIRM (fallback) | symbol={symbol} | "
+                            f"{_fb_type} | stake=${stake:.2f} | "
+                            f"contract_id={_fb_cid}"
+                        )
+                        asyncio.ensure_future(
+                            self._eagerly_subscribe_contract(_fb_cid)
+                        )
+                        return _fb_buy_info
+                    except TimeoutError:
+                        logger.error(
+                            f"BUY FAILED: {symbol} error=fallback_timeout"
+                        )
+                        return None
+                    except Exception as _fb_exc:
+                        logger.error(
+                            f"BUY FAILED: {symbol} error={_fb_exc}"
+                        )
+                        return None
 
-                # ── 8. Extract buy_info from full response ────────────────────
+                # ── 8. BUY RESPONSE log (Fix 1) ──────────────────────────────
+                logger.info(f"BUY RESPONSE: {result}")
                 resp     = result
                 buy_info = resp.get("buy", {})
                 cid      = str(buy_info.get("contract_id", ""))
@@ -863,6 +947,7 @@ class DerivClient:
 
             except TimeoutError:
                 logger.error(f"FAILED: {symbol} — timeout")
+                logger.error(f"BUY FAILED: {symbol} error=timeout")
                 return None
 
             except RuntimeError as exc:
@@ -874,10 +959,12 @@ class DerivClient:
                     )
                 else:
                     logger.error(f"FAILED: {symbol} — {err_str}")
+                logger.error(f"BUY FAILED: {symbol} error={err_str}")
                 return None
 
             except Exception as exc:
                 logger.error(f"FAILED: {symbol} — {exc}")
+                logger.error(f"BUY FAILED: {symbol} error={exc}")
                 return None
 
     async def _eagerly_subscribe_contract(self, contract_id: str):
