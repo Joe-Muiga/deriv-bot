@@ -110,7 +110,7 @@ TAKE_PROFIT_RATIO = 2.0
 BASE_STAKE_PCT       = 0.01   # 1% of balance per trade
 MIN_STAKE            = 0.50
 MAX_STAKE            = 100.0
-DAILY_LOSS_LIMIT_PCT = 0.20   # 20% max daily loss
+DAILY_LOSS_LIMIT_PCT = 2.20   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
