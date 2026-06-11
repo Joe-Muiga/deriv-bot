@@ -16,7 +16,7 @@ v13 — POLLING-BASED CONTRACT RESOLUTION (replaces subscription model):
       _cleanup_contract_subscription — all removed).
     - subscribe_contract(contract_id, callback) now simply registers the
       contract + callback in self._polling_contracts.
-    - _polling_loop() runs every 20s, calls force_check_contract(cid) for
+    - _polling_loop() runs every 30s, calls force_check_contract(cid) for
       every tracked contract. On is_sold/is_expired it pops the entry and
       fires the callback with the full proposal_open_contract dict
       (containing profit, sell_price, is_sold, is_expired, etc).
@@ -98,7 +98,7 @@ _DEFAULT_RECONNECT_INTERVAL = 5   # seconds between retries
 _DEFAULT_MAX_RECONNECTS     = 10  # 0 = unlimited
 
 # Contract polling interval in seconds
-_CONTRACT_POLL_INTERVAL = 20
+_CONTRACT_POLL_INTERVAL = 30
 
 
 def _is_boom_crash(symbol: str) -> bool:
@@ -288,24 +288,23 @@ class DerivClient:
 
     async def _polling_loop(self):
         """
-        Every 20 seconds, poll every contract registered in
+        Every 30 seconds, poll every contract registered in
         self._polling_contracts via force_check_contract().
 
         On is_sold/is_expired: pops the entry and fires its callback with
         the full proposal_open_contract dict (profit, sell_price, is_sold,
-        is_expired, etc).
+        is_expired, etc). The callback (registered by BotEngine) is
+        responsible for releasing the symbol from _active_symbols.
         """
         while True:
             await asyncio.sleep(_CONTRACT_POLL_INTERVAL)
+            if not self._polling_contracts:
+                continue
+            logger.info(
+                f"POLLING: {len(self._polling_contracts)} open contracts")
             for cid in list(self._polling_contracts.keys()):
                 try:
                     result = await self.force_check_contract(cid)
-                    if not result:
-                        continue
-                    logger.info(
-                        f"POLL: {cid} is_sold={result.get('is_sold')} "
-                        f"profit={result.get('profit')}"
-                    )
                     if result.get("is_sold") or result.get("is_expired"):
                         info = self._polling_contracts.pop(cid, None)
                         if info and info.get("callback"):
@@ -313,8 +312,9 @@ class DerivClient:
                             if asyncio.iscoroutine(cb_result) or isinstance(cb_result, asyncio.Future):
                                 await cb_result
                             logger.info(f"POLL RESOLVED: {cid} profit={result.get('profit')}")
+                    await asyncio.sleep(0.5)
                 except Exception as e:
-                    logger.error(f"POLL ERROR: {cid} {e}")
+                    logger.error(f"POLL ERROR {cid}: {e}")
 
     async def subscribe_contract(
         self,
@@ -346,13 +346,21 @@ class DerivClient:
         the API returns). Returns {} on failure.
         """
         try:
-            resp = await self._send({
+            req = {
                 "proposal_open_contract": 1,
                 "contract_id": int(contract_id),
-            })
-            return resp.get("proposal_open_contract", {})
+            }
+            resp = await self._send(req)
+            if not resp:
+                return {}
+            poc = resp.get("proposal_open_contract", {})
+            logger.info(
+                f"FORCE CHECK {contract_id}: "
+                f"is_sold={poc.get('is_sold')} "
+                f"profit={poc.get('profit')}")
+            return poc
         except Exception as e:
-            logger.error(f"force_check_contract({contract_id}): {e}")
+            logger.error(f"FORCE CHECK ERROR {contract_id}: {e}")
             return {}
 
     # ─── Request helper ───────────────────────────────────────────────────────
