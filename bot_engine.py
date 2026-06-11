@@ -828,15 +828,16 @@ class BotEngine:
             balance_after = bal_after,
         )
 
-        from keep_alive import record_trade as _rt
-        _rt(
+        from keep_alive import record_trade
+        record_trade(
             symbol        = symbol,
             direction     = direction,
             stake         = stake,
             pnl           = pnl,
             balance_after = self.client.balance,
-            won           = won,
-            strategy      = getattr(sig, "strategy", ""),
+            won           = pnl > 0,
+            strategy      = info.get("strategy", ""),
+            contract_id   = cid,
         )
 
         self.symbols.record_contract_closed(symbol)
@@ -845,6 +846,7 @@ class BotEngine:
         self._confirmed_daily_loss += abs(pnl) if pnl < 0 else 0
         self._check_confirmed_loss_limit()
         set_active_trades(len(self._open_contracts))
+        update_status(streak=self.risk.current_streak)
         self._push_dashboard()
 
         logger.info(
