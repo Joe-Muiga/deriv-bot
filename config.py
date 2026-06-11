@@ -50,14 +50,13 @@ DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 
 # Only these symbols support CALL/PUT Rise/Fall via Deriv API
 RISE_FALL_SYMBOLS = [
-    "R_10","R_25","R_50","R_75","R_100",
-    "1HZ10V","1HZ25V","1HZ50V","1HZ75V",
-    "1HZ100V","1HZ150V","1HZ200V","1HZ250V",
-    "RDBULL","RDBEAR","stpRNG",
+    "R_10","R_25","R_50",
+    "1HZ10V","1HZ25V","1HZ50V",
+    "RDBULL","RDBEAR",
 ]
 
 # All symbols combined — Rise/Fall compatible only
-ALL_SYMBOLS = RISE_FALL_SYMBOLS
+ALL_SYMBOLS       = RISE_FALL_SYMBOLS
 
 # ── MULTIPLIER SETTINGS ──────────────────────────────────────
 # Higher volatility = higher multiplier potential
@@ -113,9 +112,9 @@ DEFAULT_STOP_LOSS_PCT = 50.0
 TAKE_PROFIT_RATIO = 2.0
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
-BASE_STAKE_PCT       = 0.01   # 1% of balance per trade
-MIN_STAKE            = 0.50
-MAX_STAKE            = 100.0
+BASE_STAKE_PCT       = 0.005   # 0.5% per trade
+MIN_STAKE            = 0.35
+MAX_STAKE            = 25.0
 DAILY_LOSS_LIMIT_PCT = 2.20   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
