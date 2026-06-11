@@ -1,5 +1,10 @@
 import os
 
+# ── GENERAL ───────────────────────────────────────────────────
+LOG_LEVEL = "INFO"
+DEBUG     = False
+VERSION   = "1.0.0"
+
 # ── ALL DERIV SYNTHETIC INDICES ──────────────────────────────
 
 # Standard Volatility (2s tick)
