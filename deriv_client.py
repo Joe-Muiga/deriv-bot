@@ -692,19 +692,21 @@ class DerivClient:
     # ─── Trade execution ──────────────────────────────────────────────────────
 
     async def buy_contract(
-        self,
-        symbol:    str,
-        direction: str,
-        stake:     float,
-        duration:  int = 5,
-        dur_unit:  str = "m",
-    ) -> Optional[dict]:
+            self,
+            symbol:      str,
+            direction:   str,   # "LONG" or "SHORT"
+            stake:       float,
+            multiplier:  int    = 100,
+            stop_loss:   float  = None,
+            take_profit: float  = None,
+            **kwargs) -> dict:
         """
-        Buy a Rise (CALL) or Fall (PUT) binary option.
+        Buy a Multiplier (MULTUP/MULTDOWN) contract, optionally with a
+        stop loss and/or take profit attached via limit_order.
 
         Direction mapping (VERIFIED CORRECT — DO NOT SWAP):
-          direction="LONG"  → contract_type="CALL"  → wins if price RISES
-          direction="SHORT" → contract_type="PUT"   → wins if price FALLS
+          direction="LONG"  → contract_type="MULTUP"   → wins if price RISES
+          direction="SHORT" → contract_type="MULTDOWN" → wins if price FALLS
 
         Returns dict (buy response) on success, None on every failure path.
         Never raises.  Never increments trade counters on None return.
@@ -725,9 +727,9 @@ class DerivClient:
 
             # ── 1. Direction → contract_type ──────────────────────────────────
             if direction == "LONG":
-                contract_type = "CALL"
+                contract_type = "MULTUP"
             elif direction == "SHORT":
-                contract_type = "PUT"
+                contract_type = "MULTDOWN"
             else:
                 logger.error(
                     f"buy_contract: unknown direction '{direction}' on {symbol} — aborting"
@@ -737,22 +739,36 @@ class DerivClient:
             # Always-visible mapping log
             logger.info(f"Signal: {direction} → Contract: {contract_type}")
 
-            # ── 2. Duration override for Boom/Crash ───────────────────────────
-            if _is_boom_crash(symbol):
-                effective_duration = getattr(config, "BOOM_CRASH_TICK_DURATION", 10)
-                effective_dur_unit = getattr(config, "BOOM_CRASH_DURATION_UNIT",  "t")
-                logger.info(
-                    f"BOOM/CRASH symbol detected ({symbol}): overriding to "
-                    f"{effective_duration}{effective_dur_unit} tick contract"
-                )
-            else:
-                effective_duration = duration
-                effective_dur_unit = dur_unit
+            # ── 2. Build proposal/buy parameters ───────────────────────────────
+            params = {
+                "contract_type": contract_type,
+                "symbol":        symbol,
+                "amount":        stake,
+                "multiplier":    multiplier,
+                "basis":         "stake",
+                "currency":      config.DERIV_CURRENCY,
+            }
+
+            if stop_loss is not None and stop_loss > 0:
+                params["limit_order"] = {
+                    "stop_loss": {
+                        "order_type":   "stop_loss",
+                        "order_amount": stop_loss,
+                    }
+                }
+            if take_profit is not None and take_profit > 0:
+                params.setdefault("limit_order", {})
+                params["limit_order"]["take_profit"] = {
+                    "order_type":   "take_profit",
+                    "order_amount": take_profit,
+                }
 
             # ── 3. Pre-placement log (mandatory, zero silent placements) ──────
             logger.info(
-                f"PLACING {contract_type} on {symbol} stake=${stake:.4f} | "
-                f"duration={effective_duration}{effective_dur_unit}"
+                f"PLACING {contract_type} | "
+                f"{symbol} | ${stake:.4f} | "
+                f"{multiplier}x | "
+                f"SL=${stop_loss} TP=${take_profit}"
             )
 
             # ── 4. Market-open gate (Boom/Crash only) ─────────────────────────
@@ -770,15 +786,7 @@ class DerivClient:
             payload = {
                 "buy":   "1",
                 "price": stake,
-                "parameters": {
-                    "amount":        stake,
-                    "basis":         "stake",
-                    "contract_type": contract_type,
-                    "currency":      config.DERIV_CURRENCY,
-                    "duration":      effective_duration,
-                    "duration_unit": effective_dur_unit,
-                    "symbol":        symbol,
-                },
+                "parameters": params,
             }
 
             async def _do_buy() -> Optional[dict]:
@@ -841,7 +849,8 @@ class DerivClient:
                 # ── Post-placement confirmation log ───────────────────────────
                 logger.info(
                     f"CONFIRM | symbol={symbol} | direction={direction} → {contract_type} | "
-                    f"stake=${stake:.2f} | contract_id={cid} | "
+                    f"stake=${stake:.2f} | multiplier={multiplier}x | "
+                    f"SL=${stop_loss} TP=${take_profit} | contract_id={cid} | "
                     f"buy_price={buy_info.get('buy_price')} | "
                     f"balance=${self._balance:.4f}"
                 )
