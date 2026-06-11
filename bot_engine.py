@@ -660,7 +660,7 @@ class BotEngine:
                 return None
 
             # Stake for this potential trade
-            stake = self.risk.calculate_stake()
+            stake = await self.risk.calculate_stake()
 
             # Signal evaluation
             sig = self.signal.evaluate(
