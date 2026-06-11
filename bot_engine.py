@@ -1,55 +1,42 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v14 — Main loop and execution logic rewrite per spec.
+v15 — Multiplier contract support with stop-loss / take-profit.
 
-KEY CHANGES vs v13
+KEY CHANGES vs v14
 ──────────────────
-INITIALISATION:
-  • Only initialises symbols in config.TRADE_SYMBOLS — no volatility scan list.
-  • Logs: "Initialising {N} trade symbols"
-  • Skips symbols that fail to initialise — does not crash.
+INIT:
+  • Three timeframe builders: _htf, _mtf, _ltf per symbol.
+  • _init_data fetches all three TFs simultaneously via asyncio.gather.
+  • Two-phase startup:
+      Phase 1: PRIORITY_SYMBOLS with reduced bars — trading within 15 s.
+      Phase 2: remaining symbols in background batches (INIT_BATCH_SIZE /
+               INIT_BATCH_DELAY).
+      Phase 3: upgrade all symbols to full bar count in background.
+      Trading never paused during phases 2 and 3.
+
+SCAN:
+  • Regime check via SMC.analyse(htf, mtf, price); NEUTRAL → skip.
+  • stake calculated before signal.evaluate so sig can reference it.
+  • sig.direction == "NONE" → skip.
+
+EXECUTE:
+  • buy_contract receives multiplier, stop_loss, take_profit from sig.
+  • _open_contracts entry carries multiplier, stop_loss, take_profit.
+
+WATCHDOG:
+  • Force-close any contract open > config.MAX_TRADE_OPEN_MINS minutes
+    (funding-fee erosion guard for multiplier contracts).
 
 MAIN LOOP:
-  • Continuous non-blocking scan loop — scanning and settling fully independent.
-  • Scanning resumes immediately after execution; settlement runs as background task.
-  • Only gate: do not execute if concurrent slots full.
-
-EVERY SCAN CYCLE:
-  1. reset_session() if UTC day changed.
-  2. get_queue(initialised_symbols) for current tradeable set.
-  3. Scan all queued symbols in parallel via asyncio.gather.
-  4. Collect non-None signals.
-  5. Filter: can_trade_now() must be True.
-  6. Rank: signal.score × 0.85 + win_rate × 0.15.
-  7. Deduplicate: highest scored per symbol.
-  8. Execute top N = current_concurrent_limit in parallel.
-  9. Log: CYCLE X | Queue:Q | Signals:S | Executing:E | Open:O | Balance:$B | Streak:+W
-
-EXECUTION:
-  • _scan(symbol): get ltf_bars, call signal.evaluate, return ScanResult or None.
-  • _execute(symbol, sig): hard gate can_trade_now → stake → buy → record.
-  • PLACEMENT FAILED logged on None return; does not count as executed.
-
-CONTRACT RESULT:
-  • Pop from _open_contracts, record result, register_close, dashboard push.
-  • Confirmed daily loss tracked; _check_confirmed_loss_limit() called.
-
-ORPHAN HANDLING:
-  • force_check_contract for contracts older than CONTRACT_MAX_AGE_SECS.
-  • Force-close as loss for contracts older than CONTRACT_FORCE_CLOSE_SECS.
-
-DAILY LOSS LIMIT:
-  • _confirmed_daily_loss / _day_start_balance >= DAILY_LOSS_LIMIT_PCT → pause until midnight.
-
-REDEPLOY:
-  • _cycle_count incremented after every settle wait.
-  • At >= REDEPLOY_EVERY_N_CYCLES: drain open contracts then trigger_redeploy().
+  • Score = sig.score × 0.85 + win_rate × 0.15  (unchanged).
+  • Execute top N = risk.current_concurrent_limit (unchanged).
 
 PRESERVED (unchanged):
-  WebSocket connection, dashboard serving, keep_alive integration,
-  Render redeploy mechanism, _on_tick, _init_data, _push_dashboard,
-  _dashboard_loop, _resolve_remaining_contracts, _has_stale_contracts.
+  WebSocket, dashboard, keep_alive, redeploy, _on_tick,
+  _push_dashboard, _dashboard_loop, _resolve_remaining_contracts,
+  _has_stale_contracts, orphan monitoring, daily loss limit,
+  loss-streak pause, cycle-count redeploy.
 """
 
 import asyncio
@@ -83,11 +70,16 @@ logger = logging.getLogger(__name__)
 
 DASHBOARD_PUSH_EVERY  = 15
 SYMBOL_REFRESH_EVERY  = 3600
-INIT_BATCH_SIZE       = 10
+INIT_BATCH_SIZE       = getattr(config, "INIT_BATCH_SIZE", 10)
 
 _ORPHAN_MAX_ATTEMPTS       = 3
 CONTRACT_MAX_AGE_SECS      = getattr(config, "CONTRACT_MAX_AGE_SECS",      120)
 CONTRACT_FORCE_CLOSE_SECS  = getattr(config, "CONTRACT_FORCE_CLOSE_SECS",  300)
+
+# Reduced bar counts for Phase 1 fast startup (< 15 s target)
+_PHASE1_HTF_BARS = 20
+_PHASE1_MTF_BARS = 20
+_PHASE1_LTF_BARS = 30
 
 
 # ─── Result container ──────────────────────────────────────────────────────────
@@ -98,8 +90,6 @@ class ScanResult:
     sig:        SignalResult
     price:      float
     smc_ctx:    SMCContext
-    ltf_atr:    float
-    htf_atr:    float
     score:      float = 0.0
 
 
@@ -118,8 +108,11 @@ class BotEngine:
         self._contract_open_times:    dict               = {}
         self._active_symbols:         Set[str]           = set()
 
+        # ── Three-timeframe builders (v15) ────────────────────────────────────
         self._htf:                    Dict[str, CandlestickBuilder] = {}
+        self._mtf:                    Dict[str, CandlestickBuilder] = {}
         self._ltf:                    Dict[str, CandlestickBuilder] = {}
+
         self._initialised_symbols:    Set[str]           = set()
         self._initializing:           Set[str]           = set()
         self._last_symbol_refresh:    float              = 0.0
@@ -156,7 +149,15 @@ class BotEngine:
                 if symbol in sym_module.FOREX
                 else config.OTHER_LTF_GRANULARITY)
 
-    # ── Composite score (per spec: score×0.85 + win_rate×0.15) ───────────────
+    @staticmethod
+    def _mtf_gran(symbol: str) -> int:
+        return getattr(
+            config,
+            "FOREX_MTF_GRANULARITY" if symbol in sym_module.FOREX else "OTHER_MTF_GRANULARITY",
+            getattr(config, "MTF_GRANULARITY", 300),
+        )
+
+    # ── Composite score (spec: score×0.85 + win_rate×0.15) ───────────────────
 
     def _composite_score(self, sig: SignalResult, symbol: str) -> float:
         signal_score = getattr(sig, "score", 0.0)
@@ -191,7 +192,7 @@ class BotEngine:
 
     @staticmethod
     def _minutes_until_midnight() -> float:
-        now  = _dt.datetime.utcnow()
+        now      = _dt.datetime.utcnow()
         midnight = (now + _dt.timedelta(days=1)).replace(
             hour=0, minute=0, second=0, microsecond=0)
         return (midnight - now).total_seconds() / 60.0
@@ -205,7 +206,7 @@ class BotEngine:
 
     async def run(self):
         logger.info("=" * 64)
-        logger.info("  SIFM Deriv Trading Bot  –  parallel-scan / non-blocking")
+        logger.info("  SIFM Deriv Trading Bot  –  multiplier / parallel-scan")
         logger.info("=" * 64)
 
         ws_task = asyncio.create_task(self.client.connect())
@@ -248,38 +249,143 @@ class BotEngine:
             for t in list(self._settle_tasks):
                 t.cancel()
 
-    # ── Initialise only config.TRADE_SYMBOLS ──────────────────────────────────
+    # ── Two-phase + upgrade startup ────────────────────────────────────────────
 
     async def _init_all_symbols(self):
-        all_symbols = config.ALL_TRADE_SYMBOLS
-        logger.info(f"Initialising {len(all_symbols)} symbols in parallel")
+        """
+        Phase 1: PRIORITY_SYMBOLS with reduced bars — complete within ~15 s.
+        Phase 2: remaining symbols in background batches.
+        Phase 3: upgrade all symbols to full bar count in background.
+        Trading starts after Phase 1 returns.
+        """
+        priority   = list(getattr(config, "PRIORITY_SYMBOLS", []))
+        all_syms   = list(config.ALL_TRADE_SYMBOLS)
+        remaining  = [s for s in all_syms if s not in priority]
+        batch_size = getattr(config, "INIT_BATCH_SIZE",  INIT_BATCH_SIZE)
+        batch_delay= getattr(config, "INIT_BATCH_DELAY", 2.0)
+
+        # ── Phase 1: priority symbols, reduced bars ────────────────────────
+        logger.info(
+            f"Phase 1: initialising {len(priority)} priority symbol(s) "
+            f"(htf={_PHASE1_HTF_BARS}, mtf={_PHASE1_MTF_BARS}, ltf={_PHASE1_LTF_BARS})")
         await asyncio.gather(
-            *[self._init_data(s) for s in all_symbols],
-            return_exceptions=True
+            *[self._init_data(s,
+                              htf_bars=_PHASE1_HTF_BARS,
+                              mtf_bars=_PHASE1_MTF_BARS,
+                              ltf_bars=_PHASE1_LTF_BARS)
+              for s in priority],
+            return_exceptions=True,
         )
-        logger.info(f"Ready: {len(self._htf)} symbols initialised")
+        logger.info(
+            f"Phase 1 complete — {len(self._htf)} symbol(s) ready; "
+            f"trading now active")
         self.symbols.update_active(list(self._htf.keys()))
 
-    # ── Data initialisation ────────────────────────────────────────────────────
+        # ── Phase 2 + 3: background ────────────────────────────────────────
+        asyncio.create_task(
+            self._background_init(remaining, batch_size, batch_delay))
 
-    async def _init_data(self, symbol: str):
+    async def _background_init(
+        self,
+        remaining:   List[str],
+        batch_size:  int,
+        batch_delay: float,
+    ):
+        """Phase 2: load remaining symbols; Phase 3: upgrade all to full bars."""
+        # Phase 2
+        for i in range(0, len(remaining), batch_size):
+            batch = remaining[i : i + batch_size]
+            logger.info(
+                f"Phase 2 batch {i // batch_size + 1}: "
+                f"initialising {len(batch)} symbol(s)")
+            await asyncio.gather(
+                *[self._init_data(s,
+                                  htf_bars=_PHASE1_HTF_BARS,
+                                  mtf_bars=_PHASE1_MTF_BARS,
+                                  ltf_bars=_PHASE1_LTF_BARS)
+                  for s in batch],
+                return_exceptions=True,
+            )
+            self.symbols.update_active(list(self._htf.keys()))
+            if i + batch_size < len(remaining):
+                await asyncio.sleep(batch_delay)
+
+        logger.info(
+            f"Phase 2 complete — {len(self._htf)} symbol(s) ready")
+
+        # Phase 3: upgrade to full bars (non-blocking per symbol)
+        all_ready = list(self._htf.keys())
+        logger.info(
+            f"Phase 3: upgrading {len(all_ready)} symbol(s) to full bar count")
+        for s in all_ready:
+            try:
+                await self._upgrade_symbol(s)
+            except Exception as exc:
+                logger.debug(f"Phase 3 upgrade({s}): {exc}")
+            await asyncio.sleep(0.1)   # yield to main loop
+
+        logger.info("Phase 3 complete — all symbols at full resolution")
+
+    async def _upgrade_symbol(self, symbol: str):
+        """Re-seed a symbol's builders with full bar counts."""
+        ltf_gran = self._ltf_gran(symbol)
+        mtf_gran = self._mtf_gran(symbol)
+
+        htf_data, mtf_data, ltf_data = await asyncio.gather(
+            self.client.get_candles(symbol, config.HTF_GRANULARITY, config.HTF_BARS),
+            self.client.get_candles(symbol, mtf_gran,               config.MTF_BARS),
+            self.client.get_candles(symbol, ltf_gran,               config.LTF_BARS),
+            return_exceptions=True,
+        )
+
+        if isinstance(htf_data, Exception): htf_data = []
+        if isinstance(mtf_data, Exception): mtf_data = []
+        if isinstance(ltf_data, Exception): ltf_data = []
+
+        if htf_data and symbol in self._htf:
+            self._htf[symbol].seed(htf_data)
+        if mtf_data and symbol in self._mtf:
+            self._mtf[symbol].seed(mtf_data)
+        if ltf_data and symbol in self._ltf:
+            self._ltf[symbol].seed(ltf_data)
+
+    # ── Data initialisation — three TFs simultaneously ─────────────────────────
+
+    async def _init_data(
+        self,
+        symbol:   str,
+        htf_bars: int = None,
+        mtf_bars: int = None,
+        ltf_bars: int = None,
+    ):
         if symbol in self._initializing or symbol in self._htf:
             return
         self._initializing.add(symbol)
+
+        if htf_bars is None: htf_bars = config.HTF_BARS
+        if mtf_bars is None: mtf_bars = getattr(config, "MTF_BARS", 50)
+        if ltf_bars is None: ltf_bars = config.LTF_BARS
+
         try:
             ltf_gran = self._ltf_gran(symbol)
+            mtf_gran = self._mtf_gran(symbol)
 
             htf_b = CandlestickBuilder(granularity=config.HTF_GRANULARITY,
-                                       max_bars=config.HTF_BARS + 20)
+                                       max_bars=htf_bars + 20)
+            mtf_b = CandlestickBuilder(granularity=mtf_gran,
+                                       max_bars=mtf_bars + 20)
             ltf_b = CandlestickBuilder(granularity=ltf_gran,
-                                       max_bars=config.LTF_BARS + 20)
+                                       max_bars=ltf_bars + 20)
 
-            htf_data, ltf_data = await asyncio.gather(
-                self.client.get_candles(symbol, config.HTF_GRANULARITY, config.HTF_BARS),
-                self.client.get_candles(symbol, ltf_gran, config.LTF_BARS),
+            htf_data, mtf_data, ltf_data = await asyncio.gather(
+                self.client.get_candles(symbol, config.HTF_GRANULARITY, htf_bars),
+                self.client.get_candles(symbol, mtf_gran,               mtf_bars),
+                self.client.get_candles(symbol, ltf_gran,               ltf_bars),
                 return_exceptions=True,
             )
+
             if isinstance(htf_data, Exception): htf_data = []
+            if isinstance(mtf_data, Exception): mtf_data = []
             if isinstance(ltf_data, Exception): ltf_data = []
 
             if not htf_data and not ltf_data:
@@ -287,9 +393,11 @@ class BotEngine:
                 return
 
             if htf_data: htf_b.seed(htf_data)
+            if mtf_data: mtf_b.seed(mtf_data)
             if ltf_data: ltf_b.seed(ltf_data)
 
             self._htf[symbol] = htf_b
+            self._mtf[symbol] = mtf_b
             self._ltf[symbol] = ltf_b
             self._initialised_symbols.add(symbol)
 
@@ -299,7 +407,8 @@ class BotEngine:
 
             logger.info(
                 f"{symbol}: ready | htf={htf_b.count} | "
-                f"ltf={ltf_b.count} (ltf_gran={ltf_gran}s)")
+                f"mtf={mtf_b.count} | ltf={ltf_b.count} "
+                f"(ltf_gran={ltf_gran}s)")
 
         except Exception as exc:
             logger.error(f"_init_data({symbol}): skipping — {exc}")
@@ -312,10 +421,9 @@ class BotEngine:
         price = float(tick.get("quote", 0))
         if price == 0:
             return
-        if symbol in self._ltf:
-            self._ltf[symbol].add_tick(epoch, price)
-        if symbol in self._htf:
-            self._htf[symbol].add_tick(epoch, price)
+        for store in (self._ltf, self._mtf, self._htf):
+            if symbol in store:
+                store[symbol].add_tick(epoch, price)
 
     # ── Dashboard ──────────────────────────────────────────────────────────────
 
@@ -349,31 +457,31 @@ class BotEngine:
             balance_history       = _status.get("balance_history", []),
             suspended_symbols     = [
                 {
-                    "symbol":           s,
-                    "suspended_until":  self.symbols._suspension_until.get(s, 0),
+                    "symbol":          s,
+                    "suspended_until": self.symbols._suspension_until.get(s, 0),
                 }
                 for s in getattr(self.symbols, "_suspension_until", {})
                 if self.symbols.is_suspended(s)
             ],
-            gross_profit          = summary.get("gross_profit", 0),
-            gross_loss            = summary.get("gross_loss", 0),
+            gross_profit          = summary.get("gross_profit",  0),
+            gross_loss            = summary.get("gross_loss",    0),
             profit_factor         = summary.get("profit_factor", 0),
-            avg_rr                = summary.get("avg_rr", 0),
-            best_trade            = summary.get("best_trade", 0),
-            worst_trade           = summary.get("worst_trade", 0),
+            avg_rr                = summary.get("avg_rr",        0),
+            best_trade            = summary.get("best_trade",    0),
+            worst_trade           = summary.get("worst_trade",   0),
         )
 
     # ── Main loop — continuous non-blocking ────────────────────────────────────
 
     async def _main_loop(self):
-        scan_sleep     = getattr(config, "SCAN_CYCLE_SLEEP", 1)
+        scan_sleep     = getattr(config, "SCAN_CYCLE_SLEEP",        1)
         redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 6)
         cycle_number   = 0
 
         while True:
             cycle_start = time.time()
 
-            # ── UTC day reset ─────────────────────────────────────────────
+            # ── UTC day reset ──────────────────────────────────────────────
             today = _dt.datetime.utcnow().day
             if today != self._current_utc_day:
                 self.symbols.reset_session()
@@ -384,7 +492,7 @@ class BotEngine:
                     f"UTC day changed → session reset | "
                     f"day_start_balance=${self._day_start_balance:.4f}")
 
-            # ── keep_alive redeploy flag ──────────────────────────────────
+            # ── keep_alive redeploy flag ───────────────────────────────────
             if is_redeploy_pending():
                 if self._open_contracts:
                     logger.info(
@@ -398,7 +506,7 @@ class BotEngine:
                     await asyncio.sleep(30)
                     continue
 
-            # ── Cycle-count–based redeploy ────────────────────────────────
+            # ── Cycle-count–based redeploy ─────────────────────────────────
             if self._cycle_count >= redeploy_every:
                 n_open = len(self._open_contracts)
                 logger.info(
@@ -414,12 +522,11 @@ class BotEngine:
                 self._cycle_count = 0
                 continue
 
-            # ── Confirmed daily loss pause ────────────────────────────────
+            # ── Confirmed daily loss pause ─────────────────────────────────
             if self._confirmed_paused:
                 logger.info(
                     f"DAILY LIMIT HIT — pausing "
-                    f"{config.DAILY_LOSS_PAUSE_MINS}min"
-                )
+                    f"{config.DAILY_LOSS_PAUSE_MINS}min")
                 await asyncio.sleep(config.DAILY_LOSS_PAUSE_MINS * 60)
                 self._confirmed_paused = False
                 continue
@@ -435,7 +542,7 @@ class BotEngine:
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            # ── Stale contract gate ───────────────────────────────────────
+            # ── Stale contract gate ────────────────────────────────────────
             if self._has_stale_contracts():
                 stale = [
                     cid for cid in self._open_contracts
@@ -448,13 +555,11 @@ class BotEngine:
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            # ── Cycle bookkeeping ─────────────────────────────────────────
+            # ── Cycle bookkeeping ──────────────────────────────────────────
             self.symbols.decrement_suspensions()
-
-            # ── Build queue from initialised symbols ──────────────────────
             cycle_number += 1
 
-            # Scan ALL available symbols simultaneously every cycle
+            # ── Build queue ────────────────────────────────────────────────
             queue = self.symbols.get_queue()
             if not queue:
                 await asyncio.sleep(scan_sleep)
@@ -462,9 +567,8 @@ class BotEngine:
 
             raw_results = await asyncio.gather(
                 *[self._scan(s) for s in queue],
-                return_exceptions=True
+                return_exceptions=True,
             )
-            # Process results immediately while next scan already queued
             candidates = [
                 r for r in raw_results
                 if isinstance(r, ScanResult)
@@ -472,11 +576,11 @@ class BotEngine:
                 and self.symbols.can_trade_now(r.symbol)
             ]
 
-            # ── Score: signal.score×0.85 + win_rate×0.15 ─────────────────
+            # ── Score: signal.score×0.85 + win_rate×0.15 ──────────────────
             for r in candidates:
                 r.score = self._composite_score(r.sig, r.symbol)
 
-            # ── Deduplicate: highest score per symbol ─────────────────────
+            # ── Deduplicate: highest score per symbol ──────────────────────
             best_per_symbol: Dict[str, ScanResult] = {}
             for r in candidates:
                 if (r.symbol not in best_per_symbol
@@ -492,11 +596,11 @@ class BotEngine:
             # ── Hard block: exclude symbols with open trades ───────────────
             candidates = [r for r in ranked if r.symbol not in self._active_symbols]
 
-            # Execute all top signals in parallel instantly
-            top = candidates[:self.risk.current_concurrent_limit]
+            # ── Execute top N ──────────────────────────────────────────────
+            top = candidates[: self.risk.current_concurrent_limit]
 
             open_count = len(self._open_contracts)
-            streak = self.risk.current_streak
+            streak     = self.risk.current_streak
             logger.info(
                 f"CYCLE {cycle_number} | "
                 f"Queue:{len(queue)} | "
@@ -508,89 +612,88 @@ class BotEngine:
 
             if top and not self._confirmed_paused:
                 await asyncio.gather(
-                    *[self._execute(r.symbol, r.sig, r.price)
+                    *[self._execute(r.symbol, r.sig, r.price, r.smc_ctx)
                       for r in top],
                     return_exceptions=True,
                 )
 
-            # ── Orphan monitoring as background task ──────────────────────
+            # ── Orphan monitoring as background task ───────────────────────
             orphan_task = asyncio.create_task(self._monitor_orphans())
             self._settle_tasks.add(orphan_task)
             orphan_task.add_done_callback(self._settle_tasks.discard)
 
-            # ── Cycle sleep ───────────────────────────────────────────────
+            # ── Cycle sleep ────────────────────────────────────────────────
             elapsed   = time.time() - cycle_start
             remainder = max(0.0, scan_sleep - elapsed)
             if remainder > 0:
                 await asyncio.sleep(remainder)
 
-    # ── Per-symbol scan ────────────────────────────────────────────────────────
+    # ── Per-symbol scan — three-TF regime + signal ─────────────────────────────
 
     async def _scan(self, symbol: str) -> Optional[ScanResult]:
         try:
-            ltf_builder = self._ltf.get(symbol)
-            if ltf_builder is None:
+            htf = self._htf.get(symbol)
+            mtf = self._mtf.get(symbol)
+            ltf = self._ltf.get(symbol)
+
+            if not all([htf, mtf, ltf]):
+                return None
+            if htf.count < 10:
                 return None
 
-            ltf_bars = ltf_builder.completed_bars
-            if not ltf_bars or len(ltf_bars) < 30:
+            price = float(
+                ltf.completed_bars[-1].close if ltf.completed_bars else 0)
+            if price == 0:
                 return None
 
-            sig = self.signal.evaluate(ltf_bars, symbol)
-            if sig is None or getattr(sig, "direction", "NONE") == "NONE":
-                return None
-
+            # News filter
             if self.news.is_blocked(symbol):
                 return None
 
-            # HTF context for SMC
-            htf_builder = self._htf.get(symbol)
-            htf_atr     = 0.0
-            smc_ctx     = None
-            current_price = float(ltf_bars[-1].close)
-
-            if htf_builder is not None and htf_builder.count >= 20:
-                htf_bars = htf_builder.completed_bars
-                H = np.array([b.high  for b in htf_bars])
-                L = np.array([b.low   for b in htf_bars])
-                C = np.array([b.close for b in htf_bars])
-                htf_atr_arr = ind.atr(H, L, C, 14)
-                valid_ha    = htf_atr_arr[~np.isnan(htf_atr_arr)]
-                htf_atr     = float(valid_ha[-1]) if len(valid_ha) else 0.0
-                smc_ctx     = self.smc.analyse(htf_bars, htf_atr, symbol=symbol)
-
-            # LTF ATR filter
-            ltf_H = np.array([b.high  for b in ltf_bars])
-            ltf_L = np.array([b.low   for b in ltf_bars])
-            ltf_C = np.array([b.close for b in ltf_bars])
-            ltf_atr_arr = ind.atr(ltf_H, ltf_L, ltf_C, 14)
-            valid_la    = ltf_atr_arr[~np.isnan(ltf_atr_arr)]
-            ltf_atr     = float(valid_la[-1]) if len(valid_la) else 0.0
-
-            if htf_atr > 0 and ltf_atr > 2 * htf_atr:
+            # Regime check — HTF + MTF context
+            ctx = self.smc.analyse(
+                htf.completed_bars,
+                mtf.completed_bars,
+                price,
+            )
+            if ctx.bias == "NEUTRAL":
                 return None
 
-            # Build a minimal SMCContext stub if SMC unavailable
-            if smc_ctx is None:
-                smc_ctx = SMCContext()
+            # Stake for this potential trade
+            stake = self.risk.calculate_stake()
+
+            # Signal evaluation
+            sig = self.signal.evaluate(
+                ltf_bars = ltf.completed_bars,
+                mtf_bars = mtf.completed_bars,
+                symbol   = symbol,
+                stake    = stake,
+            )
+            if sig is None or sig.direction == "NONE":
+                return None
 
             return ScanResult(
-                symbol   = symbol,
-                sig      = sig,
-                price    = current_price,
-                smc_ctx  = smc_ctx,
-                ltf_atr  = ltf_atr,
-                htf_atr  = htf_atr,
+                symbol  = symbol,
+                sig     = sig,
+                price   = price,
+                smc_ctx = ctx,
+                score   = getattr(sig, "score", 0.0),
             )
 
         except Exception as exc:
             logger.debug(f"_scan({symbol}): {exc}")
             return None
 
-    # ── Execution ──────────────────────────────────────────────────────────────
+    # ── Execution — multiplier contract with SL/TP ─────────────────────────────
 
-    async def _execute(self, symbol: str, sig: SignalResult, price: float = 0.0) -> bool:
-        # Hard gate
+    async def _execute(
+        self,
+        symbol:  str,
+        sig:     SignalResult,
+        price:   float   = 0.0,
+        smc_ctx: SMCContext = None,
+    ) -> bool:
+        # Hard gates
         if not self.symbols.can_trade_now(symbol):
             return False
         if symbol in self._active_symbols:
@@ -602,19 +705,23 @@ class BotEngine:
         direction = sig.direction
         ac        = get_symbol_class(symbol)
 
+        if smc_ctx is None:
+            smc_ctx = SMCContext()
+
         record_signal(
             symbol    = symbol,
             direction = sig.direction,
             strategy  = getattr(sig, "strategy", "unknown"),
-            score     = getattr(sig, "score", 0.0),
+            score     = getattr(sig, "score",    0.0),
         )
 
         buy_resp = await self.client.buy_contract(
-            symbol    = symbol,
-            direction = direction,
-            stake     = stake,
-            duration  = config.TRADE_DURATION,
-            dur_unit  = config.TRADE_DURATION_UNIT,
+            symbol      = symbol,
+            direction   = direction,
+            stake       = stake,
+            multiplier  = sig.multiplier,
+            stop_loss   = sig.stop_loss,
+            take_profit = sig.take_profit,
         )
 
         if buy_resp is None:
@@ -623,14 +730,13 @@ class BotEngine:
 
         cid       = str(buy_resp.get("contract_id", ""))
         bal_b     = self.client.balance
-        price     = float(buy_resp.get("buy_price", stake))
-        smc_ctx   = SMCContext()    # lightweight placeholder post-execution
+        buy_price = float(buy_resp.get("buy_price", stake))
 
         rec = self.risk.register_open(
             symbol      = symbol,
             direction   = direction,
             stake       = stake,
-            entry_price = price,
+            entry_price = buy_price,
         )
 
         self.journal.open_trade(
@@ -638,10 +744,10 @@ class BotEngine:
             symbol         = symbol,
             direction      = direction,
             stake          = stake,
-            entry_price    = price,
+            entry_price    = buy_price,
             balance_before = bal_b,
             asset_class    = ac,
-            htf_bias       = getattr(smc_ctx, "bias", "NEUTRAL"),
+            htf_bias       = getattr(smc_ctx, "bias",      "NEUTRAL"),
             smc_structure  = getattr(smc_ctx, "structure", "NONE"),
             m1             = getattr(sig, "m1_signal", 0),
             m2             = getattr(sig, "m2_signal", 0),
@@ -653,17 +759,25 @@ class BotEngine:
             "symbol":      symbol,
             "direction":   sig.direction,
             "stake":       stake,
-            "entry_price": price,
+            "entry_price": buy_price,
             "opened_at":   time.time(),
             "rec":         rec,
             "sig":         sig,
+            "strategy":    getattr(sig, "strategy",    "unknown"),
+            "stop_loss":   getattr(sig, "stop_loss",   None),
+            "take_profit": getattr(sig, "take_profit", None),
+            "multiplier":  getattr(sig, "multiplier",  None),
         }
+
         self.symbols.record_trade_placed(symbol)
         self._active_symbols.add(symbol)
         set_active_trades(len(self._open_contracts))
 
         logger.info(
             f"▶ {direction} {symbol} | ${stake:.2f} | "
+            f"x{getattr(sig, 'multiplier', '?')} | "
+            f"SL={getattr(sig, 'stop_loss', '?')} "
+            f"TP={getattr(sig, 'take_profit', '?')} | "
             f"modules={sig.strength}/3 | streak={self.risk.current_streak}")
 
         await self.client.subscribe_contract(
@@ -701,7 +815,7 @@ class BotEngine:
         entry_price = info["entry_price"]
         rec         = info["rec"]
         sig         = info["sig"]
-        won = pnl > 0
+        won         = pnl > 0
 
         self._active_symbols.discard(symbol)
         logger.info(f"RELEASED: {symbol} | Active now: {self._active_symbols}")
@@ -714,19 +828,19 @@ class BotEngine:
             balance_after = bal_after,
         )
 
-        # Record to dashboard immediately
-        from keep_alive import record_trade, record_signal
-        record_trade(
+        from keep_alive import record_trade as _rt
+        _rt(
             symbol        = symbol,
             direction     = direction,
             stake         = stake,
             pnl           = pnl,
             balance_after = self.client.balance,
-            won           = pnl > 0,
-            strategy      = getattr(sig, 'strategy', ''),
+            won           = won,
+            strategy      = getattr(sig, "strategy", ""),
         )
+
         self.symbols.record_contract_closed(symbol)
-        self.symbols.record_result(symbol, won=pnl > 0)
+        self.symbols.record_result(symbol, won=won)
         self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
         self._confirmed_daily_loss += abs(pnl) if pnl < 0 else 0
         self._check_confirmed_loss_limit()
@@ -734,11 +848,10 @@ class BotEngine:
         self._push_dashboard()
 
         logger.info(
-            f"{'✅ WIN' if pnl>0 else '❌ LOSS'} | "
+            f"{'✅ WIN' if pnl > 0 else '❌ LOSS'} | "
             f"{symbol} | pnl=${pnl:+.4f} | "
             f"balance=${self.client.balance:.4f} | "
-            f"streak={self.risk.current_streak}"
-        )
+            f"streak={self.risk.current_streak}")
 
     # ── Orphan monitoring ──────────────────────────────────────────────────────
 
@@ -758,9 +871,9 @@ class BotEngine:
                 age       = now - open_time
 
                 if age >= CONTRACT_FORCE_CLOSE_SECS:
-                    symbol    = info["symbol"]
-                    stake     = info["stake"]
-                    rec       = info["rec"]
+                    symbol = info["symbol"]
+                    stake  = info["stake"]
+                    rec    = info["rec"]
 
                     self._open_contracts.pop(cid, None)
                     self._contract_open_times.pop(cid, None)
@@ -783,7 +896,9 @@ class BotEngine:
                 elif age >= CONTRACT_MAX_AGE_SECS:
                     try:
                         await self.client.force_check_contract(cid)
-                        logger.debug(f"force_check_contract({cid}) triggered (age={age:.0f}s)")
+                        logger.debug(
+                            f"force_check_contract({cid}) triggered "
+                            f"(age={age:.0f}s)")
                     except Exception as exc:
                         logger.warning(f"force_check_contract({cid}): {exc}")
 
@@ -792,13 +907,9 @@ class BotEngine:
         except Exception as exc:
             logger.error(f"_monitor_orphans: {exc}")
 
-    # ── Settle task launcher (preserve background settle flow) ────────────────
+    # ── Settle task launcher ───────────────────────────────────────────────────
 
     async def _settle_and_resolve(self, wait_secs: float):
-        """
-        Background task: waits for settlement window then resolves any
-        remaining open contracts.  Increments cycle count.
-        """
         try:
             await asyncio.sleep(wait_secs)
             await self._resolve_remaining_contracts()
@@ -808,7 +919,7 @@ class BotEngine:
         except Exception as exc:
             logger.error(f"_settle_and_resolve: {exc}")
 
-    # ── Orphan resolution (full, unchanged from v13) ───────────────────────────
+    # ── Orphan resolution (full) ───────────────────────────────────────────────
 
     async def _resolve_remaining_contracts(self):
         remaining = list(self._open_contracts.keys())
@@ -862,8 +973,8 @@ class BotEngine:
             if not resolved and cid in self._open_contracts:
                 info   = self._open_contracts.get(cid, {})
                 symbol = info.get("symbol", "UNKNOWN")
-                stake  = info.get("stake", 0.0)
-                rec    = info.get("rec", None)
+                stake  = info.get("stake",  0.0)
+                rec    = info.get("rec",    None)
 
                 logger.error(f"ORPHANED: {cid} — forcing close as loss")
                 self.journal.close_trade(
@@ -900,9 +1011,17 @@ class BotEngine:
                     f"ORPHAN RECORDED AS LOSS: {cid} {symbol} "
                     f"-${stake:.2f} | balance=${self.client.balance:.4f}")
 
-    # ── Contract watchdog — hard 7-minute timeout ─────────────────────────────
+    # ── Contract watchdog — funding-fee timeout for multiplier contracts ────────
 
     async def _contract_watchdog(self):
+        """
+        Runs every 15 s.
+        - At config.CONTRACT_CHECK_SECS  → force_check_contract.
+        - At config.MAX_TRADE_OPEN_MINS minutes → force-close to avoid
+          hourly funding-fee erosion on multiplier contracts.
+        """
+        max_open_secs = getattr(config, "MAX_TRADE_OPEN_MINS", 60) * 60
+
         while True:
             try:
                 await asyncio.sleep(15)
@@ -911,12 +1030,11 @@ class BotEngine:
                     age_secs = now - info.get("opened_at", now)
                     age_mins = age_secs / 60
 
-                    # At 5 minutes — force check
+                    # Check gate
                     if age_secs >= config.CONTRACT_CHECK_SECS:
                         logger.info(
                             f"WATCHDOG CHECK: {cid} "
-                            f"{info['symbol']} age={age_mins:.1f}min"
-                        )
+                            f"{info['symbol']} age={age_mins:.1f}min")
                         try:
                             result = await self.client.force_check_contract(cid)
                             if result.get("is_sold") or result.get("is_expired"):
@@ -925,17 +1043,54 @@ class BotEngine:
                         except Exception as exc:
                             logger.warning(f"WATCHDOG force_check({cid}): {exc}")
 
-                    # At 7 minutes — force close as loss
-                    if age_secs >= config.CONTRACT_TIMEOUT_SECS:
+                    # Funding-fee timeout — close regardless of P/L
+                    if age_secs >= max_open_secs:
+                        if cid in self._open_contracts:
+                            stake  = info["stake"]
+                            symbol = info["symbol"]
+                            logger.warning(
+                                f"FUNDING TIMEOUT: {cid} {symbol} "
+                                f"{age_mins:.1f}min >= MAX_TRADE_OPEN_MINS="
+                                f"{getattr(config,'MAX_TRADE_OPEN_MINS',60)} — "
+                                f"force-closing to prevent fee erosion")
+                            try:
+                                await self.client.sell_contract(cid)
+                            except Exception as exc:
+                                logger.warning(
+                                    f"sell_contract({cid}): {exc} — "
+                                    f"recording as loss")
+                            # Always record closure regardless of sell result
+                            from keep_alive import record_trade as _rt
+                            _rt(
+                                symbol        = symbol,
+                                direction     = info.get("direction", "?"),
+                                stake         = stake,
+                                pnl           = -stake,
+                                balance_after = self.client.balance,
+                                won           = False,
+                                strategy      = "FUNDING_TIMEOUT",
+                            )
+                            self._confirmed_daily_loss += stake
+                            self.risk.register_close(
+                                info["rec"], exit_price=0, pnl=-stake)
+                            self.symbols.record_contract_closed(symbol)
+                            self.symbols.record_result(symbol, won=False)
+                            self._open_contracts.pop(cid, None)
+                            self._active_symbols.discard(symbol)
+                            set_active_trades(len(self._open_contracts))
+                            self._check_confirmed_loss_limit()
+                            self._push_dashboard()
+
+                    # Legacy hard timeout (CONTRACT_TIMEOUT_SECS)
+                    elif age_secs >= config.CONTRACT_TIMEOUT_SECS:
                         if cid in self._open_contracts:
                             stake  = info["stake"]
                             symbol = info["symbol"]
                             logger.warning(
                                 f"TIMEOUT: {cid} {symbol} "
-                                f"{age_mins:.1f}min — recording loss"
-                            )
-                            from keep_alive import record_trade
-                            record_trade(
+                                f"{age_mins:.1f}min — recording loss")
+                            from keep_alive import record_trade as _rt
+                            _rt(
                                 symbol        = symbol,
                                 direction     = info.get("direction", "?"),
                                 stake         = stake,
@@ -954,6 +1109,7 @@ class BotEngine:
                             set_active_trades(len(self._open_contracts))
                             self._check_confirmed_loss_limit()
                             self._push_dashboard()
+
             except asyncio.CancelledError:
                 return
             except Exception as exc:
