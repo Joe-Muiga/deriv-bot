@@ -1,7 +1,14 @@
 """
 deriv_client.py – Async Deriv WebSocket client.
 
-v9 → v10 audit changes (full compliance pass):
+v10 → v11 audit changes (rate-limit hardening):
+
+  RATE LIMIT FIXES:
+    - _proposal_semaphore = asyncio.Semaphore(3): max 3 concurrent proposal requests
+    - _last_proposal_time: enforces 1.0s minimum gap between proposals
+    - On RateLimit error code: logs warning, sleeps 3s, retries proposal once
+    - _buy_semaphore reduced from 2 → 1: single concurrent buy at a time
+    - Buy inter-request delay increased from 0.3s → 1.0s
 
   DIRECTION MAPPING (VERIFIED CORRECT — DO NOT SWAP):
     direction="LONG"  → contract_type="CALL"  → wins if price RISES
@@ -138,8 +145,10 @@ class DerivClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # ── Rate limiting ─────────────────────────────────────────────────────
-        self._buy_semaphore  = asyncio.Semaphore(2)  # max 2 simultaneous buy requests
-        self._last_buy_time  = 0.0                   # epoch of last buy attempt
+        self._buy_semaphore      = asyncio.Semaphore(1)  # max 1 simultaneous buy request
+        self._last_buy_time      = 0.0                   # epoch of last buy attempt
+        self._proposal_semaphore = asyncio.Semaphore(3)  # max 3 concurrent proposal requests
+        self._last_proposal_time = 0.0                   # epoch of last proposal sent
 
         # ── Direction→contract mapping audit ─────────────────────────────────
         logger.info(
@@ -730,15 +739,15 @@ class DerivClient:
         """
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
-            if elapsed < 0.3:
-                await asyncio.sleep(0.3 - elapsed)
+            if elapsed < 1.0:
+                await asyncio.sleep(1.0 - elapsed)
             self._last_buy_time = time.time()
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
             logger.info(f"PLACING {contract_type} | {symbol} | ${stake:.4f}")
 
             try:
-                # Step 1: proposal
+                # Step 1: proposal (rate-limited)
                 proposal_req = {
                     "proposal":      1,
                     "amount":        stake,
@@ -749,8 +758,27 @@ class DerivClient:
                     "duration_unit": "m",
                     "symbol":        symbol,
                 }
-                proposal = await self._send(proposal_req)
+
+                _PROPOSAL_DELAY = 1.0  # seconds between proposals
+
+                async def _send_proposal_with_ratelimit():
+                    async with self._proposal_semaphore:
+                        elapsed = time.time() - self._last_proposal_time
+                        if elapsed < _PROPOSAL_DELAY:
+                            await asyncio.sleep(_PROPOSAL_DELAY - elapsed)
+                        self._last_proposal_time = time.time()
+                        return await self._send(proposal_req)
+
+                proposal = await _send_proposal_with_ratelimit()
                 logger.info(f"PROPOSAL RESPONSE: {proposal}")
+
+                # Retry once on RateLimit
+                if proposal and proposal.get("error", {}).get("code") == "RateLimit":
+                    logger.warning(f"RATE LIMIT: {symbol} — waiting 3s before retry")
+                    await asyncio.sleep(3)
+                    proposal = await _send_proposal_with_ratelimit()
+                    logger.info(f"PROPOSAL RESPONSE (retry): {proposal}")
+
                 if not proposal or proposal.get("error"):
                     err = (
                         proposal.get("error", {}).get("message", "unknown")
