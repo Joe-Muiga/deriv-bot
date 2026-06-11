@@ -224,6 +224,7 @@ class BotEngine:
         self._current_utc_day       = _dt.datetime.utcnow().day
 
         asyncio.create_task(self._contract_watchdog())
+        asyncio.create_task(self._symbol_release_watchdog())
 
         await self._init_all_symbols()
 
@@ -483,6 +484,15 @@ class BotEngine:
         while True:
             cycle_start = time.time()
 
+            # ── Fix 4: never let _active_symbols block all trading ─────────────
+            for sym in list(self._active_symbols):
+                has_open = any(
+                    v.get("symbol") == sym
+                    for v in self._open_contracts.values())
+                if not has_open:
+                    logger.warning(f"STALE ACTIVE SYMBOL: {sym} — clearing")
+                    self._active_symbols.discard(sym)
+
             today = _dt.datetime.utcnow().day
             if today != self._current_utc_day:
                 self.symbols.reset_session()
@@ -555,6 +565,11 @@ class BotEngine:
             cycle_number += 1
 
             queue = self.symbols.get_queue()
+            logger.info(
+                f"CYCLE | Queue:{len(queue)} | "
+                f"Active:{len(self._active_symbols)} | "
+                f"Open:{len(self._open_contracts)} | "
+                f"Balance:${self.client.balance:.2f}")
             if not queue:
                 await asyncio.sleep(scan_sleep)
                 continue
@@ -831,9 +846,6 @@ class BotEngine:
         logger.info(
             f"{'WIN' if won else 'LOSS'}: {symbol} pnl=${pnl:+.4f} sell_price={sell_price}")
 
-        self._active_symbols.discard(symbol)
-        logger.info(f"RELEASED: {symbol} | Active now: {self._active_symbols}")
-
         self.journal.close_trade(
             contract_id   = cid,
             exit_price    = sell_price,
@@ -855,7 +867,11 @@ class BotEngine:
             close_reason  = "normal",
         )
 
+        self._active_symbols.discard(symbol)
         self.symbols.record_contract_closed(symbol)
+        # Force queue update
+        self.symbols.update_active(list(self._htf.keys()))
+        logger.info(f"SYMBOL RELEASED: {symbol} | Active now: {self._active_symbols}")
         self.symbols.record_result(symbol, won=won)
         self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
         self._confirmed_daily_loss += abs(pnl) if pnl < 0 else 0
@@ -1171,7 +1187,41 @@ class BotEngine:
             except Exception as exc:
                 logger.error(f"_contract_watchdog: {exc}")
 
+    # ── Symbol release watchdog ─────────────────────────────────────────────────
+
+    async def _symbol_release_watchdog(self):
+        """
+        Every 60 seconds, force-release any symbol from _active_symbols
+        whose contract has been open longer than 8 minutes (480s). This
+        guarantees the queue can never permanently empty because a symbol
+        is stuck "active" due to a missed close callback.
+        """
+        while True:
+            try:
+                await asyncio.sleep(60)
+                now = time.time()
+                released = []
+                for cid, info in list(self._open_contracts.items()):
+                    age = now - info.get("opened_at", now)
+                    if age > 480:  # 8 minutes
+                        symbol = info["symbol"]
+                        logger.warning(
+                            f"FORCE RELEASING: {symbol} age={age:.0f}s")
+                        self._active_symbols.discard(symbol)
+                        self.symbols.record_contract_closed(symbol)
+                        released.append(symbol)
+                if released:
+                    logger.info(
+                        f"RELEASED SYMBOLS: {released} | "
+                        f"Queue should refill now")
+                    self.symbols.update_active(list(self._htf.keys()))
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error(f"_symbol_release_watchdog: {exc}")
+
     # ── Stale contract detection ───────────────────────────────────────────────
+
 
     def _has_stale_contracts(self) -> bool:
         stale_threshold = config.TRADE_DURATION * 60 + 30
