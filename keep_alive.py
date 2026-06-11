@@ -7,42 +7,24 @@ Routes:
   /stats     → Detailed JSON stats
   /trades    → Recent trade list as JSON
   /symbols   → Symbol leaderboard as JSON
+  /debug     → Raw _state dump as JSON
 
-v8 changes:
-  - Dashboard fully rebuilt with pure Python f-strings. Zero {{variable}} syntax anywhere.
-  - Replaced Chart.js CDN dependency with pure inline SVG balance curve.
-  - _state updated to match canonical field names used by update_status().
-  - update_status() stores all canonical fields.
-  - All other logic, routes, ping loop, and helpers are unchanged.
-
-v9 changes:
-  - Balance curve now correctly reads balance_history (populated by record_trade).
-  - _parse_hms() added to handle HH:MM:SS time strings from record_trade.
-  - record_signal() now stores a dict so the dashboard renders symbol/direction
-    badges and score separately instead of a flat string.
-  - Dashboard verified: balance, daily PnL ($+%), win rate, streak, total trades
-    today, last signal (with inverted direction badge), recent trades table,
-    suspended symbols with minutes remaining, session status — all live on
-    every 10 s refresh.
-  - _build_svg_chart() rewritten to consume balance_history directly.
-
-v10 changes:
-  - record_trade() now accepts `multiplier` and `close_reason` ("normal" | "timeout").
-  - record_trade() updates: recent_trades (last 200), all_trades (full session),
-    balance_history, hourly_pnl (by hour bucket), daily_pnl_history,
-    wins / losses / total_trades / win_rate, daily/weekly/monthly PnL + %,
-    avg_multiplier, best_trade / worst_trade, funding_fees_total
-    (sum of negative PnL on timeout closes).
-  - _check_period_resets() handles daily / weekly / monthly resets and rolls
-    the previous day's PnL into daily_pnl_history.
-  - update_open_contracts() tracks currently open multiplier contracts
-    (count + symbol list) for the dashboard.
-  - _build_svg_chart() now color-codes dots: green=win, red=loss,
-    yellow=timeout close — and draws a dashed horizontal reference line at
-    the day's starting balance.
-  - Dashboard gains cards: Avg Multiplier, Best/Worst Trade, Funding Fees,
-    Open Contracts (with symbol list), Weekly/Monthly P&L.
-  - All other logic, routes, ping loop, and helpers are unchanged.
+v11 changes:
+  - Dashboard fully rebuilt: all 10 sections from spec.
+  - P&L Summary row: Daily/Weekly/Monthly/All-time + 15% loss limit bar.
+  - Performance Stats: win rate, total/wins/losses, profit factor, avg PnL,
+    best/worst trade, current streak.
+  - Balance curve SVG — all trades, green=win, red=loss, yellow=timeout,
+    start-balance reference line.
+  - Hourly P&L bar chart SVG — one bar per hour of today.
+  - Recent trades table — last 100, columns: Time UTC, Symbol, Direction,
+    Stake, PnL, Balance After, Result, Strategy.
+  - Open contracts — symbol, direction, stake, seconds open.
+  - Suspended symbols — symbol + minutes remaining.
+  - Symbol leaderboard — trades, win%, total PnL, best, worst.
+  - Signal log — last 20 signals with symbol, direction, score, strategy, ts.
+  - record_failure() added for failed placements.
+  - Dashboard push interval exposed as DASHBOARD_PUSH_EVERY (used by bot_engine).
 """
 
 import os
@@ -77,7 +59,6 @@ _state: dict = {
     "balance_history":       [],
     "suspended_symbols":     [],
     "paused_for_loss_limit": False,
-    # Legacy / internal fields kept for compatibility
     "current_symbol":        "—",
     "uptime_seconds":        0,
     "start_time":            time.time(),
@@ -89,8 +70,6 @@ _state: dict = {
     "worst_trade":           0.0,
     "redeploy_pending":      False,
     "active_trades":         0,
-
-    # ── v10: full trade history / period tracking ──────────────────────────
     "all_trades":            [],
     "hourly_pnl":            {},
     "daily_pnl_history":     [],
@@ -103,21 +82,21 @@ _state: dict = {
     "current_day":           "",
     "current_week":          "",
     "current_month":         "",
-
-    # ── v10: multiplier / funding fee tracking ──────────────────────────────
     "avg_multiplier":        0.0,
     "multiplier_count":      0,
     "funding_fees_total":    0.0,
-
-    # ── v10: open contracts ──────────────────────────────────────────────────
     "open_contracts":        [],
     "open_contracts_count":  0,
+    # v11 additions
+    "signal_log":            [],   # last 20 emitted signals
+    "failure_log":           [],   # last 50 failed placements
+    "session_start_balance": 0.0,  # set once on first trade or bot start
 }
 
+_status = _state   # alias for bot_engine imports
 
-# Alias so bot_engine can import _status and reference the same dict
-_status = _state
 
+# ── Public state helpers ────────────────────────────────────────────────────────
 
 def update_status(**kwargs) -> None:
     _state.update(kwargs)
@@ -143,30 +122,26 @@ def get_active_trades() -> int:
 
 # ── Period reset helper ─────────────────────────────────────────────────────────
 
-def _check_period_resets(now: "datetime.datetime", balance_after: float) -> None:
-    """
-    Detect day / ISO-week / month rollovers and reset the relevant counters.
-    Called at the top of record_trade() before any other state is updated.
-    """
+def _check_period_resets(now: datetime.datetime, balance_after: float) -> None:
     today_str = now.strftime("%Y-%m-%d")
     iso_year, iso_week, _ = now.isocalendar()
-    week_str = f"{iso_year}-W{iso_week:02d}"
+    week_str  = f"{iso_year}-W{iso_week:02d}"
     month_str = now.strftime("%Y-%m")
 
     current_balance = _status.get("balance", balance_after)
 
-    # First-run initialization
     if not _status.get("current_day"):
-        _status["current_day"] = today_str
-        _status["day_start_balance"] = balance_after
+        _status["current_day"]        = today_str
+        _status["day_start_balance"]  = balance_after
     if not _status.get("current_week"):
-        _status["current_week"] = week_str
+        _status["current_week"]       = week_str
         _status["week_start_balance"] = balance_after
     if not _status.get("current_month"):
-        _status["current_month"] = month_str
+        _status["current_month"]       = month_str
         _status["month_start_balance"] = balance_after
+    if not _status.get("session_start_balance"):
+        _status["session_start_balance"] = balance_after
 
-    # Daily reset — roll yesterday's PnL into history, reset W/L counters
     if _status["current_day"] != today_str:
         prev_day_start = _status.get("day_start_balance", current_balance)
         _status["daily_pnl_history"].append({
@@ -175,179 +150,174 @@ def _check_period_resets(now: "datetime.datetime", balance_after: float) -> None
             "balance": round(current_balance, 4),
         })
         _status["daily_pnl_history"] = _status["daily_pnl_history"][-90:]
-
-        _status["current_day"] = today_str
+        _status["current_day"]       = today_str
         _status["day_start_balance"] = current_balance
-        _status["wins"] = 0
-        _status["losses"] = 0
-        _status["total_trades"] = 0
-        _status["win_rate"] = 0.0
+        _status["wins"]              = 0
+        _status["losses"]            = 0
+        _status["total_trades"]      = 0
+        _status["win_rate"]          = 0.0
 
-    # Weekly reset
     if _status["current_week"] != week_str:
-        _status["current_week"] = week_str
+        _status["current_week"]       = week_str
         _status["week_start_balance"] = current_balance
 
-    # Monthly reset
     if _status["current_month"] != month_str:
-        _status["current_month"] = month_str
+        _status["current_month"]       = month_str
         _status["month_start_balance"] = current_balance
 
 
+# ── Trade / signal recording ────────────────────────────────────────────────────
+
 def record_trade(symbol, direction, stake, pnl,
                  balance_after, won, strategy="",
-                 multiplier=None, close_reason="normal"):
-    """
-    Called directly after every trade closes.
-
-    multiplier   : the multiplier used for this trade (e.g. 100, 200), if any.
-    close_reason : "normal" (manual/TP/SL close) or "timeout" (forced close
-                   due to expiry — used for funding-fee tracking & yellow dots).
-    """
+                 multiplier=None, close_reason="normal", **_):
     from datetime import datetime, timezone
-
-    now = datetime.now(timezone.utc)
+    now       = datetime.now(timezone.utc)
     is_timeout = (close_reason == "timeout")
 
     trade = {
-        "time": now.strftime("%H:%M:%S"),
-        "date": now.strftime("%Y-%m-%d"),
-        "symbol": symbol,
-        "direction": direction,
-        "stake": round(stake, 4),
-        "pnl": round(pnl, 4),
-        "balance_after": round(balance_after, 4),
-        "won": won,
-        "strategy": strategy,
-        "multiplier": multiplier,
+        "time":         now.strftime("%H:%M:%S"),
+        "date":         now.strftime("%Y-%m-%d"),
+        "symbol":       symbol,
+        "direction":    direction,
+        "stake":        round(float(stake),         4),
+        "pnl":          round(float(pnl),           4),
+        "balance_after":round(float(balance_after), 4),
+        "won":          bool(won),
+        "strategy":     strategy,
+        "multiplier":   multiplier,
         "close_reason": close_reason,
     }
 
-    # Handle daily / weekly / monthly rollovers BEFORE updating counters
     _check_period_resets(now, balance_after)
 
-    # Add to recent trades — keep last 200
     _status["recent_trades"].insert(0, trade)
     _status["recent_trades"] = _status["recent_trades"][:200]
-
-    # Add to full session history — unbounded
     _status["all_trades"].append(trade)
 
-    # Add to balance history for chart — keep last 100
     _status["balance_history"].append({
-        "time": trade["time"],          # "HH:MM:SS"
-        "balance": balance_after,
-        "won": won,
+        "time":         trade["time"],
+        "balance":      balance_after,
+        "won":          bool(won),
         "close_reason": close_reason,
     })
-    _status["balance_history"] = _status["balance_history"][-100:]
+    _status["balance_history"] = _status["balance_history"][-500:]
 
-    # Hourly PnL bucket — keyed "YYYY-MM-DD HH:00"
     hour_key = now.strftime("%Y-%m-%d %H:00")
     _status["hourly_pnl"][hour_key] = round(
-        _status["hourly_pnl"].get(hour_key, 0.0) + pnl, 4)
+        _status["hourly_pnl"].get(hour_key, 0.0) + float(pnl), 4)
 
-    # Update win/loss counts
     if won:
-        _status["wins"] += 1
+        _status["wins"]   += 1
     else:
         _status["losses"] += 1
     _status["total_trades"] = _status["wins"] + _status["losses"]
 
-    # Recalculate win rate
     if _status["total_trades"] > 0:
         _status["win_rate"] = round(
             _status["wins"] / _status["total_trades"] * 100, 1)
 
-    # Update daily PnL
     day_start = _status.get("day_start_balance") or balance_after
-    _status["daily_pnl"] = round(balance_after - day_start, 4)
+    _status["daily_pnl"]     = round(float(balance_after) - float(day_start), 4)
     _status["daily_pnl_pct"] = round(
-        (_status["daily_pnl"] / day_start) * 100, 2) if day_start else 0.0
+        (_status["daily_pnl"] / float(day_start)) * 100, 2) if day_start else 0.0
 
-    # Update weekly PnL
     week_start = _status.get("week_start_balance") or balance_after
-    _status["weekly_pnl"] = round(balance_after - week_start, 4)
+    _status["weekly_pnl"]     = round(float(balance_after) - float(week_start), 4)
     _status["weekly_pnl_pct"] = round(
-        (_status["weekly_pnl"] / week_start) * 100, 2) if week_start else 0.0
+        (_status["weekly_pnl"] / float(week_start)) * 100, 2) if week_start else 0.0
 
-    # Update monthly PnL
     month_start = _status.get("month_start_balance") or balance_after
-    _status["monthly_pnl"] = round(balance_after - month_start, 4)
+    _status["monthly_pnl"]     = round(float(balance_after) - float(month_start), 4)
     _status["monthly_pnl_pct"] = round(
-        (_status["monthly_pnl"] / month_start) * 100, 2) if month_start else 0.0
+        (_status["monthly_pnl"] / float(month_start)) * 100, 2) if month_start else 0.0
 
-    # Average multiplier (running mean)
     if multiplier is not None:
         try:
             mult = float(multiplier)
-            n = int(_status.get("multiplier_count", 0))
-            avg = float(_status.get("avg_multiplier", 0.0))
-            _status["avg_multiplier"] = round((avg * n + mult) / (n + 1), 2)
-            _status["multiplier_count"] = n + 1
+            n    = int(_status.get("multiplier_count", 0))
+            avg  = float(_status.get("avg_multiplier", 0.0))
+            _status["avg_multiplier"]    = round((avg * n + mult) / (n + 1), 2)
+            _status["multiplier_count"]  = n + 1
         except (TypeError, ValueError):
             pass
 
-    # Best / worst single-trade PnL
-    if pnl > _status.get("best_trade", 0.0):
-        _status["best_trade"] = round(pnl, 4)
-    if pnl < _status.get("worst_trade", 0.0):
-        _status["worst_trade"] = round(pnl, 4)
+    pnl_f = float(pnl)
+    if pnl_f > float(_status.get("best_trade", 0.0)):
+        _status["best_trade"]  = round(pnl_f, 4)
+    if pnl_f < float(_status.get("worst_trade", 0.0)):
+        _status["worst_trade"] = round(pnl_f, 4)
 
-    # Funding fees — negative PnL on timeout (forced expiry) closes
-    if is_timeout and pnl < 0:
+    # gross profit / loss → profit factor
+    if pnl_f > 0:
+        _status["gross_profit"] = round(
+            float(_status.get("gross_profit", 0.0)) + pnl_f, 4)
+    else:
+        _status["gross_loss"] = round(
+            float(_status.get("gross_loss", 0.0)) + abs(pnl_f), 4)
+    gp = float(_status.get("gross_profit", 0.0))
+    gl = float(_status.get("gross_loss",   0.0))
+    _status["profit_factor"] = round(gp / gl, 3) if gl > 0 else (gp if gp > 0 else 0.0)
+
+    if is_timeout and pnl_f < 0:
         _status["funding_fees_total"] = round(
-            _status.get("funding_fees_total", 0.0) + abs(pnl), 4)
+            float(_status.get("funding_fees_total", 0.0)) + abs(pnl_f), 4)
 
-    _status["balance"] = balance_after
-
-
-def update_open_contracts(contracts: list) -> None:
-    """
-    Update the list of currently-open multiplier contracts.
-
-    `contracts` may be a list of symbol strings, or a list of dicts each
-    containing at least a "symbol" key (e.g. {"symbol": "R_100", ...}).
-    """
-    normalized = []
-    for c in contracts or []:
-        if isinstance(c, dict):
-            normalized.append(str(c.get("symbol", "—")))
-        else:
-            normalized.append(str(c))
-    _status["open_contracts"] = normalized
-    _status["open_contracts_count"] = len(normalized)
+    _status["balance"] = float(balance_after)
 
 
-def record_signal(symbol, direction, strategy, score):
-    """
-    Store last signal as a structured dict so the dashboard can render
-    the direction as a colour-coded badge and display score precisely.
-    The direction passed here must already be the INVERTED (placed) direction
-    — signal_engine applies contrarian inversion before returning.
-    """
-    _status["last_signal"] = {
+def record_signal(symbol, direction, strategy, score, timestamp=None):
+    from datetime import datetime, timezone
+    ts = timestamp or datetime.now(timezone.utc).strftime("%H:%M:%S")
+    entry = {
         "symbol":    symbol,
         "direction": direction,
         "strategy":  strategy,
         "score":     round(float(score), 3),
+        "ts":        ts,
     }
+    _status["last_signal"] = entry
+    _status["signal_log"].insert(0, entry)
+    _status["signal_log"] = _status["signal_log"][:20]
+
+
+def record_failure(symbol, direction, stake, strategy, reason=""):
+    from datetime import datetime, timezone
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S")
+    entry = {
+        "ts":       ts,
+        "symbol":   symbol,
+        "direction":direction,
+        "stake":    round(float(stake), 4),
+        "strategy": strategy,
+        "reason":   reason,
+    }
+    _status["failure_log"].insert(0, entry)
+    _status["failure_log"] = _status["failure_log"][:50]
+    logger.warning(
+        f"PLACEMENT FAILED: {symbol} {direction} stake=${stake:.2f} "
+        f"strategy={strategy} reason={reason}")
+
+
+def update_open_contracts(contracts: list) -> None:
+    normalized = []
+    for c in contracts or []:
+        if isinstance(c, dict):
+            normalized.append(c)
+        else:
+            normalized.append({"symbol": str(c)})
+    _status["open_contracts"]       = normalized
+    _status["open_contracts_count"] = len(normalized)
 
 
 def update_suspended_symbols(suspended: list) -> None:
-    """
-    Update the list of suspended symbols.
-    Each entry: {"symbol": str, "suspended_until": float (unix timestamp)}.
-    """
     _state["suspended_symbols"] = list(suspended)
 
 
 def trigger_redeploy() -> None:
     url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
     if not url:
-        logger.error(
-            "trigger_redeploy: RENDER_DEPLOY_HOOK_URL environment variable is "
-            "not set — cannot trigger Render redeploy.")
+        logger.error("trigger_redeploy: RENDER_DEPLOY_HOOK_URL not set")
         return
     logger.info("trigger_redeploy: sending POST to Render deploy hook …")
     try:
@@ -356,8 +326,7 @@ def trigger_redeploy() -> None:
             logger.info(f"trigger_redeploy: SUCCESS — HTTP {resp.status_code}")
         else:
             logger.error(
-                f"trigger_redeploy: FAILED — HTTP {resp.status_code} "
-                f"— {resp.text[:300]}")
+                f"trigger_redeploy: FAILED — HTTP {resp.status_code} — {resp.text[:300]}")
     except requests.exceptions.Timeout:
         logger.error("trigger_redeploy: FAILED — request timed out after 15 s")
     except requests.exceptions.ConnectionError as exc:
@@ -366,10 +335,9 @@ def trigger_redeploy() -> None:
         logger.error(f"trigger_redeploy: FAILED — {type(exc).__name__}: {exc}")
 
 
-# ── Time helpers ───────────────────────────────────────────────────────────────
+# ── Time helpers ────────────────────────────────────────────────────────────────
 
 def _exit_time_to_dt(raw) -> datetime.datetime | None:
-    """Parse exit_time regardless of whether it's a Unix timestamp or ISO string."""
     if raw is None:
         return None
     try:
@@ -388,57 +356,30 @@ def _exit_time_to_dt(raw) -> datetime.datetime | None:
 
 
 def _parse_hms(raw) -> str:
-    """
-    Extract HH:MM display label from a time value.
-    Handles:
-      - "HH:MM:SS" strings produced by record_trade  → slices to "HH:MM"
-      - Unix epoch floats / ints                      → formats as "HH:MM"
-      - ISO datetime strings                          → formats as "HH:MM"
-    Returns "?" on failure.
-    """
     if raw is None:
         return "?"
     s = str(raw).strip()
-    # "HH:MM:SS" or "HH:MM" — direct time string
     if len(s) >= 5 and s[2] == ":":
         return s[:5]
-    # Try Unix epoch
     try:
         f = float(s)
         if f > 1_000_000_000:
             return datetime.datetime.utcfromtimestamp(f).strftime("%H:%M")
     except (TypeError, ValueError):
         pass
-    # Try ISO datetime
     dt = _exit_time_to_dt(raw)
     if dt:
         return dt.strftime("%H:%M")
     return "?"
 
 
-# ── SVG Balance Curve ──────────────────────────────────────────────────────────
+# ── SVG Balance Curve ───────────────────────────────────────────────────────────
 
 def _build_svg_chart(balance_history: list, start_balance: float | None = None) -> str:
-    """
-    Build a pure inline SVG balance curve from balance_history entries.
-    Each entry: {"time": "HH:MM:SS", "balance": float, "won": bool,
-                  "close_reason": "normal" | "timeout"}
-    Produced by record_trade() — no external dependencies.
+    W, H             = 900, 180
+    PAD_L, PAD_R     = 62, 16
+    PAD_T, PAD_B     = 14, 32
 
-    Chart title: "Balance Curve — Today"  (rendered in caller)
-    X axis: trade timestamps as HH:MM
-    Y axis: balance after each trade
-    Dot colours:
-      - Green  = winning trade
-      - Red    = losing trade
-      - Yellow = timeout / forced-expiry close
-    A dashed horizontal reference line marks the day's starting balance.
-    Updates on every dashboard refresh (10 s).
-    """
-    W, H = 900, 180
-    PAD_L, PAD_R, PAD_T, PAD_B = 58, 12, 12, 32
-
-    # Build point list from balance_history
     points = []
     for entry in balance_history:
         try:
@@ -448,69 +389,47 @@ def _build_svg_chart(balance_history: list, start_balance: float | None = None) 
             won          = bool(entry.get("won", False))
             close_reason = str(entry.get("close_reason", "normal"))
             label        = _parse_hms(entry.get("time") or entry.get("exit_time"))
-            points.append({"t": label, "bal": bal, "won": won, "close_reason": close_reason})
+            points.append({"t": label, "bal": bal, "won": won, "cr": close_reason})
         except Exception:
             continue
 
     if not points:
         return (
             f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
-            f'style="width:100%;height:180px;">'
+            f'style="width:100%;height:{H}px;">'
             f'<text x="{W // 2}" y="{H // 2}" text-anchor="middle" '
             f'fill="#484f58" font-size="13" font-family="Segoe UI,sans-serif">'
-            f'No trades yet — chart will populate after first closed trade'
-            f'</text>'
-            f'</svg>'
+            f'No trades yet — chart populates after first closed trade'
+            f'</text></svg>'
         )
 
-    bals = [p["bal"] for p in points]
+    bals       = [p["bal"] for p in points]
+    range_vals = list(bals) + ([float(start_balance)] if start_balance else [])
+    min_b      = min(range_vals)
+    max_b      = max(range_vals)
+    span       = max_b - min_b if max_b != min_b else 1.0
+    plot_w     = W - PAD_L - PAD_R
+    plot_h     = H - PAD_T - PAD_B
+    n          = len(points)
 
-    # Include the start-balance reference line in the auto-range so it's
-    # always visible on the chart.
-    range_vals = list(bals)
-    if start_balance:
-        range_vals.append(float(start_balance))
+    def px(i):   return PAD_L + (i / max(n - 1, 1)) * plot_w
+    def py(b):   return PAD_T + plot_h - ((float(b) - min_b) / span) * plot_h
 
-    min_b  = min(range_vals)
-    max_b  = max(range_vals)
-    span   = max_b - min_b if max_b != min_b else 1.0
-
-    plot_w = W - PAD_L - PAD_R
-    plot_h = H - PAD_T - PAD_B
-    n      = len(points)
-
-    def px(i):
-        return PAD_L + (i / max(n - 1, 1)) * plot_w
-
-    def py(b):
-        return PAD_T + plot_h - ((b - min_b) / span) * plot_h
-
-    # Polyline
-    coords = " ".join(
-        f"{px(i):.1f},{py(p['bal']):.1f}" for i, p in enumerate(points)
-    )
-    line = (
+    coords = " ".join(f"{px(i):.1f},{py(p['bal']):.1f}" for i, p in enumerate(points))
+    line   = (
         f'<polyline points="{coords}" fill="none" stroke="#58a6ff" '
         f'stroke-width="2" stroke-linejoin="round"/>'
     )
 
-    # Coloured dots — green=win, red=loss, yellow=timeout close
     dots = ""
     for i, p in enumerate(points):
-        if p["close_reason"] == "timeout":
-            fill = "#d29922"
-        elif p["won"]:
-            fill = "#3fb950"
-        else:
-            fill = "#f85149"
+        fill = "#d29922" if p["cr"] == "timeout" else ("#3fb950" if p["won"] else "#f85149")
         dots += (
             f'<circle cx="{px(i):.1f}" cy="{py(p["bal"]):.1f}" r="4" '
             f'fill="{fill}" stroke="#0d1117" stroke-width="1.5">'
-            f'<title>{p["t"]}  ${p["bal"]:.4f}</title>'
-            f'</circle>'
+            f'<title>{p["t"]}  ${p["bal"]:.4f}</title></circle>'
         )
 
-    # Y-axis labels (3 ticks)
     y_labels = ""
     for tick in [0, 0.5, 1.0]:
         val = min_b + tick * span
@@ -523,9 +442,8 @@ def _build_svg_chart(balance_history: list, start_balance: float | None = None) 
             f'${val:.2f}</text>'
         )
 
-    # X-axis labels (up to 6 evenly spaced)
     x_labels = ""
-    step = max(1, n // 6)
+    step = max(1, n // 8)
     for i in range(0, n, step):
         x = px(i)
         x_labels += (
@@ -534,7 +452,6 @@ def _build_svg_chart(balance_history: list, start_balance: float | None = None) 
             f'{points[i]["t"]}</text>'
         )
 
-    # Dashed horizontal reference line at the day's starting balance
     ref_line = ""
     if start_balance:
         y_ref = py(float(start_balance))
@@ -548,69 +465,161 @@ def _build_svg_chart(balance_history: list, start_balance: float | None = None) 
 
     return (
         f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
-        f'style="width:100%;height:180px;">'
+        f'style="width:100%;height:{H}px;">'
         f'{y_labels}{ref_line}{line}{dots}{x_labels}'
         f'</svg>'
     )
 
 
-# ── Dashboard renderer ─────────────────────────────────────────────────────────
+# ── SVG Hourly P&L Bar Chart ────────────────────────────────────────────────────
+
+def _build_hourly_svg(hourly_pnl: dict) -> str:
+    W, H             = 900, 160
+    PAD_L, PAD_R     = 62, 16
+    PAD_T, PAD_B     = 14, 32
+
+    today = datetime.datetime.utcnow().strftime("%Y-%m-%d")
+    bars  = []
+    for h in range(24):
+        key = f"{today} {h:02d}:00"
+        val = float(hourly_pnl.get(key, 0.0))
+        bars.append({"h": h, "pnl": val})
+
+    non_zero = [b for b in bars if b["pnl"] != 0]
+    if not non_zero:
+        return (
+            f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
+            f'style="width:100%;height:{H}px;">'
+            f'<text x="{W // 2}" y="{H // 2}" text-anchor="middle" '
+            f'fill="#484f58" font-size="13" font-family="Segoe UI,sans-serif">'
+            f'No hourly data yet'
+            f'</text></svg>'
+        )
+
+    vals     = [b["pnl"] for b in bars]
+    max_abs  = max(abs(v) for v in vals) or 1.0
+    plot_w   = W - PAD_L - PAD_R
+    plot_h   = H - PAD_T - PAD_B
+    bar_w    = max(2, plot_w / 24 - 2)
+    mid_y    = PAD_T + plot_h / 2
+
+    # zero line
+    zero_line = (
+        f'<line x1="{PAD_L}" y1="{mid_y:.1f}" x2="{W - PAD_R}" y2="{mid_y:.1f}" '
+        f'stroke="#30363d" stroke-width="1"/>'
+    )
+
+    rects = ""
+    for b in bars:
+        pnl  = b["pnl"]
+        x    = PAD_L + b["h"] * (plot_w / 24) + 1
+        frac = abs(pnl) / max_abs * (plot_h / 2)
+        fill = "#3fb950" if pnl >= 0 else "#f85149"
+        if pnl >= 0:
+            rect_y = mid_y - frac
+            rect_h = frac
+        else:
+            rect_y = mid_y
+            rect_h = frac
+        if rect_h < 1:
+            rect_h = 1
+        rects += (
+            f'<rect x="{x:.1f}" y="{rect_y:.1f}" width="{bar_w:.1f}" height="{rect_h:.1f}" '
+            f'fill="{fill}" rx="1">'
+            f'<title>{b["h"]:02d}:00  {pnl:+.4f}</title></rect>'
+        )
+
+    # x labels every 4 hours
+    x_labels = ""
+    for h in range(0, 24, 4):
+        x = PAD_L + h * (plot_w / 24) + bar_w / 2
+        x_labels += (
+            f'<text x="{x:.1f}" y="{H - 4}" text-anchor="middle" '
+            f'fill="#8b949e" font-size="10" font-family="Segoe UI,sans-serif">'
+            f'{h:02d}h</text>'
+        )
+
+    # y labels
+    y_labels = ""
+    for tick in [-1, 0, 1]:
+        val = tick * max_abs
+        y   = mid_y - tick * (plot_h / 2)
+        y_labels += (
+            f'<text x="{PAD_L - 4}" y="{y + 4:.1f}" text-anchor="end" '
+            f'fill="#8b949e" font-size="10" font-family="Segoe UI,sans-serif">'
+            f'${val:+.2f}</text>'
+        )
+
+    return (
+        f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
+        f'style="width:100%;height:{H}px;">'
+        f'{y_labels}{zero_line}{rects}{x_labels}'
+        f'</svg>'
+    )
+
+
+# ── Dashboard renderer ──────────────────────────────────────────────────────────
 
 def _render_dashboard() -> str:
     try:
         s = _state
 
-        # ── Computed values ───────────────────────────────────────────────────
-        balance   = float(s.get("balance", 0.0))
-        day_start = float(s.get("day_start_balance", 0.0))
-        daily_pnl = balance - day_start
-        pnl_pct   = (daily_pnl / day_start * 100) if day_start else 0.0
-        loss_pct  = max(-pnl_pct, 0.0)
-        loss_bar  = min(loss_pct / 15.0 * 100, 100)   # 15 % daily loss limit
+        # ── Core values ────────────────────────────────────────────────────────
+        balance      = float(s.get("balance",           0.0))
+        day_start    = float(s.get("day_start_balance", 0.0))
+        sess_start   = float(s.get("session_start_balance", day_start or balance))
+        daily_pnl    = balance - day_start
+        daily_pnl_pct= (daily_pnl / day_start * 100) if day_start else 0.0
+        weekly_pnl   = float(s.get("weekly_pnl",       0.0))
+        weekly_pnl_pct = float(s.get("weekly_pnl_pct", 0.0))
+        monthly_pnl  = float(s.get("monthly_pnl",      0.0))
+        monthly_pnl_pct = float(s.get("monthly_pnl_pct", 0.0))
+        session_pnl  = balance - sess_start
 
-        wins      = int(s.get("wins", s.get("wins_today", 0)))
-        losses    = int(s.get("losses", s.get("losses_today", 0)))
-        trades    = int(s.get("total_trades", wins + losses))
-        win_rate  = round(wins / trades * 100, 1) if trades else 0.0
-        streak    = int(s.get("streak", 0))
-        streak_lbl = str(s.get("streak_label", "—"))
-
-        pf        = float(s.get("profit_factor", 0.0))
-
-        # ── v10: multiplier / fee / open-contract values ────────────────────────
-        avg_mult     = float(s.get("avg_multiplier", 0.0))
-        mult_count   = int(s.get("multiplier_count", 0))
-        best_trade   = float(s.get("best_trade", 0.0))
-        worst_trade  = float(s.get("worst_trade", 0.0))
+        wins         = int(s.get("wins",           0))
+        losses       = int(s.get("losses",         0))
+        trades       = int(s.get("total_trades",   wins + losses))
+        win_rate     = round(wins / trades * 100, 1) if trades else 0.0
+        streak       = int(s.get("streak",         0))
+        streak_lbl   = str(s.get("streak_label",   "—"))
+        pf           = float(s.get("profit_factor", 0.0))
+        gp           = float(s.get("gross_profit",  0.0))
+        gl           = float(s.get("gross_loss",    0.0))
+        avg_pnl      = round((gp - gl) / trades, 4) if trades else 0.0
+        best_trade   = float(s.get("best_trade",    0.0))
+        worst_trade  = float(s.get("worst_trade",   0.0))
+        avg_mult     = float(s.get("avg_multiplier",0.0))
+        mult_count   = int(s.get("multiplier_count",0))
         funding_fees = float(s.get("funding_fees_total", 0.0))
+
         open_list    = s.get("open_contracts", [])
         open_count   = int(s.get("open_contracts_count", len(open_list)))
-        open_syms    = ", ".join(open_list) if open_list else "—"
 
-        weekly_pnl      = float(s.get("weekly_pnl", 0.0))
-        weekly_pnl_pct  = float(s.get("weekly_pnl_pct", 0.0))
-        monthly_pnl     = float(s.get("monthly_pnl", 0.0))
-        monthly_pnl_pct = float(s.get("monthly_pnl_pct", 0.0))
-        weekly_color    = "green" if weekly_pnl >= 0 else "red"
-        monthly_color   = "green" if monthly_pnl >= 0 else "red"
+        loss_pct     = max(-daily_pnl_pct, 0.0)
+        loss_bar     = min(loss_pct / 15.0 * 100, 100)
+        danger_class = "danger" if loss_bar > 70 else ""
 
-        dot_class     = ("dot-green"  if s.get("running") and not s.get("paused_for_loss_limit")
-                         else "dot-yellow" if s.get("paused_for_loss_limit")
-                         else "dot-red")
+        up     = int(s.get("uptime_seconds", 0))
+        uptime = f"{up // 3600}h {(up % 3600) // 60}m"
+        now_utc= datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+        session      = str(s.get("session", "Starting"))
+        queue_count  = int(s.get("tradeable_count", 0))
+        current_sym  = str(s.get("current_symbol", "—"))
+
+        dot_class    = ("dot-green"  if s.get("running") and not s.get("paused_for_loss_limit")
+                        else "dot-yellow" if s.get("paused_for_loss_limit")
+                        else "dot-red")
+
+        def c(v, pos_cls="green", neg_cls="red", zero_cls="yellow"):
+            return pos_cls if v > 0 else (neg_cls if v < 0 else zero_cls)
+
         balance_color = "green" if balance >= day_start else "red"
-        pnl_color     = "green" if daily_pnl >= 0 else "red"
-        pnl_sign      = "+" if daily_pnl >= 0 else "−"
         wr_color      = "green" if win_rate >= 55 else "yellow" if win_rate >= 45 else "red"
         pf_color      = "green" if pf >= 1.2 else "yellow" if pf >= 1.0 else "red"
         streak_color  = "green" if streak > 0 else "red" if streak < 0 else "yellow"
         streak_disp   = f"+{streak}" if streak > 0 else str(streak) if streak < 0 else "0"
-        danger_class  = "danger" if loss_bar > 70 else ""
 
-        up     = int(s.get("uptime_seconds", 0))
-        uptime = f"{up // 3600}h {(up % 3600) // 60}m"
-        now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
-
-        # ── Paused banner ─────────────────────────────────────────────────────
         paused_banner = ""
         if s.get("paused_for_loss_limit"):
             paused_banner = (
@@ -619,90 +628,105 @@ def _render_dashboard() -> str:
                 '</div>'
             )
 
-        # ── Last signal ───────────────────────────────────────────────────────
-        # record_signal() now always stores a dict; handle legacy string too.
-        raw_sig = s.get("last_signal", "No signal yet")
-        if isinstance(raw_sig, dict):
-            sig_sym   = str(raw_sig.get("symbol", "—"))
-            sig_dir   = str(raw_sig.get("direction", "—"))
-            sig_strat = str(raw_sig.get("strategy", "—"))
-            sig_score = raw_sig.get("score", None)
-            dir_badge = (
-                '<span class="badge badge-long">LONG</span>'   if sig_dir == "LONG" else
-                '<span class="badge badge-short">SHORT</span>' if sig_dir == "SHORT" else
-                sig_dir
-            )
-            last_sig_sym    = f"{sig_sym} {dir_badge}"
-            last_sig_detail = sig_strat + (f" · score {float(sig_score):.3f}" if sig_score is not None else "")
-        else:
-            last_sig_sym    = str(raw_sig)
-            last_sig_detail = ""
+        # ── SVG charts ────────────────────────────────────────────────────────
+        svg_balance = _build_svg_chart(
+            s.get("balance_history", []),
+            start_balance=day_start or None,
+        )
+        svg_hourly  = _build_hourly_svg(s.get("hourly_pnl", {}))
 
-        # ── Recent trades table ───────────────────────────────────────────────
+        # ── Recent trades table (last 100) ────────────────────────────────────
         recent_trades_list = s.get("recent_trades", [])
         trade_rows = ""
-        bad_rows = 0
-        for t in recent_trades_list[:20]:   # already newest-first from insert(0,...)
+        bad_rows   = 0
+        for t in recent_trades_list[:100]:
             try:
-                pnl_raw = t.get("pnl") if t.get("pnl") is not None else t.get("profit", t.get("return", 0))
-                pnl   = float(pnl_raw or 0)
-                won   = bool(t.get("won", pnl > 0))
-                close_reason = str(t.get("close_reason", "normal"))
-                if close_reason == "timeout":
+                pnl_raw = t.get("pnl") if t.get("pnl") is not None else t.get("profit", 0)
+                pnl_v   = float(pnl_raw or 0)
+                won_v   = bool(t.get("won", pnl_v > 0))
+                cr      = str(t.get("close_reason", "normal"))
+                if cr == "timeout":
                     badge = '<span class="badge badge-timeout">TIMEOUT</span>'
-                elif won:
+                elif won_v:
                     badge = '<span class="badge badge-win">WIN</span>'
                 else:
                     badge = '<span class="badge badge-loss">LOSS</span>'
-                raw_dir = str(t.get("direction", t.get("contract_type", "")) or "").upper()
+                raw_dir = str(t.get("direction", "") or "").upper()
                 if "LONG" in raw_dir or "CALL" in raw_dir:
                     dir_b = '<span class="badge badge-long">LONG</span>'
                 elif "SHORT" in raw_dir or "PUT" in raw_dir:
                     dir_b = '<span class="badge badge-short">SHORT</span>'
                 else:
                     dir_b = f'<span class="ticker">{raw_dir or "—"}</span>'
-                pnl_c  = "green" if pnl >= 0 else "red"
-                # Timestamp: prefer exit_time/close_time; fall back to "time" field from record_trade
-                ts_raw = t.get("exit_time") or t.get("close_time") or t.get("time")
-                ts_str = _parse_hms(ts_raw) if ts_raw else "—"
-                stake_raw = t.get("stake") if t.get("stake") is not None else t.get("amount", t.get("buy_price", 0))
-                stake = float(stake_raw or 0)
-                bal_raw = t.get("balance_after") if t.get("balance_after") is not None else t.get("balance", 0)
-                bal_a = float(bal_raw or 0)
-                sym   = t.get("symbol", t.get("market", ""))
-                strat = t.get("strategy", "")
-                mult  = t.get("multiplier")
-                mult_str = f"{float(mult):.0f}x" if mult not in (None, "") else "—"
+                pnl_c   = "green" if pnl_v >= 0 else "red"
+                ts_raw  = t.get("time") or t.get("exit_time") or t.get("close_time")
+                ts_str  = _parse_hms(ts_raw) if ts_raw else "—"
+                stake_v = float(t.get("stake", t.get("amount", 0)) or 0)
+                bal_a   = float(t.get("balance_after", t.get("balance", 0)) or 0)
+                sym_v   = str(t.get("symbol", ""))
+                strat_v = str(t.get("strategy", ""))
                 trade_rows += (
                     f"<tr>"
                     f"<td class='ticker'>{ts_str}</td>"
-                    f"<td><b>{sym}</b></td>"
+                    f"<td><b>{sym_v}</b></td>"
                     f"<td>{dir_b}</td>"
-                    f"<td>{mult_str}</td>"
-                    f"<td>${stake:.2f}</td>"
-                    f"<td class='{pnl_c}'>{'+' if pnl >= 0 else ''}{pnl:.4f}</td>"
+                    f"<td>${stake_v:.2f}</td>"
+                    f"<td class='{pnl_c}'>{'+' if pnl_v >= 0 else ''}{pnl_v:.4f}</td>"
                     f"<td>${bal_a:.4f}</td>"
                     f"<td>{badge}</td>"
+                    f"<td class='ticker'>{strat_v}</td>"
                     f"</tr>"
                 )
             except Exception as row_err:
                 bad_rows += 1
-                logger.warning(f"trade row skipped — {row_err} — data={t}")
+                logger.warning(f"trade row skipped — {row_err}")
                 continue
         if not trade_rows:
-            detail = (f" ({len(recent_trades_list)} in state, {bad_rows} parse errors)"
+            detail = (f" ({len(recent_trades_list)} in state, {bad_rows} errors)"
                       if recent_trades_list else "")
             trade_rows = (f"<tr><td colspan='8' style='text-align:center;color:#484f58'>"
                           f"No trades yet{detail}</td></tr>")
 
+        # ── Open contracts ────────────────────────────────────────────────────
+        open_rows = ""
+        now_ts    = time.time()
+        for c_entry in open_list:
+            if isinstance(c_entry, dict):
+                sym_oc   = str(c_entry.get("symbol",    "—"))
+                dir_oc   = str(c_entry.get("direction", "—")).upper()
+                stk_oc   = float(c_entry.get("stake",   0))
+                ot       = float(c_entry.get("opened_at", now_ts))
+                secs_open= int(now_ts - ot)
+            else:
+                sym_oc   = str(c_entry)
+                dir_oc   = "—"
+                stk_oc   = 0.0
+                secs_open= 0
+            if "LONG" in dir_oc or "CALL" in dir_oc:
+                dir_badge = '<span class="badge badge-long">LONG</span>'
+            elif "SHORT" in dir_oc or "PUT" in dir_oc:
+                dir_badge = '<span class="badge badge-short">SHORT</span>'
+            else:
+                dir_badge = f'<span class="ticker">{dir_oc}</span>'
+            open_rows += (
+                f"<tr>"
+                f"<td><b>{sym_oc}</b></td>"
+                f"<td>{dir_badge}</td>"
+                f"<td>${stk_oc:.2f}</td>"
+                f"<td class='ticker'>{secs_open}s</td>"
+                f"</tr>"
+            )
+        if not open_rows:
+            open_rows = ("<tr><td colspan='4' style='text-align:center;color:#484f58'>"
+                         "No open contracts</td></tr>")
+
         # ── Suspended symbols ─────────────────────────────────────────────────
-        now_ts = time.time()
-        active_susp = [
-            x for x in s.get("suspended_symbols", [])
-            if float(x.get("suspended_until", 0)) > now_ts
-        ]
         susp_rows = ""
-        for x in sorted(active_susp, key=lambda z: float(z.get("suspended_until", 0))):
+        for x in sorted(
+            [z for z in s.get("suspended_symbols", [])
+             if float(z.get("suspended_until", 0)) > now_ts],
+            key=lambda z: float(z.get("suspended_until", 0)),
+        ):
             mins_left = max(0, int((float(x["suspended_until"]) - now_ts) / 60))
             susp_rows += (
                 f"<tr>"
@@ -714,38 +738,64 @@ def _render_dashboard() -> str:
             susp_rows = ("<tr><td colspan='2' style='text-align:center;color:#484f58'>"
                          "None suspended</td></tr>")
 
-        # ── Symbol leaderboard ────────────────────────────────────────────────
+        # ── Symbol leaderboard (all symbols, full stats) ──────────────────────
         sym_rows = ""
-        for sym in s.get("best_symbols", [])[:10]:
+        for sym in s.get("best_symbols", []):
             try:
-                pnl   = float(sym.get("pnl", 0))
-                pnl_c = "green" if pnl >= 0 else "red"
-                wr    = float(sym.get("win_rate", 0))
-                wr_c  = "green" if wr >= 55 else "yellow" if wr >= 45 else "red"
+                pnl_s   = float(sym.get("pnl", 0))
+                pnl_sc  = "green" if pnl_s >= 0 else "red"
+                wr_s    = float(sym.get("win_rate", 0))
+                wr_sc   = "green" if wr_s >= 55 else "yellow" if wr_s >= 45 else "red"
+                best_s  = float(sym.get("best_trade",  0))
+                worst_s = float(sym.get("worst_trade", 0))
                 sym_rows += (
                     f"<tr>"
                     f"<td><b>{sym.get('symbol','')}</b></td>"
                     f"<td>{sym.get('trades', 0)}</td>"
-                    f"<td class='{wr_c}'>{wr}%</td>"
-                    f"<td class='{pnl_c}'>${pnl:+.4f}</td>"
-                    f"<td class='ticker'>{float(sym.get('score', 0)):.3f}</td>"
+                    f"<td class='{wr_sc}'>{wr_s:.1f}%</td>"
+                    f"<td class='{pnl_sc}'>${pnl_s:+.4f}</td>"
+                    f"<td class='green'>${best_s:+.4f}</td>"
+                    f"<td class='red'>${worst_s:+.4f}</td>"
                     f"</tr>"
                 )
             except Exception:
                 continue
         if not sym_rows:
-            sym_rows = ("<tr><td colspan='5' style='text-align:center;color:#484f58'>"
+            sym_rows = ("<tr><td colspan='6' style='text-align:center;color:#484f58'>"
                         "No data yet</td></tr>")
 
-        # ── SVG balance curve — fed from balance_history ───────────────────────
-        # balance_history is the purpose-built list populated by record_trade().
-        # Falls back to empty list (shows "No trades yet" placeholder).
-        svg_chart = _build_svg_chart(s.get("balance_history", []), start_balance=day_start or None)
+        # ── Signal log (last 20) ──────────────────────────────────────────────
+        sig_rows = ""
+        for sig in s.get("signal_log", []):
+            try:
+                sig_dir  = str(sig.get("direction", "—")).upper()
+                if "LONG" in sig_dir or "CALL" in sig_dir:
+                    sig_db = '<span class="badge badge-long">LONG</span>'
+                elif "SHORT" in sig_dir or "PUT" in sig_dir:
+                    sig_db = '<span class="badge badge-short">SHORT</span>'
+                else:
+                    sig_db = f'<span class="ticker">{sig_dir}</span>'
+                score_v  = float(sig.get("score", 0))
+                score_c  = "green" if score_v >= 0.7 else "yellow" if score_v >= 0.5 else "red"
+                sig_rows += (
+                    f"<tr>"
+                    f"<td class='ticker'>{sig.get('ts','—')}</td>"
+                    f"<td><b>{sig.get('symbol','—')}</b></td>"
+                    f"<td>{sig_db}</td>"
+                    f"<td class='{score_c}'>{score_v:.3f}</td>"
+                    f"<td class='ticker'>{sig.get('strategy','—')}</td>"
+                    f"</tr>"
+                )
+            except Exception:
+                continue
+        if not sig_rows:
+            sig_rows = ("<tr><td colspan='5' style='text-align:center;color:#484f58'>"
+                        "No signals yet</td></tr>")
 
-        # ── Session / queue info ──────────────────────────────────────────────
-        session      = str(s.get("session", "Starting"))
-        queue_count  = int(s.get("tradeable_count", 0))
-        current_sym  = str(s.get("current_symbol", "—"))
+        # ── Helper: coloured PnL cell ─────────────────────────────────────────
+        def pnl_span(v, fmt="+.4f"):
+            cls = "green" if v >= 0 else "red"
+            return f'<span class="{cls}">${v:{fmt}}</span>'
 
         # ── Render ────────────────────────────────────────────────────────────
         return f"""<!DOCTYPE html>
@@ -757,68 +807,61 @@ def _render_dashboard() -> str:
 <title>Deriv Bot Dashboard</title>
 <style>
   :root {{
-    --bg: #0d1117; --card: #161b22; --border: #30363d;
-    --text: #c9d1d9; --muted: #8b949e; --accent: #58a6ff;
-    --green: #3fb950; --red: #f85149; --yellow: #d29922;
+    --bg:#0d1117;--card:#161b22;--border:#30363d;
+    --text:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;
+    --green:#3fb950;--red:#f85149;--yellow:#d29922;
   }}
-  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
-  body {{ background: var(--bg); color: var(--text);
-          font-family: 'Segoe UI', sans-serif; font-size: 14px; padding: 16px; }}
-  h1 {{ font-size: 20px; font-weight: 700; color: var(--accent); margin-bottom: 4px; }}
-  .subtitle {{ color: var(--muted); font-size: 12px; margin-bottom: 16px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-           gap: 12px; margin-bottom: 16px; }}
-  .card {{ background: var(--card); border: 1px solid var(--border);
-           border-radius: 8px; padding: 14px; }}
-  .card-title {{ font-size: 11px; text-transform: uppercase; letter-spacing: .05em;
-                 color: var(--muted); margin-bottom: 6px; }}
-  .card-value {{ font-size: 22px; font-weight: 700; }}
-  .card-sub {{ font-size: 11px; color: var(--muted); margin-top: 4px; }}
-  .green  {{ color: var(--green); }}
-  .red    {{ color: var(--red); }}
-  .yellow {{ color: var(--yellow); }}
-  .section-title {{ font-size: 13px; font-weight: 600; color: var(--muted);
-                    text-transform: uppercase; letter-spacing: .05em; margin: 20px 0 8px; }}
-  table {{ width: 100%; border-collapse: collapse; background: var(--card);
-           border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }}
-  th {{ background: #21262d; color: var(--muted); font-size: 11px;
-        text-transform: uppercase; padding: 8px 10px; text-align: left; }}
-  td {{ padding: 7px 10px; border-top: 1px solid var(--border); font-size: 12px; }}
-  .ticker {{ color: var(--muted); font-size: 11px; }}
-  .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px;
-            font-size: 10px; font-weight: 700; }}
-  .badge-win     {{ background: #1a3a1f; color: var(--green); }}
-  .badge-loss    {{ background: #3a1a1a; color: var(--red); }}
-  .badge-timeout {{ background: #3a2a1a; color: var(--yellow); }}
-  .badge-long  {{ background: #1a2a3a; color: var(--accent); }}
-  .badge-short {{ background: #2a1a3a; color: #c084fc; }}
-  .status-row {{ display: flex; align-items: center; gap: 8px; margin-bottom: 16px; }}
-  .dot {{ width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0; }}
-  .dot-green  {{ background: var(--green); box-shadow: 0 0 6px var(--green); }}
-  .dot-yellow {{ background: var(--yellow); box-shadow: 0 0 6px var(--yellow); }}
-  .dot-red    {{ background: var(--red);    box-shadow: 0 0 6px var(--red); }}
-  .status-text {{ font-size: 12px; color: var(--muted); }}
-  .paused-banner {{ background: #3a1a1a; border: 1px solid var(--red);
-                    border-radius: 6px; padding: 10px 14px; margin-bottom: 14px;
-                    color: var(--red); font-size: 13px; }}
-  .bar-wrap {{ background: #21262d; border-radius: 4px; height: 8px;
-               margin-top: 6px; overflow: hidden; }}
-  .bar-fill {{ height: 100%; border-radius: 4px; background: var(--green); transition: width .4s; }}
-  .bar-fill.danger {{ background: var(--red); }}
-  .chart-card {{ background: var(--card); border: 1px solid var(--border);
-                 border-radius: 8px; padding: 16px; margin-bottom: 16px; }}
-  .chart-title {{ font-size: 12px; font-weight: 600; color: var(--muted);
-                  text-transform: uppercase; letter-spacing: .05em; margin-bottom: 12px; }}
-  .susp-table td {{ font-size: 12px; }}
-  .susp-badge {{ display: inline-block; padding: 2px 7px; border-radius: 4px;
-                 font-size: 10px; font-weight: 700; background: #3a2a1a; color: var(--yellow); }}
-  .footer {{ margin-top: 20px; font-size: 11px; color: var(--muted); text-align: right; }}
+  *{{box-sizing:border-box;margin:0;padding:0;}}
+  body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;font-size:14px;padding:16px;}}
+  h1{{font-size:20px;font-weight:700;color:var(--accent);margin-bottom:4px;}}
+  .subtitle{{color:var(--muted);font-size:12px;margin-bottom:16px;}}
+  .grid{{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:12px;margin-bottom:16px;}}
+  .grid-wide{{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-bottom:16px;}}
+  .pnl-row{{display:flex;flex-wrap:wrap;gap:12px;margin-bottom:16px;}}
+  .pnl-card{{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;flex:1;min-width:160px;}}
+  .card{{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:14px;}}
+  .card-title{{font-size:11px;text-transform:uppercase;letter-spacing:.05em;color:var(--muted);margin-bottom:6px;}}
+  .card-value{{font-size:20px;font-weight:700;}}
+  .card-sub{{font-size:11px;color:var(--muted);margin-top:4px;}}
+  .green{{color:var(--green);}} .red{{color:var(--red);}} .yellow{{color:var(--yellow);}}
+  .section-title{{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;
+                  letter-spacing:.05em;margin:20px 0 8px;}}
+  table{{width:100%;border-collapse:collapse;background:var(--card);
+         border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:16px;}}
+  th{{background:#21262d;color:var(--muted);font-size:11px;text-transform:uppercase;
+      padding:8px 10px;text-align:left;}}
+  td{{padding:7px 10px;border-top:1px solid var(--border);font-size:12px;}}
+  .ticker{{color:var(--muted);font-size:11px;}}
+  .badge{{display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;}}
+  .badge-win     {{background:#1a3a1f;color:var(--green);}}
+  .badge-loss    {{background:#3a1a1a;color:var(--red);}}
+  .badge-timeout {{background:#3a2a1a;color:var(--yellow);}}
+  .badge-long    {{background:#1a2a3a;color:var(--accent);}}
+  .badge-short   {{background:#2a1a3a;color:#c084fc;}}
+  .status-row{{display:flex;align-items:center;gap:8px;margin-bottom:16px;}}
+  .dot{{width:10px;height:10px;border-radius:50%;flex-shrink:0;}}
+  .dot-green {{background:var(--green);box-shadow:0 0 6px var(--green);}}
+  .dot-yellow{{background:var(--yellow);box-shadow:0 0 6px var(--yellow);}}
+  .dot-red   {{background:var(--red);   box-shadow:0 0 6px var(--red);}}
+  .status-text{{font-size:12px;color:var(--muted);}}
+  .paused-banner{{background:#3a1a1a;border:1px solid var(--red);border-radius:6px;
+                  padding:10px 14px;margin-bottom:14px;color:var(--red);font-size:13px;}}
+  .bar-wrap{{background:#21262d;border-radius:4px;height:8px;margin-top:6px;overflow:hidden;}}
+  .bar-fill{{height:100%;border-radius:4px;background:var(--green);transition:width .4s;}}
+  .bar-fill.danger{{background:var(--red);}}
+  .chart-card{{background:var(--card);border:1px solid var(--border);border-radius:8px;
+               padding:16px;margin-bottom:16px;}}
+  .chart-title{{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;
+                letter-spacing:.05em;margin-bottom:10px;}}
+  .susp-badge{{display:inline-block;padding:2px 7px;border-radius:4px;
+               font-size:10px;font-weight:700;background:#3a2a1a;color:var(--yellow);}}
+  .footer{{margin-top:20px;font-size:11px;color:var(--muted);text-align:right;}}
 </style>
 </head>
 <body>
 
 <h1>⚡ Deriv Bot</h1>
-<p class="subtitle">Auto-refreshes every 10 s &nbsp;|&nbsp; UTC {now_utc}</p>
+<p class="subtitle">Auto-refreshes every 10 s &nbsp;|&nbsp; UTC {now_utc} &nbsp;|&nbsp; Queue: {queue_count}</p>
 
 {paused_banner}
 
@@ -826,33 +869,87 @@ def _render_dashboard() -> str:
   <div class="dot {dot_class}"></div>
   <span class="status-text">
     <b>{session}</b> &nbsp;·&nbsp; Up {uptime}
-    &nbsp;·&nbsp; Scanning: <b>{current_sym}</b>
-    &nbsp;·&nbsp; Queue: <b>{queue_count}</b>
+    &nbsp;·&nbsp; Open: <b>{open_count}</b>
+    &nbsp;·&nbsp; Balance: <b class="{balance_color}">${balance:.4f}</b>
   </span>
 </div>
 
-<!-- ── Stat Cards ── -->
+<!-- ── 1. Header card ── -->
 <div class="grid">
-
   <div class="card">
     <div class="card-title">Balance</div>
     <div class="card-value {balance_color}">${balance:.4f}</div>
     <div class="card-sub">Day start: ${day_start:.4f}</div>
   </div>
-
   <div class="card">
+    <div class="card-title">Uptime</div>
+    <div class="card-value">{uptime}</div>
+    <div class="card-sub">Queue: {queue_count} &nbsp;·&nbsp; {session}</div>
+  </div>
+</div>
+
+<!-- ── 2. P&L Summary row ── -->
+<div class="section-title">P&amp;L Summary</div>
+<div class="pnl-row">
+
+  <div class="pnl-card">
     <div class="card-title">Daily P&amp;L</div>
-    <div class="card-value {pnl_color}">{pnl_sign}${abs(daily_pnl):.4f}</div>
-    <div class="card-sub">{pnl_pct:+.2f}% &nbsp;·&nbsp; 15% loss limit</div>
+    <div class="card-value {c(daily_pnl)}">${daily_pnl:+.4f}</div>
+    <div class="card-sub">{daily_pnl_pct:+.2f}%</div>
     <div class="bar-wrap">
       <div class="bar-fill {danger_class}" style="width:{loss_bar:.0f}%"></div>
     </div>
+    <div class="card-sub" style="margin-top:4px">
+      Loss limit 15% &nbsp;·&nbsp; used {loss_pct:.1f}%
+    </div>
   </div>
+
+  <div class="pnl-card">
+    <div class="card-title">Weekly P&amp;L</div>
+    <div class="card-value {c(weekly_pnl)}">${weekly_pnl:+.4f}</div>
+    <div class="card-sub">{weekly_pnl_pct:+.2f}%</div>
+  </div>
+
+  <div class="pnl-card">
+    <div class="card-title">Monthly P&amp;L</div>
+    <div class="card-value {c(monthly_pnl)}">${monthly_pnl:+.4f}</div>
+    <div class="card-sub">{monthly_pnl_pct:+.2f}%</div>
+  </div>
+
+  <div class="pnl-card">
+    <div class="card-title">Session P&amp;L</div>
+    <div class="card-value {c(session_pnl)}">${session_pnl:+.4f}</div>
+    <div class="card-sub">Since bot start (${sess_start:.4f})</div>
+  </div>
+
+</div>
+
+<!-- ── 3. Performance Stats ── -->
+<div class="section-title">Performance Stats</div>
+<div class="grid">
 
   <div class="card">
     <div class="card-title">Win Rate</div>
     <div class="card-value {wr_color}">{win_rate:.1f}%</div>
     <div class="card-sub">{wins}W / {losses}L / {trades} trades today</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Profit Factor</div>
+    <div class="card-value {pf_color}">{pf:.3f}</div>
+    <div class="card-sub">GP ${gp:.4f} / GL ${gl:.4f}</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Avg P&amp;L / Trade</div>
+    <div class="card-value {c(avg_pnl)}">${avg_pnl:+.4f}</div>
+    <div class="card-sub">Across {trades} trade(s)</div>
+  </div>
+
+  <div class="card">
+    <div class="card-title">Best Trade</div>
+    <div class="card-value green">${best_trade:+.4f}</div>
+    <div class="card-sub red">Worst: ${worst_trade:+.4f}</div>
   </div>
 
   <div class="card">
@@ -862,88 +959,89 @@ def _render_dashboard() -> str:
   </div>
 
   <div class="card">
-    <div class="card-title">Session</div>
-    <div class="card-value" style="font-size:15px;line-height:1.4">{session}</div>
-    <div class="card-sub">Queue: {queue_count} symbols</div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Last Signal</div>
-    <div class="card-value" style="font-size:13px;line-height:1.4">{last_sig_sym}</div>
-    <div class="card-sub">{last_sig_detail}</div>
-  </div>
-
-  <div class="card">
     <div class="card-title">Avg Multiplier</div>
     <div class="card-value">{avg_mult:.1f}x</div>
     <div class="card-sub">Across {mult_count} trades</div>
   </div>
 
   <div class="card">
-    <div class="card-title">Best / Worst Trade</div>
-    <div class="card-value green">${best_trade:+.4f}</div>
-    <div class="card-sub red">${worst_trade:+.4f}</div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Funding Fees Paid</div>
+    <div class="card-title">Funding Fees</div>
     <div class="card-value red">${funding_fees:.4f}</div>
-    <div class="card-sub">Sum of negative PnL on timeout closes</div>
+    <div class="card-sub">Neg PnL on timeout closes</div>
   </div>
 
   <div class="card">
     <div class="card-title">Open Contracts</div>
     <div class="card-value">{open_count}</div>
-    <div class="card-sub">{open_syms}</div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Weekly / Monthly P&amp;L</div>
-    <div class="card-value {weekly_color}">${weekly_pnl:+.4f}</div>
-    <div class="card-sub {monthly_color}">{weekly_pnl_pct:+.2f}% week &nbsp;·&nbsp; ${monthly_pnl:+.4f} ({monthly_pnl_pct:+.2f}%) month</div>
+    <div class="card-sub">Active right now</div>
   </div>
 
 </div>
 
-<!-- ── Balance Curve (inline SVG, no external deps) ── -->
+<!-- ── 4. Balance Curve ── -->
 <div class="chart-card">
   <div class="chart-title">Balance Curve — Today
     <span style="float:right;font-weight:400;color:#3fb950">● win</span>
     <span style="float:right;font-weight:400;color:#f85149;margin-right:10px">● loss</span>
     <span style="float:right;font-weight:400;color:#d29922;margin-right:10px">● timeout</span>
   </div>
-  {svg_chart}
+  {svg_balance}
 </div>
 
-<!-- ── Recent Trades ── -->
-<div class="section-title">Recent Trades</div>
+<!-- ── 5. Hourly P&L ── -->
+<div class="chart-card">
+  <div class="chart-title">Hourly P&amp;L — Today (UTC)</div>
+  {svg_hourly}
+</div>
+
+<!-- ── 6. Recent Trades (last 100) ── -->
+<div class="section-title">Recent Trades (last 100)</div>
 <table>
   <thead>
     <tr>
-      <th>Time (UTC)</th><th>Symbol</th><th>Dir</th><th>Mult</th>
-      <th>Stake</th><th>P&amp;L</th><th>Balance After</th><th>Result</th>
+      <th>Time (UTC)</th><th>Symbol</th><th>Direction</th>
+      <th>Stake</th><th>P&amp;L</th><th>Balance After</th>
+      <th>Result</th><th>Strategy</th>
     </tr>
   </thead>
   <tbody>{trade_rows}</tbody>
 </table>
 
-<!-- ── Suspended Symbols ── -->
+<!-- ── 7. Open Contracts ── -->
+<div class="section-title">Open Contracts ({open_count})</div>
+<table>
+  <thead>
+    <tr><th>Symbol</th><th>Direction</th><th>Stake</th><th>Open For</th></tr>
+  </thead>
+  <tbody>{open_rows}</tbody>
+</table>
+
+<!-- ── 8. Suspended Symbols ── -->
 <div class="section-title">Suspended Symbols</div>
-<table class="susp-table">
+<table>
   <thead><tr><th>Symbol</th><th>Status</th></tr></thead>
   <tbody>{susp_rows}</tbody>
 </table>
 
-<!-- ── Symbol Leaderboard ── -->
+<!-- ── 9. Symbol Leaderboard ── -->
 <div class="section-title">Symbol Leaderboard</div>
 <table>
   <thead>
-    <tr><th>Symbol</th><th>Trades</th><th>Win %</th><th>P&amp;L</th><th>Score</th></tr>
+    <tr><th>Symbol</th><th>Trades</th><th>Win %</th><th>Total P&amp;L</th><th>Best</th><th>Worst</th></tr>
   </thead>
   <tbody>{sym_rows}</tbody>
 </table>
 
-<div class="footer">Deriv Bot &middot; Render deployment</div>
+<!-- ── 10. Signal Log (last 20) ── -->
+<div class="section-title">Signal Log (last 20)</div>
+<table>
+  <thead>
+    <tr><th>Time</th><th>Symbol</th><th>Direction</th><th>Score</th><th>Strategy</th></tr>
+  </thead>
+  <tbody>{sig_rows}</tbody>
+</table>
+
+<div class="footer">Deriv Bot &middot; Render deployment &middot; {now_utc} UTC</div>
 </body>
 </html>"""
 
@@ -961,7 +1059,7 @@ def _render_dashboard() -> str:
         )
 
 
-# ── Flask routes ───────────────────────────────────────────────────────────────
+# ── Flask routes ────────────────────────────────────────────────────────────────
 
 @app.route("/")
 def index():
@@ -978,51 +1076,53 @@ def stats_route():
     s         = _state
     balance   = float(s.get("balance", 0.0))
     day_start = float(s.get("day_start_balance", 0.0))
-    wins      = int(s.get("wins", s.get("wins_today", 0)))
-    losses    = int(s.get("losses", s.get("losses_today", 0)))
+    wins      = int(s.get("wins", 0))
+    losses    = int(s.get("losses", 0))
     trades    = int(s.get("total_trades", wins + losses))
     return jsonify({
-        "balance":           round(balance, 4),
-        "day_start_balance": round(day_start, 4),
-        "daily_pnl":         round(balance - day_start, 4),
-        "daily_pnl_pct":     round((balance - day_start) / day_start * 100, 2) if day_start else 0,
-        "weekly_pnl":        round(float(s.get("weekly_pnl", 0.0)), 4),
-        "weekly_pnl_pct":    round(float(s.get("weekly_pnl_pct", 0.0)), 2),
-        "monthly_pnl":       round(float(s.get("monthly_pnl", 0.0)), 4),
-        "monthly_pnl_pct":   round(float(s.get("monthly_pnl_pct", 0.0)), 2),
-        "trades":            trades,
-        "wins":              wins,
-        "losses":            losses,
-        "win_rate":          round(wins / max(trades, 1) * 100, 1),
-        "profit_factor":     round(float(s.get("profit_factor", 0)), 3),
-        "avg_rr":            round(float(s.get("avg_rr", 0)), 2),
-        "avg_multiplier":    round(float(s.get("avg_multiplier", 0.0)), 2),
-        "multiplier_count":  int(s.get("multiplier_count", 0)),
-        "best_trade":        round(float(s.get("best_trade", 0.0)), 4),
-        "worst_trade":       round(float(s.get("worst_trade", 0.0)), 4),
+        "balance":            round(balance, 4),
+        "day_start_balance":  round(day_start, 4),
+        "daily_pnl":          round(balance - day_start, 4),
+        "daily_pnl_pct":      round((balance - day_start) / day_start * 100, 2) if day_start else 0,
+        "weekly_pnl":         round(float(s.get("weekly_pnl", 0.0)), 4),
+        "weekly_pnl_pct":     round(float(s.get("weekly_pnl_pct", 0.0)), 2),
+        "monthly_pnl":        round(float(s.get("monthly_pnl", 0.0)), 4),
+        "monthly_pnl_pct":    round(float(s.get("monthly_pnl_pct", 0.0)), 2),
+        "trades":             trades,
+        "wins":               wins,
+        "losses":             losses,
+        "win_rate":           round(wins / max(trades, 1) * 100, 1),
+        "profit_factor":      round(float(s.get("profit_factor", 0)), 3),
+        "avg_rr":             round(float(s.get("avg_rr", 0)), 2),
+        "avg_multiplier":     round(float(s.get("avg_multiplier", 0.0)), 2),
+        "multiplier_count":   int(s.get("multiplier_count", 0)),
+        "best_trade":         round(float(s.get("best_trade", 0.0)), 4),
+        "worst_trade":        round(float(s.get("worst_trade", 0.0)), 4),
         "funding_fees_total": round(float(s.get("funding_fees_total", 0.0)), 4),
-        "open_contracts":    s.get("open_contracts", []),
+        "open_contracts":     s.get("open_contracts", []),
         "open_contracts_count": int(s.get("open_contracts_count", 0)),
-        "streak":            int(s.get("streak", 0)),
-        "streak_label":      str(s.get("streak_label", "—")),
-        "paused":            bool(s.get("paused_for_loss_limit", False)),
-        "current_symbol":    str(s.get("current_symbol", "—")),
-        "session":           str(s.get("session", "—")),
-        "uptime_seconds":    int(s.get("uptime_seconds", 0)),
-        "last_signal":       s.get("last_signal", "—"),
-        "tradeable_count":   int(s.get("tradeable_count", 0)),
-        "active_trades":     int(s.get("active_trades", 0)),
-        "suspended_symbols": s.get("suspended_symbols", []),
-        "hourly_pnl":        s.get("hourly_pnl", {}),
-        "daily_pnl_history": s.get("daily_pnl_history", []),
-        "all_trades_count":  len(s.get("all_trades", [])),
+        "streak":             int(s.get("streak", 0)),
+        "streak_label":       str(s.get("streak_label", "—")),
+        "paused":             bool(s.get("paused_for_loss_limit", False)),
+        "current_symbol":     str(s.get("current_symbol", "—")),
+        "session":            str(s.get("session", "—")),
+        "uptime_seconds":     int(s.get("uptime_seconds", 0)),
+        "last_signal":        s.get("last_signal", "—"),
+        "tradeable_count":    int(s.get("tradeable_count", 0)),
+        "active_trades":      int(s.get("active_trades", 0)),
+        "suspended_symbols":  s.get("suspended_symbols", []),
+        "hourly_pnl":         s.get("hourly_pnl", {}),
+        "daily_pnl_history":  s.get("daily_pnl_history", []),
+        "all_trades_count":   len(s.get("all_trades", [])),
+        "signal_log":         s.get("signal_log", []),
+        "failure_log":        s.get("failure_log", []),
     })
 
 
 @app.route("/trades")
 def trades_route():
     return jsonify({
-        "recent_trades": _state.get("recent_trades", []),
+        "recent_trades":    _state.get("recent_trades", []),
         "all_trades_count": len(_state.get("all_trades", [])),
     })
 
@@ -1032,18 +1132,21 @@ def symbols_route():
     return jsonify({"symbols": _state.get("best_symbols", [])})
 
 
+@app.route("/signals")
+def signals_route():
+    return jsonify({
+        "signal_log":  _state.get("signal_log",  []),
+        "failure_log": _state.get("failure_log", []),
+    })
+
+
 @app.route("/debug")
 def debug_route():
-    """Dump raw _state so we can see exactly what keys the bot engine writes."""
-    import json
     safe = {}
     for k, v in _state.items():
         if isinstance(v, list):
-            safe[k] = {
-                "type": "list",
-                "length": len(v),
-                "first_item": v[0] if v else None,
-            }
+            safe[k] = {"type": "list", "length": len(v),
+                       "first_item": v[0] if v else None}
         elif isinstance(v, dict):
             safe[k] = {"type": "dict", "keys": list(v.keys())}
         else:
@@ -1051,7 +1154,7 @@ def debug_route():
     return jsonify(safe), 200
 
 
-# ── Keep-alive ping loop ───────────────────────────────────────────────────────
+# ── Keep-alive ping loop ────────────────────────────────────────────────────────
 
 def _ping_loop():
     time.sleep(20)
