@@ -36,16 +36,8 @@ def is_suspended(symbol: str) -> bool:
 
 
 def can_trade_now(symbol: str) -> bool:
-    if is_suspended(symbol):
-        logger.info(f"BLOCKED: {symbol} is suspended")
-        return False
     if symbol in _active_symbols:
         logger.info(f"BLOCKED: {symbol} already has an active contract")
-        return False
-    gap = time.time() - _last_traded.get(symbol, 0)
-    if gap < config.SYMBOL_MIN_GAP_MINS * 60:
-        remaining = (config.SYMBOL_MIN_GAP_MINS * 60 - gap) / 60
-        logger.info(f"BLOCKED: {symbol} gap cooldown {remaining:.1f}min remaining")
         return False
     return True
 
@@ -65,16 +57,10 @@ def record_result(symbol: str, won: bool) -> None:
     _session_trades[symbol] = _session_trades.get(symbol, 0) + 1
     if won:
         _session_wins[symbol] = _session_wins.get(symbol, 0) + 1
-        suspend(symbol, config.SYMBOL_WIN_SUSPEND_MINS)
+        # suspension disabled
     else:
         _session_losses[symbol] = _session_losses.get(symbol, 0) + 1
-        if _session_losses[symbol] >= 4:
-            suspend(symbol, 480)
-            logger.warning(
-                f"SESSION BAN: {symbol} 4 losses this session — suspended 480min"
-            )
-        else:
-            suspend(symbol, config.SYMBOL_LOSS_SUSPEND_MINS)
+        # suspension disabled
 
 
 def get_symbol_score(symbol: str) -> float:
@@ -100,25 +86,10 @@ def update_active(symbol_list: List[str]) -> None:
 
 
 def get_queue() -> List[str]:
-    available     = []
-    suspended_log = []
-
-    for symbol in _all_active:
-        if not is_market_open(symbol):
-            continue  # always True — included for future-proofing
-        if not can_trade_now(symbol):
-            if is_suspended(symbol):
-                until = _suspension_until.get(symbol, 0)
-                remaining = max(0, (until - time.time()) / 60)
-                suspended_log.append(f"{symbol}({remaining:.1f}min)")
-            continue
-        available.append(symbol)
-
-    active_log = list(_active_symbols)
+    available = [s for s in _all_active if s not in _active_symbols]
     logger.info(
         f"QUEUE: {len(available)} available | "
-        f"Suspended: [{', '.join(suspended_log)}] | "
-        f"Active: [{', '.join(active_log)}]"
+        f"Active: [{', '.join(_active_symbols)}]"
     )
     return available
 
