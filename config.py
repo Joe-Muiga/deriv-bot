@@ -130,7 +130,7 @@ MTF_BARS          = 50
 LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
-MIN_SIGNAL_SCORE      = 0.40
+MIN_SIGNAL_SCORE      = 0.3
 EMA_FAST              = 8
 EMA_SLOW              = 21
 EMA_TREND             = 50
@@ -156,8 +156,8 @@ SYMBOL_SESSION_BAN_LOSSES = 4
 
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
-INIT_BATCH_SIZE        = 8
-INIT_BATCH_DELAY       = 0.3
+INIT_BATCH_SIZE        = 10
+INIT_BATCH_DELAY       = 0.1
 PRIORITY_SYMBOLS = [
     "R_75","R_100","1HZ75V","1HZ100V",
     "1HZ250V","BOOM500","CRASH500",
@@ -165,7 +165,7 @@ PRIORITY_SYMBOLS = [
 ]
 
 # ── RATE LIMITING ────────────────────────────────────────────
-BUY_REQUEST_DELAY_SECS = 0.5
+BUY_REQUEST_DELAY_SECS = 0.3
 MAX_BUY_PER_SECOND     = 3
 
 # ── RENDER ──────────────────────────────────────────────────
@@ -175,93 +175,32 @@ REDEPLOY_EVERY_N_CYCLES = 8
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
-MAX_CONCURRENT     = MAX_CONCURRENT_TRADES   # alias
+MAX_CONCURRENT     = 20              # alias
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
-MIN_MODULES_FOR_SIGNAL     = 2
-MIN_INDICATOR_VOTES        = 3
+MIN_MODULES_FOR_SIGNAL     = 1
+MIN_INDICATOR_VOTES        = 2
 OB_EXPIRY_BARS             = 100
 NEWS_BLOCK_MINUTES         = 60
 FOREX_LTF_GRANULARITY      = 900
 OTHER_LTF_GRANULARITY      = 60
-MIN_SIGNAL_PROBABILITY     = 0.35
-MIN_STRENGTH_REPEAT_SYMBOL = 3
+MIN_SIGNAL_PROBABILITY     = 0.3
+MIN_STRENGTH_REPEAT_SYMBOL = 1
 
 # ── DERIV WEBSOCKET ───────────────────────────────────────────
 DERIV_WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
-# ── INTERMEDIATE NAME BRIDGES (for aliases below) ─────────────
-VOLATILITY_SYMBOLS          = VOLATILITY_STANDARD + VOLATILITY_1S
-BOOM_CRASH_SYMBOLS          = BOOM_CRASH
-RANGE_BREAK_SYMBOLS         = RANGE_BREAK
-STEP_INDEX_SYMBOLS          = STEP
-WIN_STREAK_THRESHOLDS       = PLS_WIN_THRESHOLDS
-WIN_STREAK_MULTIPLIERS      = PLS_WIN_MULTIPLIERS
-WIN_STREAK_EXTRA_SLOTS      = PLS_WIN_EXTRA_SLOTS
-SYMBOL_MIN_GAP_MINUTES      = SYMBOL_MIN_GAP_MINS
-SYMBOL_WIN_SUSPENSION_MINUTES  = SYMBOL_WIN_SUSPEND_MINS
-SYMBOL_LOSS_SUSPENSION_MINUTES = SYMBOL_LOSS_SUSPEND_MINS
+# ── SIGNAL GENERATION GATES (additional) ─────────────────────
+MIN_SCORE                  = 0.3
+MIN_CONFLUENCE             = 1
+MIN_MODULE_STRENGTH        = 1
+MIN_MODULE_STRENGTH_NORMAL = 1
+MIN_CONFIDENCE_NORMAL      = 3
+MIN_CONFIDENCE_FOR_PARTIAL = 3
 
-# Trade duration aliases
-TRADE_DURATION              = 5
-TRADE_DURATION_UNIT         = "m"
-
-# Contract timeout
-CONTRACT_MAX_AGE_SECONDS              = TRADE_DURATION * 60 + 45
-CONTRACT_FORCE_CLOSE_AFTER_SECONDS    = TRADE_DURATION * 60 + 90
-CONTRACT_CHECK_SECS                   = TRADE_DURATION * 60 + 45
-CONTRACT_TIMEOUT_SECS                 = TRADE_DURATION * 60 + 90
-MAX_TRADE_OPEN_MINS                   = 30
-CHECK_TRADE_MINS                      = 20
-
-# Multiplier defaults
-MULTIPLIER_MAP              = {}
-STOP_LOSS_MAP               = {}
-DEFAULT_MULTIPLIER          = 100
-DEFAULT_STOP_LOSS_PCT       = 50.0
-TAKE_PROFIT_RATIO           = 2.0
-
-# Symbol aliases
-ALL_TRADE_SYMBOLS           = ALL_SYMBOLS
-VOLATILITY_STANDARD         = [s for s in VOLATILITY_SYMBOLS if "1HZ" not in s]
-VOLATILITY_1S               = [s for s in VOLATILITY_SYMBOLS if "1HZ" in s]
-BOOM_CRASH                  = BOOM_CRASH_SYMBOLS
-RANGE_BREAK                 = RANGE_BREAK_SYMBOLS
-STEP                        = STEP_INDEX_SYMBOLS
-JUMP                        = []
-DRIFT                       = []
-
-# PLS aliases
-PLS_WIN_THRESHOLDS          = WIN_STREAK_THRESHOLDS
-PLS_WIN_MULTIPLIERS         = WIN_STREAK_MULTIPLIERS
-PLS_WIN_EXTRA_SLOTS         = WIN_STREAK_EXTRA_SLOTS
-
-# Scanning
-INIT_BATCH_SIZE             = 8
-INIT_BATCH_DELAY            = 0.3
-PRIORITY_SYMBOLS            = ["R_75","R_100","1HZ75V","1HZ100V","BOOM500","CRASH500"]
-BUY_REQUEST_DELAY_SECS      = 0.5
-MAX_BUY_PER_SECOND          = 3
-DAILY_LOSS_PAUSE_MINS       = 30
-SYMBOL_SESSION_BAN_LOSSES   = 3
-SYMBOL_MIN_GAP_MINS         = SYMBOL_MIN_GAP_MINUTES
-SYMBOL_WIN_SUSPEND_MINS     = SYMBOL_WIN_SUSPENSION_MINUTES
-SYMBOL_LOSS_SUSPEND_MINS    = SYMBOL_LOSS_SUSPENSION_MINUTES
-MTF_GRANULARITY             = 900
-MTF_BARS                    = 50
-PHASE1_BARS_HTF             = 50
-PHASE1_BARS_MTF             = 30
-PHASE1_BARS_LTF             = 20
-PHASE2_BARS_HTF             = 100
-PHASE2_BARS_MTF             = 50
-PHASE2_BARS_LTF             = 30
-MIN_SCORE                   = MIN_SIGNAL_PROBABILITY
-MIN_CONFLUENCE              = MIN_MODULES_FOR_SIGNAL
-ATR_PERIOD                  = 14
-EMA_FAST                    = 8
-EMA_SLOW                    = 21
-EMA_TREND                   = 50
-MOMENTUM_LOOKBACK           = 10
-BREAKOUT_ATR_MULT           = 1.5
-SPIKE_ATR_MULTIPLIER        = 3.0
+# ── SESSION TIMING — disabled for 24/7 synthetics ────────────
+DEAD_ZONE_START_UTC  = 0
+DEAD_ZONE_END_UTC    = 0
+BOOM500_PRIME_START  = 0
+BOOM500_PRIME_END    = 24
