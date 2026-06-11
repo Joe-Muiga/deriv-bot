@@ -187,3 +187,6 @@ FOREX_LTF_GRANULARITY      = 900
 OTHER_LTF_GRANULARITY      = 60
 MIN_SIGNAL_PROBABILITY     = 0.35
 MIN_STRENGTH_REPEAT_SYMBOL = 3
+
+# ── DERIV WEBSOCKET ───────────────────────────────────────────
+DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3"
