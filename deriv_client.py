@@ -619,8 +619,9 @@ class DerivClient:
             take_profit: float  = None,
             **kwargs) -> dict:
         """
-        Buy a Rise/Fall (CALL/PUT) contract via the standard two-step
-        proposal -> buy flow.
+        Buy a Rise/Fall (CALL/PUT) contract via a direct buy — no
+        proposal step. This eliminates the proposal-stage RateLimit
+        errors caused by simultaneous proposal requests.
 
         Direction mapping (VERIFIED CORRECT - DO NOT SWAP):
           direction="LONG"  -> contract_type="CALL"  -> wins if price RISES
@@ -634,61 +635,37 @@ class DerivClient:
         """
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
-            if elapsed < PROPOSAL_DELAY:
-                await asyncio.sleep(PROPOSAL_DELAY - elapsed)
+            if elapsed < 3.0:
+                await asyncio.sleep(3.0 - elapsed)
             self._last_buy_time = time.time()
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
             logger.info(f"PLACING {contract_type} | {symbol} | ${stake:.4f}")
 
             try:
-                # Step 1: proposal
-                proposal_req = {
-                    "proposal":      1,
-                    "amount":        stake,
-                    "basis":         "stake",
-                    "contract_type": contract_type,
-                    "currency":      "USD",
-                    "duration":      5,
-                    "duration_unit": "m",
-                    "symbol":        symbol,
+                buy_req = {
+                    "buy": 1,
+                    "price": stake,
+                    "parameters": {
+                        "amount":         stake,
+                        "basis":          "stake",
+                        "contract_type":  contract_type,
+                        "currency":       "USD",
+                        "duration":       5,
+                        "duration_unit":  "m",
+                        "symbol":         symbol,
+                    }
                 }
-                proposal = None
-                for attempt in range(3):
-                    proposal = await self._send(proposal_req)
-                    if not proposal:
-                        break
-                    if proposal.get("error", {}).get("code") == "RateLimit":
-                        wait = 3 * (attempt + 1)
-                        logger.warning(
-                            f"RATE LIMIT — waiting {wait}s (attempt {attempt+1}/3)")
-                        await asyncio.sleep(wait)
-                        continue
-                    break
-                logger.info(f"PROPOSAL RESPONSE: {proposal}")
-                if not proposal or proposal.get("error"):
-                    err = (
-                        proposal.get("error", {}).get("message", "unknown")
-                        if proposal else "no response"
-                    )
-                    logger.error(f"PROPOSAL FAILED: {symbol} -- {err}")
+                resp = await self._send(buy_req)
+                if not resp:
+                    logger.error(f"BUY FAILED: {symbol} — no response")
+                    return None
+                if resp.get("error"):
+                    logger.error(f"BUY FAILED: {symbol} — {resp['error']['message']}")
                     return None
 
-                proposal_id = proposal["proposal"]["id"]
-
-                # Step 2: buy
-                buy_req  = {"buy": proposal_id, "price": stake}
-                buy_resp = await self._send(buy_req)
-                logger.info(f"RAW BUY RESPONSE: {buy_resp}")
-                if not buy_resp or buy_resp.get("error"):
-                    err = (
-                        buy_resp.get("error", {}).get("message", "unknown")
-                        if buy_resp else "no response"
-                    )
-                    logger.error(f"BUY FAILED: {symbol} -- {err}")
-                    return None
-
-                contract_id = str(buy_resp["buy"]["contract_id"])
+                result = resp.get("buy", {})
+                contract_id = str(result.get("contract_id", ""))
                 logger.info(
                     f"CONTRACT OPENED: {contract_id} | {symbol} | "
                     f"{contract_type} | ${stake:.4f}"
@@ -696,7 +673,7 @@ class DerivClient:
 
                 self._contract_symbol_map[contract_id] = symbol
 
-                return buy_resp["buy"]
+                return result
 
             except Exception as e:
                 logger.error(f"BUY EXCEPTION: {symbol} -- {e}")
