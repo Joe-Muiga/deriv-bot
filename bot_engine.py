@@ -630,11 +630,9 @@ class BotEngine:
                 f"Streak:{'+' if streak >= 0 else ''}{streak}")
 
             if top and not self._confirmed_paused:
-                await asyncio.gather(
-                    *[self._execute(r.symbol, r.sig, r.price, r.smc_ctx)
-                      for r in top],
-                    return_exceptions=True,
-                )
+                for sig_r in top:
+                    await self._execute(sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
+                    await asyncio.sleep(2)  # 2 second gap between each trade
 
             orphan_task = asyncio.create_task(self._monitor_orphans())
             self._settle_tasks.add(orphan_task)
