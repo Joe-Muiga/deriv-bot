@@ -715,12 +715,12 @@ class DerivClient:
             take_profit: float  = None,
             **kwargs) -> dict:
         """
-        Buy a Multiplier (MULTUP/MULTDOWN) contract, optionally with a
-        stop loss and/or take profit attached via limit_order.
+        Buy a Rise/Fall (CALL/PUT) contract via the standard two-step
+        proposal -> buy flow.
 
-        Direction mapping (VERIFIED CORRECT — DO NOT SWAP):
-          direction="LONG"  → contract_type="MULTUP"   → wins if price RISES
-          direction="SHORT" → contract_type="MULTDOWN" → wins if price FALLS
+        Direction mapping (VERIFIED CORRECT - DO NOT SWAP):
+          direction="LONG"  -> contract_type="CALL"  -> wins if price RISES
+          direction="SHORT" -> contract_type="PUT"   -> wins if price FALLS
 
         Returns dict (buy response) on success, None on every failure path.
         Never raises.  Never increments trade counters on None return.
@@ -729,250 +729,67 @@ class DerivClient:
         proposal_open_contract stream so settlement is never missed.
         """
         async with self._buy_semaphore:
-            # ── Enforce minimum gap between buy requests ──────────────────────
-            now     = time.time()
-            elapsed = now - self._last_buy_time
-            delay   = getattr(config, "BUY_REQUEST_DELAY_SECS", 0.6)
-            if elapsed < delay:
-                wait = delay - elapsed
-                logger.debug(f"Rate throttle: waiting {wait:.3f}s before buy ({symbol})")
-                await asyncio.sleep(wait)
+            elapsed = time.time() - self._last_buy_time
+            if elapsed < 0.3:
+                await asyncio.sleep(0.3 - elapsed)
             self._last_buy_time = time.time()
 
-            # ── 0. Balance-aware stake cap ────────────────────────────────────
-            current_balance = self._balance
-            if stake > current_balance:
-                stake = max(round(current_balance * 0.5, 2), 0.35)
-                logger.warning(
-                    f"STAKE CAPPED to ${stake} (balance=${current_balance})"
-                )
-            if stake < 0.35:
-                logger.warning(
-                    f"BALANCE TOO LOW: ${current_balance} — skipping"
-                )
-                return None
-
-            # ── 1. Direction → contract_type ──────────────────────────────────
-            if direction == "LONG":
-                contract_type = "MULTUP"
-            elif direction == "SHORT":
-                contract_type = "MULTDOWN"
-            else:
-                logger.error(
-                    f"buy_contract: unknown direction '{direction}' on {symbol} — aborting"
-                )
-                return None
-
-            # Always-visible mapping log
-            logger.info(f"Signal: {direction} → Contract: {contract_type}")
-
-            # ── BUY ATTEMPT log (Fix 1) ───────────────────────────────────────
-            logger.info(
-                f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake} mult={multiplier}"
-            )
-
-            # ── 2. Build proposal/buy parameters ───────────────────────────────
-            params = {
-                "contract_type": contract_type,
-                "symbol":        symbol,
-                "amount":        stake,
-                "multiplier":    multiplier,
-                "basis":         "stake",
-                "currency":      config.DERIV_CURRENCY,
-            }
-
-            if stop_loss is not None and stop_loss > 0:
-                params["limit_order"] = {
-                    "stop_loss": {
-                        "order_type":   "stop_loss",
-                        "order_amount": stop_loss,
-                    }
-                }
-            if take_profit is not None and take_profit > 0:
-                params.setdefault("limit_order", {})
-                params["limit_order"]["take_profit"] = {
-                    "order_type":   "take_profit",
-                    "order_amount": take_profit,
-                }
-
-            # ── 3. Pre-placement log (mandatory, zero silent placements) ──────
-            logger.info(
-                f"PLACING {contract_type} | "
-                f"{symbol} | ${stake:.4f} | "
-                f"{multiplier}x | "
-                f"SL=${stop_loss} TP=${take_profit}"
-            )
-
-            # ── 4. Market-open gate (Boom/Crash only) ─────────────────────────
-            if _is_boom_crash(symbol):
-                try:
-                    market_open = await self._check_market_open(symbol)
-                except Exception:
-                    market_open = False
-
-                if not market_open:
-                    logger.warning(f"FAILED: {symbol} — market_closed")
-                    return None
-
-            # ── 5. Build payload ───────────────────────────────────────────────
-            payload = {
-                "buy":   "1",
-                "price": stake,
-                "parameters": params,
-            }
-
-            async def _do_buy() -> Optional[dict]:
-                """Inner send + parse, shared by first attempt and retry."""
-                resp     = await self._send(payload, timeout=15)
-                logger.info(f"RAW BUY RESPONSE: {resp}")
-                logger.info(f"PROPOSAL RESPONSE: {resp}")   # Fix 1
-                buy_info = resp.get("buy", {})
-                cid      = str(buy_info.get("contract_id", ""))
-
-                # Check for API-level rejection inside a 200 response
-                error = resp.get("error")
-                if error:
-                    code = error.get("code",    "unknown")
-                    msg  = error.get("message", "unknown error")
-                    if code == "RateLimit":
-                        return "RATE_LIMIT"        # sentinel — caller handles retry
-                    logger.error(f"FAILED: {symbol} — {code}: {msg}")
-                    logger.error(
-                        f"DERIV REJECTED: {symbol} — {msg} (code={code})"
-                    )
-                    logger.error(f"BUY FAILED: {symbol} error={error}")   # Fix 1
-                    return None
-
-                if not cid:
-                    logger.error(
-                        f"FAILED: {symbol} — proposal_rejected (no contract_id in response)"
-                    )
-                    logger.error(f"BUY FAILED: {symbol} error=no_contract_id in response")   # Fix 1
-                    return None
-
-                return resp
+            contract_type = "CALL" if direction == "LONG" else "PUT"
+            logger.info(f"PLACING {contract_type} | {symbol} | ${stake:.4f}")
 
             try:
-                # ── 6. First attempt ──────────────────────────────────────────
-                result = await _do_buy()
-
-                # ── 7. RateLimit retry (once, after 2 s) ─────────────────────
-                if result == "RATE_LIMIT":
-                    logger.warning(
-                        f"RATE LIMIT: {symbol} — waiting 2s then retrying"
+                # Step 1: proposal
+                proposal_req = {
+                    "proposal":      1,
+                    "amount":        stake,
+                    "basis":         "stake",
+                    "contract_type": contract_type,
+                    "currency":      "USD",
+                    "duration":      5,
+                    "duration_unit": "m",
+                    "symbol":        symbol,
+                }
+                proposal = await self._send(proposal_req)
+                logger.info(f"PROPOSAL RESPONSE: {proposal}")
+                if not proposal or proposal.get("error"):
+                    err = (
+                        proposal.get("error", {}).get("message", "unknown")
+                        if proposal else "no response"
                     )
-                    await asyncio.sleep(2)
-                    self._last_buy_time = time.time()
-                    try:
-                        result = await _do_buy()
-                        if result == "RATE_LIMIT":
-                            logger.error(
-                                f"RETRY FAILED: {symbol} — still rate limited after retry"
-                            )
-                            return None
-                    except Exception as exc:
-                        logger.error(f"RETRY FAILED: {symbol} — {exc}")
-                        return None
+                    logger.error(f"PROPOSAL FAILED: {symbol} -- {err}")
+                    return None
 
-                if result is None:
-                    # ── Fix 2: Fallback to Rise/Fall (CALL/PUT) ───────────────
-                    _fb_type = "CALL" if direction == "LONG" else "PUT"
-                    logger.warning(f"FALLBACK TO RISE/FALL: {symbol}")
-                    _fb_payload = {
-                        "buy": "1",
-                        "price": stake,
-                        "parameters": {
-                            "contract_type": _fb_type,
-                            "symbol":        symbol,
-                            "amount":        stake,
-                            "basis":         "stake",
-                            "duration":      5,
-                            "duration_unit": "m",
-                            "currency":      config.DERIV_CURRENCY,
-                        },
-                    }
-                    try:
-                        _fb_resp = await self._send(_fb_payload, timeout=15)
-                        logger.info(f"BUY RESPONSE (fallback): {_fb_resp}")
-                        _fb_error = _fb_resp.get("error")
-                        if _fb_error:
-                            logger.error(
-                                f"BUY FAILED: {symbol} error={_fb_error}"
-                            )
-                            return None
-                        _fb_buy_info = _fb_resp.get("buy", {})
-                        _fb_cid = str(_fb_buy_info.get("contract_id", ""))
-                        if not _fb_cid:
-                            logger.error(
-                                f"BUY FAILED: {symbol} error=fallback no_contract_id"
-                            )
-                            return None
-                        self._contract_symbol_map[_fb_cid] = symbol
-                        logger.info(
-                            f"CONFIRM (fallback) | symbol={symbol} | "
-                            f"{_fb_type} | stake=${stake:.2f} | "
-                            f"contract_id={_fb_cid}"
-                        )
-                        asyncio.ensure_future(
-                            self._eagerly_subscribe_contract(_fb_cid)
-                        )
-                        return _fb_buy_info
-                    except TimeoutError:
-                        logger.error(
-                            f"BUY FAILED: {symbol} error=fallback_timeout"
-                        )
-                        return None
-                    except Exception as _fb_exc:
-                        logger.error(
-                            f"BUY FAILED: {symbol} error={_fb_exc}"
-                        )
-                        return None
+                proposal_id = proposal["proposal"]["id"]
 
-                # ── 8. BUY RESPONSE log (Fix 1) ──────────────────────────────
-                logger.info(f"BUY RESPONSE: {result}")
-                resp     = result
-                buy_info = resp.get("buy", {})
-                cid      = str(buy_info.get("contract_id", ""))
+                # Step 2: buy
+                buy_req  = {"buy": proposal_id, "price": stake}
+                buy_resp = await self._send(buy_req)
+                logger.info(f"RAW BUY RESPONSE: {buy_resp}")
+                if not buy_resp or buy_resp.get("error"):
+                    err = (
+                        buy_resp.get("error", {}).get("message", "unknown")
+                        if buy_resp else "no response"
+                    )
+                    logger.error(f"BUY FAILED: {symbol} -- {err}")
+                    return None
 
-                # Track symbol for cleanup log
-                self._contract_symbol_map[cid] = symbol
-
-                # ── Post-placement confirmation log ───────────────────────────
+                contract_id = str(buy_resp["buy"]["contract_id"])
                 logger.info(
-                    f"CONFIRM | symbol={symbol} | direction={direction} → {contract_type} | "
-                    f"stake=${stake:.2f} | multiplier={multiplier}x | "
-                    f"SL=${stop_loss} TP=${take_profit} | contract_id={cid} | "
-                    f"buy_price={buy_info.get('buy_price')} | "
-                    f"balance=${self._balance:.4f}"
+                    f"CONTRACT OPENED: {contract_id} | {symbol} | "
+                    f"{contract_type} | ${stake:.4f}"
                 )
 
-                # ── Immediately subscribe to contract updates ──────────────────
-                # Fire-and-forget; callback registered by subscribe_contract()
-                asyncio.ensure_future(self._eagerly_subscribe_contract(cid))
+                self._contract_symbol_map[contract_id] = symbol
+                asyncio.ensure_future(
+                    self._eagerly_subscribe_contract(contract_id)
+                )
 
-                return buy_info
+                return buy_resp["buy"]
 
-            except TimeoutError:
-                logger.error(f"FAILED: {symbol} — timeout")
-                logger.error(f"BUY FAILED: {symbol} error=timeout")
+            except Exception as e:
+                logger.error(f"BUY EXCEPTION: {symbol} -- {e}")
                 return None
 
-            except RuntimeError as exc:
-                # _send raises RuntimeError(f"{code}: {message}") on API errors
-                err_str = str(exc)
-                if "ContractBuyValidationError" in err_str or "proposal" in err_str.lower():
-                    logger.error(
-                        f"FAILED: {symbol} — proposal_rejected | detail={err_str}"
-                    )
-                else:
-                    logger.error(f"FAILED: {symbol} — {err_str}")
-                logger.error(f"BUY FAILED: {symbol} error={err_str}")
-                return None
-
-            except Exception as exc:
-                logger.error(f"FAILED: {symbol} — {exc}")
-                logger.error(f"BUY FAILED: {symbol} error={exc}")
-                return None
 
     async def _eagerly_subscribe_contract(self, contract_id: str):
         """
