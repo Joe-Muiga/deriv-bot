@@ -586,7 +586,22 @@ class BotEngine:
             )
 
             candidates = [r for r in ranked if r.symbol not in self._active_symbols]
-            top        = candidates[: self.risk.current_concurrent_limit]
+
+            # ── Fix 1: never trade the same symbol twice in one cycle ─────────
+            seen_symbols: Set[str] = set()
+            unique_candidates: List[ScanResult] = []
+            for r in sorted(candidates, key=lambda x: x.score, reverse=True):
+                if r.symbol not in seen_symbols:
+                    unique_candidates.append(r)
+                    seen_symbols.add(r.symbol)
+            candidates = unique_candidates
+
+            # ── Fix 2: rank by score before executing ─────────────────────────
+            candidates = sorted(
+                candidates, key=lambda x: getattr(x.sig, "score", x.score), reverse=True)
+            top = candidates[: self.risk.current_concurrent_limit]
+            logger.info(
+                f"RANKED: {[(r.symbol, getattr(r.sig, 'score', r.score)) for r in top]}")
 
             open_count = len(self._open_contracts)
             streak     = self.risk.current_streak
@@ -799,6 +814,7 @@ class BotEngine:
         pnl        = float(poc.get("profit",     0))
         payout     = float(poc.get("payout",     sell_price))
         bal_after  = self.client.balance
+        won        = pnl > 0
 
         info = self._open_contracts.pop(cid, None)
         self._contract_open_times.pop(cid, None)
@@ -811,7 +827,9 @@ class BotEngine:
         entry_price = info["entry_price"]
         rec         = info["rec"]
         sig         = info["sig"]
-        won         = pnl > 0
+
+        logger.info(
+            f"{'WIN' if won else 'LOSS'}: {symbol} pnl=${pnl:+.4f} sell_price={sell_price}")
 
         self._active_symbols.discard(symbol)
         logger.info(f"RELEASED: {symbol} | Active now: {self._active_symbols}")
@@ -866,7 +884,7 @@ class BotEngine:
                 open_time = info.get("opened_at", now)
                 age       = now - open_time
 
-                if age >= CONTRACT_FORCE_CLOSE_SECS:
+                if age >= 1800:
                     symbol = info["symbol"]
                     stake  = info["stake"]
                     rec    = info["rec"]
@@ -881,7 +899,7 @@ class BotEngine:
                     self._check_confirmed_loss_limit()
                     set_active_trades(len(self._open_contracts))
 
-                    # ── Record orphan as TIMEOUT loss ─────────────────────────
+                    # ── Genuine orphan after 30min — record as loss ───────────
                     record_trade(
                         symbol        = symbol,
                         direction     = info.get("direction", "?"),
@@ -895,12 +913,21 @@ class BotEngine:
                     )
 
                     logger.error(
-                        f"ORPHAN LOSS: {cid} -{stake:.2f} | "
-                        f"age={age:.0f}s > force-close threshold")
+                        f"GENUINE ORPHAN: {cid} recording as loss after 30min "
+                        f"({age:.0f}s)")
                     try:
                         self._push_dashboard()
                     except Exception:
                         pass
+
+                elif age >= CONTRACT_FORCE_CLOSE_SECS:
+                    logger.warning(
+                        f"CONTRACT STALE: {cid} {info['symbol']} "
+                        f"age={age/60:.1f}min — poller will resolve")
+                    try:
+                        await self.client.force_check_contract(cid)
+                    except Exception as exc:
+                        logger.warning(f"force_check_contract({cid}): {exc}")
 
                 elif age >= CONTRACT_MAX_AGE_SECS:
                     try:
@@ -1103,32 +1130,41 @@ class BotEngine:
                         if cid in self._open_contracts:
                             stake  = info["stake"]
                             symbol = info["symbol"]
-                            logger.warning(
-                                f"TIMEOUT: {cid} {symbol} "
-                                f"{age_mins:.1f}min — recording loss")
-                            # ── Record legacy TIMEOUT close ────────────────────
-                            record_trade(
-                                symbol        = symbol,
-                                direction     = info.get("direction", "?"),
-                                stake         = stake,
-                                pnl           = -stake,
-                                balance_after = self.client.balance,
-                                won           = False,
-                                strategy      = "TIMEOUT",
-                                multiplier    = info.get("multiplier", None),
-                                close_reason  = "timeout",
-                            )
-                            self._confirmed_daily_loss += stake
-                            self.risk.register_close(
-                                info["rec"], exit_price=0, pnl=-stake)
-                            self.symbols.record_contract_closed(symbol)
-                            self.symbols.record_result(symbol, won=False)
-                            self._open_contracts.pop(cid, None)
-                            self._active_symbols.discard(symbol)
-                            set_active_trades(len(self._open_contracts))
-                            self._check_confirmed_loss_limit()
-                            # ── Push after legacy TIMEOUT ──────────────────────
-                            self._push_dashboard()
+
+                            if age_secs >= 1800:
+                                logger.error(
+                                    f"GENUINE ORPHAN: {cid} {symbol} "
+                                    f"recording as loss after 30min "
+                                    f"({age_mins:.1f}min)")
+                                # ── Record genuine orphan TIMEOUT close ────────
+                                record_trade(
+                                    symbol        = symbol,
+                                    direction     = info.get("direction", "?"),
+                                    stake         = stake,
+                                    pnl           = -stake,
+                                    balance_after = self.client.balance,
+                                    won           = False,
+                                    strategy      = "TIMEOUT",
+                                    multiplier    = info.get("multiplier", None),
+                                    close_reason  = "timeout",
+                                )
+                                self._confirmed_daily_loss += stake
+                                self.risk.register_close(
+                                    info["rec"], exit_price=0, pnl=-stake)
+                                self.symbols.record_contract_closed(symbol)
+                                self.symbols.record_result(symbol, won=False)
+                                self._open_contracts.pop(cid, None)
+                                self._active_symbols.discard(symbol)
+                                set_active_trades(len(self._open_contracts))
+                                self._check_confirmed_loss_limit()
+                                # ── Push after genuine orphan TIMEOUT ──────────
+                                self._push_dashboard()
+                            else:
+                                logger.warning(
+                                    f"CONTRACT STALE: {cid} {symbol} "
+                                    f"age={age_mins:.1f}min — poller will resolve")
+                                # Do NOT record as loss here — let polling
+                                # get the real result via force_check_contract.
 
             except asyncio.CancelledError:
                 return
