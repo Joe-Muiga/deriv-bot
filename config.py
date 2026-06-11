@@ -29,16 +29,18 @@ VOLATILITY_1S = [
 ]
 
 # Boom & Crash
-BOOM_CRASH = [
-    "BOOM150","BOOM300","BOOM500","BOOM1000",
-    "CRASH150","CRASH300","CRASH500","CRASH1000",
-]
+# NOTE: Removed from trading — Boom/Crash symbols do NOT support
+# CALL/PUT Rise/Fall contracts via the API (OfferingsValidationError).
+# They require different contract types (e.g. multipliers) not used here.
+BOOM_CRASH = []
 
 # Step Index
 STEP = ["stpRNG"]
 
 # Jump Indices
-JUMP = ["JD10","JD25","JD50","JD75","JD100"]
+# NOTE: Removed from trading — Jump indices do NOT support
+# CALL/PUT Rise/Fall contracts via the API (OfferingsValidationError).
+JUMP = []
 
 # Range Break
 RANGE_BREAK = ["RDBULL","RDBEAR"]
@@ -46,12 +48,16 @@ RANGE_BREAK = ["RDBULL","RDBEAR"]
 # Drift Switch
 DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 
-# All symbols combined
-ALL_SYMBOLS = (
-    VOLATILITY_STANDARD + VOLATILITY_1S +
-    BOOM_CRASH + STEP + JUMP +
-    RANGE_BREAK + DRIFT
-)
+# Only these symbols support CALL/PUT Rise/Fall via Deriv API
+RISE_FALL_SYMBOLS = [
+    "R_10","R_25","R_50","R_75","R_100",
+    "1HZ10V","1HZ25V","1HZ50V","1HZ75V",
+    "1HZ100V","1HZ150V","1HZ200V","1HZ250V",
+    "RDBULL","RDBEAR","stpRNG",
+]
+
+# All symbols combined — Rise/Fall compatible only
+ALL_SYMBOLS = RISE_FALL_SYMBOLS
 
 # ── MULTIPLIER SETTINGS ──────────────────────────────────────
 # Higher volatility = higher multiplier potential
@@ -160,8 +166,8 @@ INIT_BATCH_SIZE        = 10
 INIT_BATCH_DELAY       = 0.1
 PRIORITY_SYMBOLS = [
     "R_75","R_100","1HZ75V","1HZ100V",
-    "1HZ250V","BOOM500","CRASH500",
-    "JD50","JD75","1HZ150V"
+    "1HZ250V","1HZ150V","R_50","R_25",
+    "RDBULL","RDBEAR"
 ]
 
 # ── RATE LIMITING ────────────────────────────────────────────
@@ -204,7 +210,6 @@ DEAD_ZONE_START_UTC  = 0
 DEAD_ZONE_END_UTC    = 0
 BOOM500_PRIME_START  = 0
 BOOM500_PRIME_END    = 24
-ALL_TRADE_SYMBOLS = ALL_SYMBOLS
+ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
 TRADE_DURATION = 5
 TRADE_DURATION_UNIT = "m"
-ALL_TRADE_SYMBOLS = ALL_SYMBOLS
