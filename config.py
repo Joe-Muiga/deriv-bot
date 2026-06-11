@@ -12,6 +12,7 @@ DERIV_APP_ID    = os.environ.get("DERIV_APP_ID", "1089")
 # ── SERVER ────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 10000))
 SELF_URL = os.environ.get("SELF_URL", os.environ.get("RENDER_EXTERNAL_URL", ""))
+KEEP_ALIVE_INTERVAL = 600  # seconds between self-ping requests
 
 # ── ALL DERIV SYNTHETIC INDICES ──────────────────────────────
 
