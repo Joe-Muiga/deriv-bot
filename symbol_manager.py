@@ -8,12 +8,13 @@ logger = logging.getLogger(__name__)
 
 # ── State ─────────────────────────────────────────────────────
 _suspension_until: Dict[str, float] = {}
-_last_traded: Dict[str, float]      = {}
-_session_losses: Dict[str, int]     = {}
-_session_wins: Dict[str, int]       = {}
-_session_trades: Dict[str, int]     = {}
-_active_symbols: set                = set()
-_all_active: List[str]              = []
+_last_traded:      Dict[str, float] = {}
+_session_losses:   Dict[str, int]   = {}
+_session_wins:     Dict[str, int]   = {}
+_session_trades:   Dict[str, int]   = {}
+_active_symbols:   set              = set()
+_all_active:       List[str]        = []
+current_session:   str              = "Active"
 
 
 def suspend(symbol: str, minutes: float) -> None:
@@ -67,11 +68,10 @@ def record_result(symbol: str, won: bool) -> None:
         suspend(symbol, config.SYMBOL_WIN_SUSPEND_MINS)
     else:
         _session_losses[symbol] = _session_losses.get(symbol, 0) + 1
-        if _session_losses[symbol] >= config.SYMBOL_SESSION_BAN_LOSSES:
-            suspend(symbol, config.SYMBOL_SESSION_BAN_MINS)
+        if _session_losses[symbol] >= 4:
+            suspend(symbol, 480)
             logger.warning(
-                f"SESSION BAN: {symbol} "
-                f"{config.SYMBOL_SESSION_BAN_LOSSES} losses"
+                f"SESSION BAN: {symbol} 4 losses this session — suspended 480min"
             )
         else:
             suspend(symbol, config.SYMBOL_LOSS_SUSPEND_MINS)
@@ -83,57 +83,42 @@ def get_symbol_score(symbol: str) -> float:
     return wins / trades if trades > 0 else 0.5
 
 
+def is_market_open(symbol: str) -> bool:
+    # Synthetic indices trade 24/7 — always open
+    return True
+
+
 def is_in_session(symbol: str) -> bool:
-    hour = datetime.now(timezone.utc).hour
-    if config.DEAD_ZONE_START_UTC <= hour < config.DEAD_ZONE_END_UTC:
-        if symbol in config.BOOM_CRASH_SYMBOLS + config.JUMP_SYMBOLS:
-            return False
-    if symbol in ["BOOM500", "BOOM300N", "BOOM300"]:
-        return config.BOOM500_START_UTC <= hour < config.BOOM500_END_UTC
-    if symbol in ["CRASH500", "CRASH300N", "CRASH300"]:
-        return config.CRASH500_START_UTC <= hour < config.CRASH500_END_UTC
-    if symbol in ["BOOM1000", "CRASH1000", "BOOM150", "CRASH150"]:
-        return config.BOOM_CRASH_1000_START <= hour < config.BOOM_CRASH_1000_END
-    if symbol in config.JUMP_SYMBOLS:
-        return config.JUMP_START_UTC <= hour < config.JUMP_END_UTC
-    return True  # digits, range break, step, drift always available
+    # Synthetic indices have no sessions or dead zones — always in session
+    return True
 
 
 def update_active(symbol_list: List[str]) -> None:
     global _all_active
-    _all_active = [s for s in symbol_list if s in config.ALL_TRADE_SYMBOLS]
+    _all_active = [s for s in symbol_list if s in config.ALL_SYMBOLS]
     logger.info(f"Active symbol pool: {len(_all_active)} symbols")
 
 
 def get_queue() -> List[str]:
-    available    = []
+    available     = []
     suspended_log = []
-    gap_log      = []
-    session_log  = []
 
     for symbol in _all_active:
-        if is_suspended(symbol):
-            until = _suspension_until.get(symbol, 0)
-            remaining = max(0, (until - time.time()) / 60)
-            suspended_log.append(f"{symbol}({remaining:.1f}min)")
-            continue
-        if symbol in _active_symbols:
-            continue
-        if not is_in_session(symbol):
-            session_log.append(symbol)
-            continue
-        gap = time.time() - _last_traded.get(symbol, 0)
-        if gap < config.SYMBOL_MIN_GAP_MINS * 60:
-            remaining = (config.SYMBOL_MIN_GAP_MINS * 60 - gap) / 60
-            gap_log.append(f"{symbol}({remaining:.1f}min)")
+        if not is_market_open(symbol):
+            continue  # always True — included for future-proofing
+        if not can_trade_now(symbol):
+            if is_suspended(symbol):
+                until = _suspension_until.get(symbol, 0)
+                remaining = max(0, (until - time.time()) / 60)
+                suspended_log.append(f"{symbol}({remaining:.1f}min)")
             continue
         available.append(symbol)
 
+    active_log = list(_active_symbols)
     logger.info(
         f"QUEUE: {len(available)} available | "
         f"Suspended: [{', '.join(suspended_log)}] | "
-        f"Gap: [{', '.join(gap_log)}] | "
-        f"Session-blocked: {len(session_log)}"
+        f"Active: [{', '.join(active_log)}]"
     )
     return available
 
@@ -200,6 +185,9 @@ class SymbolManager:
 
     def get_symbol_score(self, symbol: str) -> float:
         return get_symbol_score(symbol)
+
+    def is_market_open(self, symbol: str) -> bool:
+        return is_market_open(symbol)
 
     def is_in_session(self, symbol: str) -> bool:
         return is_in_session(symbol)
