@@ -602,28 +602,44 @@ class BotEngine:
 
             candidates = [r for r in ranked if r.symbol not in self._active_symbols]
 
-            # ── Fix 1: never trade the same symbol twice in one cycle ─────────
-            seen_symbols: Set[str] = set()
-            unique_candidates: List[ScanResult] = []
-            for r in sorted(candidates, key=lambda x: x.score, reverse=True):
-                if r.symbol not in seen_symbols:
-                    unique_candidates.append(r)
-                    seen_symbols.add(r.symbol)
-            candidates = unique_candidates
-
-            # ── Fix 2: rank by score before executing ─────────────────────────
+            # ── Rank all signals by score descending ──────────────────────────
             candidates = sorted(
-                candidates, key=lambda x: getattr(x.sig, "score", x.score), reverse=True)
-            top = candidates[: self.risk.current_concurrent_limit]
-            logger.info(
-                f"RANKED: {[(r.symbol, getattr(r.sig, 'score', r.score)) for r in top]}")
+                candidates,
+                key=lambda r: r.sig.score,
+                reverse=True
+            )
+
+            # Deduplicate — one signal per symbol
+            seen = set()
+            unique = []
+            for r in candidates:
+                if r.symbol not in seen:
+                    unique.append(r)
+                    seen.add(r.symbol)
+            candidates = unique
+
+            # Log full ranking
+            logger.info(f"RANKED SIGNALS THIS CYCLE:")
+            for i, r in enumerate(candidates[:10]):
+                logger.info(
+                    f"  #{i+1} {r.symbol} {r.sig.direction} "
+                    f"score={r.sig.score:.3f} "
+                    f"strategy={r.sig.strategy}")
+
+            # Execute only top N above threshold
+            top = [r for r in candidates
+                   if r.sig.score >= config.MIN_SIGNAL_SCORE
+                   ][:self.risk.current_concurrent_limit]
+
+            if not top:
+                logger.info("NO QUALIFYING SIGNALS THIS CYCLE")
 
             open_count = len(self._open_contracts)
             streak     = self.risk.current_streak
             logger.info(
                 f"CYCLE {cycle_number} | "
                 f"Queue:{len(queue)} | "
-                f"Signals:{len(ranked)} | "
+                f"Signals:{len(candidates)} | "
                 f"Executing:{len(top)} | "
                 f"Open:{open_count} | "
                 f"Balance:${self.client.balance:.4f} | "
