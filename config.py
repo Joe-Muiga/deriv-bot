@@ -50,9 +50,9 @@ DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 
 # Only these symbols support CALL/PUT Rise/Fall via Deriv API
 RISE_FALL_SYMBOLS = [
-    "R_10","R_25","R_50",
-    "1HZ10V","1HZ25V","1HZ50V",
-    "RDBULL","RDBEAR",
+    "R_10","R_25","R_50","R_75","R_100",
+    "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
+    "RDBULL","RDBEAR","stpRNG",
 ]
 
 # All symbols combined — Rise/Fall compatible only
@@ -135,7 +135,8 @@ MTF_BARS          = 50
 LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
-MIN_SIGNAL_SCORE      = 2.0
+MIN_SIGNAL_SCORE      = 0.72
+MIN_STRATEGY_AGREEMENT = 2
 EMA_FAST              = 8
 EMA_SLOW              = 21
 EMA_TREND             = 50
