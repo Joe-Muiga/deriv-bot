@@ -4,8 +4,8 @@ Momentum-based signal generation for Deriv
 synthetic indices using Multiplier contracts.
 
 Strategy per symbol type:
-  Volatility (R_10–R_100, 1HZ): EMA momentum
-    + breakout detection
+  Volatility (R_10–R_100, 1HZ): RSI + Bollinger
+    mean reversion
   Boom/Crash: drift direction after spike
   Step Index: EMA trend following
   Jump Index: pre-jump momentum window
@@ -124,63 +124,69 @@ class SignalEngine:
         return result
 
     # -----------------------------------------------------------------------
-    # Volatility indices — EMA momentum + breakout
+    # Volatility indices — RSI + Bollinger mean reversion
     # -----------------------------------------------------------------------
 
-    def _evaluate_volatility(self, ltf_bars: List, mtf_bars: List,
-                              symbol: str, stake: float) -> SignalResult:
-        """
-        EMA momentum + breakout detection for Volatility / Step / Jump / Drift.
-
-        1. momentum_score() → (score, direction) from LTF closes/highs/lows
-        2. detect_breakout() → breakout confirmation from ATR on LTF
-        3. detect_trend_strength() → ranging-market penalty
-        4. Combine: breakout agreement → +0.2; weak trend → ×0.7
-        5. Score filter: reject below config.MIN_SIGNAL_SCORE
-        6. SL/TP from STOP_LOSS_MAP and TAKE_PROFIT_RATIO; multiplier from
-           MULTIPLIER_MAP.
-        """
-        logger.info(f"EVALUATING VOLATILITY: {symbol}")
+    def _evaluate_volatility(self, ltf_bars, mtf_bars,
+                             symbol, stake):
+        if len(ltf_bars) < 20:
+            return NONE_RESULT
 
         C = np.array([b.close for b in ltf_bars])
         H = np.array([b.high  for b in ltf_bars])
         L = np.array([b.low   for b in ltf_bars])
 
-        # --- Momentum score from LTF ---
-        score, direction = ind.momentum_score(
-            C, H, L,
-            fast=config.EMA_FAST,
-            slow=config.EMA_SLOW,
-            trend=config.EMA_TREND)
+        # RSI mean reversion
+        rsi = ind.rsi(C, 14)
+        valid_rsi = rsi[~np.isnan(rsi)]
+        if len(valid_rsi) < 2:
+            return NONE_RESULT
+        last_rsi  = valid_rsi[-1]
+        prev_rsi  = valid_rsi[-2]
 
-        # --- Breakout confirmation from LTF ATR ---
-        atr_arr = ind.atr(H, L, C, config.ATR_PERIOD)
-        valid_atr = atr_arr[~np.isnan(atr_arr)]
-        atr = float(valid_atr[-1]) if len(valid_atr) else 0.0
+        # Bollinger bands
+        upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
+        valid_upper = upper[~np.isnan(upper)]
+        valid_lower = lower[~np.isnan(lower)]
+        if len(valid_upper) < 1:
+            return NONE_RESULT
+        last_close  = float(C[-1])
+        last_upper  = float(valid_upper[-1])
+        last_lower  = float(valid_lower[-1])
 
-        breakout = ind.detect_breakout(
-            C, H, L, atr_arr,
-            lookback=config.MOMENTUM_LOOKBACK,
-            mult=config.BREAKOUT_ATR_MULT)
+        direction = None
+        score     = 0.0
+        reasons   = []
 
-        # --- Trend strength filter ---
-        strength_val = ind.detect_trend_strength(C)
+        # LONG: RSI oversold AND price at/below lower BB
+        if last_rsi < 30 and last_close <= last_upper * 1.01:
+            if prev_rsi < last_rsi:  # RSI turning up
+                direction = "LONG"
+                score = 0.80
+                reasons.append(
+                    f"RSI={last_rsi:.1f} oversold+turning")
+        # Even stronger: deep oversold
+        if last_rsi < 20:
+            direction = "LONG"
+            score = 0.90
+            reasons.append(f"RSI={last_rsi:.1f} deep oversold")
 
-        # --- Combine signals ---
-        if breakout != 0 and breakout == direction:
-            score = min(score + 0.2, 1.0)
+        # SHORT: RSI overbought AND price at/above upper BB
+        if last_rsi > 70 and last_close >= last_lower * 0.99:
+            if prev_rsi > last_rsi:  # RSI turning down
+                direction = "SHORT"
+                score = 0.80
+                reasons.append(
+                    f"RSI={last_rsi:.1f} overbought+turning")
+        # Even stronger: deep overbought
+        if last_rsi > 80:
+            direction = "SHORT"
+            score = 0.90
+            reasons.append(f"RSI={last_rsi:.1f} deep overbought")
 
-        if strength_val < 0.3:
-            score *= 0.7  # penalise ranging market
-
-        if score < 0.1:
-            logger.info(
-                f"VOLATILITY REJECTED: {symbol} "
-                f"score={score:.3f} < 0.1"
-            )
+        if not direction:
             return NONE_RESULT
 
-        # --- SL / TP / multiplier ---
         sl_pct = config.STOP_LOSS_MAP.get(
             symbol, config.DEFAULT_STOP_LOSS_PCT)
         sl_amt = round(stake * sl_pct / 100, 2)
@@ -188,24 +194,16 @@ class SignalEngine:
         mult   = config.MULTIPLIER_MAP.get(
             symbol, config.DEFAULT_MULTIPLIER)
 
-        dir_str = "LONG" if direction > 0 else "SHORT"
-
         logger.info(
-            f"VOLATILITY SIGNAL: {symbol} {dir_str} "
-            f"score={score:.3f} "
-            f"mult={mult}x "
-            f"SL=${sl_amt} TP=${tp_amt}"
-        )
-        logger.info(f"SIGNAL EMITTED: {symbol} {dir_str}")
+            f"MEAN_REVERSION: {symbol} {direction} "
+            f"RSI={last_rsi:.1f} score={score:.3f}")
 
         return SignalResult(
-            direction   = dir_str,
-            strength    = 3 if score >= 0.7 else 2,
+            direction   = direction,
+            strength    = 3 if score >= 0.85 else 2,
             score       = score,
-            strategy    = "EMA_MOMENTUM",
-            reason      = (f"EMA momentum | "
-                           f"breakout={breakout} | "
-                           f"trend={strength_val:.2f}"),
+            strategy    = "MEAN_REVERSION",
+            reason      = " | ".join(reasons),
             stop_loss   = sl_amt,
             take_profit = tp_amt,
             multiplier  = mult,
