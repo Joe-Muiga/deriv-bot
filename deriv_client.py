@@ -739,15 +739,18 @@ class DerivClient:
                 await asyncio.sleep(wait)
             self._last_buy_time = time.time()
 
-            # ── 0. Stake cap (Fix 3) ──────────────────────────────────────────
-            _balance = self._balance
-            if stake > _balance * 0.5:
-                _capped = max(_balance * 0.02, 0.35)
+            # ── 0. Balance-aware stake cap ────────────────────────────────────
+            current_balance = self._balance
+            if stake > current_balance:
+                stake = max(round(current_balance * 0.5, 2), 0.35)
                 logger.warning(
-                    f"STAKE CAPPED: ${stake:.4f} → ${_capped:.4f} "
-                    f"(balance=${_balance:.4f})"
+                    f"STAKE CAPPED to ${stake} (balance=${current_balance})"
                 )
-                stake = _capped
+            if stake < 0.35:
+                logger.warning(
+                    f"BALANCE TOO LOW: ${current_balance} — skipping"
+                )
+                return None
 
             # ── 1. Direction → contract_type ──────────────────────────────────
             if direction == "LONG":
@@ -821,6 +824,7 @@ class DerivClient:
             async def _do_buy() -> Optional[dict]:
                 """Inner send + parse, shared by first attempt and retry."""
                 resp     = await self._send(payload, timeout=15)
+                logger.info(f"RAW BUY RESPONSE: {resp}")
                 logger.info(f"PROPOSAL RESPONSE: {resp}")   # Fix 1
                 buy_info = resp.get("buy", {})
                 cid      = str(buy_info.get("contract_id", ""))
@@ -833,6 +837,9 @@ class DerivClient:
                     if code == "RateLimit":
                         return "RATE_LIMIT"        # sentinel — caller handles retry
                     logger.error(f"FAILED: {symbol} — {code}: {msg}")
+                    logger.error(
+                        f"DERIV REJECTED: {symbol} — {msg} (code={code})"
+                    )
                     logger.error(f"BUY FAILED: {symbol} error={error}")   # Fix 1
                     return None
 
