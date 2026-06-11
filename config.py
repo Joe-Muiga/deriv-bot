@@ -189,4 +189,4 @@ MIN_SIGNAL_PROBABILITY     = 0.35
 MIN_STRENGTH_REPEAT_SYMBOL = 3
 
 # ── DERIV WEBSOCKET ───────────────────────────────────────────
-DERIV_WS_URL = "wss://ws.derivws.com/websockets/v3"
+DERIV_WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
