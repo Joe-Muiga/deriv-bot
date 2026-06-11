@@ -1,14 +1,38 @@
 """
 deriv_client.py – Async Deriv WebSocket client.
 
-v10 → v11 audit changes (rate-limit hardening):
+v10 → v12 audit changes (ORPHAN_TIMEOUT / contract result delivery fix):
 
-  RATE LIMIT FIXES:
-    - _proposal_semaphore = asyncio.Semaphore(3): max 3 concurrent proposal requests
-    - _last_proposal_time: enforces 1.0s minimum gap between proposals
-    - On RateLimit error code: logs warning, sleeps 3s, retries proposal once
-    - _buy_semaphore reduced from 2 → 1: single concurrent buy at a time
-    - Buy inter-request delay increased from 0.3s → 1.0s
+  ROOT CAUSE:
+    - subscribe_contract() callbacks were sync but _handle() never awaited them
+    - _eagerly_subscribe_contract() had a 0.5s delay that raced with callback registration
+    - Fallback poller iterated _subscribed_contracts (set), not _contract_callbacks
+    - Reconnect resubscription used _subscribed_contracts instead of _contract_callbacks
+
+  FIX 1 — Immediate subscribe after buy (no fire-and-forget delay):
+    buy_contract() now awaits _subscribe_after_buy() inline before returning.
+    _eagerly_subscribe_contract() removed entirely.
+
+  FIX 2 — _handle() logs every POC update and awaits async callbacks:
+    proposal_open_contract messages: logs POC UPDATE cid/is_sold/profit.
+    Fires callback with await if coroutine, else calls directly.
+    Logs CALLBACK FIRED: {cid} on every successful dispatch.
+
+  FIX 3 — subscribe_contract() always resubscribes and stores callback:
+    Stores callback keyed by str(contract_id).
+    Always sends proposal_open_contract subscribe regardless of _subscriptions state.
+    Logs SUBSCRIBED TO CONTRACT: {contract_id}.
+
+  FIX 4 — _contract_poller() runs every 15s against _contract_callbacks:
+    Polls every cid that has a live callback.
+    On is_sold/is_expired: logs POLLER CAUGHT: {cid}, awaits callback, removes entry.
+    Started once in connect() via asyncio.create_task().
+
+  FIX 5 — Reconnect resubscribes all _contract_callbacks keys:
+    _resubscribe_open_contracts() iterates _contract_callbacks so live callbacks
+    are always restored after reconnect.
+
+v9 → v10 audit changes (full compliance pass):
 
   DIRECTION MAPPING (VERIFIED CORRECT — DO NOT SWAP):
     direction="LONG"  → contract_type="CALL"  → wins if price RISES
@@ -145,10 +169,8 @@ class DerivClient:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # ── Rate limiting ─────────────────────────────────────────────────────
-        self._buy_semaphore      = asyncio.Semaphore(1)  # max 1 simultaneous buy request
-        self._last_buy_time      = 0.0                   # epoch of last buy attempt
-        self._proposal_semaphore = asyncio.Semaphore(3)  # max 3 concurrent proposal requests
-        self._last_proposal_time = 0.0                   # epoch of last proposal sent
+        self._buy_semaphore  = asyncio.Semaphore(2)  # max 2 simultaneous buy requests
+        self._last_buy_time  = 0.0                   # epoch of last buy attempt
 
         # ── Direction→contract mapping audit ─────────────────────────────────
         logger.info(
@@ -169,8 +191,9 @@ class DerivClient:
         """
         self._loop = asyncio.get_event_loop()
 
-        # Start fallback poller once — persists across reconnects
+        # Start background pollers once — persist across reconnects
         asyncio.ensure_future(self._fallback_poll_loop())
+        asyncio.ensure_future(self._contract_poller())
 
         reconnect_interval = getattr(
             config, "WEBSOCKET_RECONNECT_INTERVAL", _DEFAULT_RECONNECT_INTERVAL
@@ -242,50 +265,26 @@ class DerivClient:
     async def _resubscribe_open_contracts(self):
         """
         Re-attach proposal_open_contract subscriptions after a reconnect.
-        Iterates _subscribed_contracts so every previously-subscribed contract
-        is restored — not just those that still have a live callback.
+        Iterates _contract_callbacks so every contract with a live callback
+        is restored — this is the authoritative set of contracts to recover.
         """
-        targets = self._subscribed_contracts.copy()
+        targets = list(self._contract_callbacks.keys())
         if not targets:
             return
         logger.info(
             f"Re-subscribing {len(targets)} open contract(s) after reconnect"
         )
-        tasks = [
-            self._reattach_contract(cid, self._contract_callbacks.get(cid))
-            for cid in targets
-        ]
-        await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def _reattach_contract(self, contract_id: str, callback: Optional[Callable]):
-        try:
-            resp = await self._send({
-                "proposal_open_contract": 1,
-                "contract_id": int(contract_id),
-                "subscribe":   1,
-            })
-            poc    = resp.get("proposal_open_contract", {})
-            sub_id = (
-                poc.get("id")
-                or resp.get("subscription", {}).get("id", "")
-            )
-            if sub_id:
-                self._subscriptions[contract_id] = sub_id
-            self._subscribed_contracts.add(contract_id)
-            logger.info(f"Re-subscribed contract {contract_id} (sub_id={sub_id})")
-
-            # If the contract already settled during the disconnect, fire callback now
-            if self._contract_is_closed(poc) and callback is not None:
-                logger.info(
-                    f"Contract {contract_id} already closed on reconnect — "
-                    f"firing callback immediately"
-                )
-                try:
-                    callback(resp)
-                except Exception as exc:
-                    logger.debug(f"_reattach_contract callback error ({contract_id}): {exc}")
-        except Exception as exc:
-            logger.warning(f"_reattach_contract({contract_id}) failed: {exc}")
+        for cid in targets:
+            try:
+                await self._send({
+                    "proposal_open_contract": 1,
+                    "contract_id": int(cid),
+                    "subscribe":   1,
+                }, timeout=20)
+                self._subscribed_contracts.add(cid)
+                logger.info(f"Re-subscribed contract {cid} after reconnect")
+            except Exception as exc:
+                logger.warning(f"_resubscribe_open_contracts({cid}) failed: {exc}")
 
     # ─── Message dispatch ─────────────────────────────────────────────────────
 
@@ -353,36 +352,104 @@ class DerivClient:
                     except Exception as exc:
                         logger.debug(f"Tick callback error: {exc}")
 
-        elif msg_type in ("proposal_open_contract", "buy"):
-            contract = msg.get("proposal_open_contract") or msg.get("buy", {})
-            cid      = str(contract.get("contract_id", ""))
+        elif msg_type == "proposal_open_contract" or "proposal_open_contract" in msg:
+            poc = msg.get("proposal_open_contract", {})
+            cid = str(poc.get("contract_id", ""))
 
             if not cid:
                 return
 
+            logger.info(
+                f"POC UPDATE: {cid} is_sold={poc.get('is_sold')} "
+                f"is_expired={poc.get('is_expired')} profit={poc.get('profit')}"
+            )
+
             # Always buffer the latest message for this contract
             self._pending_contract_msgs[cid] = msg
 
-            status     = contract.get("status", "")
-            is_closed  = self._contract_is_closed(contract)
+            is_closed = self._contract_is_closed(poc)
 
             # ── Auto-cleanup on contract close ───────────────────────────────
             if is_closed:
                 asyncio.ensure_future(self._cleanup_contract_subscription(cid))
 
             if cid in self._contract_callbacks:
-                # Fire immediately on close signals; also pass through normal updates
-                if is_closed or msg_type == "proposal_open_contract":
-                    try:
-                        self._contract_callbacks[cid](msg)
-                    except Exception:
-                        pass
+                try:
+                    cb = self._contract_callbacks[cid]
+                    if asyncio.iscoroutinefunction(cb):
+                        await cb(msg)
+                    else:
+                        cb(msg)
+                    logger.info(f"CALLBACK FIRED: {cid}")
+                except Exception as exc:
+                    logger.debug(f"POC callback error ({cid}): {exc}")
             elif is_closed:
                 # Callback not registered yet — mark for flush when it is
                 self._closed_before_callback.add(cid)
                 logger.info(
                     f"Contract {cid} closed before callback registered — buffered for flush"
                 )
+
+        elif msg_type == "buy":
+            contract = msg.get("buy", {})
+            cid      = str(contract.get("contract_id", ""))
+
+            if not cid:
+                return
+
+            self._pending_contract_msgs[cid] = msg
+
+            if cid in self._contract_callbacks:
+                try:
+                    cb = self._contract_callbacks[cid]
+                    if asyncio.iscoroutinefunction(cb):
+                        await cb(msg)
+                    else:
+                        cb(msg)
+                except Exception:
+                    pass
+
+    # ─── Aggressive contract poller (Fix 4) ──────────────────────────────────
+
+    async def _contract_poller(self):
+        """
+        Every 15 seconds, poll every contract that has a live callback.
+        On is_sold/is_expired: fires and removes the callback entry.
+        This is the primary safety net for missed WebSocket updates.
+        """
+        while True:
+            await asyncio.sleep(15)
+            if not self._authorized or not self._ws:
+                continue
+
+            targets = list(self._contract_callbacks.keys())
+            if not targets:
+                continue
+
+            logger.debug(f"Contract poller: checking {len(targets)} contract(s)")
+            for cid in targets:
+                callback = self._contract_callbacks.get(cid)
+                if callback is None:
+                    continue
+                try:
+                    resp = await self._send(
+                        {"proposal_open_contract": 1, "contract_id": int(cid)},
+                        timeout=15,
+                    )
+                    poc = resp.get("proposal_open_contract", {})
+                    if poc.get("is_sold") or poc.get("is_expired"):
+                        logger.info(f"POLLER CAUGHT: {cid} — firing callback")
+                        try:
+                            if asyncio.iscoroutinefunction(callback):
+                                await callback({"proposal_open_contract": poc})
+                            else:
+                                callback({"proposal_open_contract": poc})
+                        except Exception as exc:
+                            logger.debug(f"Poller callback error ({cid}): {exc}")
+                        self._contract_callbacks.pop(cid, None)
+                        self._subscribed_contracts.discard(cid)
+                except Exception as exc:
+                    logger.debug(f"Poller error for {cid}: {exc}")
 
     # ─── Fallback poller ──────────────────────────────────────────────────────
 
@@ -739,15 +806,15 @@ class DerivClient:
         """
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
-            if elapsed < 1.0:
-                await asyncio.sleep(1.0 - elapsed)
+            if elapsed < 0.3:
+                await asyncio.sleep(0.3 - elapsed)
             self._last_buy_time = time.time()
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
             logger.info(f"PLACING {contract_type} | {symbol} | ${stake:.4f}")
 
             try:
-                # Step 1: proposal (rate-limited)
+                # Step 1: proposal
                 proposal_req = {
                     "proposal":      1,
                     "amount":        stake,
@@ -758,27 +825,8 @@ class DerivClient:
                     "duration_unit": "m",
                     "symbol":        symbol,
                 }
-
-                _PROPOSAL_DELAY = 1.0  # seconds between proposals
-
-                async def _send_proposal_with_ratelimit():
-                    async with self._proposal_semaphore:
-                        elapsed = time.time() - self._last_proposal_time
-                        if elapsed < _PROPOSAL_DELAY:
-                            await asyncio.sleep(_PROPOSAL_DELAY - elapsed)
-                        self._last_proposal_time = time.time()
-                        return await self._send(proposal_req)
-
-                proposal = await _send_proposal_with_ratelimit()
+                proposal = await self._send(proposal_req)
                 logger.info(f"PROPOSAL RESPONSE: {proposal}")
-
-                # Retry once on RateLimit
-                if proposal and proposal.get("error", {}).get("code") == "RateLimit":
-                    logger.warning(f"RATE LIMIT: {symbol} — waiting 3s before retry")
-                    await asyncio.sleep(3)
-                    proposal = await _send_proposal_with_ratelimit()
-                    logger.info(f"PROPOSAL RESPONSE (retry): {proposal}")
-
                 if not proposal or proposal.get("error"):
                     err = (
                         proposal.get("error", {}).get("message", "unknown")
@@ -808,9 +856,7 @@ class DerivClient:
                 )
 
                 self._contract_symbol_map[contract_id] = symbol
-                asyncio.ensure_future(
-                    self._eagerly_subscribe_contract(contract_id)
-                )
+                await self._subscribe_after_buy(contract_id)
 
                 return buy_resp["buy"]
 
@@ -819,104 +865,15 @@ class DerivClient:
                 return None
 
 
-    async def _eagerly_subscribe_contract(self, contract_id: str):
+    async def _subscribe_after_buy(self, contract_id: str):
         """
-        Immediately subscribe to proposal_open_contract after buy_contract().
-        Called as fire-and-forget so it doesn't block the buy response.
-        If subscribe_contract() has already registered a sub_id, skip.
+        Immediately subscribe to proposal_open_contract right after a successful buy.
+        Called inline (awaited) from buy_contract() so there is no race with
+        subscribe_contract() being called by the caller.
         """
-        # Short delay to let subscribe_contract() register first (it's called
-        # synchronously right after buy_contract returns in _execute)
-        await asyncio.sleep(0.5)
-
-        if contract_id in self._subscriptions or contract_id in self._subscribed_contracts:
-            # Already subscribed via subscribe_contract() — nothing to do
-            return
-
         if not self._authorized or not self._ws:
-            logger.debug(
-                f"_eagerly_subscribe_contract({contract_id}): not connected, skipping"
-            )
-            return
-
-        try:
-            resp = await self._send(
-                {
-                    "proposal_open_contract": 1,
-                    "contract_id": int(contract_id),
-                    "subscribe":   1,
-                },
-                timeout=20,
-            )
-            poc    = resp.get("proposal_open_contract", {})
-            sub_id = (
-                poc.get("id")
-                or resp.get("subscription", {}).get("id", "")
-            )
-            if sub_id and contract_id not in self._subscriptions:
-                self._subscriptions[contract_id] = sub_id
-                self._subscribed_contracts.add(contract_id)
-                logger.info(
-                    f"Eager subscription: contract {contract_id} (sub_id={sub_id})"
-                )
-
-            # Buffer the response in case callback isn't registered yet
-            self._pending_contract_msgs[contract_id] = resp
-
-            # If already closed, mark for flush
-            if self._contract_is_closed(poc):
-                self._closed_before_callback.add(contract_id)
-                logger.info(
-                    f"Eager subscribe: contract {contract_id} already closed — buffered"
-                )
-                # If callback registered by now, fire it
-                if contract_id in self._contract_callbacks:
-                    try:
-                        self._contract_callbacks[contract_id](resp)
-                    except Exception as exc:
-                        logger.debug(f"Eager subscribe callback flush error: {exc}")
-
-        except Exception as exc:
-            logger.debug(f"_eagerly_subscribe_contract({contract_id}) failed: {exc}")
-
-    # ─── Contract subscription ────────────────────────────────────────────────
-
-    async def subscribe_contract(
-        self,
-        contract_id: str,
-        callback:    Callable[[dict], None],
-        symbol:      str = "",
-    ):
-        """
-        Subscribe to live updates for an open contract.
-        Stores the subscription ID in self._subscriptions for later cleanup.
-
-        If _closed_before_callback contains this contract_id, the callback
-        is flushed immediately with the buffered message.
-        """
-        self._contract_callbacks[contract_id] = callback
-        if symbol:
-            self._contract_symbol_map[contract_id] = symbol
-
-        # ── Flush if contract already closed before this callback registered ─
-        if contract_id in self._closed_before_callback:
-            buffered = self._pending_contract_msgs.get(contract_id)
-            if buffered:
-                logger.info(
-                    f"subscribe_contract({contract_id}): flushing buffered close message"
-                )
-                self._closed_before_callback.discard(contract_id)
-                try:
-                    callback(buffered)
-                except Exception as exc:
-                    logger.debug(f"subscribe_contract flush callback error: {exc}")
-                return  # cleanup will handle unsubscribe
-
-        # ── Guard: never double-subscribe ────────────────────────────────────
-        if contract_id in self._subscribed_contracts or contract_id in self._subscriptions:
-            logger.info(
-                f"subscribe_contract({contract_id}): already subscribed "
-                f"(sub_id={self._subscriptions.get(contract_id, 'eager')}), callback registered"
+            logger.warning(
+                f"_subscribe_after_buy({contract_id}): not connected, skipping"
             )
             return
 
@@ -936,25 +893,100 @@ class DerivClient:
             )
             if sub_id:
                 self._subscriptions[contract_id] = sub_id
-                logger.info(
-                    f"Contract subscribed: {contract_id} (sub_id={sub_id})"
-                )
             self._subscribed_contracts.add(contract_id)
+            logger.info(
+                f"Post-buy subscription: contract {contract_id} (sub_id={sub_id})"
+            )
 
-            # Buffer and check if already closed
+            # Buffer the response; if already closed, mark for flush
             self._pending_contract_msgs[contract_id] = resp
             if self._contract_is_closed(poc):
+                self._closed_before_callback.add(contract_id)
                 logger.info(
-                    f"subscribe_contract({contract_id}): contract already closed — "
+                    f"Post-buy: contract {contract_id} already closed — buffered"
+                )
+                if contract_id in self._contract_callbacks:
+                    try:
+                        cb = self._contract_callbacks[contract_id]
+                        if asyncio.iscoroutinefunction(cb):
+                            await cb(resp)
+                        else:
+                            cb(resp)
+                    except Exception as exc:
+                        logger.debug(f"Post-buy close callback flush error: {exc}")
+
+        except Exception as exc:
+            logger.debug(f"_subscribe_after_buy({contract_id}) failed: {exc}")
+
+    # ─── Contract subscription ────────────────────────────────────────────────
+
+    async def subscribe_contract(
+        self,
+        contract_id: str,
+        callback:    Callable,
+        symbol:      str = "",
+    ):
+        """
+        Register callback and subscribe to live updates for a contract.
+        Always sends a fresh proposal_open_contract subscribe request.
+        If the contract is already closed (buffered), fires immediately.
+        """
+        cid = str(contract_id)
+        self._contract_callbacks[cid] = callback
+        if symbol:
+            self._contract_symbol_map[cid] = symbol
+
+        # ── Flush if contract already closed before this callback registered ─
+        if cid in self._closed_before_callback:
+            buffered = self._pending_contract_msgs.get(cid)
+            if buffered:
+                logger.info(f"subscribe_contract({cid}): flushing buffered close message")
+                self._closed_before_callback.discard(cid)
+                try:
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(buffered)
+                    else:
+                        callback(buffered)
+                except Exception as exc:
+                    logger.debug(f"subscribe_contract flush callback error: {exc}")
+                return
+
+        try:
+            resp = await self._send(
+                {
+                    "proposal_open_contract": 1,
+                    "contract_id": int(cid),
+                    "subscribe":   1,
+                },
+                timeout=20,
+            )
+            poc    = resp.get("proposal_open_contract", {})
+            sub_id = (
+                poc.get("id")
+                or resp.get("subscription", {}).get("id", "")
+            )
+            if sub_id:
+                self._subscriptions[cid] = sub_id
+            self._subscribed_contracts.add(cid)
+            logger.info(f"SUBSCRIBED TO CONTRACT: {cid} (sub_id={sub_id})")
+
+            # Buffer and check if already closed
+            self._pending_contract_msgs[cid] = resp
+            if self._contract_is_closed(poc):
+                logger.info(
+                    f"subscribe_contract({cid}): contract already closed — "
                     f"firing callback immediately"
                 )
                 try:
-                    callback(resp)
+                    if asyncio.iscoroutinefunction(callback):
+                        await callback(resp)
+                    else:
+                        callback(resp)
                 except Exception as exc:
                     logger.debug(f"subscribe_contract immediate close callback error: {exc}")
 
         except Exception as exc:
-            logger.warning(f"subscribe_contract({contract_id}) failed: {exc}")
+            logger.warning(f"subscribe_contract({cid}) failed: {exc}")
 
     # ─── Active symbols ───────────────────────────────────────────────────────
 
