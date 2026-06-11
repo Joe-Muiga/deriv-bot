@@ -5,6 +5,10 @@ LOG_LEVEL = "INFO"
 DEBUG     = False
 VERSION   = "1.0.0"
 
+# ── DERIV API ─────────────────────────────────────────────────
+DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
+DERIV_APP_ID    = os.environ.get("DERIV_APP_ID", "1089")
+
 # ── ALL DERIV SYNTHETIC INDICES ──────────────────────────────
 
 # Standard Volatility (2s tick)
