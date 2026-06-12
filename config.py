@@ -136,7 +136,7 @@ LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
 MIN_SIGNAL_SCORE      = 0.72
-MIN_STRATEGY_AGREEMENT = 2
+MIN_STRATEGY_AGREEMENT = 3
 EMA_FAST              = 8
 EMA_SLOW              = 21
 EMA_TREND             = 50
