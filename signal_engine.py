@@ -240,3 +240,4 @@ class SignalEngine:
             f"NO SIGNAL: {symbol} "
             f"long={len(long_scores)} short={len(short_scores)}")
         return NONE_RESULT
+ 
