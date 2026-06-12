@@ -186,12 +186,12 @@ class SignalEngine:
                 short_scores.append(score)
                 short_reasons.append(f"{name}:{reason}")
 
-        # Need minimum 2 strategies agreeing
-        if len(long_scores) >= 2 and len(long_scores) > len(short_scores):
+        # Need minimum 3 strategies agreeing
+        if len(long_scores) >= 3 and len(long_scores) > len(short_scores):
             final_score = sum(long_scores) / len(long_scores)
             agreement   = len(long_scores)
             # Bonus for more agreement
-            final_score = min(final_score + (agreement - 2) * 0.05, 0.98)
+            final_score = min(final_score + (agreement - 3) * 0.05, 0.98)
             if final_score >= config.MIN_SIGNAL_SCORE:
                 logger.info(
                     f"SIGNAL: {symbol} LONG "
@@ -212,10 +212,10 @@ class SignalEngine:
                     multiplier  = config.MULTIPLIER_MAP.get(symbol, 100),
                 )
 
-        if len(short_scores) >= 2 and len(short_scores) > len(long_scores):
+        if len(short_scores) >= 3 and len(short_scores) > len(long_scores):
             final_score = sum(short_scores) / len(short_scores)
             agreement   = len(short_scores)
-            final_score = min(final_score + (agreement - 2) * 0.05, 0.98)
+            final_score = min(final_score + (agreement - 3) * 0.05, 0.98)
             if final_score >= config.MIN_SIGNAL_SCORE:
                 logger.info(
                     f"SIGNAL: {symbol} SHORT "
