@@ -85,46 +85,24 @@ MULTIPLIER_MAP = {
     "DSHIFT10":200, "DSHIFT20":200,
     "DSHIFT30":200,
 }
-DEFAULT_MULTIPLIER = 100
-
-# ── STOP LOSS AND TAKE PROFIT (% of stake) ──────────────────
-# Stop loss as % of stake — caps maximum loss per trade
-STOP_LOSS_MAP = {
-    # Low vol — tighter SL
-    "R_10":    30.0,  "1HZ10V":  30.0,
-    "R_25":    40.0,  "1HZ25V":  40.0,
-    # Medium vol
-    "R_50":    50.0,  "1HZ50V":  50.0,
-    "R_75":    60.0,  "1HZ75V":  60.0,
-    # High vol — wider SL to avoid noise
-    "R_100":   70.0,  "1HZ100V": 70.0,
-    "1HZ150V": 75.0,  "1HZ200V": 80.0,
-    "1HZ250V": 80.0,
-    # Boom/Crash — wide SL due to spikes
-    "BOOM150": 50.0,  "BOOM300": 50.0,
-    "BOOM500": 50.0,  "BOOM1000":50.0,
-    "CRASH150":50.0,  "CRASH300":50.0,
-    "CRASH500":50.0,  "CRASH1000":50.0,
-}
-DEFAULT_STOP_LOSS_PCT = 50.0
-
-# Take profit = 2x stop loss (2:1 RR minimum)
-TAKE_PROFIT_RATIO = 2.0
+DEFAULT_MULTIPLIER    = 1
+DEFAULT_STOP_LOSS_PCT = 0
+TAKE_PROFIT_RATIO     = 0
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
-BASE_STAKE_PCT       = 0.005   # 0.5% per trade
+BASE_STAKE_PCT       = 0.01    # 1% per trade
 MIN_STAKE            = 0.35
-MAX_STAKE            = 25.0
+MAX_STAKE            = 50.0
 DAILY_LOSS_LIMIT_PCT = 2.20   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
-# ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
-PLS_WIN_THRESHOLDS  = [3,   5,   8,   12,  15  ]
-PLS_WIN_MULTIPLIERS = [2.0, 3.0, 5.0, 8.0, 10.0]
-PLS_WIN_EXTRA_SLOTS = [3,   6,   9,   12,  15  ]
+# Win streak scaling
+WIN_STREAK_THRESHOLDS  = [3,   5,   8,   12  ]
+WIN_STREAK_MULTIPLIERS = [1.5, 2.0, 3.0, 4.0 ]
+WIN_STREAK_EXTRA_SLOTS = [1,   2,   3,   4   ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 5
+MAX_CONCURRENT_TRADES = 20
 
 # ── TIMEFRAMES ───────────────────────────────────────────────
 HTF_GRANULARITY   = 3600   # 1H
@@ -158,15 +136,15 @@ BREAKOUT_ATR_MULT     = 1.5
 # ── CONTRACT SETTINGS ────────────────────────────────────────
 # Multiplier contracts — keep short to avoid funding fees
 MAX_TRADE_OPEN_MINS   = 30   # force close at 30 min
-CHECK_TRADE_MINS      = 20   # check at 20 min
+CHECK_TRADE_MINS      = 25   # check at 20 min
 CONTRACT_CHECK_SECS   = 1200
 CONTRACT_TIMEOUT_SECS = 1800
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 3
-SYMBOL_LOSS_SUSPEND_MINS  = 10
-SYMBOL_MIN_GAP_MINS       = 1
-SYMBOL_SESSION_BAN_LOSSES = 4
+SYMBOL_WIN_SUSPEND_MINS   = 5
+SYMBOL_LOSS_SUSPEND_MINS  = 17
+SYMBOL_MIN_GAP_MINS       = 3
+SYMBOL_SESSION_BAN_LOSSES = 3
 
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
@@ -188,8 +166,8 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 REDEPLOY_EVERY_N_CYCLES = 8
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
-RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
-MAX_CONCURRENT     = 5               # alias
+RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias = 0.01
+MAX_CONCURRENT     = 20               # alias
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
@@ -219,6 +197,6 @@ DEAD_ZONE_END_UTC    = 5
 BOOM500_PRIME_START  = 7
 BOOM500_PRIME_END    = 12
 ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
-TRADE_DURATION = 5
+TRADE_DURATION = 20
 TRADE_DURATION_UNIT = "m"
  
