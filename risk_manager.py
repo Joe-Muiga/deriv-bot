@@ -274,7 +274,12 @@ class RiskManager:
         = MAX_CONCURRENT_TRADES + win-streak slot bonus.
         Collapses to MAX_CONCURRENT_TRADES on any loss.
         """
-        return self.max_concurrent + self._extra_slots
+        extra = 0
+        for i, threshold in enumerate(
+                config.WIN_STREAK_THRESHOLDS):
+            if self._win_streak >= threshold:
+                extra = config.WIN_STREAK_EXTRA_SLOTS[i]
+        return config.MAX_CONCURRENT_TRADES + extra
 
     @property
     def next_stake(self) -> float:
@@ -314,33 +319,26 @@ class RiskManager:
         actual_stake = max(actual_stake, self.min_stake)
         return round(actual_stake, 2)
 
-    async def calculate_stake(self) -> float:
-        """
-        Fetch live balance, apply aggressive PLS formula, log, and return
-        the stake.
+    def calculate_stake(self) -> float:
+        base = max(
+            self._current_balance * config.RISK_PER_TRADE_PCT,
+            config.MIN_STAKE)
 
-        Log format:
-          STAKE: $X (base=$Y ×M streak=+Z)
-        """
-        balance = await self._fetch_live_balance()
+        # Apply win streak multiplier
+        multiplier = 1.0
+        for i, threshold in enumerate(
+                config.WIN_STREAK_THRESHOLDS):
+            if self._win_streak >= threshold:
+                multiplier = config.WIN_STREAK_MULTIPLIERS[i]
 
-        # Never let base exceed 50% of balance
-        base = min(
-            self._current_balance * config.BASE_STAKE_PCT,
-            self._current_balance * 0.50,
-        )
-        base  = max(base, config.MIN_STAKE)
-        stake = round(base * self._multiplier, 2)
+        stake = round(base * multiplier, 2)
         stake = min(stake, config.MAX_STAKE)
-        stake = min(stake, self._current_balance * 0.50)
         stake = max(stake, config.MIN_STAKE)
-
         logger.info(
             f"STAKE: ${stake:.4f} "
             f"(base=${base:.4f} "
-            f"×{self._multiplier:.1f} "
+            f"mult={multiplier:.1f}x "
             f"streak={self._win_streak:+d})")
-
         return stake
 
     # ── PLS can_trade gate ─────────────────────────────────────────────────────
