@@ -611,27 +611,20 @@ class DerivClient:
 
     async def buy_contract(
             self,
-            symbol:      str,
-            direction:   str,   # "LONG" or "SHORT"
-            stake:       float,
-            multiplier:  int    = 100,
-            stop_loss:   float  = None,
-            take_profit: float  = None,
+            symbol:    str,
+            direction: str,   # "LONG" or "SHORT"
+            stake:     float,
             **kwargs) -> dict:
         """
         Buy a Rise/Fall (CALL/PUT) contract via a direct buy — no
-        proposal step. This eliminates the proposal-stage RateLimit
-        errors caused by simultaneous proposal requests.
+        proposal step, no multiplier, no stop-loss, no take-profit.
 
         Direction mapping (VERIFIED CORRECT - DO NOT SWAP):
           direction="LONG"  -> contract_type="CALL"  -> wins if price RISES
           direction="SHORT" -> contract_type="PUT"   -> wins if price FALLS
 
         Returns dict (buy response) on success, None on every failure path.
-        Never raises.  Never increments trade counters on None return.
-
-        After a successful buy, the caller is expected to register the
-        contract for polling via subscribe_contract().
+        Never raises.
         """
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
@@ -647,13 +640,13 @@ class DerivClient:
                     "buy": 1,
                     "price": stake,
                     "parameters": {
-                        "amount":         stake,
-                        "basis":          "stake",
-                        "contract_type":  contract_type,
-                        "currency":       "USD",
-                        "duration":       5,
-                        "duration_unit":  "m",
-                        "symbol":         symbol,
+                        "amount":        stake,
+                        "basis":         "stake",
+                        "contract_type": contract_type,
+                        "currency":      "USD",
+                        "duration":      20,
+                        "duration_unit": "m",
+                        "symbol":        symbol,
                     }
                 }
                 resp = await self._send(buy_req)
@@ -676,7 +669,7 @@ class DerivClient:
                 return result
 
             except Exception as e:
-                logger.error(f"BUY EXCEPTION: {symbol} -- {e}")
+                logger.error(f"BUY EXCEPTION: {symbol} — {e}")
                 return None
 
     # ─── Active symbols ───────────────────────────────────────────────────────
