@@ -1,15 +1,23 @@
 """
-Multi-strategy signal engine.
-Every symbol is evaluated independently by ALL strategies.
-Only signals where multiple strategies agree are emitted.
-Final score determines execution priority.
+signal_engine.py
+Comprehensive SMC + Retail TA signal engine.
+Strategies: Order Blocks, FVGs, Liquidity Sweeps,
+Market Structure, Fibonacci, Chart Patterns,
+Candlestick Patterns, EMA Momentum, Mean Reversion,
+MACD, RSI, Bollinger Bands, ADX trend strength.
+
+INVERSION RULE: Every signal direction is inverted
+at the final return — LONG becomes SHORT and SHORT
+becomes LONG. This is intentional and must never
+be removed. All analysis runs normally; only the
+final output direction is flipped.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -48,98 +56,328 @@ NONE_RESULT = SignalResult(
 
 
 # ---------------------------------------------------------------------------
-# Strategy functions — each returns (direction, score, reason) or (None,0,"")
+# Strategy functions — each returns (direction, score, reason) or (None, 0, "")
 # ---------------------------------------------------------------------------
 
-def _strat_mean_reversion(C, H, L):
-    rsi = ind.rsi(C, 14)
-    upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
-    last_rsi = rsi[~np.isnan(rsi)][-1]
-    last_close = float(C[-1])
-    last_upper = upper[~np.isnan(upper)][-1]
-    last_lower = lower[~np.isnan(lower)][-1]
+def _strat_smc_ob(opens, H, L, C, atr) -> Tuple:
+    """
+    Order Block strategy.
+    Find fresh OBs; check if current price is inside or near one.
+    """
+    try:
+        obs = ind.find_order_blocks(opens, H, L, C, lookback=50)
+        if not obs:
+            return None, 0, ""
 
-    if last_rsi < 25 and last_close <= last_lower * 1.005:
-        score = 0.85 if last_rsi < 20 else 0.75
-        return "LONG", score, f"MeanRev RSI={last_rsi:.1f}"
-    if last_rsi > 75 and last_close >= last_upper * 0.995:
-        score = 0.85 if last_rsi > 80 else 0.75
-        return "SHORT", score, f"MeanRev RSI={last_rsi:.1f}"
-    return None, 0, ""
+        current_price = float(C[-1])
+        atr_val = float(atr[-1]) if len(atr) > 0 else 0.0
+        if atr_val == 0:
+            return None, 0, ""
 
+        best_dir   = None
+        best_score = 0.0
+        best_reason = ""
 
-def _strat_ema_momentum(C, H, L):
-    ema8  = ind.ema(C, 8)
-    ema21 = ind.ema(C, 21)
-    ema50 = ind.ema(C, 50)
+        for ob in obs:
+            if ob["test_count"] >= 2:
+                continue  # only fresh OBs (test_count < 2)
 
-    e8, e21, e50 = ema8[-1], ema21[-1], ema50[-1]
-    e8p, e21p    = ema8[-2], ema21[-2]
+            ob_h = ob["high"]
+            ob_l = ob["low"]
+            ob_type = ob["type"]
 
-    # Crossover in direction of trend
-    if e8p <= e21p and e8 > e21 and e21 > e50:
-        return "LONG", 0.70, "EMA cross up with trend"
-    if e8p >= e21p and e8 < e21 and e21 < e50:
-        return "SHORT", 0.70, "EMA cross down with trend"
-    # Strong trend alignment
-    if e8 > e21 > e50 and (e8-e50)/e50 > 0.001:
-        return "LONG", 0.65, "EMA stack bullish"
-    if e8 < e21 < e50 and (e50-e8)/e50 > 0.001:
-        return "SHORT", 0.65, "EMA stack bearish"
-    return None, 0, ""
+            # Inside OB
+            if ob_l <= current_price <= ob_h:
+                score = 0.82
+                direction = "LONG" if ob_type == "BULLISH" else "SHORT"
+                reason = f"Price inside fresh {ob_type} OB [{ob_l:.5f}-{ob_h:.5f}]"
+            # Near OB (within 0.5×ATR)
+            elif abs(current_price - ob["mid"]) <= 0.5 * atr_val:
+                score = 0.72
+                direction = "LONG" if ob_type == "BULLISH" else "SHORT"
+                reason = f"Price near fresh {ob_type} OB [{ob_l:.5f}-{ob_h:.5f}]"
+            else:
+                continue
 
+            if score > best_score:
+                best_score  = score
+                best_dir    = direction
+                best_reason = reason
 
-def _strat_indicator_confluence(C, H, L):
-    rsi = ind.rsi(C, 14)
-    _, _, hist = ind.macd(C, 12, 26, 9)
-    last_rsi  = rsi[~np.isnan(rsi)][-1]
-    last_hist = hist[~np.isnan(hist)][-1]
-    prev_hist = hist[~np.isnan(hist)][-2]
-
-    bull = 0
-    bear = 0
-
-    if last_rsi > 55: bull += 1
-    if last_rsi < 45: bear += 1
-    if last_hist > 0 and prev_hist <= 0: bull += 2  # MACD crossover
-    if last_hist < 0 and prev_hist >= 0: bear += 2
-    if last_hist > 0: bull += 1
-    if last_hist < 0: bear += 1
-
-    if bull >= 3:
-        return "LONG",  min(0.5 + bull*0.08, 0.85), f"Indicators bull={bull}"
-    if bear >= 3:
-        return "SHORT", min(0.5 + bear*0.08, 0.85), f"Indicators bear={bear}"
-    return None, 0, ""
-
-
-def _strat_structure(C, H, L):
-    # Higher highs and higher lows = bullish structure
-    if len(H) < 6:
+        if best_dir:
+            return best_dir, best_score, best_reason
         return None, 0, ""
-    hh = all(H[-i] > H[-i-1] for i in range(1, 4))
-    hl = all(L[-i] > L[-i-1] for i in range(1, 4))
-    lh = all(H[-i] < H[-i-1] for i in range(1, 4))
-    ll = all(L[-i] < L[-i-1] for i in range(1, 4))
-
-    if hh and hl:
-        return "LONG",  0.72, "Structure HH+HL"
-    if lh and ll:
-        return "SHORT", 0.72, "Structure LH+LL"
-    return None, 0, ""
+    except Exception:
+        return None, 0, ""
 
 
-def _strat_breakout(C, H, L, atr):
-    lookback = min(15, len(C)-1)
-    highest  = float(np.max(H[-lookback-1:-1]))
-    lowest   = float(np.min(L[-lookback-1:-1]))
-    last_atr = float(atr[~np.isnan(atr)][-1]) if len(atr[~np.isnan(atr)]) else 0.001
+def _strat_smc_fvg(opens, H, L, C, atr) -> Tuple:
+    """
+    Fair Value Gap strategy.
+    Look for unfilled FVGs; check if price is inside or touching one.
+    """
+    try:
+        fvgs = ind.find_fvg(opens, H, L, C, atr, min_atr=0.5)
+        if not fvgs:
+            return None, 0, ""
 
-    if float(C[-1]) > highest + 0.3 * last_atr:
-        return "LONG",  0.78, f"Breakout above {highest:.5f}"
-    if float(C[-1]) < lowest  - 0.3 * last_atr:
-        return "SHORT", 0.78, f"Breakout below {lowest:.5f}"
-    return None, 0, ""
+        current_price = float(C[-1])
+
+        for fvg in reversed(fvgs):  # most recent first
+            if fvg["filled"]:
+                continue
+            fvg_h = fvg["high"]
+            fvg_l = fvg["low"]
+            if fvg_l <= current_price <= fvg_h:
+                direction = "LONG" if fvg["type"] == "BULLISH" else "SHORT"
+                return direction, 0.78, f"Price in unfilled {fvg['type']} FVG [{fvg_l:.5f}-{fvg_h:.5f}]"
+
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_liquidity_sweep(H, L, C) -> Tuple:
+    """
+    Liquidity Sweep + Reversal strategy.
+    Highest-score strategy when it fires.
+    """
+    try:
+        result = ind.liquidity_sweep(H, L, C, lookback=20)
+        if result == 1:
+            return "LONG",  0.85, "Swept swing lows then closed above (bullish reversal)"
+        if result == -1:
+            return "SHORT", 0.85, "Swept swing highs then closed below (bearish reversal)"
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_market_structure(H, L, C) -> Tuple:
+    """
+    Market structure bias (HH+HL = BULLISH, LH+LL = BEARISH).
+    """
+    try:
+        structure, score = ind.market_structure(H, L, C, lookback=5)
+        if structure == "BULLISH" and score > 0:
+            return "LONG",  score, f"Market structure BULLISH (score={score})"
+        if structure == "BEARISH" and score > 0:
+            return "SHORT", score, f"Market structure BEARISH (score={score})"
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_fibonacci(H, L, C, atr) -> Tuple:
+    """
+    Fibonacci retracement confluence.
+    Checks if price is at key fib level aligned with market structure.
+    """
+    try:
+        n = len(C)
+        if n < 20:
+            return None, 0, ""
+
+        # Identify last swing high and low
+        sh_arr = ind.swing_highs(H, lookback=5)
+        sl_arr = ind.swing_lows(L, lookback=5)
+
+        sh_pts = [(i, float(v)) for i, v in enumerate(sh_arr) if not np.isnan(v)]
+        sl_pts = [(i, float(v)) for i, v in enumerate(sl_arr) if not np.isnan(v)]
+
+        if not sh_pts or not sl_pts:
+            return None, 0, ""
+
+        last_sh_i, last_sh = sh_pts[-1]
+        last_sl_i, last_sl = sl_pts[-1]
+        atr_val = float(atr[-1]) if len(atr) > 0 else 0.0
+
+        current = float(C[-1])
+        structure, _ = ind.market_structure(H, L, C, lookback=5)
+
+        # Uptrend: price pulling back into fib support
+        if structure == "BULLISH" and last_sh_i > last_sl_i:
+            level = ind.price_at_fib(current, last_sh, last_sl,
+                                     tolerance=0.1, atr_val=atr_val)
+            if level in ("0.618", "0.786"):
+                return "LONG", 0.80, f"Price at {level} fib retracement in uptrend"
+            if level in ("0.382", "0.5"):
+                return "LONG", 0.72, f"Price at {level} fib retracement in uptrend"
+
+        # Downtrend: price pulling back into fib resistance
+        if structure == "BEARISH" and last_sl_i > last_sh_i:
+            # For downtrend, retracement is from low to high
+            level = ind.price_at_fib(current, last_sl, last_sh,
+                                     tolerance=0.1, atr_val=atr_val)
+            if level in ("0.618", "0.786"):
+                return "SHORT", 0.80, f"Price at {level} fib retracement in downtrend"
+            if level in ("0.382", "0.5"):
+                return "SHORT", 0.72, f"Price at {level} fib retracement in downtrend"
+
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_chart_pattern(opens, H, L, C) -> Tuple:
+    """
+    Chart pattern detection.
+    """
+    try:
+        pattern, direction, score = ind.detect_chart_pattern(opens, H, L, C)
+        if pattern and direction and score > 0:
+            return direction, score, f"Chart pattern: {pattern}"
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_candlestick(opens, H, L, C) -> Tuple:
+    """
+    Candlestick pattern detection.
+    Only emits if price is near a key level (OB, FVG, or Fibonacci).
+    Score = pattern score × 0.9 if at key level.
+    """
+    try:
+        pattern, direction, score = ind.detect_candlestick_pattern(opens, H, L, C)
+        if not pattern or not direction or score == 0:
+            return None, 0, ""
+
+        # Check if price is at a key level
+        atr_arr = ind.atr(H, L, C, 14)
+        atr_val = float(atr_arr[-1]) if len(atr_arr) > 0 else 0.0
+        current = float(C[-1])
+        at_key_level = False
+
+        # Check near OBs
+        obs = ind.find_order_blocks(opens, H, L, C, lookback=50)
+        for ob in obs:
+            if ob["test_count"] < 2 and abs(current - ob["mid"]) <= atr_val:
+                at_key_level = True
+                break
+
+        # Check near FVGs
+        if not at_key_level:
+            fvgs = ind.find_fvg(opens, H, L, C, atr_arr, min_atr=0.5)
+            for fvg in fvgs:
+                if not fvg["filled"] and fvg["low"] <= current <= fvg["high"]:
+                    at_key_level = True
+                    break
+
+        # Check near Fibonacci levels
+        if not at_key_level and atr_val > 0:
+            sh_arr = ind.swing_highs(H, 5)
+            sl_arr = ind.swing_lows(L, 5)
+            sh_pts = [float(v) for v in sh_arr if not np.isnan(v)]
+            sl_pts = [float(v) for v in sl_arr if not np.isnan(v)]
+            if sh_pts and sl_pts:
+                fib = ind.fibonacci_levels(sh_pts[-1], sl_pts[-1])
+                for key in ("0.382", "0.5", "0.618", "0.786"):
+                    if abs(current - fib[key]) <= 0.1 * atr_val:
+                        at_key_level = True
+                        break
+
+        if at_key_level:
+            return direction, round(score * 0.9, 4), f"Candlestick {pattern} at key level"
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_mean_reversion(C, H, L) -> Tuple:
+    """
+    RSI + Bollinger Bands mean reversion.
+    """
+    try:
+        rsi_arr = ind.rsi(C, 14)
+        upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
+
+        rsi_vals   = rsi_arr[~np.isnan(rsi_arr)]
+        upper_vals = upper[~np.isnan(upper)]
+        lower_vals = lower[~np.isnan(lower)]
+
+        if len(rsi_vals) == 0 or len(upper_vals) == 0 or len(lower_vals) == 0:
+            return None, 0, ""
+
+        last_rsi   = float(rsi_vals[-1])
+        last_close = float(C[-1])
+        last_upper = float(upper_vals[-1])
+        last_lower = float(lower_vals[-1])
+
+        # Oversold: RSI < 25 AND price at/below lower Bollinger
+        if last_rsi < 25 and last_close <= last_lower * 1.005:
+            score = 0.88 if last_rsi < 20 else 0.80
+            return "LONG",  score, f"MeanRev RSI={last_rsi:.1f} at lower BB"
+
+        # Overbought: RSI > 75 AND price at/above upper Bollinger
+        if last_rsi > 75 and last_close >= last_upper * 0.995:
+            score = 0.88 if last_rsi > 80 else 0.80
+            return "SHORT", score, f"MeanRev RSI={last_rsi:.1f} at upper BB"
+
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_ema_momentum(C) -> Tuple:
+    """
+    EMA momentum crossover strategy.
+    EMA8 crosses above/below EMA21 in direction of EMA50.
+    """
+    try:
+        n = len(C)
+        if n < 3:
+            return None, 0, ""
+
+        ema8  = ind.ema(C, 8)
+        ema21 = ind.ema(C, 21)
+        ema50 = ind.ema(C, 50)
+
+        e8,  e21,  e50  = float(ema8[-1]),  float(ema21[-1]),  float(ema50[-1])
+        e8p, e21p        = float(ema8[-2]),  float(ema21[-2])
+
+        # Bullish crossover: EMA8 crosses above EMA21 AND EMA21 > EMA50
+        if e8p <= e21p and e8 > e21 and e21 > e50:
+            return "LONG",  0.70, "EMA8 crossed above EMA21 above EMA50"
+
+        # Bearish crossover: EMA8 crosses below EMA21 AND EMA21 < EMA50
+        if e8p >= e21p and e8 < e21 and e21 < e50:
+            return "SHORT", 0.70, "EMA8 crossed below EMA21 below EMA50"
+
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
+
+
+def _strat_macd_rsi(C) -> Tuple:
+    """
+    MACD histogram zero-cross + RSI confluence.
+    """
+    try:
+        rsi_arr = ind.rsi(C, 14)
+        _, _, hist = ind.macd(C, 12, 26, 9)
+
+        rsi_valid  = rsi_arr[~np.isnan(rsi_arr)]
+        hist_valid = hist[~np.isnan(hist)]
+
+        if len(rsi_valid) < 2 or len(hist_valid) < 2:
+            return None, 0, ""
+
+        last_rsi  = float(rsi_valid[-1])
+        last_hist = float(hist_valid[-1])
+        prev_hist = float(hist_valid[-2])
+
+        # Bullish: histogram crosses above zero AND RSI > 50
+        if prev_hist <= 0 and last_hist > 0 and last_rsi > 50:
+            return "LONG",  0.72, f"MACD hist cross +0 RSI={last_rsi:.1f}"
+
+        # Bearish: histogram crosses below zero AND RSI < 50
+        if prev_hist >= 0 and last_hist < 0 and last_rsi < 50:
+            return "SHORT", 0.72, f"MACD hist cross -0 RSI={last_rsi:.1f}"
+
+        return None, 0, ""
+    except Exception:
+        return None, 0, ""
 
 
 # ---------------------------------------------------------------------------
@@ -155,89 +393,117 @@ class SignalEngine:
     # Public entry point
     # -----------------------------------------------------------------------
 
-    def evaluate(self, ltf_bars, mtf_bars, symbol,
-                 stake=1.0, **kwargs):
+    def evaluate(self, ltf_bars, mtf_bars=None,
+                 symbol="", stake=1.0, **kwargs):
         if len(ltf_bars) < 20:
             return NONE_RESULT
 
-        C = np.array([b.close for b in ltf_bars])
-        H = np.array([b.high  for b in ltf_bars])
-        L = np.array([b.low   for b in ltf_bars])
-        atr = ind.atr(H, L, C, 14)
+        O       = np.array([b.open  for b in ltf_bars])
+        H       = np.array([b.high  for b in ltf_bars])
+        L       = np.array([b.low   for b in ltf_bars])
+        C       = np.array([b.close for b in ltf_bars])
+        atr_arr = ind.atr(H, L, C, 14)
 
+        # Run ALL strategies
         strategies = [
+            ("SWEEP",       _strat_liquidity_sweep(H, L, C)),
+            ("OB",          _strat_smc_ob(O, H, L, C, atr_arr)),
+            ("FVG",         _strat_smc_fvg(O, H, L, C, atr_arr)),
+            ("FIBONACCI",   _strat_fibonacci(H, L, C, atr_arr)),
+            ("CHART_PAT",   _strat_chart_pattern(O, H, L, C)),
+            ("STRUCTURE",   _strat_market_structure(H, L, C)),
             ("MEAN_REV",    _strat_mean_reversion(C, H, L)),
-            ("EMA_MOM",     _strat_ema_momentum(C, H, L)),
-            ("INDICATORS",  _strat_indicator_confluence(C, H, L)),
-            ("STRUCTURE",   _strat_structure(C, H, L)),
-            ("BREAKOUT",    _strat_breakout(C, H, L, atr)),
+            ("CANDLE",      _strat_candlestick(O, H, L, C)),
+            ("EMA_MOM",     _strat_ema_momentum(C)),
+            ("MACD_RSI",    _strat_macd_rsi(C)),
         ]
 
-        long_scores   = []
-        short_scores  = []
-        long_reasons  = []
-        short_reasons = []
+        long_votes  = []  # (score, name, reason)
+        short_votes = []
 
         for name, (direction, score, reason) in strategies:
-            if direction == "LONG" and score > 0:
-                long_scores.append(score)
-                long_reasons.append(f"{name}:{reason}")
+            if direction == "LONG"  and score > 0:
+                long_votes.append((score, name, reason))
             elif direction == "SHORT" and score > 0:
-                short_scores.append(score)
-                short_reasons.append(f"{name}:{reason}")
+                short_votes.append((score, name, reason))
 
-        # Need minimum 3 strategies agreeing
-        if len(long_scores) >= 3 and len(long_scores) > len(short_scores):
-            final_score = sum(long_scores) / len(long_scores)
-            agreement   = len(long_scores)
-            # Bonus for more agreement
-            final_score = min(final_score + (agreement - 3) * 0.05, 0.98)
-            if final_score >= config.MIN_SIGNAL_SCORE:
-                logger.info(
-                    f"SIGNAL: {symbol} LONG "
-                    f"score={final_score:.3f} "
-                    f"agreement={agreement}/5 "
-                    f"[{' | '.join(long_reasons)}]")
-                sl_pct = config.STOP_LOSS_MAP.get(symbol, 50.0)
-                sl_amt = round(stake * sl_pct / 100, 2)
-                tp_amt = round(sl_amt * 2.0, 2)
-                return SignalResult(
-                    direction   = "LONG",
-                    strength    = min(agreement, 3),
-                    score       = final_score,
-                    strategy    = f"MULTI({agreement}/5)",
-                    reason      = " | ".join(long_reasons),
-                    stop_loss   = sl_amt,
-                    take_profit = tp_amt,
-                    multiplier  = config.MULTIPLIER_MAP.get(symbol, 100),
-                )
+        # Determine dominant direction
+        long_count  = len(long_votes)
+        short_count = len(short_votes)
+        long_avg    = sum(s for s, _, _ in long_votes)  / max(long_count,  1)
+        short_avg   = sum(s for s, _, _ in short_votes) / max(short_count, 1)
 
-        if len(short_scores) >= 3 and len(short_scores) > len(long_scores):
-            final_score = sum(short_scores) / len(short_scores)
-            agreement   = len(short_scores)
-            final_score = min(final_score + (agreement - 3) * 0.05, 0.98)
-            if final_score >= config.MIN_SIGNAL_SCORE:
-                logger.info(
-                    f"SIGNAL: {symbol} SHORT "
-                    f"score={final_score:.3f} "
-                    f"agreement={agreement}/5 "
-                    f"[{' | '.join(short_reasons)}]")
-                sl_pct = config.STOP_LOSS_MAP.get(symbol, 50.0)
-                sl_amt = round(stake * sl_pct / 100, 2)
-                tp_amt = round(sl_amt * 2.0, 2)
-                return SignalResult(
-                    direction   = "SHORT",
-                    strength    = min(agreement, 3),
-                    score       = final_score,
-                    strategy    = f"MULTI({agreement}/5)",
-                    reason      = " | ".join(short_reasons),
-                    stop_loss   = sl_amt,
-                    take_profit = tp_amt,
-                    multiplier  = config.MULTIPLIER_MAP.get(symbol, 100),
-                )
+        # Need minimum 2 strategies agreeing
+        MIN_AGREE   = getattr(config, "MIN_STRATEGY_AGREEMENT", 2)
+        final_dir   = None
+        final_score = 0.0
+        votes_used  = []
 
-        logger.debug(
-            f"NO SIGNAL: {symbol} "
-            f"long={len(long_scores)} short={len(short_scores)}")
-        return NONE_RESULT
- 
+        if long_count >= MIN_AGREE and long_count > short_count:
+            final_dir   = "LONG"
+            final_score = long_avg + (long_count - MIN_AGREE) * 0.03
+            votes_used  = long_votes
+        elif short_count >= MIN_AGREE and short_count > long_count:
+            final_dir   = "SHORT"
+            final_score = short_avg + (short_count - MIN_AGREE) * 0.03
+            votes_used  = short_votes
+        elif long_count == short_count and long_count >= MIN_AGREE:
+            # Tie: use highest average score
+            if long_avg >= short_avg:
+                final_dir   = "LONG"
+                final_score = long_avg
+                votes_used  = long_votes
+            else:
+                final_dir   = "SHORT"
+                final_score = short_avg
+                votes_used  = short_votes
+
+        if not final_dir:
+            logger.debug(
+                f"NO SIGNAL: {symbol} "
+                f"long={long_count} short={short_count}")
+            return NONE_RESULT
+
+        final_score = min(final_score, 0.98)
+
+        if final_score < config.MIN_SIGNAL_SCORE:
+            logger.debug(
+                f"BELOW THRESHOLD: {symbol} "
+                f"score={final_score:.3f}")
+            return NONE_RESULT
+
+        # Strategy summary
+        strategy_names = "+".join(n for _, n, _ in votes_used)
+        reasons        = " | ".join(
+            f"{n}:{r}" for _, n, r in votes_used)
+
+        sl_pct = config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
+        sl_amt = round(stake * sl_pct / 100, 2)
+        tp_amt = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
+        mult   = config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER)
+
+        # ═══════════════════════════════════════════════
+        # INVERSION — applied to every signal before return
+        # Analysis direction is logged, execution is opposite
+        # ═══════════════════════════════════════════════
+        analysis_direction = final_dir
+        inverted_direction = "SHORT" if final_dir == "LONG" else "LONG"
+
+        logger.info(
+            f"SIGNAL: {symbol} | "
+            f"Analysis={analysis_direction} → "
+            f"Executing={inverted_direction} | "
+            f"score={final_score:.3f} | "
+            f"agreement={len(votes_used)}/10 | "
+            f"strategies=[{strategy_names}]")
+
+        return SignalResult(
+            direction   = inverted_direction,  # INVERTED
+            strength    = min(len(votes_used), 3),
+            score       = final_score,
+            strategy    = f"MULTI({len(votes_used)}/10)",
+            reason      = reasons,
+            stop_loss   = sl_amt,
+            take_profit = tp_amt,
+            multiplier  = mult,
+        )
