@@ -124,7 +124,7 @@ PLS_WIN_MULTIPLIERS = [2.0, 3.0, 5.0, 8.0, 10.0]
 PLS_WIN_EXTRA_SLOTS = [3,   6,   9,   12,  15  ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 30
+MAX_CONCURRENT_TRADES = 5
 
 # ── TIMEFRAMES ───────────────────────────────────────────────
 HTF_GRANULARITY   = 3600   # 1H
@@ -135,8 +135,16 @@ MTF_BARS          = 50
 LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
-MIN_SIGNAL_SCORE      = 0.72
-MIN_STRATEGY_AGREEMENT = 3
+MIN_SIGNAL_SCORE       = 0.68
+MIN_STRATEGY_AGREEMENT = 2
+
+# SMC parameters
+OB_LOOKBACK            = 50
+FVG_MIN_ATR            = 0.5
+SWEEP_LOOKBACK         = 20
+SWING_LOOKBACK         = 5
+FIB_LEVELS             = [0.382, 0.5, 0.618, 0.786]
+FIB_TOLERANCE          = 0.1
 EMA_FAST              = 8
 EMA_SLOW              = 21
 EMA_TREND             = 50
@@ -181,7 +189,7 @@ REDEPLOY_EVERY_N_CYCLES = 8
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
-MAX_CONCURRENT     = 30              # alias
+MAX_CONCURRENT     = 5               # alias
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
