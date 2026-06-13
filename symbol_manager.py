@@ -36,8 +36,13 @@ def is_suspended(symbol: str) -> bool:
 
 
 def can_trade_now(symbol: str) -> bool:
+    if is_suspended(symbol):
+        return False
     if symbol in _active_symbols:
         logger.info(f"BLOCKED: {symbol} already has an active contract")
+        return False
+    gap = time.time() - _last_traded.get(symbol, 0)
+    if gap < config.SYMBOL_MIN_GAP_MINS * 60:
         return False
     return True
 
@@ -57,10 +62,15 @@ def record_result(symbol: str, won: bool) -> None:
     _session_trades[symbol] = _session_trades.get(symbol, 0) + 1
     if won:
         _session_wins[symbol] = _session_wins.get(symbol, 0) + 1
-        # suspension disabled
+        suspend(symbol, config.SYMBOL_WIN_SUSPEND_MINS)
     else:
-        _session_losses[symbol] = _session_losses.get(symbol, 0) + 1
-        # suspension disabled
+        losses = _session_losses.get(symbol, 0) + 1
+        _session_losses[symbol] = losses
+        if losses >= config.SYMBOL_SESSION_BAN_LOSSES:
+            suspend(symbol, 480)
+            logger.warning(f"SESSION BAN: {symbol}")
+        else:
+            suspend(symbol, config.SYMBOL_LOSS_SUSPEND_MINS)
 
 
 def get_symbol_score(symbol: str) -> float:
@@ -86,10 +96,15 @@ def update_active(symbol_list: List[str]) -> None:
 
 
 def get_queue() -> List[str]:
-    available = [s for s in _all_active if s not in _active_symbols]
+    available = [s for s in _all_active if can_trade_now(s)]
+    suspended_log = [
+        f"{s}({(_suspension_until[s] - time.time()) / 60:.1f}m)"
+        for s in _all_active
+        if is_suspended(s)
+    ]
     logger.info(
         f"QUEUE: {len(available)} available | "
-        f"Active: [{', '.join(_active_symbols)}]"
+        f"Suspended: {suspended_log}"
     )
     return available
 
