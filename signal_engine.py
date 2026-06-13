@@ -381,6 +381,121 @@ def _strat_macd_rsi(C) -> Tuple:
 
 
 # ---------------------------------------------------------------------------
+# HTF bias helper
+# ---------------------------------------------------------------------------
+
+def _get_htf_bias(d1_bars, h4_bars, h1_bars):
+    votes_long  = 0
+    votes_short = 0
+    weights = [
+        (d1_bars, 3),
+        (h4_bars, 2),
+        (h1_bars, 1),
+    ]
+    available = 0
+    for bars, weight in weights:
+        if not bars or len(bars) < 5:
+            continue
+        available += 1
+        H = np.array([b.high  for b in bars])
+        L = np.array([b.low   for b in bars])
+        C = np.array([b.close for b in bars])
+        try:
+            direction, _ = ind.market_structure(H, L, C)
+        except Exception:
+            continue
+        if direction == "BULLISH":
+            votes_long  += weight
+        elif direction == "BEARISH":
+            votes_short += weight
+
+    # If no HTF data available at all — allow M5 signals through
+    if available == 0:
+        return "ALLOW_ALL"
+
+    # If only partial HTF data — lower threshold
+    threshold = 2 if available <= 1 else 3
+
+    if votes_long  > votes_short and votes_long  >= threshold:
+        return "LONG"
+    if votes_short > votes_long  and votes_short >= threshold:
+        return "SHORT"
+
+    # HTF neutral — fall back to H1 alone if available
+    if h1_bars and len(h1_bars) >= 5:
+        H = np.array([b.high  for b in h1_bars])
+        L = np.array([b.low   for b in h1_bars])
+        C = np.array([b.close for b in h1_bars])
+        try:
+            direction, score = ind.market_structure(H, L, C)
+            if direction == "BULLISH" and score >= 0.6:
+                return "LONG"
+            if direction == "BEARISH" and score >= 0.6:
+                return "SHORT"
+        except Exception:
+            pass
+
+    return "NEUTRAL"
+
+
+# ---------------------------------------------------------------------------
+# MTF zone helper
+# ---------------------------------------------------------------------------
+
+def _get_mtf_zone(mtf_bars, H_ltf, L_ltf, C_ltf, atr_arr) -> bool:
+    """
+    Returns True if current price is inside or near an MTF OB or FVG zone,
+    OR if no MTF zone data is available (fallback — allow M5 entry through).
+    Returns False only when MTF data exists but price is clearly outside all zones.
+    """
+    if not mtf_bars or len(mtf_bars) < 5:
+        return True  # no MTF data — allow through
+
+    try:
+        O_m = np.array([b.open  for b in mtf_bars])
+        H_m = np.array([b.high  for b in mtf_bars])
+        L_m = np.array([b.low   for b in mtf_bars])
+        C_m = np.array([b.close for b in mtf_bars])
+        atr_m = ind.atr(H_m, L_m, C_m, 14)
+
+        current_price = float(C_ltf[-1])
+        atr_val = float(atr_arr[-1]) if len(atr_arr) > 0 else 0.0
+
+        # Check MTF Order Blocks
+        try:
+            obs = ind.find_order_blocks(O_m, H_m, L_m, C_m, lookback=30)
+            for ob in obs:
+                if ob.get("test_count", 0) >= 2:
+                    continue
+                ob_h = ob["high"]
+                ob_l = ob["low"]
+                # Inside zone or within 1×ATR
+                if ob_l <= current_price <= ob_h:
+                    return True
+                if atr_val > 0 and abs(current_price - ob.get("mid", (ob_h + ob_l) / 2)) <= atr_val:
+                    return True
+        except Exception:
+            pass
+
+        # Check MTF FVGs
+        try:
+            fvgs = ind.find_fvg(O_m, H_m, L_m, C_m, atr_m, min_atr=0.3)
+            for fvg in fvgs:
+                if fvg.get("filled", False):
+                    continue
+                if fvg["low"] <= current_price <= fvg["high"]:
+                    return True
+        except Exception:
+            pass
+
+        # MTF data existed but no zone matched — still allow through (fallback)
+        return True
+
+    except Exception:
+        return True
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
@@ -404,6 +519,22 @@ class SignalEngine:
         C       = np.array([b.close for b in ltf_bars])
         atr_arr = ind.atr(H, L, C, 14)
 
+        # ── HTF bias gate ───────────────────────────────────────────────────
+        d1_bars  = kwargs.get("d1_bars",  [])
+        h4_bars  = kwargs.get("h4_bars",  [])
+        h1_bars  = kwargs.get("h1_bars",  [])
+        htf_bias = _get_htf_bias(d1_bars, h4_bars, h1_bars)
+
+        if htf_bias == "NEUTRAL":
+            return NONE_RESULT
+        # ALLOW_ALL means no HTF data yet — run M5 strategies unrestricted
+        allow_all = htf_bias == "ALLOW_ALL"
+
+        # ── MTF zone gate ───────────────────────────────────────────────────
+        if not _get_mtf_zone(mtf_bars, H, L, C, atr_arr):
+            logger.debug(f"MTF ZONE BLOCK: {symbol} — price outside all MTF zones")
+            return NONE_RESULT
+
         # Run ALL strategies
         strategies = [
             ("SWEEP",       _strat_liquidity_sweep(H, L, C)),
@@ -422,10 +553,12 @@ class SignalEngine:
         short_votes = []
 
         for name, (direction, score, reason) in strategies:
-            if direction == "LONG"  and score > 0:
-                long_votes.append((score, name, reason))
+            if direction == "LONG" and score > 0:
+                if allow_all or htf_bias == "LONG":
+                    long_votes.append((score, name, reason))
             elif direction == "SHORT" and score > 0:
-                short_votes.append((score, name, reason))
+                if allow_all or htf_bias == "SHORT":
+                    short_votes.append((score, name, reason))
 
         # Determine dominant direction
         long_count  = len(long_votes)
