@@ -574,16 +574,10 @@ class BotEngine:
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            # Pre-compute stake once — avoids N redundant awaits inside gather
-            cycle_stake = await self.risk.calculate_stake()
-            t_gather0   = time.perf_counter()
             raw_results = await asyncio.gather(
-                *[self._scan(s, precomputed_stake=cycle_stake) for s in queue],
+                *[self._scan(s) for s in queue],
                 return_exceptions=True,
             )
-            logger.info(
-                f"SCAN_GATHER {len(queue)} symbols in "
-                f"{(time.perf_counter() - t_gather0)*1000:.1f}ms")
             candidates = [
                 r for r in raw_results
                 if r is not None
@@ -668,39 +662,8 @@ class BotEngine:
                 await asyncio.sleep(remainder)
 
     # ── Per-symbol scan ────────────────────────────────────────────────────────
-    #
-    # PARALLELISM NOTE  (Option 3 audit)
-    # -----------------------------------
-    # _scan() is called via asyncio.gather(), which runs all coroutines
-    # concurrently on the *same* thread.  That means any synchronous CPU work
-    # inside _scan() (e.g. signal.evaluate()) blocks the event loop for every
-    # symbol until it finishes — the gather gives you concurrency only if each
-    # coroutine actually yields (awaits I/O).  Two issues were found and fixed:
-    #
-    #   1. calculate_stake() was awaited once *per symbol* inside the gather.
-    #      It returns the same value for every symbol in a cycle, so it is now
-    #      computed once before the gather and passed in as a parameter.
-    #
-    #   2. signal.evaluate() is synchronous CPU work.  Running it directly
-    #      inside the gather means each symbol blocks the loop in turn, making
-    #      the "parallel" gather effectively serial.  It is now offloaded to the
-    #      default ThreadPoolExecutor via asyncio.get_event_loop().run_in_executor()
-    #      so each symbol's evaluation genuinely runs concurrently.
-    #
-    # TIMING INSTRUMENTATION  (Option 4)
-    # ------------------------------------
-    # Every call logs:
-    #   SCAN_TIMING  <symbol>  total=Xms  eval=Xms  stake=Xms
-    # Scan hits additionally log their direction / score / strategy.
-    # Check your logs for eval= values; anything above ~20 ms per symbol
-    # is worth investigating inside SignalEngine itself.
 
-    async def _scan(
-        self,
-        symbol: str,
-        precomputed_stake: float = None,
-    ) -> Optional[ScanResult]:
-        t0 = time.perf_counter()
+    async def _scan(self, symbol: str) -> Optional[ScanResult]:
         try:
             ltf = self._ltf.get(symbol)
             htf = self._htf.get(symbol)
@@ -715,13 +678,7 @@ class BotEngine:
             if current_price == 0:
                 return None
 
-            # ── FIX 1: reuse stake computed once per cycle (avoid N awaits) ───
-            t_stake0 = time.perf_counter()
-            if precomputed_stake is not None:
-                stake = precomputed_stake
-            else:
-                stake = await self.risk.calculate_stake()
-            t_stake = (time.perf_counter() - t_stake0) * 1000
+            stake = self.risk.calculate_stake()
 
             # Safely get extra timeframes if they exist
             def safe_bars(store, sym):
@@ -731,30 +688,21 @@ class BotEngine:
                 except Exception:
                     return None
 
-            # ── FIX 2: run CPU-bound evaluate() off the event loop ────────────
-            loop = asyncio.get_event_loop()
-            t_eval0 = time.perf_counter()
-            sig = await loop.run_in_executor(
-                None,  # default ThreadPoolExecutor
-                lambda: self.signal.evaluate(
-                    ltf_bars = ltf.completed_bars,
-                    symbol   = symbol,
-                    stake    = stake,
-                    d1_bars  = safe_bars(getattr(self, "_d1",  {}), symbol),
-                    h4_bars  = safe_bars(getattr(self, "_h4",  {}), symbol),
-                    h1_bars  = safe_bars(getattr(self, "_h1",  {}), symbol),
-                    m30_bars = safe_bars(getattr(self, "_m30", {}), symbol),
-                    m15_bars = safe_bars(getattr(self, "_m15", {}), symbol),
-                )
+            sig = self.signal.evaluate(
+                ltf_bars = ltf.completed_bars,
+                symbol   = symbol,
+                stake    = stake,
+                d1_bars  = safe_bars(
+                    getattr(self, "_d1",  {}), symbol),
+                h4_bars  = safe_bars(
+                    getattr(self, "_h4",  {}), symbol),
+                h1_bars  = safe_bars(
+                    getattr(self, "_h1",  {}), symbol),
+                m30_bars = safe_bars(
+                    getattr(self, "_m30", {}), symbol),
+                m15_bars = safe_bars(
+                    getattr(self, "_m15", {}), symbol),
             )
-            t_eval  = (time.perf_counter() - t_eval0) * 1000
-            t_total = (time.perf_counter() - t0) * 1000
-
-            logger.debug(
-                f"SCAN_TIMING {symbol} "
-                f"total={t_total:.1f}ms "
-                f"eval={t_eval:.1f}ms "
-                f"stake={t_stake:.1f}ms")
 
             if sig is None or sig.direction == "NONE":
                 return None
@@ -763,8 +711,7 @@ class BotEngine:
                 f"SCAN HIT: {symbol} "
                 f"{sig.direction} "
                 f"score={sig.score:.3f} "
-                f"strategy={sig.strategy} "
-                f"[eval={t_eval:.1f}ms]")
+                f"strategy={sig.strategy}")
 
             return ScanResult(
                 symbol  = symbol,
@@ -794,7 +741,7 @@ class BotEngine:
         if not self.risk.can_trade():
             return False
 
-        stake     = await self.risk.calculate_stake()
+        stake     = self.risk.calculate_stake()
         direction = sig.direction
         ac        = get_symbol_class(symbol)
 
