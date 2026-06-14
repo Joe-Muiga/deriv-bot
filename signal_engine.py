@@ -525,10 +525,8 @@ class SignalEngine:
         h1_bars  = kwargs.get("h1_bars",  [])
         htf_bias = _get_htf_bias(d1_bars, h4_bars, h1_bars)
 
-        if htf_bias == "NEUTRAL":
-            return NONE_RESULT
-        # ALLOW_ALL means no HTF data yet — run M5 strategies unrestricted
-        allow_all = htf_bias == "ALLOW_ALL"
+        # Never return NONE_RESULT on neutral — just run unrestricted
+        allow_all = htf_bias in ("NEUTRAL", "ALLOW_ALL")
 
         # ── MTF zone gate ───────────────────────────────────────────────────
         if not _get_mtf_zone(mtf_bars, H, L, C, atr_arr):
@@ -567,7 +565,7 @@ class SignalEngine:
         short_avg   = sum(s for s, _, _ in short_votes) / max(short_count, 1)
 
         # Need minimum 2 strategies agreeing
-        MIN_AGREE   = getattr(config, "MIN_STRATEGY_AGREEMENT", 2)
+        MIN_AGREE   = 1
         final_dir   = None
         final_score = 0.0
         votes_used  = []
