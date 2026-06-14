@@ -113,8 +113,8 @@ MTF_BARS          = 50
 LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
-MIN_SIGNAL_SCORE       = 0.68
-MIN_STRATEGY_AGREEMENT = 2
+MIN_SIGNAL_SCORE       = 0.45
+MIN_STRATEGY_AGREEMENT = 1
 
 # SMC parameters
 OB_LOOKBACK            = 50
