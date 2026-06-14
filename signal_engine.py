@@ -508,133 +508,162 @@ class SignalEngine:
     # Public entry point
     # -----------------------------------------------------------------------
 
-    def evaluate(self, ltf_bars, mtf_bars=None,
-                 symbol="", stake=1.0, **kwargs):
-        if len(ltf_bars) < 20:
+    def evaluate(self, ltf_bars, symbol="", stake=1.0,
+                 d1_bars=None, h4_bars=None, h1_bars=None,
+                 m30_bars=None, m15_bars=None,
+                 mtf_bars=None, **kwargs):
+
+        if len(ltf_bars) < 14:
             return NONE_RESULT
 
-        O       = np.array([b.open  for b in ltf_bars])
-        H       = np.array([b.high  for b in ltf_bars])
-        L       = np.array([b.low   for b in ltf_bars])
-        C       = np.array([b.close for b in ltf_bars])
-        atr_arr = ind.atr(H, L, C, 14)
+        try:
+            C = np.array([b.close for b in ltf_bars])
+            H = np.array([b.high  for b in ltf_bars])
+            L = np.array([b.low   for b in ltf_bars])
 
-        # ── HTF bias gate ───────────────────────────────────────────────────
-        d1_bars  = kwargs.get("d1_bars",  [])
-        h4_bars  = kwargs.get("h4_bars",  [])
-        h1_bars  = kwargs.get("h1_bars",  [])
-        htf_bias = _get_htf_bias(d1_bars, h4_bars, h1_bars)
+            # RSI
+            rsi_arr    = ind.rsi(C, 14)
+            valid_rsi  = rsi_arr[~np.isnan(rsi_arr)]
+            if len(valid_rsi) < 2:
+                return NONE_RESULT
+            last_rsi = float(valid_rsi[-1])
+            prev_rsi = float(valid_rsi[-2])
 
-        # Never return NONE_RESULT on neutral — just run unrestricted
-        allow_all = htf_bias in ("NEUTRAL", "ALLOW_ALL")
+            # EMA
+            ema8  = ind.ema(C, 8)
+            ema21 = ind.ema(C, 21)
+            e8    = float(ema8[-1])
+            e21   = float(ema21[-1])
+            e8p   = float(ema8[-2])
+            e21p  = float(ema21[-2])
 
-        # ── MTF zone gate ───────────────────────────────────────────────────
-        if not _get_mtf_zone(mtf_bars, H, L, C, atr_arr):
-            logger.debug(f"MTF ZONE BLOCK: {symbol} — price outside all MTF zones")
-            return NONE_RESULT
+            # MACD
+            _, _, hist = ind.macd(C, 12, 26, 9)
+            valid_hist = hist[~np.isnan(hist)]
+            last_hist  = float(valid_hist[-1]) \
+                         if len(valid_hist) else 0
+            prev_hist  = float(valid_hist[-2]) \
+                         if len(valid_hist) > 1 else 0
 
-        # Run ALL strategies
-        strategies = [
-            ("SWEEP",       _strat_liquidity_sweep(H, L, C)),
-            ("OB",          _strat_smc_ob(O, H, L, C, atr_arr)),
-            ("FVG",         _strat_smc_fvg(O, H, L, C, atr_arr)),
-            ("FIBONACCI",   _strat_fibonacci(H, L, C, atr_arr)),
-            ("CHART_PAT",   _strat_chart_pattern(O, H, L, C)),
-            ("STRUCTURE",   _strat_market_structure(H, L, C)),
-            ("MEAN_REV",    _strat_mean_reversion(C, H, L)),
-            ("CANDLE",      _strat_candlestick(O, H, L, C)),
-            ("EMA_MOM",     _strat_ema_momentum(C)),
-            ("MACD_RSI",    _strat_macd_rsi(C)),
-        ]
+            # Bollinger
+            upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
+            valid_upper = upper[~np.isnan(upper)]
+            valid_lower = lower[~np.isnan(lower)]
+            last_close  = float(C[-1])
+            last_upper  = float(valid_upper[-1]) \
+                          if len(valid_upper) else last_close
+            last_lower  = float(valid_lower[-1]) \
+                          if len(valid_lower) else last_close
 
-        long_votes  = []  # (score, name, reason)
-        short_votes = []
+            long_score  = 0.0
+            short_score = 0.0
+            reasons     = []
 
-        for name, (direction, score, reason) in strategies:
-            if direction == "LONG" and score > 0:
-                if allow_all or htf_bias == "LONG":
-                    long_votes.append((score, name, reason))
-            elif direction == "SHORT" and score > 0:
-                if allow_all or htf_bias == "SHORT":
-                    short_votes.append((score, name, reason))
+            # RSI signals
+            if last_rsi < 35:
+                long_score  += 0.25
+                reasons.append(f"RSI_LOW={last_rsi:.1f}")
+            if last_rsi > 65:
+                short_score += 0.25
+                reasons.append(f"RSI_HIGH={last_rsi:.1f}")
+            if last_rsi > 50:
+                long_score  += 0.10
+            else:
+                short_score += 0.10
 
-        # Determine dominant direction
-        long_count  = len(long_votes)
-        short_count = len(short_votes)
-        long_avg    = sum(s for s, _, _ in long_votes)  / max(long_count,  1)
-        short_avg   = sum(s for s, _, _ in short_votes) / max(short_count, 1)
+            # RSI turning
+            if last_rsi > prev_rsi and last_rsi < 50:
+                long_score  += 0.15
+                reasons.append("RSI_TURNING_UP")
+            if last_rsi < prev_rsi and last_rsi > 50:
+                short_score += 0.15
+                reasons.append("RSI_TURNING_DOWN")
 
-        # Need minimum 2 strategies agreeing
-        MIN_AGREE   = 1
-        final_dir   = None
-        final_score = 0.0
-        votes_used  = []
+            # EMA signals
+            if e8 > e21:
+                long_score  += 0.15
+            else:
+                short_score += 0.15
+            if e8p <= e21p and e8 > e21:
+                long_score  += 0.20
+                reasons.append("EMA_CROSS_UP")
+            if e8p >= e21p and e8 < e21:
+                short_score += 0.20
+                reasons.append("EMA_CROSS_DOWN")
 
-        if long_count >= MIN_AGREE and long_count > short_count:
-            final_dir   = "LONG"
-            final_score = long_avg + (long_count - MIN_AGREE) * 0.03
-            votes_used  = long_votes
-        elif short_count >= MIN_AGREE and short_count > long_count:
-            final_dir   = "SHORT"
-            final_score = short_avg + (short_count - MIN_AGREE) * 0.03
-            votes_used  = short_votes
-        elif long_count == short_count and long_count >= MIN_AGREE:
-            # Tie: use highest average score
-            if long_avg >= short_avg:
+            # MACD signals
+            if last_hist > 0:
+                long_score  += 0.10
+            else:
+                short_score += 0.10
+            if prev_hist <= 0 and last_hist > 0:
+                long_score  += 0.15
+                reasons.append("MACD_CROSS_UP")
+            if prev_hist >= 0 and last_hist < 0:
+                short_score += 0.15
+                reasons.append("MACD_CROSS_DOWN")
+
+            # Bollinger signals
+            if last_close <= last_lower:
+                long_score  += 0.20
+                reasons.append("PRICE_AT_LOWER_BB")
+            if last_close >= last_upper:
+                short_score += 0.20
+                reasons.append("PRICE_AT_UPPER_BB")
+
+            # Determine direction
+            if long_score <= 0.0 and short_score <= 0.0:
+                return NONE_RESULT
+
+            if long_score >= short_score:
                 final_dir   = "LONG"
-                final_score = long_avg
-                votes_used  = long_votes
+                final_score = min(long_score, 0.98)
             else:
                 final_dir   = "SHORT"
-                final_score = short_avg
-                votes_used  = short_votes
+                final_score = min(short_score, 0.98)
 
-        if not final_dir:
-            logger.debug(
-                f"NO SIGNAL: {symbol} "
-                f"long={long_count} short={short_count}")
+            if final_score < 0.35:
+                logger.debug(
+                    f"BELOW THRESHOLD: {symbol} "
+                    f"score={final_score:.3f}")
+                return NONE_RESULT
+
+            sl_pct  = config.STOP_LOSS_MAP.get(
+                symbol, config.DEFAULT_STOP_LOSS_PCT)
+            sl_amt  = round(stake * sl_pct / 100, 2)
+            tp_amt  = round(sl_amt * 2.0, 2)
+            mult    = config.MULTIPLIER_MAP.get(
+                symbol, config.DEFAULT_MULTIPLIER)
+            reason  = " | ".join(reasons) \
+                      if reasons else "SCORE_BASED"
+
+            # ══════════════════════════════════════
+            # INVERSION — intentional, do not remove
+            # ══════════════════════════════════════
+            analysis_dir  = final_dir
+            inverted_dir  = "SHORT" \
+                            if final_dir == "LONG" \
+                            else "LONG"
+
+            logger.info(
+                f"SIGNAL: {symbol} | "
+                f"Analysis={analysis_dir} → "
+                f"Executing={inverted_dir} | "
+                f"score={final_score:.3f} | "
+                f"{reason}")
+
+            return SignalResult(
+                direction   = inverted_dir,
+                strength    = 2,
+                score       = final_score,
+                strategy    = "RSI_EMA_MACD_BB",
+                reason      = reason,
+                stop_loss   = sl_amt,
+                take_profit = tp_amt,
+                multiplier  = mult,
+            )
+
+        except Exception as e:
+            logger.error(
+                f"SIGNAL ERROR: {symbol} — {e}")
             return NONE_RESULT
-
-        final_score = min(final_score, 0.98)
-
-        if final_score < config.MIN_SIGNAL_SCORE:
-            logger.debug(
-                f"BELOW THRESHOLD: {symbol} "
-                f"score={final_score:.3f}")
-            return NONE_RESULT
-
-        # Strategy summary
-        strategy_names = "+".join(n for _, n, _ in votes_used)
-        reasons        = " | ".join(
-            f"{n}:{r}" for _, n, r in votes_used)
-
-        sl_pct = config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
-        sl_amt = round(stake * sl_pct / 100, 2)
-        tp_amt = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
-        mult   = config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER)
-
-        # ═══════════════════════════════════════════════
-        # INVERSION — applied to every signal before return
-        # Analysis direction is logged, execution is opposite
-        # ═══════════════════════════════════════════════
-        analysis_direction = final_dir
-        inverted_direction = "SHORT" if final_dir == "LONG" else "LONG"
-
-        logger.info(
-            f"SIGNAL: {symbol} | "
-            f"Analysis={analysis_direction} → "
-            f"Executing={inverted_direction} | "
-            f"score={final_score:.3f} | "
-            f"agreement={len(votes_used)}/10 | "
-            f"strategies=[{strategy_names}]")
-
-        return SignalResult(
-            direction   = inverted_direction,  # INVERTED
-            strength    = min(len(votes_used), 3),
-            score       = final_score,
-            strategy    = f"MULTI({len(votes_used)}/10)",
-            reason      = reasons,
-            stop_loss   = sl_amt,
-            take_profit = tp_amt,
-            multiplier  = mult,
-        )
