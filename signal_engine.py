@@ -513,157 +513,77 @@ class SignalEngine:
                  m30_bars=None, m15_bars=None,
                  mtf_bars=None, **kwargs):
 
-        if len(ltf_bars) < 14:
+        if len(ltf_bars) < 3:
             return NONE_RESULT
 
         try:
-            C = np.array([b.close for b in ltf_bars])
-            H = np.array([b.high  for b in ltf_bars])
-            L = np.array([b.low   for b in ltf_bars])
+            closes = [b.close for b in ltf_bars]
+            highs  = [b.high  for b in ltf_bars]
+            lows   = [b.low   for b in ltf_bars]
 
-            # RSI
-            rsi_arr    = ind.rsi(C, 14)
-            valid_rsi  = rsi_arr[~np.isnan(rsi_arr)]
-            if len(valid_rsi) < 2:
-                return NONE_RESULT
-            last_rsi = float(valid_rsi[-1])
-            prev_rsi = float(valid_rsi[-2])
+            c0 = closes[-1]  # current
+            c1 = closes[-2]  # previous
+            c2 = closes[-3]
 
-            # EMA
-            ema8  = ind.ema(C, 8)
-            ema21 = ind.ema(C, 21)
-            e8    = float(ema8[-1])
-            e21   = float(ema21[-1])
-            e8p   = float(ema8[-2])
-            e21p  = float(ema21[-2])
+            h_recent = max(highs[-10:])
+            l_recent = min(lows[-10:])
+            mid      = (h_recent + l_recent) / 2
 
-            # MACD
-            _, _, hist = ind.macd(C, 12, 26, 9)
-            valid_hist = hist[~np.isnan(hist)]
-            last_hist  = float(valid_hist[-1]) \
-                         if len(valid_hist) else 0
-            prev_hist  = float(valid_hist[-2]) \
-                         if len(valid_hist) > 1 else 0
+            bull = 0
+            bear = 0
 
-            # Bollinger
-            upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
-            valid_upper = upper[~np.isnan(upper)]
-            valid_lower = lower[~np.isnan(lower)]
-            last_close  = float(C[-1])
-            last_upper  = float(valid_upper[-1]) \
-                          if len(valid_upper) else last_close
-            last_lower  = float(valid_lower[-1]) \
-                          if len(valid_lower) else last_close
+            if c0 > c1: bull += 1
+            else:        bear += 1
 
-            long_score  = 0.0
-            short_score = 0.0
-            reasons     = []
+            if c0 > c2: bull += 1
+            else:        bear += 1
 
-            # RSI signals
-            if last_rsi < 35:
-                long_score  += 0.25
-                reasons.append(f"RSI_LOW={last_rsi:.1f}")
-            if last_rsi > 65:
-                short_score += 0.25
-                reasons.append(f"RSI_HIGH={last_rsi:.1f}")
-            if last_rsi > 50:
-                long_score  += 0.10
-            else:
-                short_score += 0.10
+            if c0 > mid: bull += 1
+            else:         bear += 1
 
-            # RSI turning
-            if last_rsi > prev_rsi and last_rsi < 50:
-                long_score  += 0.15
-                reasons.append("RSI_TURNING_UP")
-            if last_rsi < prev_rsi and last_rsi > 50:
-                short_score += 0.15
-                reasons.append("RSI_TURNING_DOWN")
+            if c1 > c2:  bull += 1
+            else:         bear += 1
 
-            # EMA signals
-            if e8 > e21:
-                long_score  += 0.15
-            else:
-                short_score += 0.15
-            if e8p <= e21p and e8 > e21:
-                long_score  += 0.20
-                reasons.append("EMA_CROSS_UP")
-            if e8p >= e21p and e8 < e21:
-                short_score += 0.20
-                reasons.append("EMA_CROSS_DOWN")
-
-            # MACD signals
-            if last_hist > 0:
-                long_score  += 0.10
-            else:
-                short_score += 0.10
-            if prev_hist <= 0 and last_hist > 0:
-                long_score  += 0.15
-                reasons.append("MACD_CROSS_UP")
-            if prev_hist >= 0 and last_hist < 0:
-                short_score += 0.15
-                reasons.append("MACD_CROSS_DOWN")
-
-            # Bollinger signals
-            if last_close <= last_lower:
-                long_score  += 0.20
-                reasons.append("PRICE_AT_LOWER_BB")
-            if last_close >= last_upper:
-                short_score += 0.20
-                reasons.append("PRICE_AT_UPPER_BB")
-
-            # Determine direction
-            if long_score <= 0.0 and short_score <= 0.0:
-                return NONE_RESULT
-
-            if long_score >= short_score:
+            if bull > bear:
                 final_dir   = "LONG"
-                final_score = min(long_score, 0.98)
+                final_score = 0.50 + (bull - bear) * 0.08
             else:
                 final_dir   = "SHORT"
-                final_score = min(short_score, 0.98)
+                final_score = 0.50 + (bear - bull) * 0.08
 
-            if final_score < 0.35:
-                logger.debug(
-                    f"BELOW THRESHOLD: {symbol} "
-                    f"score={final_score:.3f}")
-                return NONE_RESULT
+            final_score = min(final_score, 0.90)
 
-            sl_pct  = config.STOP_LOSS_MAP.get(
+            sl_pct = config.STOP_LOSS_MAP.get(
                 symbol, config.DEFAULT_STOP_LOSS_PCT)
-            sl_amt  = round(stake * sl_pct / 100, 2)
-            tp_amt  = round(sl_amt * 2.0, 2)
-            mult    = config.MULTIPLIER_MAP.get(
+            sl_amt = round(stake * sl_pct / 100, 2)
+            tp_amt = round(sl_amt * 2.0, 2)
+            mult   = config.MULTIPLIER_MAP.get(
                 symbol, config.DEFAULT_MULTIPLIER)
-            reason  = " | ".join(reasons) \
-                      if reasons else "SCORE_BASED"
 
-            # ══════════════════════════════════════
-            # INVERSION — intentional, do not remove
-            # ══════════════════════════════════════
-            analysis_dir  = final_dir
-            inverted_dir  = "SHORT" \
-                            if final_dir == "LONG" \
-                            else "LONG"
+            # ══════════════════════════════════
+            # INVERSION — intentional, never remove
+            # ══════════════════════════════════
+            inverted = "SHORT" if final_dir == "LONG" \
+                       else "LONG"
 
             logger.info(
-                f"SIGNAL: {symbol} | "
-                f"Analysis={analysis_dir} → "
-                f"Executing={inverted_dir} | "
-                f"score={final_score:.3f} | "
-                f"{reason}")
+                f"SIGNAL: {symbol} "
+                f"Analysis={final_dir} → "
+                f"Executing={inverted} "
+                f"score={final_score:.3f} "
+                f"bull={bull} bear={bear}")
 
             return SignalResult(
-                direction   = inverted_dir,
+                direction   = inverted,
                 strength    = 2,
                 score       = final_score,
-                strategy    = "RSI_EMA_MACD_BB",
-                reason      = reason,
+                strategy    = "PRICE_ACTION",
+                reason      = f"bull={bull} bear={bear}",
                 stop_loss   = sl_amt,
                 take_profit = tp_amt,
                 multiplier  = mult,
             )
 
         except Exception as e:
-            logger.error(
-                f"SIGNAL ERROR: {symbol} — {e}")
+            logger.error(f"SIGNAL ERROR {symbol}: {e}")
             return NONE_RESULT
