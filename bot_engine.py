@@ -578,6 +578,8 @@ class BotEngine:
                 *[self._scan(s) for s in queue],
                 return_exceptions=True,
             )
+            non_none = [r for r in raw_results if r is not None]
+            logger.info(f"SCAN RESULTS: {len(raw_results)} scanned, {len(non_none)} non-None")
             candidates = [
                 r for r in raw_results
                 if r is not None
@@ -665,11 +667,16 @@ class BotEngine:
 
     async def _scan(self, symbol: str) -> Optional[ScanResult]:
         try:
-            ltf = self._ltf.get(symbol)
-            htf = self._htf.get(symbol)
-            if not ltf or not htf:
-                return None
-            if ltf.count < 3:
+            ltf = None
+            for attr in ['_m5', '_ltf', '_htf']:
+                store = getattr(self, attr, {})
+                candidate = store.get(symbol)
+                if candidate and candidate.count >= 4:
+                    ltf = candidate
+                    break
+
+            if not ltf:
+                logger.debug(f"NO LTF DATA: {symbol}")
                 return None
 
             current_price = float(
@@ -678,7 +685,7 @@ class BotEngine:
             if current_price == 0:
                 return None
 
-            stake = self.risk.calculate_stake()
+            stake = await self.risk.calculate_stake()
 
             # Safely get extra timeframes if they exist
             def safe_bars(store, sym):
@@ -741,7 +748,7 @@ class BotEngine:
         if not self.risk.can_trade():
             return False
 
-        stake     = self.risk.calculate_stake()
+        stake     = await self.risk.calculate_stake()
         direction = sig.direction
         ac        = get_symbol_class(symbol)
 
