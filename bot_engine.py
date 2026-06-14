@@ -580,8 +580,10 @@ class BotEngine:
             )
             candidates = [
                 r for r in raw_results
-                if isinstance(r, ScanResult)
+                if r is not None
+                and isinstance(r, ScanResult)
                 and r.sig.direction != "NONE"
+                and r.sig.score >= 0.35
                 and self.symbols.can_trade_now(r.symbol)
             ]
 
@@ -663,52 +665,64 @@ class BotEngine:
 
     async def _scan(self, symbol: str) -> Optional[ScanResult]:
         try:
-            htf = self._htf.get(symbol)
-            mtf = self._mtf.get(symbol)
             ltf = self._ltf.get(symbol)
-
-            if not all([htf, mtf, ltf]):
+            htf = self._htf.get(symbol)
+            if not ltf or not htf:
                 return None
-            if htf.count < 10:
-                return None
-
-            price = float(
-                ltf.completed_bars[-1].close if ltf.completed_bars else 0)
-            if price == 0:
+            if ltf.count < 3:
                 return None
 
-            if self.news.is_blocked(symbol):
-                return None
-
-            ctx = self.smc.analyse(
-                htf.completed_bars,
-                mtf.completed_bars,
-                price,
-            )
-            if ctx.bias == "NEUTRAL":
+            current_price = float(
+                ltf.completed_bars[-1].close
+                if ltf.completed_bars else 0)
+            if current_price == 0:
                 return None
 
             stake = await self.risk.calculate_stake()
 
+            # Safely get extra timeframes if they exist
+            def safe_bars(store, sym):
+                try:
+                    b = store.get(sym)
+                    return b.completed_bars if b else None
+                except Exception:
+                    return None
+
             sig = self.signal.evaluate(
                 ltf_bars = ltf.completed_bars,
-                mtf_bars = mtf.completed_bars,
                 symbol   = symbol,
                 stake    = stake,
+                d1_bars  = safe_bars(
+                    getattr(self, "_d1",  {}), symbol),
+                h4_bars  = safe_bars(
+                    getattr(self, "_h4",  {}), symbol),
+                h1_bars  = safe_bars(
+                    getattr(self, "_h1",  {}), symbol),
+                m30_bars = safe_bars(
+                    getattr(self, "_m30", {}), symbol),
+                m15_bars = safe_bars(
+                    getattr(self, "_m15", {}), symbol),
             )
+
             if sig is None or sig.direction == "NONE":
                 return None
+
+            logger.info(
+                f"SCAN HIT: {symbol} "
+                f"{sig.direction} "
+                f"score={sig.score:.3f} "
+                f"strategy={sig.strategy}")
 
             return ScanResult(
                 symbol  = symbol,
                 sig     = sig,
-                price   = price,
-                smc_ctx = ctx,
-                score   = getattr(sig, "score", 0.0),
+                price   = current_price,
+                smc_ctx = None,
+                score   = sig.score,
             )
 
-        except Exception as exc:
-            logger.debug(f"_scan({symbol}): {exc}")
+        except Exception as e:
+            logger.error(f"SCAN ERROR {symbol}: {e}")
             return None
 
     # ── Execution ──────────────────────────────────────────────────────────────
