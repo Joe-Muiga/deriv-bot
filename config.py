@@ -189,7 +189,7 @@ REDEPLOY_EVERY_N_CYCLES = 8
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
-MAX_CONCURRENT     = 5               # alias
+MAX_CONCURRENT     = 20               # alias
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
@@ -219,6 +219,6 @@ DEAD_ZONE_END_UTC    = 5
 BOOM500_PRIME_START  = 7
 BOOM500_PRIME_END    = 12
 ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
-TRADE_DURATION = 11
+TRADE_DURATION = 12
 TRADE_DURATION_UNIT = "m"
  
