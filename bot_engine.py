@@ -578,14 +578,10 @@ class BotEngine:
                 *[self._scan(s) for s in queue],
                 return_exceptions=True,
             )
-            non_none = [r for r in raw_results if r is not None]
-            logger.info(f"SCAN RESULTS: {len(raw_results)} scanned, {len(non_none)} non-None")
             candidates = [
                 r for r in raw_results
-                if r is not None
-                and isinstance(r, ScanResult)
+                if isinstance(r, ScanResult)
                 and r.sig.direction != "NONE"
-                and r.sig.score >= 0.35
                 and self.symbols.can_trade_now(r.symbol)
             ]
 
@@ -606,44 +602,28 @@ class BotEngine:
 
             candidates = [r for r in ranked if r.symbol not in self._active_symbols]
 
-            # ── Rank all signals by score descending ──────────────────────────
+            # ── Fix 1: never trade the same symbol twice in one cycle ─────────
+            seen_symbols: Set[str] = set()
+            unique_candidates: List[ScanResult] = []
+            for r in sorted(candidates, key=lambda x: x.score, reverse=True):
+                if r.symbol not in seen_symbols:
+                    unique_candidates.append(r)
+                    seen_symbols.add(r.symbol)
+            candidates = unique_candidates
+
+            # ── Fix 2: rank by score before executing ─────────────────────────
             candidates = sorted(
-                candidates,
-                key=lambda r: r.sig.score,
-                reverse=True
-            )
-
-            # Deduplicate — one signal per symbol
-            seen = set()
-            unique = []
-            for r in candidates:
-                if r.symbol not in seen:
-                    unique.append(r)
-                    seen.add(r.symbol)
-            candidates = unique
-
-            # Log full ranking
-            logger.info(f"RANKED SIGNALS THIS CYCLE:")
-            for i, r in enumerate(candidates[:10]):
-                logger.info(
-                    f"  #{i+1} {r.symbol} {r.sig.direction} "
-                    f"score={r.sig.score:.3f} "
-                    f"strategy={r.sig.strategy}")
-
-            # Execute only top N above threshold
-            top = [r for r in candidates
-                   if r.sig.score >= config.MIN_SIGNAL_SCORE
-                   ][:self.risk.current_concurrent_limit]
-
-            if not top:
-                logger.info("NO QUALIFYING SIGNALS THIS CYCLE")
+                candidates, key=lambda x: getattr(x.sig, "score", x.score), reverse=True)
+            top = candidates[: self.risk.current_concurrent_limit]
+            logger.info(
+                f"RANKED: {[(r.symbol, getattr(r.sig, 'score', r.score)) for r in top]}")
 
             open_count = len(self._open_contracts)
             streak     = self.risk.current_streak
             logger.info(
                 f"CYCLE {cycle_number} | "
                 f"Queue:{len(queue)} | "
-                f"Signals:{len(candidates)} | "
+                f"Signals:{len(ranked)} | "
                 f"Executing:{len(top)} | "
                 f"Open:{open_count} | "
                 f"Balance:${self.client.balance:.4f} | "
@@ -667,69 +647,52 @@ class BotEngine:
 
     async def _scan(self, symbol: str) -> Optional[ScanResult]:
         try:
-            ltf = None
-            for attr in ['_m5', '_ltf', '_htf']:
-                store = getattr(self, attr, {})
-                candidate = store.get(symbol)
-                if candidate and candidate.count >= 4:
-                    ltf = candidate
-                    break
+            htf = self._htf.get(symbol)
+            mtf = self._mtf.get(symbol)
+            ltf = self._ltf.get(symbol)
 
-            if not ltf:
-                logger.debug(f"NO LTF DATA: {symbol}")
+            if not all([htf, mtf, ltf]):
+                return None
+            if htf.count < 10:
                 return None
 
-            current_price = float(
-                ltf.completed_bars[-1].close
-                if ltf.completed_bars else 0)
-            if current_price == 0:
+            price = float(
+                ltf.completed_bars[-1].close if ltf.completed_bars else 0)
+            if price == 0:
+                return None
+
+            if self.news.is_blocked(symbol):
+                return None
+
+            ctx = self.smc.analyse(
+                htf.completed_bars,
+                mtf.completed_bars,
+                price,
+            )
+            if ctx.bias == "NEUTRAL":
                 return None
 
             stake = await self.risk.calculate_stake()
 
-            # Safely get extra timeframes if they exist
-            def safe_bars(store, sym):
-                try:
-                    b = store.get(sym)
-                    return b.completed_bars if b else None
-                except Exception:
-                    return None
-
             sig = self.signal.evaluate(
                 ltf_bars = ltf.completed_bars,
+                mtf_bars = mtf.completed_bars,
                 symbol   = symbol,
                 stake    = stake,
-                d1_bars  = safe_bars(
-                    getattr(self, "_d1",  {}), symbol),
-                h4_bars  = safe_bars(
-                    getattr(self, "_h4",  {}), symbol),
-                h1_bars  = safe_bars(
-                    getattr(self, "_h1",  {}), symbol),
-                m30_bars = safe_bars(
-                    getattr(self, "_m30", {}), symbol),
-                m15_bars = safe_bars(
-                    getattr(self, "_m15", {}), symbol),
             )
-
             if sig is None or sig.direction == "NONE":
                 return None
-
-            logger.info(
-                f"SCAN HIT: {symbol} "
-                f"{sig.direction} "
-                f"score={sig.score:.3f} "
-                f"strategy={sig.strategy}")
 
             return ScanResult(
                 symbol  = symbol,
                 sig     = sig,
-                price   = current_price,
-                smc_ctx = None,
-                score   = sig.score,
+                price   = price,
+                smc_ctx = ctx,
+                score   = getattr(sig, "score", 0.0),
             )
 
-        except Exception as e:
-            logger.error(f"SCAN ERROR {symbol}: {e}")
+        except Exception as exc:
+            logger.debug(f"_scan({symbol}): {exc}")
             return None
 
     # ── Execution ──────────────────────────────────────────────────────────────
