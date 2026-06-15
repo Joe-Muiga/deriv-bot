@@ -115,7 +115,7 @@ TAKE_PROFIT_RATIO = 2.0
 BASE_STAKE_PCT       = 0.005   # 0.5% per trade
 MIN_STAKE            = 0.35
 MAX_STAKE            = 25.0
-DAILY_LOSS_LIMIT_PCT = 2.20   # 20% max daily loss
+DAILY_LOSS_LIMIT_PCT = 0.50   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
@@ -136,7 +136,7 @@ LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
 MIN_SIGNAL_SCORE       = 0.68
-MIN_STRATEGY_AGREEMENT = 2
+MIN_STRATEGY_AGREEMENT = 3
 
 # SMC parameters
 OB_LOOKBACK            = 50
@@ -163,8 +163,8 @@ CONTRACT_CHECK_SECS   = 1200
 CONTRACT_TIMEOUT_SECS = 1800
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 3
-SYMBOL_LOSS_SUSPEND_MINS  = 10
+SYMBOL_WIN_SUSPEND_MINS   = 10
+SYMBOL_LOSS_SUSPEND_MINS  = 25
 SYMBOL_MIN_GAP_MINS       = 1
 SYMBOL_SESSION_BAN_LOSSES = 4
 
