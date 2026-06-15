@@ -124,7 +124,7 @@ PLS_WIN_MULTIPLIERS = [2.0, 3.0, 5.0, 8.0, 10.0]
 PLS_WIN_EXTRA_SLOTS = [3,   6,   9,   12,  15  ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 5
+MAX_CONCURRENT_TRADES = 30
 
 # ── TIMEFRAMES ───────────────────────────────────────────────
 HTF_GRANULARITY   = 3600   # 1H
