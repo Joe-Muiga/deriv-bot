@@ -51,12 +51,13 @@ DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 # Only these symbols support CALL/PUT Rise/Fall via Deriv API
 RISE_FALL_SYMBOLS = [
     "R_10","R_25","R_50","R_75","R_100",
-    "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
+    "1HZ10V","1HZ25V","1HZ50V","1HZ75V",
+    "1HZ100V","1HZ150V","1HZ200V","1HZ250V",
     "RDBULL","RDBEAR","stpRNG",
 ]
 
 # All symbols combined — Rise/Fall compatible only
-ALL_SYMBOLS       = RISE_FALL_SYMBOLS
+ALL_SYMBOLS = RISE_FALL_SYMBOLS
 
 # ── MULTIPLIER SETTINGS ──────────────────────────────────────
 # Higher volatility = higher multiplier potential
@@ -85,21 +86,43 @@ MULTIPLIER_MAP = {
     "DSHIFT10":200, "DSHIFT20":200,
     "DSHIFT30":200,
 }
-DEFAULT_MULTIPLIER    = 1
-DEFAULT_STOP_LOSS_PCT = 0
-TAKE_PROFIT_RATIO     = 0
+DEFAULT_MULTIPLIER = 100
+
+# ── STOP LOSS AND TAKE PROFIT (% of stake) ──────────────────
+# Stop loss as % of stake — caps maximum loss per trade
+STOP_LOSS_MAP = {
+    # Low vol — tighter SL
+    "R_10":    30.0,  "1HZ10V":  30.0,
+    "R_25":    40.0,  "1HZ25V":  40.0,
+    # Medium vol
+    "R_50":    50.0,  "1HZ50V":  50.0,
+    "R_75":    60.0,  "1HZ75V":  60.0,
+    # High vol — wider SL to avoid noise
+    "R_100":   70.0,  "1HZ100V": 70.0,
+    "1HZ150V": 75.0,  "1HZ200V": 80.0,
+    "1HZ250V": 80.0,
+    # Boom/Crash — wide SL due to spikes
+    "BOOM150": 50.0,  "BOOM300": 50.0,
+    "BOOM500": 50.0,  "BOOM1000":50.0,
+    "CRASH150":50.0,  "CRASH300":50.0,
+    "CRASH500":50.0,  "CRASH1000":50.0,
+}
+DEFAULT_STOP_LOSS_PCT = 50.0
+
+# Take profit = 2x stop loss (2:1 RR minimum)
+TAKE_PROFIT_RATIO = 2.0
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
-BASE_STAKE_PCT       = 0.01    # 1% per trade
-MIN_STAKE            = 0.35
-MAX_STAKE            = 50.0
+BASE_STAKE_PCT       = 0.01   # 1% of balance per trade
+MIN_STAKE            = 0.50
+MAX_STAKE            = 100.0
 DAILY_LOSS_LIMIT_PCT = 2.20   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
-# Win streak scaling
-WIN_STREAK_THRESHOLDS  = [3,   5,   8,   12  ]
-WIN_STREAK_MULTIPLIERS = [1.5, 2.0, 3.0, 4.0 ]
-WIN_STREAK_EXTRA_SLOTS = [1,   2,   3,   4   ]
+# ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
+PLS_WIN_THRESHOLDS  = [3,   5,   8,   12,  15  ]
+PLS_WIN_MULTIPLIERS = [2.0, 3.0, 5.0, 8.0, 10.0]
+PLS_WIN_EXTRA_SLOTS = [3,   6,   9,   12,  15  ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
 MAX_CONCURRENT_TRADES = 20
@@ -113,16 +136,7 @@ MTF_BARS          = 50
 LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
-MIN_SIGNAL_SCORE       = 0.45
-MIN_STRATEGY_AGREEMENT = 1
-
-# SMC parameters
-OB_LOOKBACK            = 50
-FVG_MIN_ATR            = 0.5
-SWEEP_LOOKBACK         = 20
-SWING_LOOKBACK         = 5
-FIB_LEVELS             = [0.382, 0.5, 0.618, 0.786]
-FIB_TOLERANCE          = 0.1
+MIN_SIGNAL_SCORE      = 0.3
 EMA_FAST              = 8
 EMA_SLOW              = 21
 EMA_TREND             = 50
@@ -136,20 +150,20 @@ BREAKOUT_ATR_MULT     = 1.5
 # ── CONTRACT SETTINGS ────────────────────────────────────────
 # Multiplier contracts — keep short to avoid funding fees
 MAX_TRADE_OPEN_MINS   = 30   # force close at 30 min
-CHECK_TRADE_MINS      = 25   # check at 20 min
+CHECK_TRADE_MINS      = 20   # check at 20 min
 CONTRACT_CHECK_SECS   = 1200
 CONTRACT_TIMEOUT_SECS = 1800
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 5
-SYMBOL_LOSS_SUSPEND_MINS  = 17
-SYMBOL_MIN_GAP_MINS       = 3
-SYMBOL_SESSION_BAN_LOSSES = 3
+SYMBOL_WIN_SUSPEND_MINS   = 3
+SYMBOL_LOSS_SUSPEND_MINS  = 10
+SYMBOL_MIN_GAP_MINS       = 1
+SYMBOL_SESSION_BAN_LOSSES = 4
 
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
-INIT_BATCH_SIZE        = 8
-INIT_BATCH_DELAY       = 0.3
+INIT_BATCH_SIZE        = 10
+INIT_BATCH_DELAY       = 0.1
 PRIORITY_SYMBOLS = [
     "R_75","R_100","1HZ75V","1HZ100V",
     "1HZ250V","1HZ150V","R_50","R_25",
@@ -157,7 +171,7 @@ PRIORITY_SYMBOLS = [
 ]
 
 # ── RATE LIMITING ────────────────────────────────────────────
-BUY_REQUEST_DELAY_SECS = 3.0
+BUY_REQUEST_DELAY_SECS = 0.3
 MAX_BUY_PER_SECOND     = 3
 
 # ── RENDER ──────────────────────────────────────────────────
@@ -166,38 +180,36 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 REDEPLOY_EVERY_N_CYCLES = 8
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
-RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias = 0.01
-MAX_CONCURRENT     = 20               # alias
+RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
+MAX_CONCURRENT     = 20              # alias
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
-MIN_MODULES_FOR_SIGNAL     = 2
-MIN_INDICATOR_VOTES        = 3
+MIN_MODULES_FOR_SIGNAL     = 1
+MIN_INDICATOR_VOTES        = 2
 OB_EXPIRY_BARS             = 100
 NEWS_BLOCK_MINUTES         = 60
 FOREX_LTF_GRANULARITY      = 900
 OTHER_LTF_GRANULARITY      = 60
-MIN_SIGNAL_PROBABILITY     = 1.8
-MIN_STRENGTH_REPEAT_SYMBOL = 3
+MIN_SIGNAL_PROBABILITY     = 0.3
+MIN_STRENGTH_REPEAT_SYMBOL = 1
 
 # ── DERIV WEBSOCKET ───────────────────────────────────────────
 DERIV_WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # ── SIGNAL GENERATION GATES (additional) ─────────────────────
-MIN_SCORE                  = 2.0
-MIN_CONFLUENCE             = 2
-MIN_MODULE_STRENGTH        = 2
-MIN_MODULE_STRENGTH_NORMAL = 2
-MIN_CONFIDENCE_NORMAL      = 5
-MIN_CONFIDENCE_FOR_PARTIAL = 5
+MIN_SCORE                  = 0.3
+MIN_CONFLUENCE             = 1
+MIN_MODULE_STRENGTH        = 1
+MIN_MODULE_STRENGTH_NORMAL = 1
+MIN_CONFIDENCE_NORMAL      = 3
+MIN_CONFIDENCE_FOR_PARTIAL = 3
 
 # ── SESSION TIMING — disabled for 24/7 synthetics ────────────
 DEAD_ZONE_START_UTC  = 0
-DEAD_ZONE_END_UTC    = 5
-BOOM500_PRIME_START  = 7
-BOOM500_PRIME_END    = 12
+DEAD_ZONE_END_UTC    = 0
+BOOM500_PRIME_START  = 0
+BOOM500_PRIME_END    = 24
 ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
-TRADE_DURATION = 20
+TRADE_DURATION = 11
 TRADE_DURATION_UNIT = "m"
-
- 
