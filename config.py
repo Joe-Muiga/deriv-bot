@@ -51,13 +51,12 @@ DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 # Only these symbols support CALL/PUT Rise/Fall via Deriv API
 RISE_FALL_SYMBOLS = [
     "R_10","R_25","R_50","R_75","R_100",
-    "1HZ10V","1HZ25V","1HZ50V","1HZ75V",
-    "1HZ100V","1HZ150V","1HZ200V","1HZ250V",
+    "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
     "RDBULL","RDBEAR","stpRNG",
 ]
 
 # All symbols combined — Rise/Fall compatible only
-ALL_SYMBOLS = RISE_FALL_SYMBOLS
+ALL_SYMBOLS       = RISE_FALL_SYMBOLS
 
 # ── MULTIPLIER SETTINGS ──────────────────────────────────────
 # Higher volatility = higher multiplier potential
@@ -113,9 +112,9 @@ DEFAULT_STOP_LOSS_PCT = 50.0
 TAKE_PROFIT_RATIO = 2.0
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
-BASE_STAKE_PCT       = 0.01   # 1% of balance per trade
-MIN_STAKE            = 0.50
-MAX_STAKE            = 100.0
+BASE_STAKE_PCT       = 0.005   # 0.5% per trade
+MIN_STAKE            = 0.35
+MAX_STAKE            = 25.0
 DAILY_LOSS_LIMIT_PCT = 2.20   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
@@ -125,7 +124,7 @@ PLS_WIN_MULTIPLIERS = [2.0, 3.0, 5.0, 8.0, 10.0]
 PLS_WIN_EXTRA_SLOTS = [3,   6,   9,   12,  15  ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 20
+MAX_CONCURRENT_TRADES = 5
 
 # ── TIMEFRAMES ───────────────────────────────────────────────
 HTF_GRANULARITY   = 3600   # 1H
@@ -136,7 +135,16 @@ MTF_BARS          = 50
 LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
-MIN_SIGNAL_SCORE      = 0.3
+MIN_SIGNAL_SCORE       = 0.68
+MIN_STRATEGY_AGREEMENT = 2
+
+# SMC parameters
+OB_LOOKBACK            = 50
+FVG_MIN_ATR            = 0.5
+SWEEP_LOOKBACK         = 20
+SWING_LOOKBACK         = 5
+FIB_LEVELS             = [0.382, 0.5, 0.618, 0.786]
+FIB_TOLERANCE          = 0.1
 EMA_FAST              = 8
 EMA_SLOW              = 21
 EMA_TREND             = 50
@@ -162,8 +170,8 @@ SYMBOL_SESSION_BAN_LOSSES = 4
 
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
-INIT_BATCH_SIZE        = 10
-INIT_BATCH_DELAY       = 0.1
+INIT_BATCH_SIZE        = 8
+INIT_BATCH_DELAY       = 0.3
 PRIORITY_SYMBOLS = [
     "R_75","R_100","1HZ75V","1HZ100V",
     "1HZ250V","1HZ150V","R_50","R_25",
@@ -171,7 +179,7 @@ PRIORITY_SYMBOLS = [
 ]
 
 # ── RATE LIMITING ────────────────────────────────────────────
-BUY_REQUEST_DELAY_SECS = 0.3
+BUY_REQUEST_DELAY_SECS = 3.0
 MAX_BUY_PER_SECOND     = 3
 
 # ── RENDER ──────────────────────────────────────────────────
@@ -181,35 +189,36 @@ REDEPLOY_EVERY_N_CYCLES = 8
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
-MAX_CONCURRENT     = 20              # alias
+MAX_CONCURRENT     = 5               # alias
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
-MIN_MODULES_FOR_SIGNAL     = 1
-MIN_INDICATOR_VOTES        = 2
+MIN_MODULES_FOR_SIGNAL     = 2
+MIN_INDICATOR_VOTES        = 3
 OB_EXPIRY_BARS             = 100
 NEWS_BLOCK_MINUTES         = 60
 FOREX_LTF_GRANULARITY      = 900
 OTHER_LTF_GRANULARITY      = 60
-MIN_SIGNAL_PROBABILITY     = 0.3
-MIN_STRENGTH_REPEAT_SYMBOL = 1
+MIN_SIGNAL_PROBABILITY     = 1.8
+MIN_STRENGTH_REPEAT_SYMBOL = 3
 
 # ── DERIV WEBSOCKET ───────────────────────────────────────────
 DERIV_WS_URL = f"wss://ws.binaryws.com/websockets/v3?app_id={DERIV_APP_ID}"
 
 # ── SIGNAL GENERATION GATES (additional) ─────────────────────
-MIN_SCORE                  = 0.3
-MIN_CONFLUENCE             = 1
-MIN_MODULE_STRENGTH        = 1
-MIN_MODULE_STRENGTH_NORMAL = 1
-MIN_CONFIDENCE_NORMAL      = 3
-MIN_CONFIDENCE_FOR_PARTIAL = 3
+MIN_SCORE                  = 2.0
+MIN_CONFLUENCE             = 2
+MIN_MODULE_STRENGTH        = 2
+MIN_MODULE_STRENGTH_NORMAL = 2
+MIN_CONFIDENCE_NORMAL      = 5
+MIN_CONFIDENCE_FOR_PARTIAL = 5
 
 # ── SESSION TIMING — disabled for 24/7 synthetics ────────────
 DEAD_ZONE_START_UTC  = 0
-DEAD_ZONE_END_UTC    = 0
-BOOM500_PRIME_START  = 0
-BOOM500_PRIME_END    = 24
+DEAD_ZONE_END_UTC    = 5
+BOOM500_PRIME_START  = 7
+BOOM500_PRIME_END    = 12
 ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
 TRADE_DURATION = 11
 TRADE_DURATION_UNIT = "m"
+ 
