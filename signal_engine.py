@@ -1,16 +1,8 @@
 """
-signal_engine.py
-Momentum-based signal generation for Deriv
-synthetic indices using Multiplier contracts.
-
-Strategy per symbol type:
-  Volatility (R_10–R_100, 1HZ): EMA momentum
-    + breakout detection
-  Boom/Crash: drift direction after spike
-  Step Index: EMA trend following
-  Jump Index: pre-jump momentum window
-  Range Break: breakout confirmation
-  Drift Switch: regime direction
+Multi-strategy signal engine.
+Every symbol is evaluated independently by ALL strategies.
+Only signals where multiple strategies agree are emitted.
+Final score determines execution priority.
 """
 
 from __future__ import annotations
@@ -56,6 +48,101 @@ NONE_RESULT = SignalResult(
 
 
 # ---------------------------------------------------------------------------
+# Strategy functions — each returns (direction, score, reason) or (None,0,"")
+# ---------------------------------------------------------------------------
+
+def _strat_mean_reversion(C, H, L):
+    rsi = ind.rsi(C, 14)
+    upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
+    last_rsi = rsi[~np.isnan(rsi)][-1]
+    last_close = float(C[-1])
+    last_upper = upper[~np.isnan(upper)][-1]
+    last_lower = lower[~np.isnan(lower)][-1]
+
+    if last_rsi < 25 and last_close <= last_lower * 1.005:
+        score = 0.85 if last_rsi < 20 else 0.75
+        return "LONG", score, f"MeanRev RSI={last_rsi:.1f}"
+    if last_rsi > 75 and last_close >= last_upper * 0.995:
+        score = 0.85 if last_rsi > 80 else 0.75
+        return "SHORT", score, f"MeanRev RSI={last_rsi:.1f}"
+    return None, 0, ""
+
+
+def _strat_ema_momentum(C, H, L):
+    ema8  = ind.ema(C, 8)
+    ema21 = ind.ema(C, 21)
+    ema50 = ind.ema(C, 50)
+
+    e8, e21, e50 = ema8[-1], ema21[-1], ema50[-1]
+    e8p, e21p    = ema8[-2], ema21[-2]
+
+    # Crossover in direction of trend
+    if e8p <= e21p and e8 > e21 and e21 > e50:
+        return "LONG", 0.70, "EMA cross up with trend"
+    if e8p >= e21p and e8 < e21 and e21 < e50:
+        return "SHORT", 0.70, "EMA cross down with trend"
+    # Strong trend alignment
+    if e8 > e21 > e50 and (e8-e50)/e50 > 0.001:
+        return "LONG", 0.65, "EMA stack bullish"
+    if e8 < e21 < e50 and (e50-e8)/e50 > 0.001:
+        return "SHORT", 0.65, "EMA stack bearish"
+    return None, 0, ""
+
+
+def _strat_indicator_confluence(C, H, L):
+    rsi = ind.rsi(C, 14)
+    _, _, hist = ind.macd(C, 12, 26, 9)
+    last_rsi  = rsi[~np.isnan(rsi)][-1]
+    last_hist = hist[~np.isnan(hist)][-1]
+    prev_hist = hist[~np.isnan(hist)][-2]
+
+    bull = 0
+    bear = 0
+
+    if last_rsi > 55: bull += 1
+    if last_rsi < 45: bear += 1
+    if last_hist > 0 and prev_hist <= 0: bull += 2  # MACD crossover
+    if last_hist < 0 and prev_hist >= 0: bear += 2
+    if last_hist > 0: bull += 1
+    if last_hist < 0: bear += 1
+
+    if bull >= 3:
+        return "LONG",  min(0.5 + bull*0.08, 0.85), f"Indicators bull={bull}"
+    if bear >= 3:
+        return "SHORT", min(0.5 + bear*0.08, 0.85), f"Indicators bear={bear}"
+    return None, 0, ""
+
+
+def _strat_structure(C, H, L):
+    # Higher highs and higher lows = bullish structure
+    if len(H) < 6:
+        return None, 0, ""
+    hh = all(H[-i] > H[-i-1] for i in range(1, 4))
+    hl = all(L[-i] > L[-i-1] for i in range(1, 4))
+    lh = all(H[-i] < H[-i-1] for i in range(1, 4))
+    ll = all(L[-i] < L[-i-1] for i in range(1, 4))
+
+    if hh and hl:
+        return "LONG",  0.72, "Structure HH+HL"
+    if lh and ll:
+        return "SHORT", 0.72, "Structure LH+LL"
+    return None, 0, ""
+
+
+def _strat_breakout(C, H, L, atr):
+    lookback = min(15, len(C)-1)
+    highest  = float(np.max(H[-lookback-1:-1]))
+    lowest   = float(np.min(L[-lookback-1:-1]))
+    last_atr = float(atr[~np.isnan(atr)][-1]) if len(atr[~np.isnan(atr)]) else 0.001
+
+    if float(C[-1]) > highest + 0.3 * last_atr:
+        return "LONG",  0.78, f"Breakout above {highest:.5f}"
+    if float(C[-1]) < lowest  - 0.3 * last_atr:
+        return "SHORT", 0.78, f"Breakout below {lowest:.5f}"
+    return None, 0, ""
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
@@ -68,240 +155,89 @@ class SignalEngine:
     # Public entry point
     # -----------------------------------------------------------------------
 
-    def evaluate(self, ltf_bars: List, mtf_bars: List,
-                 symbol: str, stake: float = 1.0,
-                 **kwargs) -> SignalResult:
-        """
-        Route to the correct strategy by symbol type and return a SignalResult.
-
-        Routing:
-          VOLATILITY_STANDARD + VOLATILITY_1S +
-          STEP + JUMP + DRIFT                  → _evaluate_volatility
-          BOOM_CRASH                           → _evaluate_boom_crash
-          RANGE_BREAK                          → _evaluate_range_break
-          <unrecognised>                       → _evaluate_volatility (fallback)
-        """
-        logger.info(
-            f"SIGNAL EVAL START: {symbol} "
-            f"ltf_bars={len(ltf_bars)} stake={stake}"
-        )
-
-        if len(ltf_bars) < 15:
-            logger.info(
-                f"SIGNAL EVAL REJECTED: {symbol} "
-                f"insufficient bars ({len(ltf_bars)} < 15)"
-            )
+    def evaluate(self, ltf_bars, mtf_bars, symbol,
+                 stake=1.0, **kwargs):
+        if len(ltf_bars) < 20:
             return NONE_RESULT
 
-        if symbol in (config.VOLATILITY_STANDARD +
-                      config.VOLATILITY_1S +
-                      config.STEP + config.JUMP +
-                      config.DRIFT):
-            result = self._evaluate_volatility(
-                ltf_bars, mtf_bars, symbol, stake)
-
-        elif symbol in config.BOOM_CRASH:
-            result = self._evaluate_boom_crash(
-                ltf_bars, symbol, stake)
-
-        elif symbol in config.RANGE_BREAK:
-            result = self._evaluate_range_break(
-                ltf_bars, symbol, stake)
-
-        else:
-            logger.info(
-                f"SIGNAL EVAL: {symbol} unrecognised — "
-                f"falling back to volatility strategy"
-            )
-            result = self._evaluate_volatility(
-                ltf_bars, mtf_bars, symbol, stake)
-
-        logger.info(
-            f"SIGNAL EVAL END: {symbol} → "
-            f"{result.direction} strength={result.strength} "
-            f"score={result.score:.3f} mult={result.multiplier}x"
-        )
-        return result
-
-    # -----------------------------------------------------------------------
-    # Volatility indices — EMA momentum + breakout
-    # -----------------------------------------------------------------------
-
-    def _evaluate_volatility(self, ltf_bars: List, mtf_bars: List,
-                              symbol: str, stake: float) -> SignalResult:
-        """
-        EMA momentum + breakout detection for Volatility / Step / Jump / Drift.
-
-        1. momentum_score() → (score, direction) from LTF closes/highs/lows
-        2. detect_breakout() → breakout confirmation from ATR on LTF
-        3. detect_trend_strength() → ranging-market penalty
-        4. Combine: breakout agreement → +0.2; weak trend → ×0.7
-        5. Score filter: reject below config.MIN_SIGNAL_SCORE
-        6. SL/TP from STOP_LOSS_MAP and TAKE_PROFIT_RATIO; multiplier from
-           MULTIPLIER_MAP.
-        """
-        logger.info(f"EVALUATING VOLATILITY: {symbol}")
-
         C = np.array([b.close for b in ltf_bars])
         H = np.array([b.high  for b in ltf_bars])
         L = np.array([b.low   for b in ltf_bars])
+        atr = ind.atr(H, L, C, 14)
 
-        # --- Momentum score from LTF ---
-        score, direction = ind.momentum_score(
-            C, H, L,
-            fast=config.EMA_FAST,
-            slow=config.EMA_SLOW,
-            trend=config.EMA_TREND)
+        strategies = [
+            ("MEAN_REV",    _strat_mean_reversion(C, H, L)),
+            ("EMA_MOM",     _strat_ema_momentum(C, H, L)),
+            ("INDICATORS",  _strat_indicator_confluence(C, H, L)),
+            ("STRUCTURE",   _strat_structure(C, H, L)),
+            ("BREAKOUT",    _strat_breakout(C, H, L, atr)),
+        ]
 
-        # --- Breakout confirmation from LTF ATR ---
-        atr_arr = ind.atr(H, L, C, config.ATR_PERIOD)
-        valid_atr = atr_arr[~np.isnan(atr_arr)]
-        atr = float(valid_atr[-1]) if len(valid_atr) else 0.0
+        long_scores   = []
+        short_scores  = []
+        long_reasons  = []
+        short_reasons = []
 
-        breakout = ind.detect_breakout(
-            C, H, L, atr_arr,
-            lookback=config.MOMENTUM_LOOKBACK,
-            mult=config.BREAKOUT_ATR_MULT)
+        for name, (direction, score, reason) in strategies:
+            if direction == "LONG" and score > 0:
+                long_scores.append(score)
+                long_reasons.append(f"{name}:{reason}")
+            elif direction == "SHORT" and score > 0:
+                short_scores.append(score)
+                short_reasons.append(f"{name}:{reason}")
 
-        # --- Trend strength filter ---
-        strength_val = ind.detect_trend_strength(C)
+        # Need minimum 3 strategies agreeing
+        if len(long_scores) >= 3 and len(long_scores) > len(short_scores):
+            final_score = sum(long_scores) / len(long_scores)
+            agreement   = len(long_scores)
+            # Bonus for more agreement
+            final_score = min(final_score + (agreement - 3) * 0.05, 0.98)
+            if final_score >= config.MIN_SIGNAL_SCORE:
+                logger.info(
+                    f"SIGNAL: {symbol} LONG "
+                    f"score={final_score:.3f} "
+                    f"agreement={agreement}/5 "
+                    f"[{' | '.join(long_reasons)}]")
+                sl_pct = config.STOP_LOSS_MAP.get(symbol, 50.0)
+                sl_amt = round(stake * sl_pct / 100, 2)
+                tp_amt = round(sl_amt * 2.0, 2)
+                return SignalResult(
+                    direction   = "LONG",
+                    strength    = min(agreement, 3),
+                    score       = final_score,
+                    strategy    = f"MULTI({agreement}/5)",
+                    reason      = " | ".join(long_reasons),
+                    stop_loss   = sl_amt,
+                    take_profit = tp_amt,
+                    multiplier  = config.MULTIPLIER_MAP.get(symbol, 100),
+                )
 
-        # --- Combine signals ---
-        if breakout != 0 and breakout == direction:
-            score = min(score + 0.2, 1.0)
+        if len(short_scores) >= 3 and len(short_scores) > len(long_scores):
+            final_score = sum(short_scores) / len(short_scores)
+            agreement   = len(short_scores)
+            final_score = min(final_score + (agreement - 3) * 0.05, 0.98)
+            if final_score >= config.MIN_SIGNAL_SCORE:
+                logger.info(
+                    f"SIGNAL: {symbol} SHORT "
+                    f"score={final_score:.3f} "
+                    f"agreement={agreement}/5 "
+                    f"[{' | '.join(short_reasons)}]")
+                sl_pct = config.STOP_LOSS_MAP.get(symbol, 50.0)
+                sl_amt = round(stake * sl_pct / 100, 2)
+                tp_amt = round(sl_amt * 2.0, 2)
+                return SignalResult(
+                    direction   = "SHORT",
+                    strength    = min(agreement, 3),
+                    score       = final_score,
+                    strategy    = f"MULTI({agreement}/5)",
+                    reason      = " | ".join(short_reasons),
+                    stop_loss   = sl_amt,
+                    take_profit = tp_amt,
+                    multiplier  = config.MULTIPLIER_MAP.get(symbol, 100),
+                )
 
-        if strength_val < 0.3:
-            score *= 0.7  # penalise ranging market
-
-        if score < 0.1:
-            logger.info(
-                f"VOLATILITY REJECTED: {symbol} "
-                f"score={score:.3f} < 0.1"
-            )
-            return NONE_RESULT
-
-        # --- SL / TP / multiplier ---
-        sl_pct = config.STOP_LOSS_MAP.get(
-            symbol, config.DEFAULT_STOP_LOSS_PCT)
-        sl_amt = round(stake * sl_pct / 100, 2)
-        tp_amt = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
-        mult   = config.MULTIPLIER_MAP.get(
-            symbol, config.DEFAULT_MULTIPLIER)
-
-        dir_str = "LONG" if direction > 0 else "SHORT"
-
-        logger.info(
-            f"VOLATILITY SIGNAL: {symbol} {dir_str} "
-            f"score={score:.3f} "
-            f"mult={mult}x "
-            f"SL=${sl_amt} TP=${tp_amt}"
-        )
-        logger.info(f"SIGNAL EMITTED: {symbol} {dir_str}")
-
-        return SignalResult(
-            direction   = dir_str,
-            strength    = 3 if score >= 0.7 else 2,
-            score       = score,
-            strategy    = "EMA_MOMENTUM",
-            reason      = (f"EMA momentum | "
-                           f"breakout={breakout} | "
-                           f"trend={strength_val:.2f}"),
-            stop_loss   = sl_amt,
-            take_profit = tp_amt,
-            multiplier  = mult,
-        )
-
-    # -----------------------------------------------------------------------
-    # Boom / Crash — drift direction after spike
-    # -----------------------------------------------------------------------
-
-    def _evaluate_boom_crash(self, ltf_bars: List,
-                              symbol: str, stake: float) -> SignalResult:
-        """
-        Detect post-spike drift direction for Boom/Crash indices.
-
-        Uses ind.boom_crash_drift() which analyses the LTF close array
-        and returns +1 (bullish drift), -1 (bearish drift), or 0 (none).
-        """
-        logger.info(f"EVALUATING BOOM/CRASH: {symbol}")
-
-        C = np.array([b.close for b in ltf_bars])
-        H = np.array([b.high  for b in ltf_bars])
-        L = np.array([b.low   for b in ltf_bars])
-
-        drift = ind.boom_crash_drift(C)
-
-        score   = 0.65
-        dir_str = "LONG" if drift > 0 else "SHORT"
-        sl_pct  = config.STOP_LOSS_MAP.get(
-            symbol, config.DEFAULT_STOP_LOSS_PCT)
-        sl_amt  = round(stake * sl_pct / 100, 2)
-        tp_amt  = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
-        mult    = config.MULTIPLIER_MAP.get(
-            symbol, config.DEFAULT_MULTIPLIER)
-
-        logger.info(
-            f"BOOM/CRASH SIGNAL: {symbol} {dir_str} "
-            f"drift score={score:.3f} "
-            f"mult={mult}x "
-            f"SL=${sl_amt} TP=${tp_amt}"
-        )
-        logger.info(f"SIGNAL EMITTED: {symbol} {dir_str}")
-
-        return SignalResult(
-            direction   = dir_str,
-            strength    = 2,
-            score       = score,
-            strategy    = "BOOM_CRASH_DRIFT",
-            reason      = f"Drift {dir_str} detected",
-            stop_loss   = sl_amt,
-            take_profit = tp_amt,
-            multiplier  = mult,
-        )
-
-    # -----------------------------------------------------------------------
-    # Range Break — breakout confirmation
-    # -----------------------------------------------------------------------
-
-    def _evaluate_range_break(self, ltf_bars: List,
-                               symbol: str, stake: float) -> SignalResult:
-        """
-        ATR-based breakout confirmation for Range Break indices.
-
-        Uses a 15-bar lookback and 1.0× ATR multiplier.
-        Returns LONG / SHORT at strength=3 score=0.75 on confirmed breakout.
-        """
-        logger.info(f"EVALUATING RANGE BREAK: {symbol}")
-
-        C = np.array([b.close for b in ltf_bars])
-        H = np.array([b.high  for b in ltf_bars])
-        L = np.array([b.low   for b in ltf_bars])
-
-        atr_arr  = ind.atr(H, L, C, config.ATR_PERIOD)
-        breakout = ind.detect_breakout(
-            C, H, L, atr_arr, lookback=15, mult=1.0)
-
-        dir_str = "LONG" if breakout > 0 else "SHORT"
-        sl_amt  = round(
-            stake * config.DEFAULT_STOP_LOSS_PCT / 100, 2)
-        tp_amt  = round(sl_amt * config.TAKE_PROFIT_RATIO, 2)
-        mult    = config.MULTIPLIER_MAP.get(
-            symbol, config.DEFAULT_MULTIPLIER)
-
-        logger.info(
-            f"RANGE BREAK SIGNAL: {symbol} {dir_str} "
-            f"mult={mult}x "
-            f"SL=${sl_amt} TP=${tp_amt}"
-        )
-        logger.info(f"SIGNAL EMITTED: {symbol} {dir_str}")
-
-        return SignalResult(
-            direction   = dir_str,
-            strength    = 3,
-            score       = 0.75,
-            strategy    = "RANGE_BREAK",
-            reason      = f"Breakout {dir_str}",
-            stop_loss   = sl_amt,
-            take_profit = tp_amt,
-            multiplier  = mult,
-        )
+        logger.debug(
+            f"NO SIGNAL: {symbol} "
+            f"long={len(long_scores)} short={len(short_scores)}")
+        return NONE_RESULT
+ 
