@@ -319,7 +319,7 @@ class RiskManager:
         actual_stake = max(actual_stake, self.min_stake)
         return round(actual_stake, 2)
 
-    def calculate_stake(self) -> float:
+    async def calculate_stake(self) -> float:
         base = max(
             self._current_balance * config.RISK_PER_TRADE_PCT,
             config.MIN_STAKE)
