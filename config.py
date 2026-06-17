@@ -114,8 +114,8 @@ TAKE_PROFIT_RATIO = 2.0
 # ── STAKE SETTINGS ───────────────────────────────────────────
 BASE_STAKE_PCT       = 0.005   # 0.5% per trade
 MIN_STAKE            = 0.35
-MAX_STAKE            = 25.0
-DAILY_LOSS_LIMIT_PCT = 0.50   # 20% max daily loss
+MAX_STAKE            = 0.35
+DAILY_LOSS_LIMIT_PCT = 0.15   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
@@ -136,7 +136,7 @@ LTF_BARS          = 30
 
 # ── SIGNAL SETTINGS ──────────────────────────────────────────
 MIN_SIGNAL_SCORE       = 0.68
-MIN_STRATEGY_AGREEMENT = 3
+MIN_STRATEGY_AGREEMENT = 4
 
 # SMC parameters
 OB_LOOKBACK            = 50
@@ -163,8 +163,8 @@ CONTRACT_CHECK_SECS   = 1200
 CONTRACT_TIMEOUT_SECS = 1800
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 10
-SYMBOL_LOSS_SUSPEND_MINS  = 25
+SYMBOL_WIN_SUSPEND_MINS   = 20
+SYMBOL_LOSS_SUSPEND_MINS  = 55
 SYMBOL_MIN_GAP_MINS       = 1
 SYMBOL_SESSION_BAN_LOSSES = 4
 
@@ -193,7 +193,7 @@ MAX_CONCURRENT     = 20               # alias
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
-MIN_MODULES_FOR_SIGNAL     = 2
+MIN_MODULES_FOR_SIGNAL     = 3
 MIN_INDICATOR_VOTES        = 3
 OB_EXPIRY_BARS             = 100
 NEWS_BLOCK_MINUTES         = 60
@@ -219,6 +219,6 @@ DEAD_ZONE_END_UTC    = 5
 BOOM500_PRIME_START  = 7
 BOOM500_PRIME_END    = 12
 ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
-TRADE_DURATION = 12
+TRADE_DURATION = 14
 TRADE_DURATION_UNIT = "m"
  
