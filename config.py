@@ -203,7 +203,10 @@ MIN_SIGNAL_PROBABILITY     = 1.8
 MIN_STRENGTH_REPEAT_SYMBOL = 3
 
 # ── DERIV WEBSOCKET ───────────────────────────────────────────
-DERIV_WS_URL : str = f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+DERIV_WS_URL : str = os.environ.get(
+    "DERIV_WS_URL",
+    f"wss://ws.derivws.com/websockets/v3?app_id={DERIV_APP_ID}"
+)
 
 # ── SIGNAL GENERATION GATES (additional) ─────────────────────
 MIN_SCORE                  = 2.0
