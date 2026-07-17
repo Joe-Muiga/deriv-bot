@@ -82,7 +82,7 @@ import time
 from typing import Callable, Dict, Optional, List, Any
 
 import websockets
-from websockets.exceptions import ConnectionClosed
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 import config
 
@@ -201,6 +201,29 @@ class DerivClient:
                         except (asyncio.CancelledError, Exception):
                             pass
 
+            except InvalidStatus as exc:
+                attempt += 1
+                resp = exc.response
+                header_dump = dict(resp.headers.raw_items()) if hasattr(
+                    resp.headers, "raw_items") else dict(resp.headers)
+                body_text = ""
+                if resp.body:
+                    try:
+                        body_text = resp.body.decode("utf-8", errors="replace")
+                    except Exception:
+                        body_text = repr(resp.body)
+                logger.error(
+                    "HANDSHAKE REJECTED — Deriv's server refused the WebSocket "
+                    f"upgrade before any messages were exchanged.\n"
+                    f"  status_code   = {resp.status_code}\n"
+                    f"  reason_phrase = {resp.reason_phrase!r}\n"
+                    f"  headers       = {header_dump}\n"
+                    f"  body          = {body_text!r}"
+                )
+                logger.warning(
+                    f"WEBSOCKET DISCONNECTED — reconnecting in {reconnect_interval}s "
+                    f"(attempt {attempt}/{max_label}) | reason={exc}"
+                )
             except ConnectionClosed as exc:
                 attempt += 1
                 logger.warning(
