@@ -9,3 +9,4 @@ pandas-market-calendars>=4.0
 gunicorn>=21.0.0
 setuptools>=68.0.0
 pyarrow>=14.0.0
+aiohttp
