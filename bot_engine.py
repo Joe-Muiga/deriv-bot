@@ -258,14 +258,23 @@ class BotEngine:
         logger.info(
             f"Phase 1: initialising {len(priority)} priority symbol(s) "
             f"(htf={_PHASE1_HTF_BARS}, mtf={_PHASE1_MTF_BARS}, ltf={_PHASE1_LTF_BARS})")
-        await asyncio.gather(
-            *[self._init_data(s,
-                              htf_bars=_PHASE1_HTF_BARS,
-                              mtf_bars=_PHASE1_MTF_BARS,
-                              ltf_bars=_PHASE1_LTF_BARS)
-              for s in priority],
-            return_exceptions=True,
-        )
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(
+                    *[self._init_data(s,
+                                      htf_bars=_PHASE1_HTF_BARS,
+                                      mtf_bars=_PHASE1_MTF_BARS,
+                                      ltf_bars=_PHASE1_LTF_BARS)
+                      for s in priority],
+                    return_exceptions=True,
+                ),
+                timeout=90,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Phase 1 TIMED OUT after 90s globally — "
+                "proceeding with whatever symbol(s) are ready so the bot "
+                "and dashboard are not stuck forever")
         logger.info(
             f"Phase 1 complete — {len(self._htf)} symbol(s) ready; "
             f"trading now active")
@@ -314,12 +323,19 @@ class BotEngine:
         ltf_gran = self._ltf_gran(symbol)
         mtf_gran = self._mtf_gran(symbol)
 
-        htf_data, mtf_data, ltf_data = await asyncio.gather(
-            self.client.get_candles(symbol, config.HTF_GRANULARITY, config.HTF_BARS),
-            self.client.get_candles(symbol, mtf_gran,               config.MTF_BARS),
-            self.client.get_candles(symbol, ltf_gran,               config.LTF_BARS),
-            return_exceptions=True,
-        )
+        try:
+            htf_data, mtf_data, ltf_data = await asyncio.wait_for(
+                asyncio.gather(
+                    self.client.get_candles(symbol, config.HTF_GRANULARITY, config.HTF_BARS),
+                    self.client.get_candles(symbol, mtf_gran,               config.MTF_BARS),
+                    self.client.get_candles(symbol, ltf_gran,               config.LTF_BARS),
+                    return_exceptions=True,
+                ),
+                timeout=15,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"{symbol}: Phase 3 upgrade get_candles timed out — skipping upgrade")
+            return
 
         if isinstance(htf_data, Exception): htf_data = []
         if isinstance(mtf_data, Exception): mtf_data = []
@@ -357,12 +373,19 @@ class BotEngine:
             ltf_b = CandlestickBuilder(granularity=ltf_gran,
                                        max_bars=ltf_bars + 20)
 
-            htf_data, mtf_data, ltf_data = await asyncio.gather(
-                self.client.get_candles(symbol, config.HTF_GRANULARITY, htf_bars),
-                self.client.get_candles(symbol, mtf_gran,               mtf_bars),
-                self.client.get_candles(symbol, ltf_gran,               ltf_bars),
-                return_exceptions=True,
-            )
+            try:
+                htf_data, mtf_data, ltf_data = await asyncio.wait_for(
+                    asyncio.gather(
+                        self.client.get_candles(symbol, config.HTF_GRANULARITY, htf_bars),
+                        self.client.get_candles(symbol, mtf_gran,               mtf_bars),
+                        self.client.get_candles(symbol, ltf_gran,               ltf_bars),
+                        return_exceptions=True,
+                    ),
+                    timeout=15,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(f"{symbol}: get_candles timed out after 15s — skipping")
+                return
 
             if isinstance(htf_data, Exception): htf_data = []
             if isinstance(mtf_data, Exception): mtf_data = []
@@ -381,9 +404,17 @@ class BotEngine:
             self._ltf[symbol] = ltf_b
             self._initialised_symbols.add(symbol)
 
-            await self.client.subscribe_ticks(
-                symbol,
-                lambda tick, s=symbol: self._on_tick(s, tick))
+            try:
+                await asyncio.wait_for(
+                    self.client.subscribe_ticks(
+                        symbol,
+                        lambda tick, s=symbol: self._on_tick(s, tick)),
+                    timeout=10,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"{symbol}: subscribe_ticks timed out — "
+                    f"proceeding without live tick stream")
 
             logger.info(
                 f"{symbol}: ready | htf={htf_b.count} | "
