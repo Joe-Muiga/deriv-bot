@@ -683,16 +683,22 @@ class BotEngine:
             ltf = self._ltf.get(symbol)
 
             if not all([htf, mtf, ltf]):
+                logger.info(f"SCAN MISS {symbol}: builders missing "
+                            f"(htf={htf is not None} mtf={mtf is not None} ltf={ltf is not None})")
                 return None
             if htf.count < 10:
+                logger.info(f"SCAN MISS {symbol}: htf.count={htf.count} < 10")
                 return None
 
             price = float(
                 ltf.completed_bars[-1].close if ltf.completed_bars else 0)
             if price == 0:
+                logger.info(f"SCAN MISS {symbol}: price=0 "
+                            f"(ltf.completed_bars={len(ltf.completed_bars) if ltf.completed_bars else 0})")
                 return None
 
             if self.news.is_blocked(symbol):
+                logger.info(f"SCAN MISS {symbol}: news-blocked")
                 return None
 
             ctx = self.smc.analyse(
@@ -701,6 +707,7 @@ class BotEngine:
                 price,
             )
             if ctx.bias == "NEUTRAL":
+                logger.info(f"SCAN MISS {symbol}: smc bias=NEUTRAL")
                 return None
 
             stake = await self.risk.calculate_stake()
@@ -712,7 +719,12 @@ class BotEngine:
                 stake    = stake,
             )
             if sig is None or sig.direction == "NONE":
+                logger.info(f"SCAN MISS {symbol}: signal.evaluate -> "
+                            f"{'None' if sig is None else sig.direction}")
                 return None
+
+            logger.info(f"SCAN HIT {symbol}: dir={sig.direction} "
+                        f"score={getattr(sig, 'score', 0.0)} bias={ctx.bias}")
 
             return ScanResult(
                 symbol  = symbol,
@@ -723,7 +735,7 @@ class BotEngine:
             )
 
         except Exception as exc:
-            logger.debug(f"_scan({symbol}): {exc}")
+            logger.error(f"SCAN ERROR {symbol}: {type(exc).__name__}: {exc}", exc_info=True)
             return None
 
     # ── Execution ──────────────────────────────────────────────────────────────
