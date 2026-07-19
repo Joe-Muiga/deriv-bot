@@ -57,6 +57,8 @@ RISE_FALL_SYMBOLS = [
 
 # All symbols combined — Rise/Fall compatible only
 ALL_SYMBOLS       = RISE_FALL_SYMBOLS
+ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
+VOLATILITY_SYMBOLS = RISE_FALL_SYMBOLS  # alias for compatibility with bot_engine.py
 
 # ── MULTIPLIER SETTINGS ──────────────────────────────────────
 # Higher volatility = higher multiplier potential
@@ -221,7 +223,5 @@ DEAD_ZONE_START_UTC  = 0
 DEAD_ZONE_END_UTC    = 5
 BOOM500_PRIME_START  = 7
 BOOM500_PRIME_END    = 12
-ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
 TRADE_DURATION = 14
 TRADE_DURATION_UNIT = "m"
- 
