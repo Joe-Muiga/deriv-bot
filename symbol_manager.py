@@ -36,6 +36,8 @@ def is_suspended(symbol: str) -> bool:
 
 
 def can_trade_now(symbol: str) -> bool:
+    # Suspension check intentionally removed for now to confirm queue fills.
+    # Re-add `or is_suspended(symbol)` once queue is confirmed populated.
     if symbol in _active_symbols:
         logger.info(f"BLOCKED: {symbol} already has an active contract")
         return False
@@ -86,6 +88,21 @@ def update_active(symbol_list: List[str]) -> None:
 
 
 def get_queue() -> List[str]:
+    # Safety net: if _all_active is empty (e.g. bot_engine never called
+    # update_active(), or called it with an empty/wrong list), repopulate
+    # directly from config so the queue doesn't stay stuck at 0.
+    # This masks the symptom — if you keep seeing this warning, check
+    # bot_engine.py's scan loop for where update_active() is (or isn't)
+    # being called each cycle.
+    if not _all_active:
+        import config as _cfg
+        update_active(list(getattr(
+            _cfg, 'ALL_TRADE_SYMBOLS',
+            getattr(_cfg, 'ALL_SYMBOLS', []))))
+        logger.warning(
+            f"QUEUE was empty — repopulated "
+            f"with {len(_all_active)} symbols")
+
     available = [s for s in _all_active if s not in _active_symbols]
     logger.info(
         f"QUEUE: {len(available)} available | "
