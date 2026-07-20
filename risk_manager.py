@@ -1,48 +1,58 @@
 """
 risk_manager.py – Phase C risk overlay for the SIFM bot.
 
-v12 — Aggressive Compounding PLS rewrite.
+v17 — PLS (Progressive Loss Scaling) rewrite.
 
-KEY CHANGES vs v11
+KEY CHANGES vs v16
 ──────────────────
-• PLS tiers replaced with aggressive compounding multipliers.
-  Goal: flip small accounts to large balances as fast as possible
-  while stop-losses protect the downside.
+• Replaced all aggressive/Martingale-adjacent scaling with the
+  research-documented safest recovery method: Progressive Loss Scaling.
+  PLS scales stake and concurrency UP only on confirmed win streaks,
+  and collapses INSTANTLY to baseline on any loss. Martingale-style
+  doubling-after-loss is never used anywhere in this module.
 
 BASE STAKE
 ──────────
-  base_stake = BASE_STAKE_PCT × current_live_balance
+  base_stake = config.BASE_STAKE_PCT × current_live_balance
   Recalculated from live balance before EVERY single trade.
   As balance grows, base stake grows — pure compounding.
   Fixed dollar amounts are never used as base.
 
-AGGRESSIVE PLS WIN SCALING
-──────────────────────────
-  Streak  0–2  →  1×  stake,  +0  extra slots
-  Streak ≥ 3   →  2×  stake,  +3  extra slots
-  Streak ≥ 5   →  3×  stake,  +6  extra slots
-  Streak ≥ 8   →  5×  stake,  +9  extra slots
-  Streak ≥ 12  →  8×  stake,  +12 extra slots
-  Streak ≥ 15  → 10×  stake,  +15 extra slots
+PLS WIN SCALING
+───────────────
+  Streak 0–2   →  1.0×  stake
+  Streak ≥ 3   →  1.5×  stake
+  Streak ≥ 5   →  2.0×  stake
+  Streak ≥ 8   →  3.0×  stake
+  Streak ≥ 12  →  4.0×  stake
 
-  Final stake = base × multiplier, hard-capped at MAX_STAKE.
+  Final stake = base × multiplier, hard-capped at config.MAX_STAKE.
 
 ON ANY LOSS — IMMEDIATE RESET
 ──────────────────────────────
+  _win_streak  → 0
   _multiplier  → 1.0
   _extra_slots → 0
-  _win_streak  → 0
   Next base recalculated immediately from current (reduced) balance.
-  Stake NEVER raised to recover a loss.
+  Stake is NEVER increased to recover a loss.
+
+CONCURRENT SLOT SCALING
+────────────────────────
+  Default: config.MAX_CONCURRENT_TRADES
+  Streak ≥ 3   →  +2 extra slots
+  Streak ≥ 5   →  +4 extra slots
+  Streak ≥ 8   →  +6 extra slots
+  Streak ≥ 12  →  +8 extra slots
+  Any loss     →  reset to default immediately
 
 can_trade() GATES
-─────────────────
+──────────────────
   True iff: open_contracts < current_concurrent_limit
         AND current_balance > MIN_STAKE
   Nothing else blocks trading.
 
 POST-CLOSE LOG
-──────────────
+───────────────
   PLS | Streak: +{N} | Multiplier: {M}x | Balance: ${B:.4f} | Next stake: ${S:.4f}
 """
 
@@ -61,18 +71,17 @@ import config
 logger = logging.getLogger(__name__)
 
 
-# ── Aggressive PLS tier table ──────────────────────────────────────────────────
+# ── PLS tier table ──────────────────────────────────────────────────────────
 #
 # Indexed in descending threshold order so the first match wins.
 # Each entry: (min_streak, stake_multiplier, extra_concurrent_slots)
 #
 _PLS_TIERS: list[tuple[int, float, int]] = [
-    (15, 10.0, 15),
-    (12,  8.0, 12),
-    ( 8,  5.0,  9),
-    ( 5,  3.0,  6),
-    ( 3,  2.0,  3),
-    ( 0,  1.0,  0),   # baseline — always matches
+    (12, 4.0, 8),
+    ( 8, 3.0, 6),
+    ( 5, 2.0, 4),
+    ( 3, 1.5, 2),
+    ( 0, 1.0, 0),   # baseline — always matches
 ]
 
 
@@ -87,7 +96,7 @@ def _pls_tier(win_streak: int) -> tuple[float, int]:
     return 1.0, 0          # unreachable, but safe
 
 
-# ── Bot state enum ─────────────────────────────────────────────────────────────
+# ── Bot state enum ────────────────────────────────────────────────────────────
 
 class BotState(Enum):
     RUNNING  = auto()
@@ -95,7 +104,7 @@ class BotState(Enum):
     STOPPED  = auto()
 
 
-# ── Trade record ───────────────────────────────────────────────────────────────
+# ── Trade record ──────────────────────────────────────────────────────────────
 
 @dataclass
 class TradeRecord:
@@ -109,11 +118,11 @@ class TradeRecord:
     timestamp:   float = field(default_factory=time.time)
 
 
-# ── RiskManager ────────────────────────────────────────────────────────────────
+# ── RiskManager ───────────────────────────────────────────────────────────────
 
 class RiskManager:
     """
-    Stateful risk and position-sizing layer using Aggressive Compounding PLS.
+    Stateful risk and position-sizing layer using Progressive Loss Scaling.
 
     PLS Design
     ──────────
@@ -122,7 +131,9 @@ class RiskManager:
     actual_stake clamped to [MIN_STAKE, MAX_STAKE]
 
     Any loss instantly collapses: multiplier → 1.0×, extra_slots → 0,
-    win_streak → 0.  Stake NEVER increases to recover a loss.
+    win_streak → 0. Stake NEVER increases to recover a loss. This is
+    explicitly not Martingale — there is no doubling after a loss, and
+    scaling only ever happens off confirmed, already-banked wins.
     """
 
     def __init__(
@@ -173,7 +184,7 @@ class RiskManager:
         self.total_pnl:    float = 0.0
         self._trades: List[TradeRecord] = []
 
-    # ── Bot-state management ───────────────────────────────────────────────────
+    # ── Bot-state management ──────────────────────────────────────────────────
 
     def set_bot_state(self, state: BotState) -> None:
         self._bot_state = state
@@ -183,12 +194,12 @@ class RiskManager:
     def bot_state(self) -> BotState:
         return self._bot_state
 
-    # ── Cycle clock ────────────────────────────────────────────────────────────
+    # ── Cycle clock ───────────────────────────────────────────────────────────
 
     def tick_cycle(self) -> None:
         self._current_cycle += 1
 
-    # ── Pause-cycle management (bot_engine compatibility) ──────────────────────
+    # ── Pause-cycle management (bot_engine compatibility) ─────────────────────
 
     @property
     def pause_cycles_remaining(self) -> int:
@@ -201,7 +212,7 @@ class RiskManager:
     def consume_pause_cycle(self) -> None:
         self.decrement_pause()
 
-    # ── Balance management ─────────────────────────────────────────────────────
+    # ── Balance management ────────────────────────────────────────────────────
 
     def set_balance(self, balance: float) -> None:
         self._current_balance = balance
@@ -295,11 +306,11 @@ class RiskManager:
         # PLS tracks only win streaks; loss streak is always 0 or 1
         return 0
 
-    # ── PLS stake computation ──────────────────────────────────────────────────
+    # ── PLS stake computation ───────────────────────────────────────────────────
 
     def _compute_stake(self, balance: float) -> float:
         """
-        Core aggressive PLS formula (synchronous, no I/O).
+        Core PLS formula (synchronous, no I/O).
 
           base_stake   = max(BASE_STAKE_PCT × balance, MIN_STAKE)
           actual_stake = base_stake × current_multiplier
@@ -316,7 +327,7 @@ class RiskManager:
 
     async def calculate_stake(self) -> float:
         """
-        Fetch live balance, apply aggressive PLS formula, log, and return
+        Fetch live balance, apply the PLS formula, log, and return
         the stake.
 
         Log format:
@@ -324,26 +335,20 @@ class RiskManager:
         """
         balance = await self._fetch_live_balance()
 
-        # Never let base exceed 50% of balance
-        base = min(
-            self._current_balance * config.BASE_STAKE_PCT,
-            self._current_balance * 0.50,
-        )
-        base  = max(base, config.MIN_STAKE)
+        base  = max(self._current_balance * self.base_stake_pct, self.min_stake)
         stake = round(base * self._multiplier, 2)
-        stake = min(stake, config.MAX_STAKE)
-        stake = min(stake, self._current_balance * 0.50)
-        stake = max(stake, config.MIN_STAKE)
+        stake = min(stake, self.max_stake)
+        stake = max(stake, self.min_stake)
 
         logger.info(
             f"STAKE: ${stake:.4f} "
             f"(base=${base:.4f} "
             f"×{self._multiplier:.1f} "
-            f"streak={self._win_streak:+d})")
+            f"streak=+{self._win_streak})")
 
         return stake
 
-    # ── PLS can_trade gate ─────────────────────────────────────────────────────
+    # ── PLS can_trade gate ──────────────────────────────────────────────────────
 
     def can_trade(self) -> bool:
         """
@@ -368,16 +373,16 @@ class RiskManager:
 
         return True
 
-    # ── PLS result recording ───────────────────────────────────────────────────
+    # ── PLS result recording ────────────────────────────────────────────────────
 
     def record_result(self, won: bool) -> None:
         """
-        Update aggressive PLS win streak and emit the mandated post-trade
-        log line.
+        Update the PLS win streak and emit the mandated post-trade log line.
 
         WIN  → increment streak → _update_multiplier() raises tier.
-        LOSS → immediate reset: multiplier → 1.0, extra_slots → 0,
-               win_streak → 0.  Stake NEVER raised to recover a loss.
+        LOSS → immediate reset: win_streak → 0, multiplier → 1.0,
+               extra_slots → 0. Stake is NEVER raised to recover a loss —
+               this is the core distinction from Martingale.
 
         Log format (win):
           PLS | Streak: +{N} | Multiplier: {M}x | Balance: ${B:.4f} | Next stake: ${S:.4f}
@@ -390,12 +395,12 @@ class RiskManager:
             self._update_multiplier()
         else:
             self.losses          += 1
+            self._win_streak      = 0
             self._multiplier      = 1.0
             self._extra_slots     = 0
-            self._win_streak      = 0
 
-        balance    = self._current_balance if self._current_balance > 0 else self.min_stake
-        ns         = self._compute_stake(balance)
+        balance = self._current_balance if self._current_balance > 0 else self.min_stake
+        ns      = self._compute_stake(balance)
 
         streak_label = (
             f"+{self._win_streak}" if won
@@ -408,7 +413,7 @@ class RiskManager:
             f"Balance: ${balance:.4f} | "
             f"Next stake: ${ns:.4f}")
 
-    # ── Trade lifecycle ────────────────────────────────────────────────────────
+    # ── Trade lifecycle ─────────────────────────────────────────────────────────
 
     def register_open(
         self,
@@ -455,7 +460,7 @@ class RiskManager:
             f"balance=${self._current_balance:.4f} | "
             f"open={self._open_trade_count}")
 
-    # ── Session helpers ────────────────────────────────────────────────────────
+    # ── Session helpers ─────────────────────────────────────────────────────────
 
     @property
     def current_balance(self) -> float:
@@ -504,7 +509,7 @@ class RiskManager:
         }
 
 
-# ── Module-level helpers ───────────────────────────────────────────────────────
+# ── Module-level helpers ──────────────────────────────────────────────────────
 
 def _today_tag() -> str:
     return datetime.datetime.utcnow().strftime("%Y-%m-%d")
