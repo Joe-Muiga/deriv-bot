@@ -144,6 +144,9 @@ class DerivClient:
         # {contract_id: {"callback": fn, "placed_at": time}}
         self._polling_contracts: Dict[str, dict] = {}
 
+        # ── WS subscription-based contract resolution (primary; poller is fallback) ──
+        self._subscribed_contracts: set = set()
+
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
         # ── Rate limiting ─────────────────────────────────────────────────────
@@ -302,6 +305,7 @@ class DerivClient:
                     dispatch_task = asyncio.ensure_future(self._dispatch_loop())
                     try:
                         await self._subscribe_balance()
+                        await self._resubscribe_contracts()
                         await dispatch_task
                     finally:
                         dispatch_task.cancel()
@@ -419,6 +423,26 @@ class DerivClient:
                     except Exception as exc:
                         logger.debug(f"Tick callback error: {exc}")
 
+        if msg_type == "proposal_open_contract":
+            poc = msg.get("proposal_open_contract", {})
+            cid = str(poc.get("contract_id", ""))
+            closed = bool(
+                poc.get("is_sold") or poc.get("is_expired") or poc.get("status") == "sold"
+            )
+            if cid and closed:
+                self._subscribed_contracts.discard(cid)
+                info = self._polling_contracts.pop(cid, None)
+                if info and info.get("callback"):
+                    try:
+                        cb_result = info["callback"]({"proposal_open_contract": poc})
+                        if asyncio.iscoroutine(cb_result) or isinstance(cb_result, asyncio.Future):
+                            await cb_result
+                    except Exception as exc:
+                        logger.error(f"Contract close callback error {cid}: {exc}")
+                logger.info(
+                    f"SUBSCRIPTION CLOSED: {cid} profit={poc.get('profit')}"
+                )
+
     # ─── Polling-based contract resolution (replaces subscriptions) ──────────
 
     async def _polling_loop(self):
@@ -440,7 +464,7 @@ class DerivClient:
             for cid in list(self._polling_contracts.keys()):
                 try:
                     result = await self.force_check_contract(cid)
-                    if result.get("is_sold") or result.get("is_expired"):
+                    if result.get("is_sold") or result.get("is_expired") or result.get("status") == "sold":
                         info = self._polling_contracts.pop(cid, None)
                         if info and info.get("callback"):
                             cb_result = info["callback"]({"proposal_open_contract": result})
@@ -469,6 +493,39 @@ class DerivClient:
         if symbol:
             self._contract_symbol_map[cid] = symbol
         logger.info(f"TRACKING: {cid} via polling")
+        asyncio.create_task(self._subscribe_ws_contract(cid))
+
+    # ─── WS subscription (primary close signal; poller above is the fallback) ─
+
+    async def _subscribe_ws_contract(self, contract_id: str):
+        """
+        Subscribe to proposal_open_contract updates for *contract_id*
+        (subscribe: 1). Never double-subscribes — guarded by
+        self._subscribed_contracts. Pushes are handled in _handle().
+        """
+        cid = str(contract_id)
+        if cid in self._subscribed_contracts:
+            return
+        try:
+            await self._send({
+                "proposal_open_contract": 1,
+                "contract_id": int(cid),
+                "subscribe": 1,
+            })
+            self._subscribed_contracts.add(cid)
+            logger.info(f"SUBSCRIBED: {cid} (proposal_open_contract)")
+        except Exception as e:
+            logger.error(f"SUBSCRIBE FAILED: {cid} — {e}")
+
+    async def _resubscribe_contracts(self):
+        """Re-subscribe every tracked contract_id after a (re)connect."""
+        if not self._subscribed_contracts:
+            return
+        pending = list(self._subscribed_contracts)
+        self._subscribed_contracts.clear()
+        logger.info(f"RESUBSCRIBING: {len(pending)} contracts after reconnect")
+        for cid in pending:
+            await self._subscribe_ws_contract(cid)
 
     # ─── Force check a specific contract ─────────────────────────────────────
 
@@ -772,7 +829,7 @@ class DerivClient:
             self._last_buy_time = time.time()
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
-            logger.info(f"PLACING {contract_type} | {symbol} | ${stake:.4f}")
+            logger.info(f"PLACING {contract_type} on {symbol} stake=${stake:.4f}")
 
             try:
                 buy_req = {
@@ -790,10 +847,10 @@ class DerivClient:
                 }
                 resp = await self._send(buy_req)
                 if not resp:
-                    logger.error(f"BUY FAILED: {symbol} — no response")
+                    logger.error(f"FAILED: {symbol} — no response")
                     return None
                 if resp.get("error"):
-                    logger.error(f"BUY FAILED: {symbol} — {resp['error']['message']}")
+                    logger.error(f"FAILED: {symbol} — {resp['error']['message']}")
                     return None
 
                 result = resp.get("buy", {})
@@ -805,10 +862,16 @@ class DerivClient:
 
                 self._contract_symbol_map[contract_id] = symbol
 
+                # Guaranteed closure: subscribe to this contract immediately.
+                # (subscribe_contract(), called later by the caller to attach
+                # its close callback, will no-op the resend via the
+                # _subscribed_contracts guard — never double-subscribes.)
+                asyncio.create_task(self._subscribe_ws_contract(contract_id))
+
                 return result
 
             except Exception as e:
-                logger.error(f"BUY EXCEPTION: {symbol} -- {e}")
+                logger.error(f"FAILED: {symbol} — {e}")
                 return None
 
     # ─── Active symbols ───────────────────────────────────────────────────────
