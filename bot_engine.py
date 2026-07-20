@@ -1,41 +1,37 @@
 """
 bot_engine.py – Central async orchestrator.
 
-v16 — Dashboard push every 5 s; full open-contract dicts pushed to dashboard;
-      record_signal() called on every OPEN; record_trade() called on every CLOSE
-      and every TIMEOUT; record_failure() called on every failed placement;
-      _push_dashboard() called after every state change.
+v17 — Continuous non-blocking parallel-scan rewrite.
 
-KEY CHANGES vs v15
-──────────────────
-DASHBOARD:
-  • DASHBOARD_PUSH_EVERY = 5  (was 15)
-  • _push_dashboard() now builds full open-contract dicts (symbol, direction,
-    stake, opened_at) and passes them via update_open_contracts().
-  • _push_dashboard() also passes open_contracts_count and active_trades.
+KEY CHANGES vs v16
+───────────────────
+INIT:
+  • Only config.TRADE_SYMBOLS are initialised — no volatility-index /
+    ALL_TRADE_SYMBOLS phased startup. Symbols that fail to initialise are
+    skipped; the bot never crashes on a single symbol failure.
 
-TRADE OPEN (_execute):
-  • Calls record_signal() right before buy_contract (was already present).
-  • Calls _push_dashboard() immediately after contract is registered open.
+MAIN LOOP:
+  • Scanning and settling are fully decoupled. The main loop scans every
+    ready symbol in parallel every cycle via asyncio.gather and does NOT
+    wait for open contracts to settle before scanning again.
+  • The only execution gate is concurrent-slot availability
+    (self.risk.current_concurrent_limit).
+  • Signals are ranked by score*0.85 + symbol_win_rate*0.15, deduplicated
+    (highest score per symbol kept), and the top N ranked signals are
+    executed in parallel via asyncio.gather.
 
-TRADE CLOSE (_on_contract_result):
-  • record_trade() call updated: passes multiplier and close_reason="normal".
-  • _push_dashboard() called immediately after.
+SETTLING:
+  • A separate `_settle_loop` task runs independently of the scan loop.
+    After every settle wait it resolves orphaned contracts and increments
+    `_cycle_count`; once REDEPLOY_EVERY_N_CYCLES is reached it drains all
+    open contracts and triggers a Render redeploy.
 
-TIMEOUT / FUNDING TIMEOUT (_contract_watchdog):
-  • Both timeout branches call record_trade(..., close_reason="timeout").
-  • Both call _push_dashboard() immediately after.
-
-PLACEMENT FAILURE (_execute):
-  • buy_resp is None → calls record_failure() with symbol, direction, stake,
-    strategy, reason="buy_resp=None".
-  • _push_dashboard() called on failure too.
-
-ORPHAN LOSS (_monitor_orphans, _resolve_remaining_contracts):
-  • Both orphan paths call record_trade() with close_reason="timeout" and
-    _push_dashboard() after.
-
-ALL OTHER logic, routes, timeframes, scoring, redeploy, and init are unchanged.
+UNCHANGED:
+  • Websocket connection (DerivClient), dashboard serving (_push_dashboard /
+    _dashboard_loop), keep_alive integration (record_signal, record_trade,
+    record_failure, update_open_contracts, set_active_trades, update_status),
+    and the Render redeploy mechanism (restart_scheduler.trigger_redeploy /
+    is_redeploy_pending).
 """
 
 import asyncio
@@ -69,16 +65,10 @@ from symbols import get_symbol_class
 logger = logging.getLogger(__name__)
 
 DASHBOARD_PUSH_EVERY  = 5        # push every 5 seconds
-SYMBOL_REFRESH_EVERY  = 3600
 INIT_BATCH_SIZE       = getattr(config, "INIT_BATCH_SIZE", 10)
 
-_ORPHAN_MAX_ATTEMPTS      = 3
 CONTRACT_MAX_AGE_SECS     = getattr(config, "CONTRACT_MAX_AGE_SECS",      120)
 CONTRACT_FORCE_CLOSE_SECS = getattr(config, "CONTRACT_FORCE_CLOSE_SECS",  300)
-
-_PHASE1_HTF_BARS = 20
-_PHASE1_MTF_BARS = 20
-_PHASE1_LTF_BARS = 30
 
 
 # ─── Result container ──────────────────────────────────────────────────────────
@@ -97,14 +87,11 @@ class ScanResult:
 class BotEngine:
 
     def __init__(self):
-        self._queue:                  List[str]          = []
         self._cycle_count:            int                = 0
         self._running:                bool               = False
-        self._prescan_buffer:         List[ScanResult]   = []
         self._session_start_balance:  float              = 0.0
         self._open_contracts:         dict               = {}
         self._contract_open_times:    dict               = {}
-        self._active_symbols:         Set[str]           = set()
 
         self._htf:                    Dict[str, CandlestickBuilder] = {}
         self._mtf:                    Dict[str, CandlestickBuilder] = {}
@@ -112,14 +99,11 @@ class BotEngine:
 
         self._initialised_symbols:    Set[str]           = set()
         self._initializing:           Set[str]           = set()
-        self._last_symbol_refresh:    float              = 0.0
 
         self._confirmed_daily_loss:   float              = 0.0
         self._day_start_balance:      float              = 0.0
         self._confirmed_paused:       bool               = False
         self._current_utc_day:        int                = -1
-
-        self._settle_tasks:           Set[asyncio.Task]  = set()
 
         self.client  = DerivClient()
         self.risk    = RiskManager(
@@ -176,10 +160,7 @@ class BotEngine:
             loss_ratio = self._confirmed_daily_loss / self._day_start_balance
             if loss_ratio >= config.DAILY_LOSS_LIMIT_PCT:
                 if not self._confirmed_paused:
-                    mins = self._minutes_until_midnight()
-                    logger.warning(
-                        f"DAILY LIMIT HIT — paused until midnight UTC "
-                        f"(~{mins:.0f} min)")
+                    logger.warning("DAILY LIMIT HIT — paused until midnight UTC")
                 self._confirmed_paused = True
             else:
                 self._confirmed_paused = False
@@ -202,7 +183,7 @@ class BotEngine:
 
     async def run(self):
         logger.info("=" * 64)
-        logger.info("  SIFM Deriv Trading Bot  –  multiplier / parallel-scan")
+        logger.info("  SIFM Deriv Trading Bot  –  continuous parallel-scan")
         logger.info("=" * 64)
 
         ws_task = asyncio.create_task(self.client.connect())
@@ -223,9 +204,6 @@ class BotEngine:
         self._session_start_balance = self.client.balance
         self._current_utc_day       = _dt.datetime.utcnow().day
 
-        asyncio.create_task(self._contract_watchdog())
-        asyncio.create_task(self._symbol_release_watchdog())
-
         await self._init_all_symbols()
 
         try:
@@ -233,7 +211,9 @@ class BotEngine:
         except Exception:
             pass
 
-        dash_task = asyncio.create_task(self._dashboard_loop())
+        dash_task   = asyncio.create_task(self._dashboard_loop())
+        settle_task = asyncio.create_task(self._settle_loop())
+
         try:
             await self._main_loop()
         except asyncio.CancelledError:
@@ -242,108 +222,28 @@ class BotEngine:
             logger.critical(f"Main loop crashed: {exc}\n{traceback.format_exc()}")
         finally:
             dash_task.cancel()
+            settle_task.cancel()
             ws_task.cancel()
-            for t in list(self._settle_tasks):
-                t.cancel()
 
-    # ── Two-phase + upgrade startup ────────────────────────────────────────────
+    # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
 
     async def _init_all_symbols(self):
-        priority   = list(getattr(config, "PRIORITY_SYMBOLS", []))
-        all_syms   = list(config.ALL_TRADE_SYMBOLS)
-        remaining  = [s for s in all_syms if s not in priority]
-        batch_size = getattr(config, "INIT_BATCH_SIZE",  INIT_BATCH_SIZE)
-        batch_delay= getattr(config, "INIT_BATCH_DELAY", 2.0)
+        trade_symbols = list(getattr(config, "TRADE_SYMBOLS", []))
+        logger.info(f"Initialising {len(trade_symbols)} trade symbols")
 
+        results = await asyncio.gather(
+            *[self._init_data(s) for s in trade_symbols],
+            return_exceptions=True,
+        )
+        for s, r in zip(trade_symbols, results):
+            if isinstance(r, Exception):
+                logger.warning(f"{s}: failed to initialise — skipping ({r})")
+
+        self._initialised_symbols = set(self._htf.keys())
+        self.symbols.update_active(list(self._initialised_symbols))
         logger.info(
-            f"Phase 1: initialising {len(priority)} priority symbol(s) "
-            f"(htf={_PHASE1_HTF_BARS}, mtf={_PHASE1_MTF_BARS}, ltf={_PHASE1_LTF_BARS})")
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(
-                    *[self._init_data(s,
-                                      htf_bars=_PHASE1_HTF_BARS,
-                                      mtf_bars=_PHASE1_MTF_BARS,
-                                      ltf_bars=_PHASE1_LTF_BARS)
-                      for s in priority],
-                    return_exceptions=True,
-                ),
-                timeout=90,
-            )
-        except asyncio.TimeoutError:
-            logger.error(
-                "Phase 1 TIMED OUT after 90s globally — "
-                "proceeding with whatever symbol(s) are ready so the bot "
-                "and dashboard are not stuck forever")
-        logger.info(
-            f"Phase 1 complete — {len(self._htf)} symbol(s) ready; "
-            f"trading now active")
-        self.symbols.update_active(list(self._htf.keys()))
-
-        asyncio.create_task(
-            self._background_init(remaining, batch_size, batch_delay))
-
-    async def _background_init(
-        self,
-        remaining:   List[str],
-        batch_size:  int,
-        batch_delay: float,
-    ):
-        for i in range(0, len(remaining), batch_size):
-            batch = remaining[i : i + batch_size]
-            logger.info(
-                f"Phase 2 batch {i // batch_size + 1}: "
-                f"initialising {len(batch)} symbol(s)")
-            await asyncio.gather(
-                *[self._init_data(s,
-                                  htf_bars=_PHASE1_HTF_BARS,
-                                  mtf_bars=_PHASE1_MTF_BARS,
-                                  ltf_bars=_PHASE1_LTF_BARS)
-                  for s in batch],
-                return_exceptions=True,
-            )
-            self.symbols.update_active(list(self._htf.keys()))
-            if i + batch_size < len(remaining):
-                await asyncio.sleep(batch_delay)
-
-        logger.info(f"Phase 2 complete — {len(self._htf)} symbol(s) ready")
-
-        all_ready = list(self._htf.keys())
-        logger.info(f"Phase 3: upgrading {len(all_ready)} symbol(s) to full bar count")
-        for s in all_ready:
-            try:
-                await self._upgrade_symbol(s)
-            except Exception as exc:
-                logger.debug(f"Phase 3 upgrade({s}): {exc}")
-            await asyncio.sleep(0.1)
-
-        logger.info("Phase 3 complete — all symbols at full resolution")
-
-    async def _upgrade_symbol(self, symbol: str):
-        ltf_gran = self._ltf_gran(symbol)
-        mtf_gran = self._mtf_gran(symbol)
-
-        try:
-            htf_data, mtf_data, ltf_data = await asyncio.wait_for(
-                asyncio.gather(
-                    self.client.get_candles(symbol, config.HTF_GRANULARITY, config.HTF_BARS),
-                    self.client.get_candles(symbol, mtf_gran,               config.MTF_BARS),
-                    self.client.get_candles(symbol, ltf_gran,               config.LTF_BARS),
-                    return_exceptions=True,
-                ),
-                timeout=15,
-            )
-        except asyncio.TimeoutError:
-            logger.warning(f"{symbol}: Phase 3 upgrade get_candles timed out — skipping upgrade")
-            return
-
-        if isinstance(htf_data, Exception): htf_data = []
-        if isinstance(mtf_data, Exception): mtf_data = []
-        if isinstance(ltf_data, Exception): ltf_data = []
-
-        if htf_data and symbol in self._htf: self._htf[symbol].seed(htf_data)
-        if mtf_data and symbol in self._mtf: self._mtf[symbol].seed(mtf_data)
-        if ltf_data and symbol in self._ltf: self._ltf[symbol].seed(ltf_data)
+            f"{len(self._initialised_symbols)}/{len(trade_symbols)} "
+            f"symbol(s) ready — trading active")
 
     # ── Data initialisation — three TFs simultaneously ─────────────────────────
 
@@ -450,7 +350,6 @@ class BotEngine:
         risk_s  = self.risk.summary()
         summary = self.journal.session_summary()
 
-        # Build full open-contract dicts for dashboard rendering
         oc_list = []
         now_ts  = time.time()
         for cid, info in self._open_contracts.items():
@@ -505,25 +404,16 @@ class BotEngine:
             active_trades         = len(self._open_contracts),
         )
 
-    # ── Main loop ──────────────────────────────────────────────────────────────
+    # ── Main loop — continuous, non-blocking ───────────────────────────────────
 
     async def _main_loop(self):
-        scan_sleep     = getattr(config, "SCAN_CYCLE_SLEEP",        1)
-        redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 6)
-        cycle_number   = 0
+        scan_sleep   = getattr(config, "SCAN_CYCLE_SLEEP", 1)
+        cycle_number = 0
 
         while True:
             cycle_start = time.time()
 
-            # ── Fix 4: never let _active_symbols block all trading ─────────────
-            for sym in list(self._active_symbols):
-                has_open = any(
-                    v.get("symbol") == sym
-                    for v in self._open_contracts.values())
-                if not has_open:
-                    logger.warning(f"STALE ACTIVE SYMBOL: {sym} — clearing")
-                    self._active_symbols.discard(sym)
-
+            # 1. UTC day rollover → reset session
             today = _dt.datetime.utcnow().day
             if today != self._current_utc_day:
                 self.symbols.reset_session()
@@ -535,202 +425,92 @@ class BotEngine:
                     f"day_start_balance=${self._day_start_balance:.4f}")
 
             if is_redeploy_pending():
-                if self._open_contracts:
-                    logger.info(
-                        f"Redeploy pending – waiting for "
-                        f"{len(self._open_contracts)} open trade(s)")
-                    await asyncio.sleep(10)
-                    continue
-                else:
-                    logger.info(
-                        "Redeploy pending – all trades closed, safe to restart")
-                    await asyncio.sleep(30)
-                    continue
-
-            if self._cycle_count >= redeploy_every:
-                n_open = len(self._open_contracts)
-                logger.info(
-                    f"REDEPLOY TRIGGERED: draining {n_open} open "
-                    f"contract(s) before restart")
-                while self._open_contracts:
-                    logger.info(
-                        f"Draining — {len(self._open_contracts)} contract(s) open")
-                    await asyncio.sleep(5)
-                restart_scheduler.trigger_redeploy()
-                logger.info("Redeploy triggered — standing by for 300 s")
-                await asyncio.sleep(300)
-                self._cycle_count = 0
-                continue
-
-            if self._confirmed_paused:
-                logger.info(
-                    f"DAILY LIMIT HIT — pausing "
-                    f"{config.DAILY_LOSS_PAUSE_MINS}min")
-                await asyncio.sleep(config.DAILY_LOSS_PAUSE_MINS * 60)
-                self._confirmed_paused = False
-                continue
-
-            self.risk.decrement_pause()
-            if self.risk.pause_cycles_remaining > 0:
-                logger.info(
-                    f"⏸ Loss-streak pause: "
-                    f"{self.risk.pause_cycles_remaining} cycle(s) remaining | "
-                    f"streak={self.risk.current_streak}")
-                self.risk.consume_pause_cycle()
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            if self._has_stale_contracts():
-                stale = [
-                    cid for cid in self._open_contracts
-                    if (time.time() - self._contract_open_times.get(cid, time.time()))
-                    > config.TRADE_DURATION * 60 + 30
-                ]
-                logger.warning(
-                    f"Stale contracts detected: {stale} — running force-check")
-                await self._resolve_remaining_contracts()
-                await asyncio.sleep(scan_sleep)
-                continue
-
-            self.symbols.decrement_suspensions()
             cycle_number += 1
 
-            queue = self.symbols.get_queue()
-            logger.info(
-                f"CYCLE | Queue:{len(queue)} | "
-                f"Active:{len(self._active_symbols)} | "
-                f"Open:{len(self._open_contracts)} | "
-                f"Balance:${self.client.balance:.2f}")
-            if not queue:
-                await asyncio.sleep(scan_sleep)
-                continue
+            # 2. Get queue of ready symbols
+            queue = self.symbols.get_queue(list(self._initialised_symbols))
 
+            # 3. Scan all queued symbols in parallel — never wait for settles
             raw_results = await asyncio.gather(
                 *[self._scan(s) for s in queue],
                 return_exceptions=True,
             )
-            candidates = [
-                r for r in raw_results
-                if isinstance(r, ScanResult)
-                and r.sig.direction != "NONE"
-                and self.symbols.can_trade_now(r.symbol)
-            ]
 
-            for r in candidates:
+            # 4. Collect all non-None signals
+            signals = [r for r in raw_results if isinstance(r, ScanResult)]
+
+            # 5. Filter out symbols that can't trade right now
+            signals = [r for r in signals if self.symbols.can_trade_now(r.symbol)]
+
+            # 6. Rank by score*0.85 + win_rate*0.15
+            for r in signals:
                 r.score = self._composite_score(r.sig, r.symbol)
 
+            # 7. Remove duplicates — keep highest scored per symbol
             best_per_symbol: Dict[str, ScanResult] = {}
-            for r in candidates:
+            for r in signals:
                 if (r.symbol not in best_per_symbol
                         or r.score > best_per_symbol[r.symbol].score):
                     best_per_symbol[r.symbol] = r
 
             ranked: List[ScanResult] = sorted(
-                best_per_symbol.values(),
-                key=lambda r: r.score,
-                reverse=True,
-            )
+                best_per_symbol.values(), key=lambda r: r.score, reverse=True)
 
-            candidates = [r for r in ranked if r.symbol not in self._active_symbols]
+            # 8. Execute top N where N = current_concurrent_limit,
+            #    gated only by concurrent-slot availability
+            concurrent_limit = self.risk.current_concurrent_limit
+            open_count       = len(self._open_contracts)
+            available_slots  = max(0, concurrent_limit - open_count)
 
-            # ── Fix 1: never trade the same symbol twice in one cycle ─────────
-            seen_symbols: Set[str] = set()
-            unique_candidates: List[ScanResult] = []
-            for r in sorted(candidates, key=lambda x: x.score, reverse=True):
-                if r.symbol not in seen_symbols:
-                    unique_candidates.append(r)
-                    seen_symbols.add(r.symbol)
-            candidates = unique_candidates
+            top = ranked[:available_slots] if (
+                available_slots > 0 and not self._confirmed_paused) else []
 
-            # ── Fix 2: rank by score before executing ─────────────────────────
-            candidates = sorted(
-                candidates, key=lambda x: getattr(x.sig, "score", x.score), reverse=True)
-            top = candidates[: self.risk.current_concurrent_limit]
-            logger.info(
-                f"RANKED: {[(r.symbol, getattr(r.sig, 'score', r.score)) for r in top]}")
+            # 9. Execute all top signals in parallel
+            if top:
+                await asyncio.gather(
+                    *[self._execute(r.symbol, r.sig) for r in top],
+                    return_exceptions=True,
+                )
 
-            open_count = len(self._open_contracts)
-            streak     = self.risk.current_streak
+            # 10. Cycle log
+            streak = self.risk.current_streak
             logger.info(
                 f"CYCLE {cycle_number} | "
                 f"Queue:{len(queue)} | "
-                f"Signals:{len(ranked)} | "
+                f"Signals:{len(signals)} | "
                 f"Executing:{len(top)} | "
-                f"Open:{open_count} | "
+                f"Open:{len(self._open_contracts)} | "
                 f"Balance:${self.client.balance:.4f} | "
                 f"Streak:{'+' if streak >= 0 else ''}{streak}")
 
-            if top and not self._confirmed_paused:
-                for sig_r in top:
-                    await self._execute(sig_r.symbol, sig_r.sig, sig_r.price, sig_r.smc_ctx)
-                    await asyncio.sleep(2)  # 2 second gap between each trade
-
-            orphan_task = asyncio.create_task(self._monitor_orphans())
-            self._settle_tasks.add(orphan_task)
-            orphan_task.add_done_callback(self._settle_tasks.discard)
-
             elapsed   = time.time() - cycle_start
             remainder = max(0.0, scan_sleep - elapsed)
-            if remainder > 0:
-                await asyncio.sleep(remainder)
+            await asyncio.sleep(remainder if remainder > 0 else 0.01)
 
     # ── Per-symbol scan ────────────────────────────────────────────────────────
 
     async def _scan(self, symbol: str) -> Optional[ScanResult]:
         try:
-            htf = self._htf.get(symbol)
-            mtf = self._mtf.get(symbol)
-            ltf = self._ltf.get(symbol)
-
-            if not all([htf, mtf, ltf]):
-                logger.info(f"SCAN MISS {symbol}: builders missing "
-                            f"(htf={htf is not None} mtf={mtf is not None} ltf={ltf is not None})")
-                return None
-            if htf.count < 10:
-                logger.info(f"SCAN MISS {symbol}: htf.count={htf.count} < 10")
+            builder = self._ltf.get(symbol)
+            if builder is None:
                 return None
 
-            price = float(
-                ltf.completed_bars[-1].close if ltf.completed_bars else 0)
-            if price == 0:
-                logger.info(f"SCAN MISS {symbol}: price=0 "
-                            f"(ltf.completed_bars={len(ltf.completed_bars) if ltf.completed_bars else 0})")
+            ltf_bars = builder.completed_bars
+
+            sig = self.signal.evaluate(ltf_bars, symbol)
+            if sig is None or getattr(sig, "direction", "NONE") == "NONE":
                 return None
 
-            if self.news.is_blocked(symbol):
-                logger.info(f"SCAN MISS {symbol}: news-blocked")
-                return None
-
-            ctx = self.smc.analyse(
-                htf.completed_bars,
-                mtf.completed_bars,
-                price,
-            )
-            if ctx.bias == "NEUTRAL":
-                logger.info(f"SCAN MISS {symbol}: smc bias=NEUTRAL")
-                return None
-
-            stake = await self.risk.calculate_stake()
-
-            sig = self.signal.evaluate(
-                ltf_bars = ltf.completed_bars,
-                mtf_bars = mtf.completed_bars,
-                symbol   = symbol,
-                stake    = stake,
-            )
-            if sig is None or sig.direction == "NONE":
-                logger.info(f"SCAN MISS {symbol}: signal.evaluate -> "
-                            f"{'None' if sig is None else sig.direction}")
-                return None
-
-            logger.info(f"SCAN HIT {symbol}: dir={sig.direction} "
-                        f"score={getattr(sig, 'score', 0.0)} bias={ctx.bias}")
+            price = float(ltf_bars[-1].close) if ltf_bars else 0.0
 
             return ScanResult(
                 symbol  = symbol,
                 sig     = sig,
                 price   = price,
-                smc_ctx = ctx,
+                smc_ctx = SMCContext(),
                 score   = getattr(sig, "score", 0.0),
             )
 
@@ -740,31 +520,17 @@ class BotEngine:
 
     # ── Execution ──────────────────────────────────────────────────────────────
 
-    async def _execute(
-        self,
-        symbol:  str,
-        sig:     SignalResult,
-        price:   float    = 0.0,
-        smc_ctx: SMCContext = None,
-    ) -> bool:
+    async def _execute(self, symbol: str, sig: SignalResult) -> bool:
+        # Hard gate — re-verify right before placing the order
         if not self.symbols.can_trade_now(symbol):
-            return False
-        if symbol in self._active_symbols:
-            return False
-        if not self.risk.can_trade():
             return False
 
         stake     = await self.risk.calculate_stake()
         direction = sig.direction
-        ac        = get_symbol_class(symbol)
 
-        if smc_ctx is None:
-            smc_ctx = SMCContext()
-
-        # ── Record signal on every trade OPEN ─────────────────────────────────
         record_signal(
             symbol    = symbol,
-            direction = sig.direction,
+            direction = direction,
             strategy  = getattr(sig, "strategy", "unknown"),
             score     = getattr(sig, "score",    0.0),
         )
@@ -773,14 +539,13 @@ class BotEngine:
             symbol      = symbol,
             direction   = direction,
             stake       = stake,
-            multiplier  = sig.multiplier,
-            stop_loss   = sig.stop_loss,
-            take_profit = sig.take_profit,
+            multiplier  = getattr(sig, "multiplier",  None),
+            stop_loss   = getattr(sig, "stop_loss",   None),
+            take_profit = getattr(sig, "take_profit", None),
         )
 
         if buy_resp is None:
             logger.warning(f"PLACEMENT FAILED: {symbol}")
-            # ── Record failure ─────────────────────────────────────────────────
             record_failure(
                 symbol    = symbol,
                 direction = direction,
@@ -794,9 +559,9 @@ class BotEngine:
                 pass
             return False
 
-        cid       = str(buy_resp.get("contract_id", ""))
-        bal_b     = self.client.balance
-        buy_price = float(buy_resp.get("buy_price", stake))
+        cid        = str(buy_resp.get("contract_id", ""))
+        bal_before = self.client.balance
+        buy_price  = float(buy_resp.get("buy_price", stake))
 
         rec = self.risk.register_open(
             symbol      = symbol,
@@ -805,25 +570,28 @@ class BotEngine:
             entry_price = buy_price,
         )
 
-        self.journal.open_trade(
-            contract_id    = cid,
-            symbol         = symbol,
-            direction      = direction,
-            stake          = stake,
-            entry_price    = buy_price,
-            balance_before = bal_b,
-            asset_class    = ac,
-            htf_bias       = getattr(smc_ctx, "bias",      "NEUTRAL"),
-            smc_structure  = getattr(smc_ctx, "structure", "NONE"),
-            m1             = getattr(sig, "m1_signal", 0),
-            m2             = getattr(sig, "m2_signal", 0),
-            m3             = getattr(sig, "m3_signal", sig.strength),
-            modules        = sig.strength,
-        )
+        try:
+            self.journal.open_trade(
+                contract_id    = cid,
+                symbol         = symbol,
+                direction      = direction,
+                stake          = stake,
+                entry_price    = buy_price,
+                balance_before = bal_before,
+                asset_class    = get_symbol_class(symbol),
+                htf_bias       = "NEUTRAL",
+                smc_structure  = "NONE",
+                m1             = getattr(sig, "m1_signal", 0),
+                m2             = getattr(sig, "m2_signal", 0),
+                m3             = getattr(sig, "m3_signal", getattr(sig, "strength", 0)),
+                modules        = getattr(sig, "strength", 0),
+            )
+        except Exception:
+            pass
 
         self._open_contracts[cid] = {
             "symbol":      symbol,
-            "direction":   sig.direction,
+            "direction":   direction,
             "stake":       stake,
             "entry_price": buy_price,
             "opened_at":   time.time(),
@@ -834,9 +602,9 @@ class BotEngine:
             "take_profit": getattr(sig, "take_profit", None),
             "multiplier":  getattr(sig, "multiplier",  None),
         }
+        self._contract_open_times[cid] = time.time()
 
         self.symbols.record_trade_placed(symbol)
-        self._active_symbols.add(symbol)
         set_active_trades(len(self._open_contracts))
 
         logger.info(
@@ -844,14 +612,16 @@ class BotEngine:
             f"x{getattr(sig, 'multiplier', '?')} | "
             f"SL={getattr(sig, 'stop_loss', '?')} "
             f"TP={getattr(sig, 'take_profit', '?')} | "
-            f"modules={sig.strength}/3 | streak={self.risk.current_streak}")
+            f"streak={self.risk.current_streak}")
 
-        await self.client.subscribe_contract(
-            cid,
-            lambda msg, _cid=cid: asyncio.create_task(
-                self._on_contract_result(_cid, msg)))
+        try:
+            await self.client.subscribe_contract(
+                cid,
+                lambda msg, _cid=cid: asyncio.create_task(
+                    self._on_contract_result(_cid, msg)))
+        except Exception as exc:
+            logger.warning(f"subscribe_contract({cid}): {exc}")
 
-        # ── Push dashboard after trade OPENS ──────────────────────────────────
         try:
             self._push_dashboard()
         except Exception:
@@ -866,97 +636,132 @@ class BotEngine:
         if not poc.get("is_sold"):
             return
 
-        sell_price = float(poc.get("sell_price", 0))
-        pnl        = float(poc.get("profit",     0))
-        payout     = float(poc.get("payout",     sell_price))
-        bal_after  = self.client.balance
-        won        = pnl > 0
-
         info = self._open_contracts.pop(cid, None)
         self._contract_open_times.pop(cid, None)
         if not info:
             return
 
         symbol      = info["symbol"]
-        direction   = info["direction"]
         stake       = info["stake"]
-        entry_price = info["entry_price"]
-        rec         = info["rec"]
-        sig         = info["sig"]
+        rec         = info.get("rec")
 
-        logger.info(
-            f"{'WIN' if won else 'LOSS'}: {symbol} pnl=${pnl:+.4f} sell_price={sell_price}")
+        sell_price = float(poc.get("sell_price", 0))
+        payout     = float(poc.get("payout",     sell_price))
+        pnl        = float(poc.get("profit",     0))
+        won        = pnl > 0
 
-        self.journal.close_trade(
-            contract_id   = cid,
-            exit_price    = sell_price,
-            pnl           = pnl,
-            payout        = payout,
-            balance_after = bal_after,
-        )
+        try:
+            self.journal.close_trade(
+                contract_id   = cid,
+                exit_price    = sell_price,
+                pnl           = pnl,
+                payout        = payout,
+                balance_after = self.client.balance,
+            )
+        except Exception:
+            pass
 
-        # ── Record trade on every normal CLOSE ───────────────────────────────
+        self.symbols.record_contract_closed(symbol)
+        self.symbols.record_result(symbol, won=won)
+        try:
+            self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
+        except Exception:
+            pass
+
+        if pnl < 0:
+            self._confirmed_daily_loss += abs(pnl)
+        self._check_confirmed_loss_limit()
+
+        set_active_trades(len(self._open_contracts))
+        update_status(streak=self.risk.current_streak)
+
         record_trade(
             symbol        = symbol,
-            direction     = direction,
+            direction     = info.get("direction", "?"),
             stake         = stake,
             pnl           = pnl,
             balance_after = self.client.balance,
-            won           = pnl > 0,
+            won           = won,
             strategy      = info.get("strategy", ""),
             multiplier    = info.get("multiplier", None),
             close_reason  = "normal",
         )
 
-        self._active_symbols.discard(symbol)
-        self.symbols.record_contract_closed(symbol)
-        # Force queue update
-        self.symbols.update_active(list(self._htf.keys()))
-        logger.info(f"SYMBOL RELEASED: {symbol} | Active now: {self._active_symbols}")
-        self.symbols.record_result(symbol, won=won)
-        self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
-        self._confirmed_daily_loss += abs(pnl) if pnl < 0 else 0
-        self._check_confirmed_loss_limit()
-        set_active_trades(len(self._open_contracts))
-        update_status(streak=self.risk.current_streak)
-
-        # ── Push dashboard after trade CLOSES ─────────────────────────────────
-        self._push_dashboard()
-
-        logger.info(
-            f"{'✅ WIN' if pnl > 0 else '❌ LOSS'} | "
-            f"{symbol} | pnl=${pnl:+.4f} | "
-            f"balance=${self.client.balance:.4f} | "
-            f"streak={self.risk.current_streak}")
-
-    # ── Orphan monitoring ──────────────────────────────────────────────────────
-
-    async def _monitor_orphans(self):
         try:
-            now = time.time()
-            for cid in list(self._open_contracts.keys()):
-                info = self._open_contracts.get(cid)
-                if not info:
-                    continue
-                open_time = info.get("opened_at", now)
-                age       = now - open_time
+            self._push_dashboard()
+        except Exception:
+            pass
 
-                if age >= 1800:
-                    symbol = info["symbol"]
-                    stake  = info["stake"]
-                    rec    = info["rec"]
+        streak = self.risk.current_streak
+        logger.info(
+            f"{'✅ WIN' if won else '❌ LOSS'} | "
+            f"{symbol} | {info.get('strategy', '')} | "
+            f"pnl=${pnl:+.4f} | "
+            f"balance=${self.client.balance:.4f} | "
+            f"streak={streak}")
 
-                    self._open_contracts.pop(cid, None)
-                    self._contract_open_times.pop(cid, None)
-                    self._active_symbols.discard(symbol)
+    # ── Settle loop — independent of the scan loop ─────────────────────────────
 
+    async def _settle_loop(self):
+        settle_wait    = getattr(config, "SETTLE_WAIT_SECS", 15)
+        redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 6)
+
+        while True:
+            try:
+                await asyncio.sleep(settle_wait)
+
+                await self._handle_orphans()
+                self._check_confirmed_loss_limit()
+
+                self._cycle_count += 1
+                if self._cycle_count >= redeploy_every:
+                    n_open = len(self._open_contracts)
+                    logger.info(
+                        f"REDEPLOY TRIGGERED: draining {n_open} open "
+                        f"contract(s) before restart")
+                    while self._open_contracts:
+                        logger.info(
+                            f"Draining — {len(self._open_contracts)} "
+                            f"contract(s) open")
+                        await asyncio.sleep(5)
+                    restart_scheduler.trigger_redeploy()
+                    logger.info("Redeploy triggered — standing by")
+                    self._cycle_count = 0
+
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error(f"_settle_loop: {exc}")
+
+    # ── Orphan handling ─────────────────────────────────────────────────────────
+
+    async def _handle_orphans(self):
+        now = time.time()
+
+        for cid, info in list(self._open_contracts.items()):
+            opened_at = info.get("opened_at", now)
+            age       = now - opened_at
+
+            if age >= CONTRACT_FORCE_CLOSE_SECS:
+                symbol = info.get("symbol", "UNKNOWN")
+                stake  = info.get("stake", 0.0)
+                rec    = info.get("rec")
+
+                try:
                     self.symbols.record_result(symbol, won=False)
+                except Exception:
+                    pass
+                try:
                     self.risk.register_close(rec, exit_price=0, pnl=-stake)
-                    self._confirmed_daily_loss += stake
-                    self._check_confirmed_loss_limit()
-                    set_active_trades(len(self._open_contracts))
+                except Exception:
+                    pass
+                self.symbols.record_contract_closed(symbol)
 
-                    # ── Genuine orphan after 30min — record as loss ───────────
+                self._open_contracts.pop(cid, None)
+                self._contract_open_times.pop(cid, None)
+                set_active_trades(len(self._open_contracts))
+
+                try:
                     record_trade(
                         symbol        = symbol,
                         direction     = info.get("direction", "?"),
@@ -968,307 +773,18 @@ class BotEngine:
                         multiplier    = info.get("multiplier", None),
                         close_reason  = "timeout",
                     )
-
-                    logger.error(
-                        f"GENUINE ORPHAN: {cid} recording as loss after 30min "
-                        f"({age:.0f}s)")
-                    try:
-                        self._push_dashboard()
-                    except Exception:
-                        pass
-
-                elif age >= CONTRACT_FORCE_CLOSE_SECS:
-                    logger.warning(
-                        f"CONTRACT STALE: {cid} {info['symbol']} "
-                        f"age={age/60:.1f}min — poller will resolve")
-                    try:
-                        await self.client.force_check_contract(cid)
-                    except Exception as exc:
-                        logger.warning(f"force_check_contract({cid}): {exc}")
-
-                elif age >= CONTRACT_MAX_AGE_SECS:
-                    try:
-                        await self.client.force_check_contract(cid)
-                        logger.debug(
-                            f"force_check_contract({cid}) triggered "
-                            f"(age={age:.0f}s)")
-                    except Exception as exc:
-                        logger.warning(f"force_check_contract({cid}): {exc}")
-
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.error(f"_monitor_orphans: {exc}")
-
-    # ── Settle task launcher ───────────────────────────────────────────────────
-
-    async def _settle_and_resolve(self, wait_secs: float):
-        try:
-            await asyncio.sleep(wait_secs)
-            await self._resolve_remaining_contracts()
-            self._cycle_count += 1
-        except asyncio.CancelledError:
-            pass
-        except Exception as exc:
-            logger.error(f"_settle_and_resolve: {exc}")
-
-    # ── Orphan resolution (full) ───────────────────────────────────────────────
-
-    async def _resolve_remaining_contracts(self):
-        remaining = list(self._open_contracts.keys())
-        n   = len(remaining)
-        now = time.time()
-
-        if n == 0:
-            logger.info("Open contracts remaining: 0")
-            return
-
-        age_parts = []
-        for cid in remaining:
-            info_r   = self._open_contracts.get(cid, {})
-            age_secs = int(now - info_r.get("opened_at", now))
-            age_parts.append(f"{cid}({age_secs}s)")
-        logger.info(f"Open contracts remaining: {n} — " + ", ".join(age_parts))
-
-        for cid in remaining:
-            if cid not in self._open_contracts:
-                continue
-
-            resolved = False
-            for attempt in range(1, _ORPHAN_MAX_ATTEMPTS + 1):
-                try:
-                    resp = await self.client.force_check_contract(cid)
-                    poc  = resp.get("proposal_open_contract", {})
-                    is_closed = bool(
-                        poc.get("is_sold")
-                        or poc.get("is_expired")
-                        or poc.get("status") in ("sold", "won", "lost")
-                    )
-                    if is_closed:
-                        logger.info(
-                            f"force_check({cid}): confirmed closed "
-                            f"(attempt {attempt}) — firing result handler")
-                        await self._on_contract_result(cid, resp)
-                        resolved = True
-                        break
-                    else:
-                        logger.debug(
-                            f"force_check({cid}): still open "
-                            f"(attempt {attempt}/{_ORPHAN_MAX_ATTEMPTS})")
-                        if attempt < _ORPHAN_MAX_ATTEMPTS:
-                            await asyncio.sleep(5)
-                except Exception as exc:
-                    logger.warning(
-                        f"force_check({cid}) attempt {attempt} error: {exc}")
-                    if attempt < _ORPHAN_MAX_ATTEMPTS:
-                        await asyncio.sleep(5)
-
-            if not resolved and cid in self._open_contracts:
-                info   = self._open_contracts.get(cid, {})
-                symbol = info.get("symbol", "UNKNOWN")
-                stake  = info.get("stake",  0.0)
-                rec    = info.get("rec",    None)
-
-                logger.error(f"ORPHANED: {cid} — forcing close as loss")
-                self.journal.close_trade(
-                    contract_id   = cid,
-                    exit_price    = 0,
-                    pnl           = -stake,
-                    payout        = 0,
-                    balance_after = self.client.balance,
-                )
-                self._confirmed_daily_loss += stake
-                self._check_confirmed_loss_limit()
-
-                # ── Record resolution orphan as TIMEOUT loss ──────────────────
-                record_trade(
-                    symbol        = symbol,
-                    direction     = info.get("direction", "?"),
-                    stake         = stake,
-                    pnl           = -stake,
-                    balance_after = self.client.balance,
-                    won           = False,
-                    strategy      = "RESOLVE_TIMEOUT",
-                    multiplier    = info.get("multiplier", None),
-                    close_reason  = "timeout",
-                )
-
-                try:
-                    self.symbols.record_result(symbol, won=False)
                 except Exception:
                     pass
-                if rec is not None:
-                    try:
-                        self.risk.register_close(rec, exit_price=0, pnl=-stake)
-                    except Exception:
-                        pass
-
-                self._open_contracts.pop(cid, None)
-                self._contract_open_times.pop(cid, None)
-                self._active_symbols.discard(symbol)
-                set_active_trades(len(self._open_contracts))
 
                 try:
                     self._push_dashboard()
                 except Exception:
                     pass
 
-                logger.error(
-                    f"ORPHAN RECORDED AS LOSS: {cid} {symbol} "
-                    f"-${stake:.2f} | balance=${self.client.balance:.4f}")
+                logger.error(f"ORPHAN LOSS: {cid} -{stake}")
 
-    # ── Contract watchdog ──────────────────────────────────────────────────────
-
-    async def _contract_watchdog(self):
-        max_open_secs = getattr(config, "MAX_TRADE_OPEN_MINS", 60) * 60
-
-        while True:
-            try:
-                await asyncio.sleep(15)
-                now = time.time()
-                for cid, info in list(self._open_contracts.items()):
-                    age_secs = now - info.get("opened_at", now)
-                    age_mins = age_secs / 60
-
-                    if age_secs >= config.CONTRACT_CHECK_SECS:
-                        logger.info(
-                            f"WATCHDOG CHECK: {cid} "
-                            f"{info['symbol']} age={age_mins:.1f}min")
-                        try:
-                            result = await self.client.force_check_contract(cid)
-                            if result.get("is_sold") or result.get("is_expired"):
-                                await self._on_contract_result(
-                                    cid, {"proposal_open_contract": result})
-                        except Exception as exc:
-                            logger.warning(f"WATCHDOG force_check({cid}): {exc}")
-
-                    # Funding-fee timeout — force-close to prevent fee erosion
-                    if age_secs >= max_open_secs:
-                        if cid in self._open_contracts:
-                            stake  = info["stake"]
-                            symbol = info["symbol"]
-                            logger.warning(
-                                f"FUNDING TIMEOUT: {cid} {symbol} "
-                                f"{age_mins:.1f}min >= MAX_TRADE_OPEN_MINS="
-                                f"{getattr(config,'MAX_TRADE_OPEN_MINS',60)} — "
-                                f"force-closing to prevent fee erosion")
-                            try:
-                                await self.client.sell_contract(cid)
-                            except Exception as exc:
-                                logger.warning(
-                                    f"sell_contract({cid}): {exc} — "
-                                    f"recording as loss")
-                            # ── Record FUNDING TIMEOUT close ──────────────────
-                            record_trade(
-                                symbol        = symbol,
-                                direction     = info.get("direction", "?"),
-                                stake         = stake,
-                                pnl           = -stake,
-                                balance_after = self.client.balance,
-                                won           = False,
-                                strategy      = "FUNDING_TIMEOUT",
-                                multiplier    = info.get("multiplier", None),
-                                close_reason  = "timeout",
-                            )
-                            self._confirmed_daily_loss += stake
-                            self.risk.register_close(
-                                info["rec"], exit_price=0, pnl=-stake)
-                            self.symbols.record_contract_closed(symbol)
-                            self.symbols.record_result(symbol, won=False)
-                            self._open_contracts.pop(cid, None)
-                            self._active_symbols.discard(symbol)
-                            set_active_trades(len(self._open_contracts))
-                            self._check_confirmed_loss_limit()
-                            # ── Push after FUNDING TIMEOUT ─────────────────────
-                            self._push_dashboard()
-
-                    # Legacy hard timeout (CONTRACT_TIMEOUT_SECS)
-                    elif age_secs >= config.CONTRACT_TIMEOUT_SECS:
-                        if cid in self._open_contracts:
-                            stake  = info["stake"]
-                            symbol = info["symbol"]
-
-                            if age_secs >= 1800:
-                                logger.error(
-                                    f"GENUINE ORPHAN: {cid} {symbol} "
-                                    f"recording as loss after 30min "
-                                    f"({age_mins:.1f}min)")
-                                # ── Record genuine orphan TIMEOUT close ────────
-                                record_trade(
-                                    symbol        = symbol,
-                                    direction     = info.get("direction", "?"),
-                                    stake         = stake,
-                                    pnl           = -stake,
-                                    balance_after = self.client.balance,
-                                    won           = False,
-                                    strategy      = "TIMEOUT",
-                                    multiplier    = info.get("multiplier", None),
-                                    close_reason  = "timeout",
-                                )
-                                self._confirmed_daily_loss += stake
-                                self.risk.register_close(
-                                    info["rec"], exit_price=0, pnl=-stake)
-                                self.symbols.record_contract_closed(symbol)
-                                self.symbols.record_result(symbol, won=False)
-                                self._open_contracts.pop(cid, None)
-                                self._active_symbols.discard(symbol)
-                                set_active_trades(len(self._open_contracts))
-                                self._check_confirmed_loss_limit()
-                                # ── Push after genuine orphan TIMEOUT ──────────
-                                self._push_dashboard()
-                            else:
-                                logger.warning(
-                                    f"CONTRACT STALE: {cid} {symbol} "
-                                    f"age={age_mins:.1f}min — poller will resolve")
-                                # Do NOT record as loss here — let polling
-                                # get the real result via force_check_contract.
-
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                logger.error(f"_contract_watchdog: {exc}")
-
-    # ── Symbol release watchdog ─────────────────────────────────────────────────
-
-    async def _symbol_release_watchdog(self):
-        """
-        Every 60 seconds, force-release any symbol from _active_symbols
-        whose contract has been open longer than 8 minutes (480s). This
-        guarantees the queue can never permanently empty because a symbol
-        is stuck "active" due to a missed close callback.
-        """
-        while True:
-            try:
-                await asyncio.sleep(60)
-                now = time.time()
-                released = []
-                for cid, info in list(self._open_contracts.items()):
-                    age = now - info.get("opened_at", now)
-                    if age > 480:  # 8 minutes
-                        symbol = info["symbol"]
-                        logger.warning(
-                            f"FORCE RELEASING: {symbol} age={age:.0f}s")
-                        self._active_symbols.discard(symbol)
-                        self.symbols.record_contract_closed(symbol)
-                        released.append(symbol)
-                if released:
-                    logger.info(
-                        f"RELEASED SYMBOLS: {released} | "
-                        f"Queue should refill now")
-                    self.symbols.update_active(list(self._htf.keys()))
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                logger.error(f"_symbol_release_watchdog: {exc}")
-
-    # ── Stale contract detection ───────────────────────────────────────────────
-
-
-    def _has_stale_contracts(self) -> bool:
-        stale_threshold = config.TRADE_DURATION * 60 + 30
-        now = time.time()
-        for cid, open_time in list(self._contract_open_times.items()):
-            if cid in self._open_contracts:
-                if now - open_time > stale_threshold:
-                    return True
-        return False
+            elif age >= CONTRACT_MAX_AGE_SECS:
+                try:
+                    await self.client.force_check_contract(cid)
+                except Exception as exc:
+                    logger.warning(f"force_check_contract({cid}): {exc}")
