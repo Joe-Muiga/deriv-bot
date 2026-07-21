@@ -302,6 +302,7 @@ class DerivClient:
                     # The OTP embedded in ws_url already authenticated this
                     # connection — no separate authorize message needed/accepted.
                     self._authorized = True
+                    self._ready.set()
                     dispatch_task = asyncio.ensure_future(self._dispatch_loop())
                     try:
                         await self._subscribe_balance()
