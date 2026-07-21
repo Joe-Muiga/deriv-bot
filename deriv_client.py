@@ -851,7 +851,11 @@ class DerivClient:
                     logger.error(f"FAILED: {symbol} — no response")
                     return None
                 if resp.get("error"):
-                    logger.error(f"FAILED: {symbol} — {resp['error']['message']}")
+                    err = resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={buy_req}"
+                    )
                     return None
 
                 result = resp.get("buy", {})
