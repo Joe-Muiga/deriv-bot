@@ -71,10 +71,11 @@ def evaluate_digit(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     raw_score, digit_dir = ind.digit_score(
         close=C, rsi=rsi, bb_upper=upper, bb_mid=mid, bb_lower=lower, roc=roc
     )
+    partial_score = raw_score / 8.0
 
     if digit_dir is None or raw_score < 6:
-        logger.debug(f"REJECTED: {symbol} DIGIT strength=0 score=0.000 — below threshold")
-        return NONE_RESULT
+        logger.debug(f"REJECTED: {symbol} DIGIT strength=0 score={partial_score:.3f} — below threshold")
+        return SignalResult("NONE", 0, partial_score, "DIGIT", "Below entry threshold")
 
     direction = "LONG" if digit_dir == "OVER" else "SHORT"
     score = raw_score / 8.0
@@ -85,7 +86,7 @@ def evaluate_digit(ltf_bars: List[Candle], symbol: str) -> SignalResult:
         strength = 2
     else:
         logger.info(f"REJECTED: {symbol} DIGIT strength=1 score={score:.3f} — below threshold")
-        return NONE_RESULT
+        return SignalResult("NONE", 0, score, "DIGIT", "Below entry threshold")
 
     logger.info(f"DIGIT: {symbol} {direction} score={raw_score}/8")
     return SignalResult(
@@ -157,13 +158,13 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
     else:
         best = max(long_score, short_score)
         logger.debug(f"REJECTED: {symbol} MEAN_REV strength=0 score={best/8.0:.3f} — below threshold")
-        return NONE_RESULT
+        return SignalResult("NONE", 0, best / 8.0, "MEAN_REV", "Below entry threshold")
 
     score = raw / 8.0
     strength = 3 if all_met else (2 if score >= 6 / 8.0 else 1)
     if strength <= 1:
         logger.info(f"REJECTED: {symbol} MEAN_REV strength=1 score={score:.3f} — below threshold")
-        return NONE_RESULT
+        return SignalResult("NONE", 0, score, "MEAN_REV", "Below entry threshold")
 
     logger.info(
         f"SIGNAL: {symbol} {direction} MEAN_REV strength={strength} score={score:.3f}"
@@ -228,7 +229,7 @@ def evaluate_range_break(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
     if breakout_dir is None:
         logger.debug(f"REJECTED: {symbol} RANGE_BREAK strength=0 score=0.000 — below threshold")
-        return NONE_RESULT
+        return SignalResult("NONE", 0, 0.0, "RANGE_BREAK", "No breakout detected")
 
     # --- Phase B: retest ---
     current_price = float(C[-1])
@@ -236,7 +237,7 @@ def evaluate_range_break(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
     if not retested:
         logger.debug(f"REJECTED: {symbol} RANGE_BREAK strength=0 score=0.250 — below threshold")
-        return NONE_RESULT
+        return SignalResult("NONE", 0, 0.25, "RANGE_BREAK", "Breakout found, awaiting retest")
 
     rsi_confirmed = (last_rsi > 52) if breakout_dir == "LONG" else (last_rsi < 48)
 
@@ -249,7 +250,7 @@ def evaluate_range_break(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
     if not rsi_confirmed:
         logger.info(f"REJECTED: {symbol} RANGE_BREAK strength=1 score={confirmed/4.0:.3f} — below threshold")
-        return NONE_RESULT
+        return SignalResult("NONE", 0, confirmed / 4.0, "RANGE_BREAK", "RSI not confirmed")
 
     strength = 3 if (has_consolidation and rsi_confirmed) else 2
     score = confirmed / 4.0
