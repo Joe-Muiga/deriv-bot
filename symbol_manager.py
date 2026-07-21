@@ -161,27 +161,39 @@ class SymbolManager:
         return True
 
     def get_queue(self, active_list: list = None) -> list:
-        if active_list is None:
-            active_list = self._all_active
+        # Use passed list, or fall back to _all_active, or fall back to config
+        source = active_list or self._all_active
+        if not source:
+            source = list(getattr(config, 'ALL_TRADE_SYMBOLS',
+                          getattr(config, 'TRADE_SYMBOLS',
+                          getattr(config, 'ALL_SYMBOLS', []))))
+            self._all_active = source
+            logger.warning(
+                f"get_queue: _all_active was empty — fell back to "
+                f"config symbol list ({len(source)} symbols)"
+            )
 
         tradeable = []
         suspended_list = []
         session_blocked = []
 
-        for symbol in active_list:
-            if symbol not in config.TRADE_SYMBOLS:
+        now = time.time()
+        for symbol in source:
+            if symbol in self._active_symbols:
                 continue
 
-            if self.is_suspended(symbol):
-                suspended_list.append(symbol)
+            if now < self._suspension_until.get(symbol, 0):
+                remaining = (self._suspension_until[symbol] - now) / 60
+                suspended_list.append(f"{symbol}({remaining:.1f}m)")
                 continue
 
             if not self.is_in_session(symbol):
                 session_blocked.append(symbol)
                 continue
 
-            if not self.can_trade_now(symbol):
-                # can_trade_now already logs the specific reason
+            gap_required = getattr(config, 'SYMBOL_MIN_GAP_MINS', 1) * 60
+            elapsed = now - self._last_traded.get(symbol, 0)
+            if elapsed < gap_required:
                 continue
 
             tradeable.append(symbol)
