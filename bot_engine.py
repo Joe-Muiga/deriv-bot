@@ -228,8 +228,17 @@ class BotEngine:
     # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
 
     async def _init_all_symbols(self):
-        trade_symbols = list(getattr(config, "TRADE_SYMBOLS", []))
-        logger.info(f"Initialising {len(trade_symbols)} trade symbols")
+        trade_symbols = list(getattr(config, "TRADE_SYMBOLS",
+                             getattr(config, "ALL_TRADE_SYMBOLS",
+                             getattr(config, "ALL_SYMBOLS", []))))
+
+        logger.info(f"Initialising {len(trade_symbols)} symbols: {trade_symbols}")
+
+        if not trade_symbols:
+            logger.error(
+                "NO SYMBOLS IN CONFIG — check TRADE_SYMBOLS / "
+                "ALL_TRADE_SYMBOLS in config.py")
+            return
 
         results = await asyncio.gather(
             *[self._init_data(s) for s in trade_symbols],
@@ -239,11 +248,12 @@ class BotEngine:
             if isinstance(r, Exception):
                 logger.warning(f"{s}: failed to initialise — skipping ({r})")
 
-        self._initialised_symbols = set(self._htf.keys())
-        self.symbols.update_active(list(self._initialised_symbols))
+        ready = list(self._htf.keys())
+        self._initialised_symbols = set(ready)
+        self.symbols.update_active(ready)
         logger.info(
-            f"{len(self._initialised_symbols)}/{len(trade_symbols)} "
-            f"symbol(s) ready — trading active")
+            f"Initialised: {len(ready)}/{len(trade_symbols)} "
+            f"symbol(s) ready: {ready}")
 
     # ── Data initialisation — three TFs simultaneously ─────────────────────────
 
@@ -254,7 +264,10 @@ class BotEngine:
         mtf_bars: int = None,
         ltf_bars: int = None,
     ):
+        logger.info(f"INIT_DATA: starting {symbol}")
+
         if symbol in self._initializing or symbol in self._htf:
+            logger.info(f"INIT_DATA: {symbol} already initializing/initialised — skipping")
             return
         self._initializing.add(symbol)
 
@@ -320,6 +333,7 @@ class BotEngine:
                 f"{symbol}: ready | htf={htf_b.count} | "
                 f"mtf={mtf_b.count} | ltf={ltf_b.count} "
                 f"(ltf_gran={ltf_gran}s)")
+            logger.info(f"INIT_DATA: {symbol} ready — htf={htf_b.count} ltf={ltf_b.count}")
 
         except Exception as exc:
             logger.error(f"_init_data({symbol}): skipping — {exc}")
