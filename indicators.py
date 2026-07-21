@@ -525,3 +525,25 @@ def find_rsi_divergence(
         return 0
     except Exception:
         return 0
+
+
+# ─── Compatibility aliases ───────────────────────────────────────────────────
+# signal_engine.py calls these under the shorter names below. Kept as thin
+# wrappers so the original functions/docstrings above stay untouched.
+
+def roc(closes: ArrayLike, period: int = 10) -> np.ndarray:
+    """Alias for rate_of_change(), matching the name signal_engine.py calls."""
+    return rate_of_change(closes, period)
+
+
+def donchian(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    period: int = 20,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Alias for donchian_channel(), but returns only (upper, lower) — matching
+    the 2-value unpack signal_engine.py does (it doesn't use the mid band).
+    """
+    upper, lower, _mid = donchian_channel(highs, lows, period)
+    return upper, lower
