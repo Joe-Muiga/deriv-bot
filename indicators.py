@@ -11,7 +11,7 @@ Architectural contract (enforced throughout):
 """
 
 import numpy as np
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 ArrayLike = Union[List[float], np.ndarray]
 
@@ -337,43 +337,54 @@ def donchian_channel(
 # ─── Consolidation Detector ─────────────────────────────────────────────────
 
 def find_consolidation(
-    closes: ArrayLike,
     highs: ArrayLike,
     lows: ArrayLike,
+    closes: ArrayLike,
     lookback: int = 15,
     avg_lookback: int = 50,
     ratio: float = 0.4,
-) -> bool:
+) -> Optional[Tuple[float, float]]:
     """
-    Returns True if current lookback range < ratio * avg_lookback range.
-    Used for Range Break strategy.
+    Returns (upper, lower) bounds of the current consolidation zone if the
+    recent lookback range is tight (< ratio * avg_lookback range), else None.
+
+    Used for Range Break strategy. signal_engine.py calls this as
+    find_consolidation(H, L, C) and does:
+        consolidation = ind.find_consolidation(H, L, C)
+        has_consolidation = consolidation is not None
+        if has_consolidation:
+            cons_upper, cons_lower = consolidation
+    — so the argument order and None/tuple return here must match that.
     """
     try:
-        H, L = _to(highs), _to(lows)
-        C = _to(closes)
+        H, L, C = _to(highs), _to(lows), _to(closes)
         n = len(C)
         if len(H) != n:
             H = C.copy()
         if len(L) != n:
             L = C.copy()
         if n < lookback:
-            return False
+            return None
 
         recent_start = max(0, n - lookback)
-        recent_range = float(np.max(H[recent_start:n]) - np.min(L[recent_start:n]))
+        recent_high  = float(np.max(H[recent_start:n]))
+        recent_low   = float(np.min(L[recent_start:n]))
+        recent_range = recent_high - recent_low
 
-        avg_start = max(0, n - avg_lookback)
+        avg_start    = max(0, n - avg_lookback)
         avg_window_h = H[avg_start:n]
         avg_window_l = L[avg_start:n]
         if len(avg_window_h) == 0:
-            return False
+            return None
         avg_range = float(np.max(avg_window_h) - np.min(avg_window_l))
 
         if avg_range == 0.0:
-            return False
-        return bool(recent_range < ratio * avg_range)
+            return None
+        if recent_range < ratio * avg_range:
+            return (recent_high, recent_low)
+        return None
     except Exception:
-        return False
+        return None
 
 
 # ─── Spike Detector ─────────────────────────────────────────────────────────
