@@ -430,8 +430,15 @@ class BotEngine:
 
             cycle_number += 1
 
-            # 2. Get queue of ready symbols
+            # 2. Refresh active list every cycle in case new symbols initialised,
+            #    then get queue of ready symbols
+            if self._htf:
+                self.symbols.update_active(list(self._htf.keys()))
+
             queue = self.symbols.get_queue(list(self._initialised_symbols))
+            logger.info(
+                f"CYCLE {cycle_number} | Queue:{len(queue)} | "
+                f"Active:{len(self._htf)} initialised")
 
             # 3. Scan all queued symbols in parallel — never wait for settles
             raw_results = await asyncio.gather(
