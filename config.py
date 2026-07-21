@@ -55,6 +55,19 @@ RISE_FALL_SYMBOLS = [
     "RDBULL","RDBEAR","stpRNG",
 ]
 
+# Digit (Match/Differ/Over/Under/Even/Odd) contracts are not used by this bot —
+# only CALL/PUT Rise/Fall is traded — so this stays empty. signal_engine.py
+# checks `if symbol in config.DIGIT_SYMBOLS` to route digit-specific logic;
+# an empty list means that branch is always skipped, as intended.
+DIGIT_SYMBOLS = []
+
+# ── STRATEGY ROUTING (signal_engine.py) ──────────────────────
+# Every traded symbol is routed to exactly one strategy evaluator.
+MEAN_REVERSION_SYMBOLS = VOLATILITY_STANDARD + VOLATILITY_1S  # all 10 vol indices
+RANGE_BREAK_SYMBOLS    = RANGE_BREAK                            # RDBULL, RDBEAR
+BOOM_CRASH_SYMBOLS     = BOOM_CRASH                              # empty — not traded
+STEP_SYMBOLS           = STEP                                    # stpRNG
+
 # All symbols combined — Rise/Fall compatible only
 ALL_SYMBOLS       = RISE_FALL_SYMBOLS
 ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
