@@ -127,16 +127,26 @@ DEFAULT_STOP_LOSS_PCT = 50.0
 TAKE_PROFIT_RATIO = 2.0
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
-BASE_STAKE_PCT       = 0.005   # 0.5% per trade
-MIN_STAKE            = 0.35
-MAX_STAKE            = 0.35
+BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
+                                # IS the compounding: stake grows/shrinks
+                                # automatically as balance grows/shrinks.
+MIN_STAKE            = 0.35    # safety floor — never stake less than this
+MAX_STAKE            = 1000.0  # safety backstop only, not the everyday
+                                # driver — was previously == MIN_STAKE,
+                                # which silently capped every trade at
+                                # $0.35 regardless of balance or the 0.5%
+                                # calculation above. Adjust if you want a
+                                # tighter per-trade ceiling.
 DAILY_LOSS_LIMIT_PCT = 0.15   # 20% max daily loss
 DAILY_LOSS_PAUSE_MINS = 30
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
+# Disabled per user request — stake no longer scales up on win streaks.
+# Multipliers all set to 1.0 so PLS tier lookups (wherever risk_manager.py
+# applies them) are a no-op; stake stays flat regardless of streak length.
 PLS_WIN_THRESHOLDS  = [3,   5,   8,   12,  15  ]
-PLS_WIN_MULTIPLIERS = [2.0, 3.0, 5.0, 8.0, 10.0]
-PLS_WIN_EXTRA_SLOTS = [3,   6,   9,   12,  15  ]
+PLS_WIN_MULTIPLIERS = [1.0, 1.0, 1.0, 1.0, 1.0]
+PLS_WIN_EXTRA_SLOTS = [0,   0,   0,   0,   0   ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
 MAX_CONCURRENT_TRADES = 30
