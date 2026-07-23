@@ -73,27 +73,21 @@ logger = logging.getLogger(__name__)
 
 # ── PLS tier table ──────────────────────────────────────────────────────────
 #
-# Indexed in descending threshold order so the first match wins.
-# Each entry: (min_streak, stake_multiplier, extra_concurrent_slots)
-#
+# Disabled per user request: stake no longer scales with win streak.
+# _pls_tier() always returns (1.0, 0) — kept as a function (rather than
+# deleted) so _update_multiplier()/callers don't need to change.
 _PLS_TIERS: list[tuple[int, float, int]] = [
-    (12, 4.0, 8),
-    ( 8, 3.0, 6),
-    ( 5, 2.0, 4),
-    ( 3, 1.5, 2),
-    ( 0, 1.0, 0),   # baseline — always matches
+    (0, 1.0, 0),   # baseline — always matches, streak has no effect
 ]
 
 
 def _pls_tier(win_streak: int) -> tuple[float, int]:
     """
-    Return (stake_multiplier, extra_concurrent_slots) for *win_streak*.
-    win_streak must be >= 0 (callers normalise before calling).
+    Win-streak stake scaling is disabled — always returns (1.0, 0)
+    regardless of win_streak. Stake sizing instead comes purely from
+    base_stake = BASE_STAKE_PCT × current_balance in _compute_stake().
     """
-    for min_streak, mult, slots in _PLS_TIERS:
-        if win_streak >= min_streak:
-            return mult, slots
-    return 1.0, 0          # unreachable, but safe
+    return 1.0, 0
 
 
 # ── Bot state enum ────────────────────────────────────────────────────────────
