@@ -14,8 +14,18 @@ _DIGIT_SYMBOLS = getattr(config, 'DIGIT_SYMBOLS', [])
 _MEAN_REVERSION_SYMBOLS = getattr(config, 'MEAN_REVERSION_SYMBOLS', getattr(config, 'MEAN_REVERSION', []))
 _STEP_SYMBOLS = getattr(config, 'STEP_SYMBOLS', [])
 _JUMP_SYMBOLS = getattr(config, 'JUMP_SYMBOLS', [])
+_BEAR_BULL_SYMBOLS = getattr(config, 'BEAR_BULL_SYMBOLS', [])
 
 _BOOM_CRASH_ALL = set(_BOOM_CRASH_500_300) | set(_CRASH500_ONLY) | set(_BOOM_CRASH_1000)
+_BEAR_BULL_SET = set(_BEAR_BULL_SYMBOLS)
+
+# Bear/Bull ("Daily Reset") indices reset to a baseline at 00:00 GMT and then
+# trend (up for Bull, down for Bear) with constant volatility until the next
+# reset. The window immediately following the reset is flagged — not
+# blocked — since behavior right after reset may differ from mid-cycle
+# trending. Duration is configurable via config.BEAR_BULL_TREND_SHIFT_MINS
+# (defaults to 20 if unset).
+_BEAR_BULL_POST_RESET_MINS = getattr(config, 'BEAR_BULL_TREND_SHIFT_MINS', 20)
 
 
 class SymbolManager:
@@ -116,6 +126,32 @@ class SymbolManager:
         ]
         return sorted(scored, key=lambda x: x["win_rate"], reverse=True)[:n]
 
+    def is_post_reset(self, symbol: str) -> bool:
+        """
+        True if `symbol` is a Bear/Bull ("Daily Reset") index currently within
+        the configurable post-reset window (config.BEAR_BULL_TREND_SHIFT_MINS
+        minutes since 00:00 GMT). This is an informational flag only — it
+        does NOT block trading. Callers (e.g. signal_engine.py / risk_manager.py)
+        can use it to apply different logic post-reset vs. mid-cycle.
+        Returns False for non-Bear/Bull symbols or outside the window.
+        """
+        if symbol not in _BEAR_BULL_SET:
+            return False
+        now = datetime.now(timezone.utc)
+        minutes_since_reset = now.hour * 60 + now.minute
+        return minutes_since_reset < _BEAR_BULL_POST_RESET_MINS
+
+    def get_bear_bull_state(self, symbol: str):
+        """
+        Returns "post_reset", "mid_cycle", or None (symbol is not a
+        configured Bear/Bull index). Convenience wrapper around
+        is_post_reset() for callers that want a labeled state rather
+        than a bool.
+        """
+        if symbol not in _BEAR_BULL_SET:
+            return None
+        return "post_reset" if self.is_post_reset(symbol) else "mid_cycle"
+
     def is_in_session(self, symbol: str) -> bool:
         now_hour = datetime.now(timezone.utc).hour
 
@@ -155,6 +191,19 @@ class SymbolManager:
             # Preferred window 07:00-20:00 UTC, but always allowed
             if not (7 <= now_hour < 20):
                 logger.debug(f"SESSION: {symbol} outside preferred window but still allowed")
+            return True
+
+        if symbol in _BEAR_BULL_SET:
+            # Daily Reset indices: never blocked by session, but the window
+            # right after 00:00 GMT reset is flagged as a distinct state —
+            # mirrors the Boom/Crash dead-zone pattern except it flags
+            # instead of blocking. See is_post_reset() / get_bear_bull_state().
+            if self.is_post_reset(symbol):
+                logger.debug(
+                    f"SESSION: {symbol} in post-reset window "
+                    f"(within {_BEAR_BULL_POST_RESET_MINS}min of 00:00 GMT reset) — "
+                    f"flagged, not blocked"
+                )
             return True
 
         # Default: no restriction defined, allow
