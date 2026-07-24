@@ -3,7 +3,7 @@ import os
 # ── GENERAL ───────────────────────────────────────────────────
 LOG_LEVEL = "INFO"
 DEBUG     = False
-VERSION   = "1.0.0"
+VERSION   = "1.1.0"
 
 # ── DERIV API ─────────────────────────────────────────────────
 DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
@@ -43,16 +43,37 @@ STEP = ["stpRNG"]
 JUMP = []
 
 # Range Break
-RANGE_BREAK = ["RDBULL","RDBEAR"]
+# REMOVED FROM ACTIVE TRADING (this pass) — confirmed MT5-only / not reachable
+# via this bot's contract API. Kept here as a disabled reference list only;
+# it is intentionally NOT folded into RISE_FALL_SYMBOLS, RANGE_BREAK_SYMBOLS,
+# ALL_SYMBOLS, or PRIORITY_SYMBOLS below. Do not re-add without re-verifying
+# against a fresh contracts_for audit.
+RANGE_BREAK = ["RDBULL", "RDBEAR"]          # disabled — MT5-only, not in trade queue
+RANGE_BREAK_ENABLED = False
 
 # Drift Switch
 DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 
+# ── BEAR/BULL MARKET SYMBOLS — PENDING AUDIT CONFIRMATION ────
+# NOT ADDED YET. Your message referenced pasting symbol_audit.py output but
+# the actual output/findings were never included (placeholder text was left
+# in the prompt). Per your own instruction #2, these are only to be added if
+# the audit confirms they are currently active on your account.
+#
+# Once you have real output, fill this in and route it into RISE_FALL_SYMBOLS
+# / MEAN_REVERSION_SYMBOLS (or a new strategy list) as appropriate:
+#
+# BEAR_BULL_SYMBOLS = ["<symbol_from_audit>", ...]
+# BEAR_BULL_TREND_SHIFT_MINS = 20   # configurable: 10 / 20 / 30
+BEAR_BULL_SYMBOLS = []              # left empty — unconfirmed
+BEAR_BULL_TREND_SHIFT_MINS = 20     # default if/when enabled (10, 20, or 30)
+
 # Only these symbols support CALL/PUT Rise/Fall via Deriv API
+# (RDBULL/RDBEAR removed — see RANGE_BREAK note above)
 RISE_FALL_SYMBOLS = [
     "R_10","R_25","R_50","R_75","R_100",
     "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
-    "RDBULL","RDBEAR","stpRNG",
+    "stpRNG",
 ]
 
 # Digit (Match/Differ/Over/Under/Even/Odd) contracts are not used by this bot —
@@ -64,7 +85,7 @@ DIGIT_SYMBOLS = []
 # ── STRATEGY ROUTING (signal_engine.py) ──────────────────────
 # Every traded symbol is routed to exactly one strategy evaluator.
 MEAN_REVERSION_SYMBOLS = VOLATILITY_STANDARD + VOLATILITY_1S  # all 10 vol indices
-RANGE_BREAK_SYMBOLS    = RANGE_BREAK                            # RDBULL, RDBEAR
+RANGE_BREAK_SYMBOLS    = []                                      # disabled — see RANGE_BREAK note
 BOOM_CRASH_SYMBOLS     = BOOM_CRASH                              # empty — not traded
 STEP_SYMBOLS           = STEP                                    # stpRNG
 
@@ -96,6 +117,7 @@ MULTIPLIER_MAP = {
     "JD10":    100, "JD25":    200,
     "JD50":    300, "JD75":    400,
     "JD100":   500,
+    # RDBULL/RDBEAR kept for reference only — not traded (RANGE_BREAK_ENABLED = False)
     "RDBULL":  200, "RDBEAR":  200,
     "DSHIFT10":200, "DSHIFT20":200,
     "DSHIFT30":200,
@@ -137,7 +159,7 @@ MAX_STAKE            = 1000.0  # safety backstop only, not the everyday
                                 # $0.35 regardless of balance or the 0.5%
                                 # calculation above. Adjust if you want a
                                 # tighter per-trade ceiling.
-DAILY_LOSS_LIMIT_PCT = 0.15   # 20% max daily loss
+DAILY_LOSS_LIMIT_PCT = 0.15   # NOTE: value is 15%, comment below said 20% — see flags in reply
 DAILY_LOSS_PAUSE_MINS = 30
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
@@ -200,7 +222,6 @@ INIT_BATCH_DELAY       = 0.3
 PRIORITY_SYMBOLS = [
     "R_75","R_100","1HZ75V","1HZ100V",
     "1HZ250V","1HZ150V","R_50","R_25",
-    "RDBULL","RDBEAR"
 ]
 
 # ── RATE LIMITING ────────────────────────────────────────────
@@ -214,7 +235,7 @@ REDEPLOY_EVERY_N_CYCLES = 8
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
-MAX_CONCURRENT     = 20               # alias
+MAX_CONCURRENT     = 20               # alias — NOTE: mismatched with MAX_CONCURRENT_TRADES=30, see flags
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
@@ -248,3 +269,80 @@ BOOM500_PRIME_START  = 7
 BOOM500_PRIME_END    = 12
 TRADE_DURATION = 14
 TRADE_DURATION_UNIT = "m"
+
+# ══════════════════════════════════════════════════════════════
+# NEW STRATEGY CONFIG (added in this pass — none of these are
+# wired into ALL_SYMBOLS / signal_engine.py routing yet; they are
+# config surfaces for strategies you're building incrementally)
+# ══════════════════════════════════════════════════════════════
+
+# ── DIGIT STRATEGY (Over/Under) ───────────────────────────────
+# When True, a Digit Over/Under signal must be confirmed by BOTH an
+# indicator-based read AND a statistical digit-frequency read before
+# it fires. DIGIT_SYMBOLS is still empty above, so this is inert
+# until you populate that list.
+DIGIT_HYBRID_MODE = False
+
+# ── ACCUMULATOR SETTINGS ──────────────────────────────────────
+ACCU_GROWTH_RATE_MIN = 1.0   # percent, per-tick growth rate floor
+ACCU_GROWTH_RATE_MAX = 5.0   # percent, per-tick growth rate ceiling
+# Fraction of a symbol's historical average in-range tick survival at
+# which to take profit early instead of holding to knockout.
+# e.g. 0.7 = exit once you've captured 70% of the typical survival length.
+ACCU_EXIT_FRACTION = 0.7
+
+# ── STRATEGY PERFORMANCE MONITORING ───────────────────────────
+# Once a (strategy, symbol) pair has 100+ logged trades, flag it as
+# underperforming if its win rate falls below this floor.
+STRATEGY_WIN_RATE_FLOOR = 0.55
+STRATEGY_WIN_RATE_MIN_TRADES = 100
+
+# ── META-LABELING (future ML filter) ──────────────────────────
+META_LABEL_MIN_TRADES      = 200   # trades required before the filter is trusted
+META_LABEL_RETRAIN_EVERY_N = 100   # retrain cadence, in newly logged trades
+
+# ── POSITION SIZING (Kelly) ───────────────────────────────────
+# Conservative multiplier applied to full Kelly-optimal sizing.
+# 0.25 = quarter-Kelly.
+KELLY_FRACTION_MULTIPLIER = 0.25
+
+# ── ENSEMBLE MODE ──────────────────────────────────────────────
+# When True, requires 2+ independent strategies to agree within the
+# agreement window before a signal fires.
+ENSEMBLE_MODE = False
+ENSEMBLE_AGREEMENT_WINDOW_SECS = 60
+ENSEMBLE_MIN_STRATEGIES_AGREEING = 2
+
+# ── SESSION / DAY-OF-WEEK SCORE WEIGHTING ─────────────────────
+# Multiplier applied to signal score based on symbol category, UTC
+# hour, and day of week. Range is 0.8-1.2 by convention (0.8 = dampen,
+# 1.2 = boost, 1.0 = neutral/no adjustment).
+#
+# `days` uses Python's datetime.weekday() convention:
+#   Monday=0, Tuesday=1, Wednesday=2, Thursday=3, Friday=4, Saturday=5, Sunday=6
+# `days: None` means "applies every day". `hours_utc` is an inclusive
+# (start, end) 24h UTC range; `hours_utc: None` means "applies all hours".
+#
+# NOTE: Boom/Crash and Jump symbols are currently NOT traded by this bot
+# (BOOM_CRASH = [] and JUMP = [] above, since they don't support Rise/Fall
+# via this API). These entries are config-only placeholders for when/if
+# you add a Multipliers-contract strategy for them — they have no effect
+# until something actually reads this table for those categories.
+SESSION_DOW_WEIGHT_TABLE = {
+    "BOOM600_CRASH900": {
+        "hours_utc": (14, 20),   # boosted 14:00-20:00 UTC
+        "days": None,             # every day
+        "multiplier": 1.2,
+    },
+    "BOOM300N_CRASH300N": {
+        "hours_utc": None,
+        "days": [6],               # Sunday
+        "multiplier": 1.15,
+    },
+    "JUMP50": {
+        "hours_utc": (11, 13),   # around 12:00 UTC
+        "days": [5],               # Saturday
+        "multiplier": 1.15,
+    },
+}
+SESSION_DOW_WEIGHT_DEFAULT = 1.0  # applied when no table entry matches
