@@ -1,6 +1,38 @@
 """
 deriv_client.py – Async Deriv WebSocket client.
 
+v14 — ACCUMULATOR + MATCHES/DIFFERS SUPPORT (additive, no existing
+      contract logic touched):
+
+  All new methods follow buy_contract()'s existing logging/error
+  conventions (BUY ATTEMPT / PROPOSAL RESPONSE / BUY RESPONSE / FAILED),
+  the same never-raises / None-on-failure contract, the same
+  _buy_semaphore + 3s inter-buy spacing, and register successfully-bought
+  contracts for polling exactly like buy_contract() does.
+
+  Unlike Rise/Fall (which buys directly, no proposal step), ACCU and
+  Matches/Differs contracts are bought via the standard two-step
+  proposal -> buy flow, since Deriv's API requires a proposal id for
+  these contract types.
+
+  NEW — get_accumulator_proposal() / buy_accumulator():
+    - contract_type="ACCU", growth_rate accepted as 1-5 (%) and sent to
+      the API as a 0.01-0.05 decimal.
+    - buy_accumulator() supports an optional take_profit limit_order.
+
+  NEW — sell_contract(contract_id, price):
+    - Generic early-close/sell, usable for closing an ACCU position
+      before knockout (or any other open contract).
+
+  NEW — get_digit_proposal() / buy_digit_contract():
+    - contract_type="DIGITMATCH" or "DIGITDIFF" (match_type="MATCH" /
+      "DIFFER"), barrier=str(digit), duration_unit defaults to "t".
+
+  NEW — _cap_stake() helper:
+    - Mirrors the FIX 3 stake-cap rule documented below for
+      buy_contract(), reused by the new proposal-based buy methods.
+      buy_contract() itself was left untouched.
+
 v13 — POLLING-BASED CONTRACT RESOLUTION (replaces subscription model):
 
   ROOT CAUSE OF ORPHAN_TIMEOUT:
@@ -799,6 +831,26 @@ class DerivClient:
 
     # ─── Trade execution ──────────────────────────────────────────────────────
 
+    def _cap_stake(self, stake: float, symbol: str) -> float:
+        """
+        Mirrors the FIX 3 stake-cap rule documented above for buy_contract()
+        (if stake > balance * 0.5, cap at max(balance * 0.02, 0.35)).
+
+        Used only by the new proposal-based buy methods below —
+        buy_contract() itself is left untouched per task instructions.
+        """
+        balance = self._balance
+        if balance > 0 and stake > balance * 0.5:
+            capped = max(balance * 0.02, 0.35)
+            logger.info(f"STAKE CAPPED: ${stake:.4f} → ${capped:.4f} ({symbol})")
+            return capped
+        return stake
+
+    @staticmethod
+    def _digit_contract_type(match_type: str) -> Optional[str]:
+        mapping = {"MATCH": "DIGITMATCH", "DIFFER": "DIGITDIFF"}
+        return mapping.get(str(match_type).upper())
+
     async def buy_contract(
             self,
             symbol:      str,
@@ -871,6 +923,398 @@ class DerivClient:
                 # (subscribe_contract(), called later by the caller to attach
                 # its close callback, will no-op the resend via the
                 # _subscribed_contracts guard — never double-subscribes.)
+                asyncio.create_task(self._subscribe_ws_contract(contract_id))
+
+                return result
+
+            except Exception as e:
+                logger.error(f"FAILED: {symbol} — {e}")
+                return None
+
+    # ─── Accumulator (ACCU) contracts ──────────────────────────────────────────
+
+    async def get_accumulator_proposal(
+            self,
+            symbol:      str,
+            stake:       float,
+            growth_rate: float,
+            take_profit: float = None,
+            **kwargs) -> Optional[dict]:
+        """
+        Request a proposal for an Accumulator (ACCU) contract.
+
+        growth_rate is accepted as a percentage (1-5, matching Deriv's UI)
+        and converted internally to the decimal the API expects
+        (0.01-0.05) — pass growth_rate=2 for 2%.
+
+        take_profit, if given, is attached as a limit_order so the
+        contract auto-closes at that profit level.
+
+        Returns the full 'proposal' dict (contains 'id' and 'ask_price',
+        needed by buy_accumulator) on success, None on any failure path.
+        Never raises.
+        """
+        if not (1 <= growth_rate <= 5):
+            logger.error(
+                f"FAILED: {symbol} — invalid growth_rate={growth_rate} "
+                f"(must be 1-5, i.e. 1%-5%)"
+            )
+            return None
+
+        try:
+            req = {
+                "proposal":      1,
+                "amount":        stake,
+                "basis":         "stake",
+                "contract_type": "ACCU",
+                "currency":      "USD",
+                "symbol":        symbol,
+                "growth_rate":   growth_rate / 100.0,
+            }
+            if take_profit is not None:
+                req["limit_order"] = {"take_profit": take_profit}
+
+            logger.info(
+                f"PROPOSAL REQUEST: ACCU {symbol} stake=${stake:.4f} "
+                f"growth_rate={growth_rate}%"
+            )
+            resp = await self._send(req)
+            if not resp:
+                logger.error(f"FAILED: {symbol} — no response (ACCU proposal)")
+                return None
+            if resp.get("error"):
+                err = resp["error"]
+                logger.error(
+                    f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                    f"| details={err.get('details')} | full_req={req}"
+                )
+                return None
+
+            proposal = resp.get("proposal", {})
+            logger.info(f"PROPOSAL RESPONSE: {proposal}")
+            return proposal
+
+        except Exception as e:
+            logger.error(f"FAILED: {symbol} — {e}")
+            return None
+
+    async def buy_accumulator(
+            self,
+            symbol:      str,
+            stake:       float,
+            growth_rate: float,
+            take_profit: float = None,
+            **kwargs) -> Optional[dict]:
+        """
+        Buy an Accumulator (ACCU) contract: proposal step, then buy against
+        the returned proposal id. ACCU contracts cannot use the direct-buy
+        shortcut buy_contract() uses for Rise/Fall — the API requires a
+        proposal id here.
+
+        growth_rate is a percentage 1-5 (see get_accumulator_proposal).
+
+        Returns dict (buy response) on success, None on every failure
+        path. Never raises. Trade counters should never be incremented by
+        the caller on a None return (same contract as buy_contract()).
+
+        After a successful buy, the caller is expected to register the
+        contract for polling via subscribe_contract() — mirrors
+        buy_contract()'s existing division of responsibility.
+        """
+        async with self._buy_semaphore:
+            elapsed = time.time() - self._last_buy_time
+            if elapsed < 3.0:
+                await asyncio.sleep(3.0 - elapsed)
+            self._last_buy_time = time.time()
+
+            if not (1 <= growth_rate <= 5):
+                logger.error(
+                    f"FAILED: {symbol} — invalid growth_rate={growth_rate} "
+                    f"(must be 1-5, i.e. 1%-5%)"
+                )
+                return None
+
+            stake = self._cap_stake(stake, symbol)
+            logger.info(
+                f"BUY ATTEMPT: {symbol} ACCU stake=${stake:.4f} "
+                f"growth_rate={growth_rate}%"
+            )
+
+            try:
+                proposal_req = {
+                    "proposal":      1,
+                    "amount":        stake,
+                    "basis":         "stake",
+                    "contract_type": "ACCU",
+                    "currency":      "USD",
+                    "symbol":        symbol,
+                    "growth_rate":   growth_rate / 100.0,
+                }
+                if take_profit is not None:
+                    proposal_req["limit_order"] = {"take_profit": take_profit}
+
+                prop_resp = await self._send(proposal_req)
+                if not prop_resp:
+                    logger.error(f"FAILED: {symbol} — no response (ACCU proposal)")
+                    return None
+                if prop_resp.get("error"):
+                    err = prop_resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={proposal_req}"
+                    )
+                    return None
+
+                proposal = prop_resp.get("proposal", {})
+                logger.info(f"PROPOSAL RESPONSE: {proposal}")
+
+                proposal_id = proposal.get("id")
+                ask_price   = proposal.get("ask_price", stake)
+                if not proposal_id:
+                    logger.error(
+                        f"FAILED: {symbol} — proposal_rejected (no id in {proposal})"
+                    )
+                    return None
+
+                buy_req = {"buy": proposal_id, "price": ask_price}
+                resp = await self._send(buy_req)
+                if not resp:
+                    logger.error(f"FAILED: {symbol} — no response (ACCU buy)")
+                    return None
+                if resp.get("error"):
+                    err = resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={buy_req}"
+                    )
+                    return None
+
+                result = resp.get("buy", {})
+                contract_id = str(result.get("contract_id", ""))
+                logger.info(
+                    f"CONTRACT OPENED: {contract_id} | {symbol} | ACCU | "
+                    f"${stake:.4f} | growth_rate={growth_rate}%"
+                )
+
+                self._contract_symbol_map[contract_id] = symbol
+                asyncio.create_task(self._subscribe_ws_contract(contract_id))
+
+                return result
+
+            except Exception as e:
+                logger.error(f"FAILED: {symbol} — {e}")
+                return None
+
+    async def sell_contract(
+            self,
+            contract_id: str,
+            price:       float = 0) -> Optional[dict]:
+        """
+        Close/sell an open contract early — e.g. an ACCU position before
+        knockout, or any other open contract that supports early exit.
+
+        price is the minimum acceptable sell price. 0 is Deriv's
+        documented "accept the current market price unconditionally"
+        sentinel.
+
+        Returns dict (sell response — contains sold_for, contract_id) on
+        success, None on every failure path. Never raises.
+        """
+        try:
+            req = {"sell": int(contract_id), "price": price}
+            logger.info(f"SELL ATTEMPT: {contract_id} min_price=${price:.4f}")
+            resp = await self._send(req)
+            if not resp:
+                logger.error(f"FAILED: sell {contract_id} — no response")
+                return None
+            if resp.get("error"):
+                err = resp["error"]
+                logger.error(
+                    f"FAILED: sell {contract_id} — {err.get('code')}: "
+                    f"{err.get('message')} | details={err.get('details')}"
+                )
+                return None
+
+            result = resp.get("sell", {})
+            logger.info(
+                f"CONTRACT SOLD: {contract_id} | sold_for=${result.get('sold_for')}"
+            )
+            # It's closed now — stop tracking it under both resolution paths.
+            self._polling_contracts.pop(str(contract_id), None)
+            self._subscribed_contracts.discard(str(contract_id))
+            return result
+
+        except Exception as e:
+            logger.error(f"FAILED: sell {contract_id} — {e}")
+            return None
+
+    # ─── Matches/Differs (digit) contracts ─────────────────────────────────────
+
+    async def get_digit_proposal(
+            self,
+            symbol:        str,
+            stake:         float,
+            digit:         int,
+            match_type:    str,   # "MATCH" or "DIFFER"
+            duration:      int = 5,
+            duration_unit: str = "t") -> Optional[dict]:
+        """
+        Request a proposal for a Matches ('MATCH') or Differs ('DIFFER')
+        digit contract targeting last-digit value `digit` (0-9).
+
+        duration_unit defaults to "t" (ticks) — the standard unit for
+        digit contracts on volatility indices.
+
+        Returns the full 'proposal' dict on success, None on any failure
+        path. Never raises.
+        """
+        contract_type = self._digit_contract_type(match_type)
+        if contract_type is None:
+            logger.error(
+                f"FAILED: {symbol} — invalid match_type={match_type!r} "
+                f"(must be 'MATCH' or 'DIFFER')"
+            )
+            return None
+        if not (0 <= digit <= 9):
+            logger.error(f"FAILED: {symbol} — invalid digit={digit} (must be 0-9)")
+            return None
+
+        try:
+            req = {
+                "proposal":      1,
+                "amount":        stake,
+                "basis":         "stake",
+                "contract_type": contract_type,
+                "currency":      "USD",
+                "duration":      duration,
+                "duration_unit": duration_unit,
+                "symbol":        symbol,
+                "barrier":       str(digit),
+            }
+            logger.info(
+                f"PROPOSAL REQUEST: {contract_type} digit={digit} {symbol} "
+                f"stake=${stake:.4f}"
+            )
+            resp = await self._send(req)
+            if not resp:
+                logger.error(f"FAILED: {symbol} — no response ({contract_type} proposal)")
+                return None
+            if resp.get("error"):
+                err = resp["error"]
+                logger.error(
+                    f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                    f"| details={err.get('details')} | full_req={req}"
+                )
+                return None
+
+            proposal = resp.get("proposal", {})
+            logger.info(f"PROPOSAL RESPONSE: {proposal}")
+            return proposal
+
+        except Exception as e:
+            logger.error(f"FAILED: {symbol} — {e}")
+            return None
+
+    async def buy_digit_contract(
+            self,
+            symbol:        str,
+            stake:         float,
+            digit:         int,
+            match_type:    str,   # "MATCH" or "DIFFER"
+            duration:      int = 5,
+            duration_unit: str = "t",
+            **kwargs) -> Optional[dict]:
+        """
+        Buy a Matches ('MATCH') or Differs ('DIFFER') digit contract:
+        proposal step, then buy against the returned proposal id.
+
+        Returns dict (buy response) on success, None on every failure
+        path. Never raises.
+
+        After a successful buy, the caller is expected to register the
+        contract for polling via subscribe_contract() — mirrors
+        buy_contract()'s existing division of responsibility.
+        """
+        contract_type = self._digit_contract_type(match_type)
+
+        async with self._buy_semaphore:
+            elapsed = time.time() - self._last_buy_time
+            if elapsed < 3.0:
+                await asyncio.sleep(3.0 - elapsed)
+            self._last_buy_time = time.time()
+
+            if contract_type is None:
+                logger.error(
+                    f"FAILED: {symbol} — invalid match_type={match_type!r} "
+                    f"(must be 'MATCH' or 'DIFFER')"
+                )
+                return None
+            if not (0 <= digit <= 9):
+                logger.error(f"FAILED: {symbol} — invalid digit={digit} (must be 0-9)")
+                return None
+
+            stake = self._cap_stake(stake, symbol)
+            logger.info(
+                f"BUY ATTEMPT: {symbol} {contract_type} digit={digit} "
+                f"stake=${stake:.4f}"
+            )
+
+            try:
+                proposal_req = {
+                    "proposal":      1,
+                    "amount":        stake,
+                    "basis":         "stake",
+                    "contract_type": contract_type,
+                    "currency":      "USD",
+                    "duration":      duration,
+                    "duration_unit": duration_unit,
+                    "symbol":        symbol,
+                    "barrier":       str(digit),
+                }
+                prop_resp = await self._send(proposal_req)
+                if not prop_resp:
+                    logger.error(f"FAILED: {symbol} — no response ({contract_type} proposal)")
+                    return None
+                if prop_resp.get("error"):
+                    err = prop_resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={proposal_req}"
+                    )
+                    return None
+
+                proposal = prop_resp.get("proposal", {})
+                logger.info(f"PROPOSAL RESPONSE: {proposal}")
+
+                proposal_id = proposal.get("id")
+                ask_price   = proposal.get("ask_price", stake)
+                if not proposal_id:
+                    logger.error(
+                        f"FAILED: {symbol} — proposal_rejected (no id in {proposal})"
+                    )
+                    return None
+
+                buy_req = {"buy": proposal_id, "price": ask_price}
+                resp = await self._send(buy_req)
+                if not resp:
+                    logger.error(f"FAILED: {symbol} — no response ({contract_type} buy)")
+                    return None
+                if resp.get("error"):
+                    err = resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={buy_req}"
+                    )
+                    return None
+
+                result = resp.get("buy", {})
+                contract_id = str(result.get("contract_id", ""))
+                logger.info(
+                    f"CONTRACT OPENED: {contract_id} | {symbol} | {contract_type} | "
+                    f"digit={digit} | ${stake:.4f}"
+                )
+
+                self._contract_symbol_map[contract_id] = symbol
                 asyncio.create_task(self._subscribe_ws_contract(contract_id))
 
                 return result
