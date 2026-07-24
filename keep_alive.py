@@ -36,6 +36,13 @@ import requests
 from flask import Flask, jsonify, Response
 import config
 
+try:
+    from strategy_stats import stats as _strategy_stats
+    _STRATEGY_STATS_AVAILABLE = True
+except Exception:  # pragma: no cover - defensive import guard
+    _strategy_stats = None
+    _STRATEGY_STATS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
@@ -1059,6 +1066,127 @@ def _render_dashboard() -> str:
         )
 
 
+# ── Strategy/symbol stats page renderer ─────────────────────────────────────────
+
+def _render_strategy_stats_page() -> str:
+    """
+    Standalone HTML page listing every (strategy, symbol) pair from
+    strategy_stats.py — win rate, 95% Wilson confidence interval, and
+    trade count. Sorted by trade count (all-time) descending. Reuses the
+    same dark-theme CSS variables/classes as the main dashboard so it
+    matches visually, but is rendered as its own page (not injected into
+    _render_dashboard) to avoid touching that function.
+    """
+    now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+
+    try:
+        if not _STRATEGY_STATS_AVAILABLE:
+            raise RuntimeError("strategy_stats module not available")
+
+        rows = _strategy_stats.all_stats()
+        rows.sort(key=lambda d: d.get("total_trades", 0), reverse=True)
+
+        body_rows = ""
+        for r in rows:
+            strategy = str(r.get("strategy", "—"))
+            symbol   = str(r.get("symbol", "—"))
+            win_rate = float(r.get("win_rate", 0.0)) * 100
+            ci_low   = float(r.get("ci_low", 0.0)) * 100
+            ci_high  = float(r.get("ci_high", 0.0)) * 100
+            n        = int(r.get("n", 0))
+            total    = int(r.get("total_trades", 0))
+            underperf= bool(r.get("underperforming", False))
+
+            wr_color = "green" if win_rate >= 55 else "yellow" if win_rate >= 45 else "red"
+            flag = ('<span class="badge badge-loss">UNDERPERFORMING</span>'
+                    if underperf else
+                    '<span class="ticker">—</span>')
+
+            body_rows += (
+                f"<tr>"
+                f"<td><b>{strategy}</b></td>"
+                f"<td>{symbol}</td>"
+                f"<td class='{wr_color}'>{win_rate:.1f}%</td>"
+                f"<td class='ticker'>{ci_low:.1f}% – {ci_high:.1f}%</td>"
+                f"<td>{n}</td>"
+                f"<td>{total}</td>"
+                f"<td>{flag}</td>"
+                f"</tr>"
+            )
+
+        if not body_rows:
+            body_rows = (
+                "<tr><td colspan='7' style='text-align:center;color:#484f58'>"
+                "No strategy/symbol trades recorded yet</td></tr>"
+            )
+
+        backend_name = _strategy_stats.backend_name
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="30">
+<title>Strategy Stats — Deriv Bot</title>
+<style>
+  :root {{
+    --bg:#0d1117;--card:#161b22;--border:#30363d;
+    --text:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;
+    --green:#3fb950;--red:#f85149;--yellow:#d29922;
+  }}
+  *{{box-sizing:border-box;margin:0;padding:0;}}
+  body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;font-size:14px;padding:16px;}}
+  h1{{font-size:20px;font-weight:700;color:var(--accent);margin-bottom:4px;}}
+  .subtitle{{color:var(--muted);font-size:12px;margin-bottom:16px;}}
+  .section-title{{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;
+                  letter-spacing:.05em;margin:20px 0 8px;}}
+  table{{width:100%;border-collapse:collapse;background:var(--card);
+         border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:16px;}}
+  th{{background:#21262d;color:var(--muted);font-size:11px;text-transform:uppercase;
+      padding:8px 10px;text-align:left;}}
+  td{{padding:7px 10px;border-top:1px solid var(--border);font-size:12px;}}
+  .ticker{{color:var(--muted);font-size:11px;}}
+  .badge{{display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;}}
+  .badge-loss{{background:#3a1a1a;color:var(--red);}}
+  .green{{color:var(--green);}} .red{{color:var(--red);}} .yellow{{color:var(--yellow);}}
+  .footer{{margin-top:20px;font-size:11px;color:var(--muted);text-align:right;}}
+</style>
+</head>
+<body>
+
+<h1>📊 Strategy / Symbol Stats</h1>
+<p class="subtitle">Auto-refreshes every 30 s &nbsp;|&nbsp; UTC {now_utc} &nbsp;|&nbsp; Backend: {backend_name} &nbsp;|&nbsp; <a href="/" style="color:var(--accent)">← Dashboard</a></p>
+
+<div class="section-title">All Strategy / Symbol Pairs (sorted by total trades)</div>
+<table>
+  <thead>
+    <tr>
+      <th>Strategy</th><th>Symbol</th><th>Win Rate</th>
+      <th>95% CI</th><th>N (window)</th><th>Total Trades</th><th>Flag</th>
+    </tr>
+  </thead>
+  <tbody>{body_rows}</tbody>
+</table>
+
+<div class="footer">Deriv Bot &middot; Strategy Stats &middot; {now_utc} UTC</div>
+</body>
+</html>"""
+
+    except Exception as exc:
+        logger.exception(f"_render_strategy_stats_page error: {exc}")
+        return (
+            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+            "<meta http-equiv='refresh' content='30'>"
+            "<title>Strategy Stats</title></head>"
+            "<body style='background:#0d1117;color:#c9d1d9;font-family:sans-serif;padding:30px'>"
+            f"<h2 style='color:#f85149'>Strategy stats render error</h2>"
+            f"<pre style='color:#8b949e'>{exc}</pre>"
+            "<p>Bot may still be running. Check logs. Page reloads in 30 s.</p>"
+            "</body></html>"
+        )
+
+
 # ── Flask routes ────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -1117,6 +1245,11 @@ def stats_route():
         "signal_log":         s.get("signal_log", []),
         "failure_log":        s.get("failure_log", []),
     })
+
+
+@app.route("/strategy-stats")
+def strategy_stats_route():
+    return Response(_render_strategy_stats_page(), mimetype="text/html")
 
 
 @app.route("/trades")
