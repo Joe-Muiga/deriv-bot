@@ -886,7 +886,7 @@ class DerivClient:
 
             try:
                 buy_req = {
-                    "buy": 1,
+                    "buy": "1",
                     "price": stake,
                     "parameters": {
                         "amount":         stake,
