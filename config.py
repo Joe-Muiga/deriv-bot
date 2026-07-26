@@ -215,6 +215,16 @@ SYMBOL_LOSS_SUSPEND_MINS  = 55
 SYMBOL_MIN_GAP_MINS       = 1
 SYMBOL_SESSION_BAN_LOSSES = 4
 
+# ── RAW TICK BUFFER (feeds tick-based evaluators via evaluate(ticks=...)) ──
+TICK_BUFFER_MAXLEN = 200
+
+# ── DEGRADED-SYMBOL TICK-SUBSCRIPTION RETRY ──────────────────
+TICK_RESUBSCRIBE_RETRY_SECS = 30
+
+# ── BUY-FAILURE CIRCUIT BREAKER ──────────────────────────────
+BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD    = 5
+BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS = 15
+
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
 INIT_BATCH_SIZE        = 8
