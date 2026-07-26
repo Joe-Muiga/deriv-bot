@@ -8,6 +8,7 @@ Routes:
   /trades    → Recent trade list as JSON
   /symbols   → Symbol leaderboard as JSON
   /debug     → Raw _state dump as JSON
+  /audit     → One-time-per-deploy symbol/contract-type audit (from symbol_audit.py)
 
 v11 changes:
   - Dashboard fully rebuilt: all 10 sections from spec.
@@ -101,6 +102,21 @@ _state: dict = {
 }
 
 _status = _state   # alias for bot_engine imports
+
+# ── Symbol audit cache (populated once by bot_engine at startup via
+#    set_symbol_audit_result(); read by the /audit route) ──────────────────
+_symbol_audit_cache: dict = None
+
+
+def set_symbol_audit_result(data: dict) -> None:
+    """Called by bot_engine after symbol_audit.run_audit_once() completes
+    (whether freshly run or loaded from a cached prior deploy)."""
+    global _symbol_audit_cache
+    _symbol_audit_cache = data
+
+
+def get_symbol_audit_result():
+    return _symbol_audit_cache
 
 
 # ── Public state helpers ────────────────────────────────────────────────────────
@@ -1187,6 +1203,79 @@ def _render_strategy_stats_page() -> str:
         )
 
 
+def _render_audit_page() -> str:
+    """
+    /audit — one-time-at-startup symbol/contract-type audit, rendered in
+    the same visual style as /strategy-stats. Reads whatever
+    bot_engine.py last pushed via set_symbol_audit_result() (either a
+    fresh run or a cached result loaded from symbol_contract_map.json on
+    a deploy where the guard file was already present).
+    """
+    try:
+        import symbol_audit
+        now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+        output = get_symbol_audit_result()
+        fragment = symbol_audit.render_html_fragment(output)
+        generated_at = (output or {}).get("generated_at", "—")
+        total = (output or {}).get("total_symbols", 0)
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta http-equiv="refresh" content="60">
+<title>Symbol Audit — Deriv Bot</title>
+<style>
+  :root {{
+    --bg:#0d1117;--card:#161b22;--border:#30363d;
+    --text:#c9d1d9;--muted:#8b949e;--accent:#58a6ff;
+    --green:#3fb950;--red:#f85149;--yellow:#d29922;
+  }}
+  *{{box-sizing:border-box;margin:0;padding:0;}}
+  body{{background:var(--bg);color:var(--text);font-family:'Segoe UI',sans-serif;font-size:14px;padding:16px;}}
+  h1{{font-size:20px;font-weight:700;color:var(--accent);margin-bottom:4px;}}
+  .subtitle{{color:var(--muted);font-size:12px;margin-bottom:16px;}}
+  .section-title{{font-size:13px;font-weight:600;color:var(--muted);text-transform:uppercase;
+                  letter-spacing:.05em;margin:20px 0 8px;}}
+  table{{width:100%;border-collapse:collapse;background:var(--card);
+         border:1px solid var(--border);border-radius:8px;overflow:hidden;margin-bottom:16px;}}
+  th{{background:#21262d;color:var(--muted);font-size:11px;text-transform:uppercase;
+      padding:8px 10px;text-align:left;}}
+  td{{padding:7px 10px;border-top:1px solid var(--border);font-size:12px;}}
+  .ticker{{color:var(--muted);font-size:11px;}}
+  .badge{{display:inline-block;padding:2px 6px;border-radius:4px;font-size:10px;font-weight:700;}}
+  .badge-loss{{background:#3a1a1a;color:var(--red);}}
+  .green{{color:var(--green);}} .red{{color:var(--red);}} .yellow{{color:var(--yellow);}}
+  .footer{{margin-top:20px;font-size:11px;color:var(--muted);text-align:right;}}
+</style>
+</head>
+<body>
+
+<h1>🔎 Symbol / Contract-Type Audit</h1>
+<p class="subtitle">Runs once per deploy at startup &nbsp;|&nbsp; generated_at={generated_at} &nbsp;|&nbsp; {total} symbols &nbsp;|&nbsp; Auto-refreshes every 60s &nbsp;|&nbsp; UTC {now_utc} &nbsp;|&nbsp; <a href="/" style="color:var(--accent)">← Dashboard</a></p>
+
+{fragment}
+
+<div class="footer">Deriv Bot &middot; Symbol Audit &middot; {now_utc} UTC</div>
+</body>
+</html>"""
+
+    except Exception as exc:
+        logger.exception(f"_render_audit_page error: {exc}")
+        return (
+            "<!DOCTYPE html><html><head><meta charset='UTF-8'>"
+            "<meta http-equiv='refresh' content='60'>"
+            "<title>Symbol Audit</title></head>"
+            "<body style='background:#0d1117;color:#c9d1d9;font-family:sans-serif;padding:30px'>"
+            f"<h2 style='color:#f85149'>Symbol audit render error</h2>"
+            f"<pre style='color:#8b949e'>{exc}</pre>"
+            "<p>Bot may still be running normally — this page is diagnostic-only. "
+            "Check logs. Page reloads in 60 s.</p>"
+            "</body></html>"
+        )
+
+
 # ── Flask routes ────────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -1250,6 +1339,11 @@ def stats_route():
 @app.route("/strategy-stats")
 def strategy_stats_route():
     return Response(_render_strategy_stats_page(), mimetype="text/html")
+
+
+@app.route("/audit")
+def audit_route():
+    return Response(_render_audit_page(), mimetype="text/html")
 
 
 @app.route("/trades")
