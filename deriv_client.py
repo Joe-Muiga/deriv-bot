@@ -438,8 +438,13 @@ class DerivClient:
             fut = self._pending.pop(req_id)
             if not fut.done():
                 if error:
+                    detail_suffix = (
+                        f" | details={error.get('details')}"
+                        if error.get("details") else ""
+                    )
                     fut.set_exception(RuntimeError(
                         f"{error.get('code', 'ERR')}: {error.get('message', 'Unknown error')}"
+                        f"{detail_suffix}"
                     ))
                 else:
                     fut.set_result(msg)
@@ -928,7 +933,7 @@ class DerivClient:
                 return result
 
             except Exception as e:
-                logger.error(f"FAILED: {symbol} — {e}")
+                logger.error(f"FAILED: {symbol} — {e} | full_req={buy_req}")
                 return None
 
     # ─── Accumulator (ACCU) contracts ──────────────────────────────────────────
