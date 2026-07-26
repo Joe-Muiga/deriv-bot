@@ -145,8 +145,23 @@ class BotEngine:
         self._mtf:                    Dict[str, CandlestickBuilder] = {}
         self._ltf:                    Dict[str, CandlestickBuilder] = {}
 
+        # ── Raw tick buffer — feeds evaluate(ticks=...) for the tick-based
+        #    evaluators (digit parity, drift fade, jump buildup, trend
+        #    shift), which previously always saw ticks=None because
+        #    nothing ever populated or passed a tick buffer.
+        self._raw_ticks:              Dict[str, Deque[dict]] = {}
+
         self._initialised_symbols:    Set[str]           = set()
         self._initializing:           Set[str]           = set()
+
+        # ── Symbols whose tick subscription failed during _init_data —
+        #    candles/data are seeded but no live ticks are arriving, so
+        #    these are ready-but-frozen until re-subscribed.
+        self._tick_degraded:          Set[str]           = set()
+
+        # ── Consecutive identical buy-placement failures per symbol —
+        #    drives the circuit breaker in _execute().
+        self._buy_failure_streak:     Dict[str, int]     = {}
 
         self._confirmed_daily_loss:   float              = 0.0
         self._day_start_balance:      float              = 0.0
@@ -346,8 +361,9 @@ class BotEngine:
         except Exception:
             pass
 
-        dash_task   = asyncio.create_task(self._dashboard_loop())
-        settle_task = asyncio.create_task(self._settle_loop())
+        dash_task    = asyncio.create_task(self._dashboard_loop())
+        settle_task  = asyncio.create_task(self._settle_loop())
+        degraded_task = asyncio.create_task(self._degraded_retry_loop())
 
         try:
             await self._main_loop()
@@ -358,6 +374,7 @@ class BotEngine:
         finally:
             dash_task.cancel()
             settle_task.cancel()
+            degraded_task.cancel()
             ws_task.cancel()
 
     # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
@@ -459,10 +476,20 @@ class BotEngine:
                         lambda tick, s=symbol: self._on_tick(s, tick)),
                     timeout=10,
                 )
+                self._tick_degraded.discard(symbol)
             except asyncio.TimeoutError:
                 logger.warning(
                     f"{symbol}: subscribe_ticks timed out — "
-                    f"proceeding without live tick stream")
+                    f"DEGRADED (no live tick stream, candles frozen at seed) "
+                    f"— will retry every {config.TICK_RESUBSCRIBE_RETRY_SECS}s")
+                self._tick_degraded.add(symbol)
+            except Exception as tick_exc:
+                logger.warning(
+                    f"{symbol}: subscribe_ticks failed — "
+                    f"DEGRADED (no live tick stream, candles frozen at seed) "
+                    f"— will retry every {config.TICK_RESUBSCRIBE_RETRY_SECS}s "
+                    f"| {tick_exc}")
+                self._tick_degraded.add(symbol)
 
             logger.info(
                 f"{symbol}: ready | htf={htf_b.count} | "
@@ -480,10 +507,46 @@ class BotEngine:
         epoch = int(tick.get("epoch", int(_t.time())))
         price = float(tick.get("quote", 0))
         if price == 0:
+            logger.debug(f"TICK IGNORED: {symbol} — zero/invalid quote in {tick}")
             return
+
+        buf = self._raw_ticks.setdefault(
+            symbol, deque(maxlen=config.TICK_BUFFER_MAXLEN))
+        buf.append({"epoch": epoch, "quote": price})
+
         for store in (self._ltf, self._mtf, self._htf):
             if symbol in store:
                 store[symbol].add_tick(epoch, price)
+
+        self._tick_degraded.discard(symbol)
+        logger.debug(f"TICK: {symbol} epoch={epoch} price={price}")
+
+    # ── Degraded-symbol tick resubscription ─────────────────────────────────────
+
+    async def _degraded_retry_loop(self):
+        interval = getattr(config, "TICK_RESUBSCRIBE_RETRY_SECS", 30)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                for symbol in list(self._tick_degraded):
+                    logger.info(f"{symbol}: retrying tick subscription (degraded)")
+                    try:
+                        await asyncio.wait_for(
+                            self.client.subscribe_ticks(
+                                symbol,
+                                lambda tick, s=symbol: self._on_tick(s, tick)),
+                            timeout=10,
+                        )
+                        self._tick_degraded.discard(symbol)
+                        logger.info(f"{symbol}: tick subscription recovered")
+                    except Exception as exc:
+                        logger.warning(
+                            f"{symbol}: degraded retry failed — still no "
+                            f"live tick stream | {exc}")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error(f"_degraded_retry_loop: {exc}")
 
     # ── Dashboard ──────────────────────────────────────────────────────────────
 
@@ -686,8 +749,9 @@ class BotEngine:
                 return None
 
             ltf_bars = builder.completed_bars
+            ticks    = list(self._raw_ticks.get(symbol, ()))
 
-            sig = self.signal.evaluate(ltf_bars, symbol)
+            sig = self.signal.evaluate(ltf_bars, symbol, ticks=ticks)
             if sig is None or getattr(sig, "direction", "NONE") == "NONE":
                 return None
 
@@ -772,11 +836,30 @@ class BotEngine:
                 strategy  = getattr(sig, "strategy", "unknown"),
                 reason    = "buy_resp=None",
             )
+
+            # ── Circuit breaker — repeated identical buy failures on the
+            #    same symbol previously retried every ~3s indefinitely
+            #    with the same broken parameters. Suspend after N in a
+            #    row so it stops hammering the API on a bug that a
+            #    fast retry loop can't fix.
+            streak = self._buy_failure_streak.get(symbol, 0) + 1
+            self._buy_failure_streak[symbol] = streak
+            threshold = config.BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD
+            if streak >= threshold:
+                suspend_mins = config.BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS
+                logger.error(
+                    f"CIRCUIT BREAKER: {symbol} hit {streak} consecutive "
+                    f"buy failures — suspending {suspend_mins}min")
+                self.symbols.suspend(symbol, suspend_mins)
+                self._buy_failure_streak[symbol] = 0
+
             try:
                 self._push_dashboard()
             except Exception:
                 pass
             return False
+
+        self._buy_failure_streak[symbol] = 0
 
         cid        = str(buy_resp.get("contract_id", ""))
         bal_before = self.client.balance
