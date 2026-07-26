@@ -37,16 +37,20 @@ UNCHANGED:
 import asyncio
 import datetime as _dt
 import logging
+import random
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set
+from typing import Deque, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
 import config
 import restart_scheduler
 import symbols as sym_module
+import strategy_stats
+import meta_labeling
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
@@ -75,11 +79,55 @@ CONTRACT_FORCE_CLOSE_SECS = getattr(config, "CONTRACT_FORCE_CLOSE_SECS",  300)
 
 @dataclass
 class ScanResult:
-    symbol:  str
-    sig:     SignalResult
-    price:   float
-    smc_ctx: SMCContext
-    score:   float = 0.0
+    symbol:    str
+    sig:       SignalResult
+    price:     float
+    smc_ctx:   SMCContext
+    score:     float = 0.0
+    rank_key:  float = 0.0   # score * bandit priority weight — sort key only,
+                              # never persisted/logged in place of `score`
+
+
+# ─── Thompson sampling bandit ───────────────────────────────────────────────
+
+class _ThompsonBandit:
+    """
+    Beta(alpha, beta) posterior per (strategy, symbol) pair, used ONLY to
+    weight execution priority when multiple signals compete for the same
+    cycle's slots — it never touches the composite score itself.
+
+    Deliberately stateless / derived-on-read from strategy_stats rather
+    than kept as a running in-memory counter: _settle_loop triggers a
+    Render redeploy every config.REDEPLOY_EVERY_N_CYCLES settle ticks,
+    which wipes process memory. An in-memory posterior would reset to a
+    flat Beta(1,1) prior on every one of those restarts and effectively
+    never learn anything. Reading wins/losses straight out of
+    strategy_stats' persisted backend means the posterior survives
+    redeploys (as long as the underlying SQLite/JSON file sits on a
+    disk that itself survives redeploys — see strategy_stats.py's own
+    persistence caveat).
+    """
+
+    def __init__(self, window: int = strategy_stats.DEFAULT_WINDOW):
+        self._window = window
+
+    def sample(self, strategy: str, symbol: str) -> float:
+        try:
+            rate, _lo, _hi, n = strategy_stats.stats.get_win_rate(
+                strategy, symbol, window=self._window)
+        except Exception as exc:
+            logger.warning(f"bandit.sample({strategy},{symbol}) failed: {exc}")
+            return 0.5
+
+        wins   = round(rate * n)
+        losses = n - wins
+        alpha  = 1.0 + wins    # Beta(1,1) uniform prior with no history
+        beta_p = 1.0 + losses
+
+        try:
+            return random.betavariate(alpha, beta_p)
+        except Exception:
+            return 0.5
 
 
 # ─── Bot engine ────────────────────────────────────────────────────────────────
@@ -104,6 +152,16 @@ class BotEngine:
         self._day_start_balance:      float              = 0.0
         self._confirmed_paused:       bool               = False
         self._current_utc_day:        int                = -1
+
+        # ── Ensemble voting: per-symbol rolling history of (strategy,
+        #    direction, timestamp) tuples for every signal produced by
+        #    _scan, pruned to config.ENSEMBLE_AGREEMENT_WINDOW_SECS.
+        self._ensemble_history:       Dict[str, Deque[Tuple[str, str, float]]] = {}
+
+        # ── Thompson sampling bandit — see _ThompsonBandit docstring
+        #    for why this reads through strategy_stats instead of
+        #    keeping its own in-memory posterior.
+        self._bandit = _ThompsonBandit()
 
         self.client  = DerivClient()
         self.risk    = RiskManager(
@@ -144,6 +202,83 @@ class BotEngine:
         win_rate     = (self.symbols.win_rate(symbol)
                         if hasattr(self.symbols, "win_rate") else 0.5)
         return round(float(signal_score) * 0.85 + float(win_rate) * 0.15, 4)
+
+    # ── Ensemble voting ────────────────────────────────────────────────────────
+
+    def _log_ensemble_signal(self, symbol: str, strategy: str, direction: str):
+        """Record every signal _scan produces (whether or not it ends up
+        trading) so the agreement window has something to check against."""
+        window = getattr(config, "ENSEMBLE_AGREEMENT_WINDOW_SECS", 60)
+        now    = time.time()
+        dq     = self._ensemble_history.setdefault(symbol, deque())
+        dq.append((strategy, direction, now))
+        while dq and (now - dq[0][2]) > window:
+            dq.popleft()
+
+    def _ensemble_agrees(self, symbol: str, direction: str) -> bool:
+        """
+        True if >= config.ENSEMBLE_MIN_STRATEGIES_AGREEING distinct
+        strategies have signalled `direction` on `symbol` within the
+        agreement window (including the current signal, since it was
+        logged via _log_ensemble_signal before this is called).
+
+        NOTE: config.py's own STRATEGY ROUTING section states every
+        traded symbol is routed to exactly one strategy evaluator
+        (MEAN_REVERSION_SYMBOLS / STEP_SYMBOLS / etc are disjoint).
+        With that routing, at most one strategy will ever signal a
+        given symbol in a given cycle, so this will almost always
+        return False once ENSEMBLE_MODE=True — see flags in the
+        accompanying explanation before enabling it.
+        """
+        window    = getattr(config, "ENSEMBLE_AGREEMENT_WINDOW_SECS", 60)
+        min_agree = getattr(config, "ENSEMBLE_MIN_STRATEGIES_AGREEING", 2)
+        now       = time.time()
+        dq        = self._ensemble_history.get(symbol)
+        if not dq:
+            return False
+        strategies = {s for (s, d, ts) in dq
+                      if d == direction and (now - ts) <= window}
+        return len(strategies) >= min_agree
+
+    # ── Session / day-of-week score weighting ─────────────────────────────────
+
+    def _session_dow_weight(self, symbol: str) -> float:
+        """
+        Multiplier from config.SESSION_DOW_WEIGHT_TABLE, keyed on the
+        symbol's category (via symbols.get_symbol_class), current UTC
+        hour, and current UTC day-of-week (Mon=0..Sun=6).
+
+        NOTE: the table shipped in config.py only has entries for Boom/
+        Crash/Jump categories, none of which are in RISE_FALL_SYMBOLS /
+        TRADE_SYMBOLS right now (BOOM_CRASH=[] and JUMP=[] — disabled,
+        see config comments). Until entries are added for the
+        categories get_symbol_class() actually returns for your traded
+        symbols (volatility indices, stpRNG, drift), every lookup below
+        falls through to SESSION_DOW_WEIGHT_DEFAULT=1.0, i.e. a no-op.
+        """
+        try:
+            category = get_symbol_class(symbol)
+        except Exception:
+            return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
+
+        table = getattr(config, "SESSION_DOW_WEIGHT_TABLE", {})
+        entry = table.get(category)
+        if not entry:
+            return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
+
+        now = _dt.datetime.utcnow()
+
+        days = entry.get("days")
+        if days is not None and now.weekday() not in days:
+            return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
+
+        hours_utc = entry.get("hours_utc")
+        if hours_utc is not None:
+            start, end = hours_utc
+            if not (start <= now.hour <= end):
+                return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
+
+        return float(entry.get("multiplier", getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)))
 
     # ── Daily loss limit ───────────────────────────────────────────────────────
 
@@ -463,12 +598,32 @@ class BotEngine:
             # 4. Collect all non-None signals
             signals = [r for r in raw_results if isinstance(r, ScanResult)]
 
+            # 4b. Log every raw signal into the ensemble agreement tracker —
+            #     unconditionally, so the rolling window has data whether
+            #     or not ENSEMBLE_MODE is currently on.
+            for r in signals:
+                self._log_ensemble_signal(
+                    r.symbol, getattr(r.sig, "strategy", "unknown"), r.sig.direction)
+
             # 5. Filter out symbols that can't trade right now
             signals = [r for r in signals if self.symbols.can_trade_now(r.symbol)]
+
+            # 5b. Ensemble voting gate — require >=N independent strategies
+            #     agreeing on direction within the window before a signal
+            #     is even eligible to be ranked/executed. No-op when
+            #     config.ENSEMBLE_MODE is False (the default).
+            if getattr(config, "ENSEMBLE_MODE", False):
+                signals = [r for r in signals
+                           if self._ensemble_agrees(r.symbol, r.sig.direction)]
 
             # 6. Rank by score*0.85 + win_rate*0.15
             for r in signals:
                 r.score = self._composite_score(r.sig, r.symbol)
+
+            # 6b. Session/day-of-week weighting — multiplier on the final
+            #     score itself (not just the ranking order).
+            for r in signals:
+                r.score = round(r.score * self._session_dow_weight(r.symbol), 4)
 
             # 7. Remove duplicates — keep highest scored per symbol
             best_per_symbol: Dict[str, ScanResult] = {}
@@ -477,8 +632,19 @@ class BotEngine:
                         or r.score > best_per_symbol[r.symbol].score):
                     best_per_symbol[r.symbol] = r
 
+            # 7b. Thompson-sampling bandit — draws a fresh Beta(alpha,beta)
+            #     sample per (strategy, symbol) pair each cycle and uses it
+            #     to weight *ranking order only* (0.9x-1.1x band, so it
+            #     nudges priority among competing signals without
+            #     overriding the composite score). r.score itself (already
+            #     including session/dow weighting) stays what's logged.
+            for r in best_per_symbol.values():
+                bandit_sample = self._bandit.sample(
+                    getattr(r.sig, "strategy", "unknown"), r.symbol)
+                r.rank_key = round(r.score * (0.9 + 0.2 * bandit_sample), 4)
+
             ranked: List[ScanResult] = sorted(
-                best_per_symbol.values(), key=lambda r: r.score, reverse=True)
+                best_per_symbol.values(), key=lambda r: r.rank_key, reverse=True)
 
             # 8. Execute top N where N = current_concurrent_limit,
             #    gated only by concurrent-slot availability
@@ -544,6 +710,38 @@ class BotEngine:
     async def _execute(self, symbol: str, sig: SignalResult) -> bool:
         # Hard gate — re-verify right before placing the order
         if not self.symbols.can_trade_now(symbol):
+            return False
+
+        strategy = getattr(sig, "strategy", "unknown")
+
+        # Meta-labeling gate — skip execution if the take-trade-or-not
+        # filter rejects it. predict_take_trade() has its own internal
+        # min-trades gating (config.META_LABEL_MIN_TRADES); below that
+        # threshold it always returns (True, 1.0) — a pass-through, not
+        # a real prediction.
+        try:
+            take, confidence = meta_labeling.predict_take_trade({
+                "strategy":    strategy,
+                "symbol":      symbol,
+                "entry_score": float(getattr(sig, "score", 0.0)),
+            })
+        except Exception as exc:
+            logger.warning(
+                f"meta_labeling.predict_take_trade({symbol}) failed — "
+                f"passing signal through: {exc}")
+            take, confidence = True, 1.0
+
+        if not take:
+            logger.info(
+                f"META-LABEL SKIP: {symbol} | {strategy} | "
+                f"P(win)={confidence:.3f} < threshold")
+            record_failure(
+                symbol    = symbol,
+                direction = sig.direction,
+                stake     = 0.0,
+                strategy  = strategy,
+                reason    = f"meta_label_reject(conf={confidence:.3f})",
+            )
             return False
 
         stake     = await self.risk.calculate_stake()
@@ -689,6 +887,31 @@ class BotEngine:
         except Exception:
             pass
 
+        strategy    = info.get("strategy", "unknown")
+        entry_score = float(getattr(info.get("sig"), "score", 0.0))
+
+        # Feed strategy_stats — this is the source of truth the
+        # meta-labeling filter and the Thompson bandit both read from,
+        # so it has to be populated for either of those to do anything.
+        try:
+            strategy_stats.stats.record_trade(
+                strategy    = strategy,
+                symbol      = symbol,
+                entry_score = entry_score,
+                won         = won,
+                stake       = stake,
+                payout      = payout,
+            )
+        except Exception as exc:
+            logger.warning(f"strategy_stats.record_trade({symbol}) failed: {exc}")
+
+        # Backfill the outcome onto the oldest pending meta-label
+        # prediction for this pair, for later validation of the filter.
+        try:
+            meta_labeling.record_outcome(strategy=strategy, symbol=symbol, won=won)
+        except Exception as exc:
+            logger.warning(f"meta_labeling.record_outcome({symbol}) failed: {exc}")
+
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
         self._check_confirmed_loss_limit()
@@ -777,6 +1000,25 @@ class BotEngine:
                 except Exception:
                     pass
                 self.symbols.record_contract_closed(symbol)
+
+                orphan_strategy = info.get("strategy", "unknown")
+                orphan_score    = float(getattr(info.get("sig"), "score", 0.0))
+                try:
+                    strategy_stats.stats.record_trade(
+                        strategy    = orphan_strategy,
+                        symbol      = symbol,
+                        entry_score = orphan_score,
+                        won         = False,
+                        stake       = stake,
+                        payout      = 0.0,
+                    )
+                except Exception as exc:
+                    logger.warning(f"strategy_stats.record_trade(orphan {symbol}) failed: {exc}")
+                try:
+                    meta_labeling.record_outcome(
+                        strategy=orphan_strategy, symbol=symbol, won=False)
+                except Exception as exc:
+                    logger.warning(f"meta_labeling.record_outcome(orphan {symbol}) failed: {exc}")
 
                 self._open_contracts.pop(cid, None)
                 self._contract_open_times.pop(cid, None)
