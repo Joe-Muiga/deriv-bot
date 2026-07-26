@@ -185,6 +185,9 @@ class DerivClient:
         self._buy_semaphore  = asyncio.Semaphore(1)  # one at a time
         self._last_buy_time  = 0.0                   # epoch of last buy attempt
 
+        # ── Circuit breaker: {(symbol, strategy): {"count": int, "cooldown_until": epoch}} ──
+        self._circuit_breaker: Dict[tuple, dict] = {}
+
         # ── Direction→contract mapping audit ─────────────────────────────────
         logger.info(
             "Direction mapping: LONG → CALL (price rises) | SHORT → PUT (price falls)"
@@ -856,30 +859,82 @@ class DerivClient:
         mapping = {"MATCH": "DIGITMATCH", "DIFFER": "DIGITDIFF"}
         return mapping.get(str(match_type).upper())
 
+    # ─── Circuit breaker (per symbol+strategy) ─────────────────────────────
+    # Suspends new buy attempts on a (symbol, strategy) combination after N
+    # consecutive failures, for a cooldown period — prevents the same dead
+    # signal from retrying every scan cycle indefinitely.
+
+    @staticmethod
+    def _cb_key(symbol: str, strategy: str) -> tuple:
+        return (symbol, strategy or "default")
+
+    def _cb_blocked(self, symbol: str, strategy: str) -> Optional[float]:
+        """Returns seconds remaining in cooldown, or None if not blocked."""
+        state = self._circuit_breaker.get(self._cb_key(symbol, strategy))
+        if not state:
+            return None
+        remaining = state.get("cooldown_until", 0.0) - time.time()
+        return remaining if remaining > 0 else None
+
+    def _cb_record_failure(self, symbol: str, strategy: str,
+                            threshold: int, cooldown: float):
+        key = self._cb_key(symbol, strategy)
+        state = self._circuit_breaker.setdefault(key, {"count": 0, "cooldown_until": 0.0})
+        state["count"] += 1
+        if state["count"] >= threshold:
+            state["cooldown_until"] = time.time() + cooldown
+            state["count"] = 0
+            logger.warning(
+                f"CIRCUIT BREAKER TRIPPED: {symbol}/{strategy} — "
+                f"{threshold} consecutive buy failures, suspending for {cooldown:.0f}s"
+            )
+
+    def _cb_record_success(self, symbol: str, strategy: str):
+        self._circuit_breaker.pop(self._cb_key(symbol, strategy), None)
+
     async def buy_contract(
             self,
-            symbol:      str,
-            direction:   str,   # "LONG" or "SHORT"
-            stake:       float,
-            multiplier:  int    = 100,
-            stop_loss:   float  = None,
-            take_profit: float  = None,
+            symbol:        str,
+            direction:     str,   # "LONG" or "SHORT"
+            stake:         float,
+            multiplier:    int    = 100,
+            stop_loss:     float  = None,
+            take_profit:   float  = None,
+            strategy:      str    = "default",
+            cb_threshold:  int    = 3,
+            cb_cooldown:   float  = 60.0,
             **kwargs) -> dict:
         """
-        Buy a Rise/Fall (CALL/PUT) contract via a direct buy — no
-        proposal step. This eliminates the proposal-stage RateLimit
-        errors caused by simultaneous proposal requests.
+        Buy a Rise/Fall (CALL/PUT) contract via the required proposal ->
+        buy flow. Deriv rejects inline 'parameters' (incl. 'symbol') on a
+        direct buy request — a proposal must be requested first to obtain
+        a proposal_id and ask_price, matching Deriv's documented API and
+        every up-to-date client library.
 
         Direction mapping (VERIFIED CORRECT - DO NOT SWAP):
           direction="LONG"  -> contract_type="CALL"  -> wins if price RISES
           direction="SHORT" -> contract_type="PUT"   -> wins if price FALLS
 
-        Returns dict (buy response) on success, None on every failure path.
-        Never raises.  Never increments trade counters on None return.
+        strategy identifies the signal/strategy that produced this trade,
+        used as the second half of the circuit-breaker key (symbol,
+        strategy). After cb_threshold consecutive failures on that
+        combination, new attempts are suspended for cb_cooldown seconds.
+
+        Returns dict (buy response) on success, None on every failure path
+        (including a circuit-breaker cooldown skip). Never raises. Never
+        increments trade counters on None return.
 
         After a successful buy, the caller is expected to register the
         contract for polling via subscribe_contract().
         """
+        remaining = self._cb_blocked(symbol, strategy)
+        if remaining is not None:
+            logger.info(
+                f"SKIPPED: {symbol}/{strategy} — circuit breaker cooldown "
+                f"active ({remaining:.0f}s remaining)"
+            )
+            return None
+
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
             if elapsed < 3.0:
@@ -887,25 +942,60 @@ class DerivClient:
             self._last_buy_time = time.time()
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
-            logger.info(f"PLACING {contract_type} on {symbol} stake=${stake:.4f}")
+            logger.info(f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f}")
+
+            proposal_req = {
+                "proposal":      1,
+                "amount":        stake,
+                "basis":         "stake",
+                "contract_type": contract_type,
+                "currency":      "USD",
+                "duration":      5,
+                "duration_unit": "m",
+                "symbol":        symbol,
+            }
+            barrier = kwargs.get("barrier")
+            if barrier is not None:
+                proposal_req["barrier"] = barrier
 
             try:
-                buy_req = {
-                    "buy": "1",
-                    "price": stake,
-                    "parameters": {
-                        "amount":         stake,
-                        "basis":          "stake",
-                        "contract_type":  contract_type,
-                        "currency":       "USD",
-                        "duration":       5,
-                        "duration_unit":  "m",
-                        "symbol":         symbol,
-                    }
-                }
+                prop_resp = await self._send(proposal_req)
+                if not prop_resp:
+                    logger.error(f"FAILED: {symbol} — no response (proposal)")
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+                if prop_resp.get("error"):
+                    err = prop_resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={proposal_req}"
+                    )
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+
+                proposal = prop_resp.get("proposal", {})
+                logger.info(f"PROPOSAL RESPONSE: {proposal}")
+
+                proposal_id = proposal.get("id")
+                ask_price   = proposal.get("ask_price", stake)
+                if not proposal_id:
+                    logger.error(
+                        f"FAILED: {symbol} — proposal_rejected (no id in {proposal})"
+                    )
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+
+                logger.info(
+                    f"PRICE CHECK: {symbol} ask_price=${ask_price:.4f} "
+                    f"vs stake=${stake:.4f} "
+                    f"(diff=${ask_price - stake:+.4f})"
+                )
+
+                buy_req = {"buy": proposal_id, "price": ask_price}
                 resp = await self._send(buy_req)
                 if not resp:
-                    logger.error(f"FAILED: {symbol} — no response")
+                    logger.error(f"FAILED: {symbol} — no response (buy)")
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
                     return None
                 if resp.get("error"):
                     err = resp["error"]
@@ -913,6 +1003,7 @@ class DerivClient:
                         f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
                         f"| details={err.get('details')} | full_req={buy_req}"
                     )
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
                     return None
 
                 result = resp.get("buy", {})
@@ -923,6 +1014,7 @@ class DerivClient:
                 )
 
                 self._contract_symbol_map[contract_id] = symbol
+                self._cb_record_success(symbol, strategy)
 
                 # Guaranteed closure: subscribe to this contract immediately.
                 # (subscribe_contract(), called later by the caller to attach
@@ -933,7 +1025,8 @@ class DerivClient:
                 return result
 
             except Exception as e:
-                logger.error(f"FAILED: {symbol} — {e} | full_req={buy_req}")
+                logger.error(f"FAILED: {symbol} — {e} | full_req={proposal_req}")
+                self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
                 return None
 
     # ─── Accumulator (ACCU) contracts ──────────────────────────────────────────
