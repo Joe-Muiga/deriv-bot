@@ -137,6 +137,16 @@ class _SqliteBackend:
         )
         return cur.fetchone()[0]
 
+    def recent_trades(self, strategy: str, symbol: str, window: int) -> List[Tuple[bool, float, float]]:
+        """Most recent `window` trades as (won, stake, payout) tuples, newest first."""
+        conn = self._conn()
+        cur = conn.execute(
+            "SELECT won, stake, payout FROM trades WHERE strategy=? AND symbol=? "
+            "ORDER BY timestamp DESC LIMIT ?",
+            (strategy, symbol, window),
+        )
+        return [(bool(row[0]), row[1], row[2]) for row in cur.fetchall()]
+
     def all_pairs(self) -> List[Tuple[str, str]]:
         conn = self._conn()
         cur = conn.execute("SELECT DISTINCT strategy, symbol FROM trades")
@@ -189,6 +199,13 @@ class _JsonBackend:
     def count(self, strategy: str, symbol: str) -> int:
         data = self._read()
         return len(data.get(self._key(strategy, symbol), []))
+
+    def recent_trades(self, strategy: str, symbol: str, window: int) -> List[Tuple[bool, float, float]]:
+        """Most recent `window` trades as (won, stake, payout) tuples, newest first."""
+        data = self._read()
+        rows = data.get(self._key(strategy, symbol), [])
+        rows_sorted = sorted(rows, key=lambda r: r["timestamp"], reverse=True)[:window]
+        return [(bool(r["won"]), r["stake"], r["payout"]) for r in rows_sorted]
 
     def all_pairs(self) -> List[Tuple[str, str]]:
         data = self._read()
@@ -263,6 +280,29 @@ class StrategyStats:
         rate = wins / n
         ci_low, ci_high = _wilson_interval(wins, n)
         return rate, ci_low, ci_high, n
+
+    def get_avg_win_payout_ratio(
+        self, strategy: str, symbol: str, window: int = DEFAULT_WINDOW
+    ) -> Optional[float]:
+        """
+        Average payout/stake ratio across WINNING trades only, over the
+        most recent `window` trades for this (strategy, symbol) pair.
+
+        This is the raw ratio a winning stake returns (e.g. 1.9 on a
+        $1 stake), i.e. the input needed to derive Kelly's `b` (net
+        odds) via b = ratio - 1. Losing trades are excluded since they
+        don't inform the win-payout side of the formula.
+
+        Returns None if there are no winning trades in the window, or
+        no valid (stake > 0) winning trades — callers should treat
+        None as "not enough data" rather than 0.
+        """
+        with self._lock:
+            rows = self._backend.recent_trades(strategy, symbol, window)
+        ratios = [payout / stake for won, stake, payout in rows if won and stake > 0]
+        if not ratios:
+            return None
+        return sum(ratios) / len(ratios)
 
     def is_underperforming(self, strategy: str, symbol: str) -> bool:
         """
