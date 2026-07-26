@@ -54,6 +54,34 @@ can_trade() GATES
 POST-CLOSE LOG
 ───────────────
   PLS | Streak: +{N} | Multiplier: {M}x | Balance: ${B:.4f} | Next stake: ${S:.4f}
+
+KELLY OVERLAY (v18 addition)
+──────────────────────────────
+  Sits ON TOP of PLS. Does not touch PLS's own math (base stake,
+  multiplier tiers, streak logic are all untouched from v17).
+
+  Per (strategy, symbol) pair, using strategy_stats.py's rolling data:
+    p = rolling win rate
+    b = avg_win_payout_ratio - 1   (net odds: profit per $1 staked on a win)
+    q = 1 - p
+    f* = (b*p - q) / b
+    adjusted_f* = f* × config.KELLY_FRACTION_MULTIPLIER
+
+  Requires config.KELLY_MIN_TRADES (falls back to 20 if absent — this
+  constant does not exist in config.py yet, see reply) logged trades
+  for that pair before it activates. Below that, or if payout data is
+  missing, the overlay is a no-op and PLS's stake passes through
+  unchanged.
+
+  Once active:
+    adjusted_f* <= 0   → stake forced to $0.00 for that pair, no matter
+                         what PLS's multiplier says.
+    adjusted_f* > 0    → kelly_stake = adjusted_f* × balance
+                         final_stake = min(pls_stake, kelly_stake)
+                         (Kelly caps/scales PLS down, never scales it up)
+
+  Every recalculation is logged with its p/b/q/f* inputs regardless of
+  outcome.
 """
 
 from __future__ import annotations
@@ -67,6 +95,7 @@ from enum import Enum, auto
 from typing import List, Optional
 
 import config
+import strategy_stats
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +174,13 @@ class RiskManager:
         self.max_stake      = max_stake      or getattr(config, "MAX_STAKE",             50.0)
         self.max_concurrent = max_concurrent or getattr(config, "MAX_CONCURRENT_TRADES", 15)
         self._deriv_client  = deriv_client
+
+        # ── Kelly overlay config ──────────────────────────────────────
+        self.kelly_fraction_multiplier = getattr(config, "KELLY_FRACTION_MULTIPLIER", 0.25)
+        # NOTE: config.py does not define KELLY_MIN_TRADES — defaulting
+        # to 20 here. Add an explicit KELLY_MIN_TRADES constant to
+        # config.py to make this tunable instead of hardcoded (see reply).
+        self.kelly_min_trades = getattr(config, "KELLY_MIN_TRADES", 20)
 
         # Live balance — updated by set_balance() and _fetch_live_balance()
         self._current_balance: float = 0.0
@@ -319,26 +355,152 @@ class RiskManager:
         actual_stake = max(actual_stake, self.min_stake)
         return round(actual_stake, 2)
 
-    async def calculate_stake(self) -> float:
+    # ── Kelly overlay ────────────────────────────────────────────────────────
+
+    def compute_kelly_fraction(self, strategy: str, symbol: str) -> Optional[float]:
         """
-        Fetch live balance, apply the PLS formula, log, and return
-        the stake.
+        Compute the config.KELLY_FRACTION_MULTIPLIER-adjusted Kelly
+        fraction for a (strategy, symbol) pair using strategy_stats.py's
+        rolling win rate and average win-payout ratio.
+
+        Returns:
+          None  → not enough data yet (fewer than self.kelly_min_trades
+                  logged trades for this pair, or no winning-trade
+                  payout data available). Caller should treat this as
+                  "overlay inactive" and let PLS's stake pass through.
+          0.0   → data is sufficient but there is no computable edge
+                  (b <= 0) or the Kelly formula itself is <= 0. Caller
+                  must force stake to zero for this pair.
+          >0.0  → the adjusted Kelly-optimal fraction of balance to risk.
+
+        Every call is logged with its inputs, regardless of outcome.
+        """
+        rate, ci_low, ci_high, n = strategy_stats.stats.get_win_rate(
+            strategy, symbol, window=strategy_stats.DEFAULT_WINDOW
+        )
+        if n < self.kelly_min_trades:
+            logger.info(
+                f"KELLY | {strategy}/{symbol} | n={n} < "
+                f"kelly_min_trades={self.kelly_min_trades} | overlay inactive, "
+                f"PLS stake passes through unchanged")
+            return None
+
+        avg_win_ratio = strategy_stats.stats.get_avg_win_payout_ratio(
+            strategy, symbol, window=strategy_stats.DEFAULT_WINDOW
+        )
+        if avg_win_ratio is None:
+            logger.info(
+                f"KELLY | {strategy}/{symbol} | n={n} but no winning-trade "
+                f"payout data available | overlay inactive, PLS stake passes "
+                f"through unchanged")
+            return None
+
+        p = rate
+        q = 1.0 - p
+        b = avg_win_ratio - 1.0  # net odds: profit per $1 staked on a win
+
+        if b <= 0:
+            logger.info(
+                f"KELLY | {strategy}/{symbol} | p={p:.4f} q={q:.4f} "
+                f"avg_win_payout_ratio={avg_win_ratio:.4f} b={b:.4f} n={n} | "
+                f"b<=0, no computable edge -> fraction forced to 0.0")
+            return 0.0
+
+        raw_fraction = (b * p - q) / b
+        adjusted_fraction = raw_fraction * self.kelly_fraction_multiplier
+
+        logger.info(
+            f"KELLY | {strategy}/{symbol} | p={p:.4f} q={q:.4f} b={b:.4f} n={n} | "
+            f"raw_f*={raw_fraction:.4f} × multiplier={self.kelly_fraction_multiplier} "
+            f"-> adjusted_f*={adjusted_fraction:.4f}")
+
+        return adjusted_fraction
+
+    def _apply_kelly_overlay(
+        self,
+        pls_stake: float,
+        balance:   float,
+        strategy:  Optional[str],
+        symbol:    Optional[str],
+    ) -> float:
+        """
+        Gate/scale a PLS-computed stake through the Kelly overlay.
+        PLS's own math is never touched — this only ever caps or zeroes
+        what PLS already produced.
+        """
+        if strategy is None or symbol is None:
+            # No pair context supplied — overlay can't run, PLS stake stands.
+            return pls_stake
+
+        kelly_fraction = self.compute_kelly_fraction(strategy, symbol)
+
+        if kelly_fraction is None:
+            return pls_stake  # insufficient data — PLS passes through unchanged
+
+        if kelly_fraction <= 0:
+            logger.info(
+                f"KELLY | {strategy}/{symbol} | fraction<=0 -> forcing stake to "
+                f"$0.00 (overriding PLS stake of ${pls_stake:.4f})")
+            return 0.0
+
+        kelly_stake = balance * kelly_fraction
+        final_stake = min(pls_stake, kelly_stake)
+        final_stake = round(final_stake, 2)
+
+        if final_stake < pls_stake:
+            logger.info(
+                f"KELLY | {strategy}/{symbol} | kelly_stake=${kelly_stake:.4f} < "
+                f"pls_stake=${pls_stake:.4f} -> capped to ${final_stake:.4f}")
+
+        return final_stake
+
+    def next_stake_for(self, strategy: str, symbol: str) -> float:
+        """
+        Synchronous preview of the stake that would be used for the very
+        next trade on this (strategy, symbol) pair, PLS + Kelly overlay
+        combined, using the current cached balance.
+        """
+        pls_stake = self._compute_stake(self._current_balance)
+        return self._apply_kelly_overlay(
+            pls_stake, self._current_balance, strategy, symbol
+        )
+
+    # ── Stake calculation (PLS + Kelly overlay) ─────────────────────────────
+
+    async def calculate_stake(
+        self,
+        strategy: Optional[str] = None,
+        symbol:   Optional[str] = None,
+    ) -> float:
+        """
+        Fetch live balance, apply the PLS formula (unchanged from v17),
+        then gate/scale the result through the Kelly overlay for this
+        (strategy, symbol) pair, log, and return the final stake.
+
+        strategy/symbol are optional for backward compatibility with
+        existing callers — if omitted, the Kelly overlay is skipped
+        entirely and behavior is identical to v17 (pure PLS).
 
         Log format:
-          STAKE: $X (base=$Y ×M streak=+Z)
+          STAKE: $X (pls=$Y base=$Z ×M streak=+N [strategy=... symbol=...])
         """
         balance = await self._fetch_live_balance()
 
-        base  = max(self._current_balance * self.base_stake_pct, self.min_stake)
-        stake = round(base * self._multiplier, 2)
-        stake = min(stake, self.max_stake)
-        stake = max(stake, self.min_stake)
+        base      = max(self._current_balance * self.base_stake_pct, self.min_stake)
+        pls_stake = round(base * self._multiplier, 2)
+        pls_stake = min(pls_stake, self.max_stake)
+        pls_stake = max(pls_stake, self.min_stake)
 
+        stake = self._apply_kelly_overlay(pls_stake, self._current_balance, strategy, symbol)
+
+        pair_suffix = f" strategy={strategy} symbol={symbol}" if strategy and symbol else ""
         logger.info(
             f"STAKE: ${stake:.4f} "
-            f"(base=${base:.4f} "
+            f"(pls=${pls_stake:.4f} "
+            f"base=${base:.4f} "
             f"×{self._multiplier:.1f} "
-            f"streak=+{self._win_streak})")
+            f"streak=+{self._win_streak}"
+            f"{pair_suffix})")
 
         return stake
 
