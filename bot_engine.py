@@ -51,7 +51,6 @@ import restart_scheduler
 import symbols as sym_module
 import strategy_stats
 import meta_labeling
-import symbol_audit
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
@@ -64,8 +63,7 @@ import indicators as ind
 from keep_alive import (update_status, set_active_trades,
                         is_redeploy_pending, record_trade,
                         record_signal, record_failure,
-                        update_open_contracts, _status,
-                        set_symbol_audit_result)
+                        update_open_contracts, _status)
 from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
@@ -356,11 +354,6 @@ class BotEngine:
         self._session_start_balance = self.client.balance
         self._current_utc_day       = _dt.datetime.utcnow().day
 
-        try:
-            await self._run_symbol_audit_once()
-        except Exception as exc:
-            logger.error(f"Symbol audit step raised unexpectedly (continuing startup): {exc}")
-
         await self._init_all_symbols()
 
         try:
@@ -383,50 +376,6 @@ class BotEngine:
             settle_task.cancel()
             degraded_task.cancel()
             ws_task.cancel()
-
-    # ── One-time symbol/contract-type audit ─────────────────────────────────
-    #    Folded in from the standalone symbol_audit.py diagnostic. Uses its
-    #    own direct-WS + authorize connection (MiniDerivClient inside
-    #    symbol_audit.py) — deliberately NOT routed through self.client /
-    #    DerivClient.connect(), since that flow is still being fixed and
-    #    this diagnostic should work independent of it. Guarded so it only
-    #    actually hits the network once per deploy (see
-    #    symbol_audit.run_audit_once() for the guard-file logic); on
-    #    guarded/skipped runs it still loads the cached JSON so the
-    #    dashboard has something to show. Never allowed to block or crash
-    #    the trading startup — any failure here is logged and swallowed.
-    async def _run_symbol_audit_once(self):
-        try:
-            output, ran, error = await symbol_audit.run_audit_once()
-        except Exception as exc:
-            logger.error(f"Symbol audit step crashed unexpectedly: {exc}")
-            return
-
-        if error is not None:
-            logger.error(f"Symbol audit did not complete this deploy: {error}")
-            return
-
-        if output is None:
-            logger.info(
-                "Symbol audit: no cached result and nothing run yet — "
-                "will run on a future deploy once the guard file is absent."
-            )
-            return
-
-        logger.info(
-            "Symbol audit: fresh run completed." if ran else
-            "Symbol audit: guard file present — showing cached result from a previous deploy."
-        )
-
-        try:
-            logger.info("\n" + symbol_audit.render_text_summary(output))
-        except Exception as exc:
-            logger.warning(f"Could not render symbol audit text summary: {exc}")
-
-        try:
-            set_symbol_audit_result(output)
-        except Exception as exc:
-            logger.warning(f"Could not push symbol audit result to dashboard: {exc}")
 
     # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
 
