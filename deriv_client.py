@@ -321,8 +321,8 @@ class DerivClient:
 
         while True:
             try:
-                ws_url = config.DERIV_WS_URL
-                logger.info(f"Connecting to {ws_url} …")
+                ws_url = await self._fetch_otp_ws_url()
+                logger.info(f"Connecting to {self._mask_otp(ws_url)} …")
                 async with websockets.connect(
                     ws_url,
                     ping_interval=20,
@@ -334,9 +334,10 @@ class DerivClient:
                     attempt         = 0          # reset on successful connection
                     logger.info("WebSocket connected ✓")
 
-                    # Standard Deriv auth: send {"authorize": token} and wait
-                    # for the authorize response before doing anything else.
-                    await self._authorize()
+                    # The OTP embedded in ws_url already authenticated this
+                    # connection — no separate authorize message needed/accepted.
+                    self._authorized = True
+                    self._ready.set()
                     dispatch_task = asyncio.ensure_future(self._dispatch_loop())
                     try:
                         await self._subscribe_balance()
