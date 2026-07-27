@@ -827,7 +827,7 @@ class DerivClient:
             )
             symbols = resp.get("active_symbols", [])
             for s in symbols:
-                if s.get("symbol") == symbol:
+                if s.get("underlying_symbol") == symbol:
                     open_flag = s.get("exchange_is_open", 0)
                     return bool(open_flag)
             # Symbol not found in active list → treat as closed
@@ -952,7 +952,7 @@ class DerivClient:
                 "currency":      "USD",
                 "duration":      5,
                 "duration_unit": "m",
-                "symbol":        symbol,
+                "underlying_symbol": symbol,
             }
             barrier = kwargs.get("barrier")
             if barrier is not None:
@@ -1066,7 +1066,7 @@ class DerivClient:
                 "basis":         "stake",
                 "contract_type": "ACCU",
                 "currency":      "USD",
-                "symbol":        symbol,
+                "underlying_symbol": symbol,
                 "growth_rate":   growth_rate / 100.0,
             }
             if take_profit is not None:
@@ -1145,7 +1145,7 @@ class DerivClient:
                     "basis":         "stake",
                     "contract_type": "ACCU",
                     "currency":      "USD",
-                    "symbol":        symbol,
+                    "underlying_symbol": symbol,
                     "growth_rate":   growth_rate / 100.0,
                 }
                 if take_profit is not None:
@@ -1286,7 +1286,7 @@ class DerivClient:
                 "currency":      "USD",
                 "duration":      duration,
                 "duration_unit": duration_unit,
-                "symbol":        symbol,
+                "underlying_symbol": symbol,
                 "barrier":       str(digit),
             }
             logger.info(
@@ -1366,7 +1366,7 @@ class DerivClient:
                     "currency":      "USD",
                     "duration":      duration,
                     "duration_unit": duration_unit,
-                    "symbol":        symbol,
+                    "underlying_symbol": symbol,
                     "barrier":       str(digit),
                 }
                 prop_resp = await self._send(proposal_req)
