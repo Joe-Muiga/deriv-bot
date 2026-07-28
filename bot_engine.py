@@ -1032,6 +1032,7 @@ class BotEngine:
     async def _settle_loop(self):
         settle_wait    = getattr(config, "SETTLE_WAIT_SECS", 15)
         redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 6)
+        drain_max_secs = getattr(config, "DRAIN_MAX_SECS", 900)
 
         while True:
             try:
@@ -1046,11 +1047,38 @@ class BotEngine:
                     logger.info(
                         f"REDEPLOY TRIGGERED: draining {n_open} open "
                         f"contract(s) before restart")
+
+                    drain_started = time.time()
                     while self._open_contracts:
+                        # Keep running the orphan force-close safety net
+                        # while draining — without this, a contract that
+                        # never resolves via WS/poll blocks every future
+                        # redeploy cycle forever.
+                        await self._handle_orphans()
+                        if not self._open_contracts:
+                            break
+
+                        drain_elapsed = time.time() - drain_started
+                        if drain_elapsed >= drain_max_secs:
+                            stuck = [
+                                f"{cid} (age={int(time.time() - info.get('opened_at', time.time()))}s)"
+                                for cid, info in self._open_contracts.items()
+                            ]
+                            logger.warning(
+                                f"DRAIN_MAX_SECS ({drain_max_secs}s) exceeded — "
+                                f"force-clearing {len(self._open_contracts)} stuck "
+                                f"contract(s) and proceeding with redeploy: "
+                                f"{', '.join(stuck)}")
+                            self._open_contracts.clear()
+                            self._contract_open_times.clear()
+                            set_active_trades(0)
+                            break
+
                         logger.info(
                             f"Draining — {len(self._open_contracts)} "
                             f"contract(s) open")
                         await asyncio.sleep(5)
+
                     restart_scheduler.trigger_redeploy()
                     logger.info("Redeploy triggered — standing by")
                     self._cycle_count = 0
