@@ -57,13 +57,20 @@ COMMODITIES = [
 
 # Synthetic indices – available 24 / 7 (great for out-of-hours trading)
 SYNTHETIC = [
-    "R_10",   "R_25",   "R_50",   "R_75",   "R_100",   # Volatility indices (1 s)
+    "R_10",   "R_25",   "R_50",   "R_75",   "R_100",   # Volatility indices (2s tick)
     "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V", # Volatility (1 Hz)
+    "1HZ150V","1HZ200V","1HZ250V",                        # Volatility (1 Hz), higher tiers
     "stpRNG",                                             # Step index
     "BOOM300N", "BOOM500",  "BOOM1000",                   # Boom indices
     "CRASH300N","CRASH500", "CRASH1000",                  # Crash indices
     "JD10",   "JD25",   "JD50",   "JD75",   "JD100",    # Jump indices
-    "RDBEAR", "RDBULL",                                   # Range-break indices
+    "RDBEAR", "RDBULL",                                   # Bear/Bull ("Daily Reset") indices
+                                                           # NOTE: these were mislabeled as
+                                                           # "Range-break indices" previously —
+                                                           # they are not. True Range Break
+                                                           # symbol codes are not yet confirmed
+                                                           # for this account and are not listed
+                                                           # here; see config.py's RANGE_BREAK note.
 ]
 
 # Ordered by priority (most liquid / best spreads first)
