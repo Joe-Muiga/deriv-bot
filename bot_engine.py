@@ -818,14 +818,27 @@ class BotEngine:
             score     = getattr(sig, "score",    0.0),
         )
 
-        buy_resp = await self.client.buy_contract(
-            symbol      = symbol,
-            direction   = direction,
-            stake       = stake,
-            multiplier  = getattr(sig, "multiplier",  None),
-            stop_loss   = getattr(sig, "stop_loss",   None),
-            take_profit = getattr(sig, "take_profit", None),
-        )
+        # Boom/Crash, Jump, and Drift Switch symbols don't support CALL/PUT
+        # Rise/Fall on this account — route them to buy_multiplier() instead.
+        # config.MULTIPLIER_SYMBOLS is the single source of truth for this
+        # split (see config.py's "STRATEGY ROUTING" section); everything
+        # else keeps using buy_contract() exactly as before.
+        if symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
+            buy_resp = await self.client.buy_multiplier(
+                symbol   = symbol,
+                direction= direction,
+                stake    = stake,
+                strategy = strategy,
+            )
+        else:
+            buy_resp = await self.client.buy_contract(
+                symbol      = symbol,
+                direction   = direction,
+                stake       = stake,
+                multiplier  = getattr(sig, "multiplier",  None),
+                stop_loss   = getattr(sig, "stop_loss",   None),
+                take_profit = getattr(sig, "take_profit", None),
+            )
 
         if buy_resp is None:
             logger.warning(f"PLACEMENT FAILED: {symbol}")
