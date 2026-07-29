@@ -1029,6 +1029,171 @@ class DerivClient:
                 self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
                 return None
 
+    async def buy_multiplier(
+            self,
+            symbol:        str,
+            direction:     str,   # "LONG" or "SHORT"
+            stake:         float,
+            multiplier:    int    = None,
+            stop_loss_pct: float  = None,
+            take_profit_ratio: float = None,
+            strategy:      str    = "default",
+            cb_threshold:  int    = 3,
+            cb_cooldown:   float  = 60.0,
+            **kwargs) -> dict:
+        """
+        Buy a Multipliers (MULTUP/MULTDOWN) contract via the required
+        proposal -> buy flow. Mirrors buy_contract()'s defensive error
+        handling (log and return None on every failure path, never raise)
+        and its circuit-breaker gating, but targets Multiplier contracts
+        instead of Rise/Fall — needed for symbols (Boom/Crash, Jump,
+        Drift Switch, and any future Range Break / Bear-Bull additions)
+        that do not support CALL/PUT on this account.
+
+        Direction mapping (mirrors buy_contract — DO NOT SWAP):
+          direction="LONG"  -> contract_type="MULTUP"    -> wins if price RISES
+          direction="SHORT" -> contract_type="MULTDOWN"  -> wins if price FALLS
+
+        multiplier defaults to config.MULTIPLIER_MAP[symbol] (falling back
+        to config.DEFAULT_MULTIPLIER) when not passed explicitly.
+
+        Multiplier contracts have no fixed duration — risk is bounded here
+        via an explicit limit_order (stop_loss / take_profit) attached to
+        the proposal, rather than a duration/duration_unit pair.
+        stop_loss_pct defaults to config.STOP_LOSS_MAP[symbol] (falling
+        back to config.DEFAULT_STOP_LOSS_PCT); take_profit_ratio defaults
+        to config.TAKE_PROFIT_RATIO. Both are expressed relative to stake:
+          stop_loss_amount   = stake * (stop_loss_pct / 100)
+          take_profit_amount = stop_loss_amount * take_profit_ratio
+
+        strategy identifies the signal/strategy that produced this trade,
+        used as the second half of the circuit-breaker key (symbol,
+        strategy), exactly as in buy_contract().
+
+        Returns dict (buy response) on success, None on every failure path
+        (including a circuit-breaker cooldown skip). Never raises. Never
+        increments trade counters on None return.
+
+        After a successful buy, the caller is expected to register the
+        contract for polling via subscribe_contract() — already handled
+        here the same way buy_contract() does it, via _subscribe_ws_contract.
+        """
+        remaining = self._cb_blocked(symbol, strategy)
+        if remaining is not None:
+            logger.info(
+                f"SKIPPED: {symbol}/{strategy} — circuit breaker cooldown "
+                f"active ({remaining:.0f}s remaining)"
+            )
+            return None
+
+        if multiplier is None:
+            multiplier = config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER)
+        if stop_loss_pct is None:
+            stop_loss_pct = config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
+        if take_profit_ratio is None:
+            take_profit_ratio = config.TAKE_PROFIT_RATIO
+
+        async with self._buy_semaphore:
+            elapsed = time.time() - self._last_buy_time
+            if elapsed < 3.0:
+                await asyncio.sleep(3.0 - elapsed)
+            self._last_buy_time = time.time()
+
+            stake = self._cap_stake(stake, symbol)
+            contract_type = "MULTUP" if direction == "LONG" else "MULTDOWN"
+            stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
+            take_profit_amount = round(stop_loss_amount * take_profit_ratio, 2)
+
+            logger.info(
+                f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f} "
+                f"multiplier={multiplier}x SL=${stop_loss_amount:.2f} "
+                f"TP=${take_profit_amount:.2f}"
+            )
+
+            proposal_req = {
+                "proposal":      1,
+                "amount":        stake,
+                "basis":         "stake",
+                "contract_type": contract_type,
+                "currency":      "USD",
+                "underlying_symbol": symbol,
+                "multiplier":    multiplier,
+                "limit_order": {
+                    "stop_loss":   stop_loss_amount,
+                    "take_profit": take_profit_amount,
+                },
+            }
+
+            try:
+                prop_resp = await self._send(proposal_req)
+                if not prop_resp:
+                    logger.error(f"FAILED: {symbol} — no response (multiplier proposal)")
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+                if prop_resp.get("error"):
+                    err = prop_resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={proposal_req}"
+                    )
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+
+                proposal = prop_resp.get("proposal", {})
+                logger.info(f"PROPOSAL RESPONSE: {proposal}")
+
+                proposal_id = proposal.get("id")
+                ask_price   = proposal.get("ask_price", stake)
+                if not proposal_id:
+                    logger.error(
+                        f"FAILED: {symbol} — proposal_rejected (no id in {proposal})"
+                    )
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+
+                logger.info(
+                    f"PRICE CHECK: {symbol} ask_price=${ask_price:.4f} "
+                    f"vs stake=${stake:.4f} "
+                    f"(diff=${ask_price - stake:+.4f})"
+                )
+
+                buy_req = {"buy": proposal_id, "price": ask_price}
+                resp = await self._send(buy_req)
+                if not resp:
+                    logger.error(f"FAILED: {symbol} — no response (multiplier buy)")
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+                if resp.get("error"):
+                    err = resp["error"]
+                    logger.error(
+                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                        f"| details={err.get('details')} | full_req={buy_req}"
+                    )
+                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                    return None
+
+                result = resp.get("buy", {})
+                contract_id = str(result.get("contract_id", ""))
+                logger.info(
+                    f"CONTRACT OPENED: {contract_id} | {symbol} | "
+                    f"{contract_type} | ${stake:.4f} | {multiplier}x"
+                )
+
+                self._contract_symbol_map[contract_id] = symbol
+                self._cb_record_success(symbol, strategy)
+
+                # Guaranteed closure: subscribe to this contract immediately,
+                # same as buy_contract() — subscribe_contract() later no-ops
+                # the resend via the _subscribed_contracts guard.
+                asyncio.create_task(self._subscribe_ws_contract(contract_id))
+
+                return result
+
+            except Exception as e:
+                logger.error(f"FAILED: {symbol} — {e} | full_req={proposal_req}")
+                self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                return None
+
     # ─── Accumulator (ACCU) contracts ──────────────────────────────────────────
 
     async def get_accumulator_proposal(
