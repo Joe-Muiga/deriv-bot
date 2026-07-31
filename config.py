@@ -167,7 +167,7 @@ MAX_STAKE            = 1000.0  # safety backstop only, not the everyday
                                 # $0.35 regardless of balance or the 0.5%
                                 # calculation above. Adjust if you want a
                                 # tighter per-trade ceiling.
-DAILY_LOSS_LIMIT_PCT = 0.15   # NOTE: value is 15%, comment below said 20% — see flags in reply
+DAILY_LOSS_LIMIT_PCT = 0.15   # daily loss cap as a fraction of balance (15%)
 DAILY_LOSS_PAUSE_MINS = 30
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
@@ -261,7 +261,7 @@ SETTLE_WAIT_SECS = 15
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
-MAX_CONCURRENT     = 20               # alias — NOTE: mismatched with MAX_CONCURRENT_TRADES=30, see flags
+MAX_CONCURRENT     = MAX_CONCURRENT_TRADES   # alias — now tracks MAX_CONCURRENT_TRADES (was hardcoded to a stale 20)
 DAILY_LOSS_LIMIT   = DAILY_LOSS_LIMIT_PCT    # alias
 
 # ── ADDITIONAL SIGNAL/RISK SETTINGS ──────────────────────────
