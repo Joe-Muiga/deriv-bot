@@ -199,11 +199,11 @@ def evaluate_digit(
     roc = ind.roc(C, 10)
 
     raw_score, digit_dir = ind.digit_score(
-        close=C, rsi=rsi, bb_upper=upper, bb_mid=mid, bb_lower=lower, roc=roc
+        closes=C, rsi_vals=rsi, bb_upper=upper, bb_lower=lower, roc_vals=roc
     )
     partial_score = raw_score / 8.0
 
-    if digit_dir is None or raw_score < 6:
+    if digit_dir == "NONE" or raw_score < 6:
         logger.debug(f"REJECTED: {symbol} DIGIT strength=0 score={partial_score:.3f} — below threshold")
         return SignalResult("NONE", 0, partial_score, "DIGIT", "Below entry threshold")
 
@@ -498,29 +498,44 @@ def evaluate_boom_crash(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     last_atr = _last(atr) or 0.001
     last_rsi = _last(rsi)
 
-    spike = ind.detect_spike(C, H, L, lookback=12)
-    # Expected spike shape: {"detected": bool, "type": "BOOM"|"CRASH",
-    #                        "size": float, "bars_ago": int}
-    if not spike or not spike.get("detected"):
-        return NONE_RESULT
+    # detect_spike() only reports on the single most-recent bar of whatever
+    # slice it's given (+1 up-spike / -1 down-spike / 0 none — no dict, no
+    # bars_ago/type/size). To ask "was the bar N bars ago a spike bar",
+    # trim the array's tail by N bars so that bar becomes the new "last" one.
+    def _spike_at(bars_ago: int, period: int = 14, atr_multiplier: float = 3.0):
+        c_s = C[:-bars_ago] if bars_ago > 0 else C
+        h_s = H[:-bars_ago] if bars_ago > 0 else H
+        l_s = L[:-bars_ago] if bars_ago > 0 else L
+        if len(c_s) < 2:
+            return 0, 0.0
+        direction = ind.detect_spike(c_s, h_s, l_s, period=period, atr_multiplier=atr_multiplier)
+        size = abs(float(c_s[-1]) - float(c_s[-2])) if direction != 0 else 0.0
+        return direction, size
 
-    bars_ago = spike.get("bars_ago", 0)
-    spike_type = spike.get("type")
-    spike_size = float(spike.get("size", 0.0))
+    # Must be within last 2 bars, but at least 1 bar since the spike bar
+    # closed (bars_ago=0 would be the still-forming most-recent bar).
+    spike_dir, spike_size, bars_ago = 0, 0.0, 0
+    for candidate in (1, 2):
+        d, sz = _spike_at(candidate)
+        if d != 0:
+            spike_dir, spike_size, bars_ago = d, sz, candidate
+            break
 
-    # Must be within last 2 bars, but at least 1 bar since the spike bar closed
-    if bars_ago < 1 or bars_ago > 2:
+    if spike_dir == 0:
         logger.debug(f"REJECTED: {symbol} BOOM_CRASH strength=0 score=0.000 — below threshold")
         return NONE_RESULT
 
-    # Cooldown: no earlier spike in the preceding 10 bars
-    earlier_spike = ind.detect_spike(
-        C[: -bars_ago] if bars_ago > 0 else C,
-        H[: -bars_ago] if bars_ago > 0 else H,
-        L[: -bars_ago] if bars_ago > 0 else L,
-        lookback=10,
-    )
-    if earlier_spike and earlier_spike.get("detected"):
+    spike_type = "BOOM" if spike_dir > 0 else "CRASH"
+
+    # Cooldown: no earlier spike in the 10 bars preceding the one just found.
+    cooldown_hit = False
+    for earlier_bars_ago in range(bars_ago + 1, bars_ago + 11):
+        earlier_dir, _ = _spike_at(earlier_bars_ago)
+        if earlier_dir != 0:
+            cooldown_hit = True
+            break
+
+    if cooldown_hit:
         logger.info(f"REJECTED: {symbol} BOOM_CRASH strength=1 score=0.000 — below threshold")
         return NONE_RESULT
 
