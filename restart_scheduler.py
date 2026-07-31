@@ -1,6 +1,19 @@
 """
 restart_scheduler.py – Graceful auto-redeploy on Render.
 
+v2 → v3 changes (fixed 2-hour cadence):
+
+  CHANGED — MIN_INTERVAL / MAX_INTERVAL:
+    Was a random 50-90 min window. Now both constants are set to
+    FIXED_INTERVAL_SECS (2 hours), so random.randint(MIN, MAX) always
+    resolves to exactly 7200s. This is now intended to be the ONLY
+    redeploy trigger — see config.py's REDEPLOY_EVERY_N_CYCLES note:
+    the cycle-based redeploy in bot_engine._settle_loop must be
+    disabled (set to an effectively unreachable count) or you will
+    have TWO independent redeploy triggers fighting each other, which
+    is what was causing redeploys roughly every ~2 minutes instead of
+    every 2 hours.
+
 v1 → v2 changes (BUG 4):
 
   NEW — trigger_redeploy():
@@ -45,8 +58,11 @@ from keep_alive import set_redeploy_pending, get_active_trades
 logger = logging.getLogger(__name__)
 
 # ── Tuneable constants ────────────────────────────────────────────────────────
-MIN_INTERVAL  = 50 * 60   # 50 min in seconds
-MAX_INTERVAL  = 90 * 60   # 90 min in seconds
+FIXED_INTERVAL_SECS = 2 * 60 * 60   # 2 hours — fixed redeploy cadence
+MIN_INTERVAL  = FIXED_INTERVAL_SECS   # kept as a separate name so the
+MAX_INTERVAL  = FIXED_INTERVAL_SECS   # randint() call below still works
+                                       # unchanged; MIN==MAX means it always
+                                       # returns exactly 7200s.
 DRAIN_TIMEOUT = 10 * 60   # wait at most 10 min for open trades to close
 DRAIN_POLL    = 5         # poll active-trade count every 5 seconds
 # ─────────────────────────────────────────────────────────────────────────────
@@ -120,7 +136,7 @@ def _scheduler_loop() -> None:
 
     logger.info(
         f"Restart scheduler started "
-        f"(random interval {MIN_INTERVAL // 60}–{MAX_INTERVAL // 60} min, "
+        f"(fixed interval {FIXED_INTERVAL_SECS // 60} min, "
         f"drain timeout {DRAIN_TIMEOUT // 60} min)."
     )
 
