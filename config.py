@@ -29,23 +29,18 @@ VOLATILITY_1S = [
 ]
 
 # Boom & Crash
-# Boom/Crash symbols do NOT support CALL/PUT Rise/Fall (OfferingsValidationError)
-# — they trade via Multipliers (MULTUP/MULTDOWN), now implemented as
-# deriv_client.buy_multiplier(). Enabled here; MULTIPLIER_SYMBOLS below routes
-# these to buy_multiplier() instead of buy_contract() in bot_engine._execute().
-# Symbol codes verified against symbols.py's SYNTHETIC list.
-# NOT YET RE-VERIFIED against a live contracts_for audit on this account/app_id
-# — run audit_contracts.py before relying on this live. Pull any symbol here
-# that the audit doesn't confirm supports MULTUP/MULTDOWN.
-BOOM_CRASH = ["BOOM300N", "BOOM500", "BOOM1000", "CRASH300N", "CRASH500", "CRASH1000"]
+# NOTE: Removed from trading — Boom/Crash symbols do NOT support
+# CALL/PUT Rise/Fall contracts via the API (OfferingsValidationError).
+# They require different contract types (e.g. multipliers) not used here.
+BOOM_CRASH = []
 
 # Step Index
 STEP = ["stpRNG"]
 
 # Jump Indices
-# Jump indices do NOT support CALL/PUT Rise/Fall (OfferingsValidationError) —
-# trade via Multipliers, same as Boom/Crash above. Same audit caveat applies.
-JUMP = ["JD10", "JD25", "JD50", "JD75", "JD100"]
+# NOTE: Removed from trading — Jump indices do NOT support
+# CALL/PUT Rise/Fall contracts via the API (OfferingsValidationError).
+JUMP = []
 
 # Range Break
 # REMOVED FROM ACTIVE TRADING (this pass) — confirmed MT5-only / not reachable
@@ -75,9 +70,17 @@ BEAR_BULL_TREND_SHIFT_MINS = 20     # default if/when enabled (10, 20, or 30)
 
 # Only these symbols support CALL/PUT Rise/Fall via Deriv API
 # (RDBULL/RDBEAR removed — see RANGE_BREAK note above)
+# NOTE: 1HZ150V / 1HZ200V / 1HZ250V added — same Rise/Fall-compatible
+# 1-second volatility family as 1HZ10V-1HZ100V above, and both already
+# had MULTIPLIER_MAP and STOP_LOSS_MAP entries defined further down in
+# this file with nothing routing symbols to them. Confirm with a fresh
+# contracts_for / symbol_audit.py pass before relying on this in
+# production — treat as "should work by the same pattern as its
+# siblings", not yet empirically re-verified against your account.
 RISE_FALL_SYMBOLS = [
     "R_10","R_25","R_50","R_75","R_100",
     "1HZ10V","1HZ25V","1HZ50V","1HZ75V","1HZ100V",
+    "1HZ150V","1HZ200V","1HZ250V",
     "stpRNG",
 ]
 
@@ -91,42 +94,12 @@ DIGIT_SYMBOLS = []
 # Every traded symbol is routed to exactly one strategy evaluator.
 MEAN_REVERSION_SYMBOLS = VOLATILITY_STANDARD + VOLATILITY_1S  # all 10 vol indices
 RANGE_BREAK_SYMBOLS    = []                                      # disabled — see RANGE_BREAK note
-BOOM_CRASH_SYMBOLS     = BOOM_CRASH                              # -> evaluate_boom_crash()
+BOOM_CRASH_SYMBOLS     = BOOM_CRASH                              # empty — not traded
 STEP_SYMBOLS           = STEP                                    # stpRNG
 
-# symbol_manager.py's is_in_session() applies a tighter session window to
-# BOOM500/BOOM300N/CRASH300N and CRASH500 than the 00:00-05:00 dead-zone
-# blanket rule (see _BOOM_CRASH_ALL there). Populate these explicitly —
-# without them symbol_manager falls back to its own hardcoded defaults,
-# which reference the non-existent names "BOOM300"/"CRASH300".
-BOOM_CRASH_500_300 = ["BOOM500", "BOOM300N", "CRASH300N"]  # 07:00-12:00 UTC
-CRASH500_ONLY       = ["CRASH500"]                          # 07:00-16:00 UTC
-BOOM_CRASH_1000      = ["BOOM1000", "CRASH1000"]             # 05:00-20:00 UTC
-
-# signal_engine.SignalEngine.evaluate() routes these two by exact name —
-# keep in sync with BOOM_CRASH_SYMBOLS naming pattern above.
-DRIFT_FADE_SYMBOLS     = DRIFT   # -> evaluate_drift_fade()  (DSHIFT10/20/30)
-JUMP_BUILDUP_SYMBOLS   = JUMP    # -> evaluate_jump_buildup() (JD10-JD100)
-
-# symbol_manager.py's session-window logic keys off JUMP_SYMBOLS (not
-# JUMP_BUILDUP_SYMBOLS) for its 07:00-20:00 UTC preferred-window flag —
-# alias so both modules see the same list without maintaining it twice.
-JUMP_SYMBOLS = JUMP
-
-# Symbols that must execute via deriv_client.buy_multiplier() (MULTUP/
-# MULTDOWN) instead of buy_contract() (CALL/PUT) — bot_engine._execute()
-# checks this set to pick the execution path. RANGE_BREAK_SYMBOLS /
-# BEAR_BULL_SYMBOLS are included too (both currently empty, pending audit
-# confirmation) so they route correctly the moment they're populated.
-MULTIPLIER_SYMBOLS = set(
-    BOOM_CRASH_SYMBOLS + DRIFT_FADE_SYMBOLS + JUMP_BUILDUP_SYMBOLS
-    + RANGE_BREAK_SYMBOLS + BEAR_BULL_SYMBOLS
-)
-
-# All symbols combined — Rise/Fall (CALL/PUT) plus the newly-executable
-# Multiplier (MULTUP/MULTDOWN) symbols above.
-ALL_SYMBOLS       = RISE_FALL_SYMBOLS + BOOM_CRASH_SYMBOLS + DRIFT_FADE_SYMBOLS + JUMP_BUILDUP_SYMBOLS
-ALL_TRADE_SYMBOLS = ALL_SYMBOLS
+# All symbols combined — Rise/Fall compatible only
+ALL_SYMBOLS       = RISE_FALL_SYMBOLS
+ALL_TRADE_SYMBOLS = RISE_FALL_SYMBOLS
 VOLATILITY_SYMBOLS = RISE_FALL_SYMBOLS  # alias for compatibility with bot_engine.py
 
 # ── MULTIPLIER SETTINGS ──────────────────────────────────────
@@ -142,11 +115,11 @@ MULTIPLIER_MAP = {
     "R_100":   500, "1HZ100V": 500,
     "1HZ150V": 500, "1HZ200V": 500,
     "1HZ250V": 500,
-    # Boom/Crash — moderate (spike risk). Names match symbols.py exactly
-    # (BOOM300N/CRASH300N, not BOOM300/CRASH300 — those aren't real symbol
-    # codes and were silently no-ops via DEFAULT_MULTIPLIER before).
-    "BOOM300N": 100, "BOOM500": 100, "BOOM1000": 100,
-    "CRASH300N":100, "CRASH500":100, "CRASH1000":100,
+    # Boom/Crash — moderate (spike risk)
+    "BOOM150": 100, "BOOM300": 100,
+    "BOOM500": 100, "BOOM1000":100,
+    "CRASH150":100, "CRASH300":100,
+    "CRASH500":100, "CRASH1000":100,
     # Others
     "stpRNG":  200,
     "JD10":    100, "JD25":    200,
@@ -172,14 +145,11 @@ STOP_LOSS_MAP = {
     "R_100":   70.0,  "1HZ100V": 70.0,
     "1HZ150V": 75.0,  "1HZ200V": 80.0,
     "1HZ250V": 80.0,
-    # Boom/Crash — wide SL due to spikes. Names match symbols.py exactly
-    # (BOOM300N/CRASH300N — see MULTIPLIER_MAP note above for why).
-    "BOOM300N": 50.0, "BOOM500": 50.0, "BOOM1000": 50.0,
-    "CRASH300N":50.0, "CRASH500":50.0, "CRASH1000":50.0,
-    # Jump indices — moderate SL
-    "JD10": 40.0, "JD25": 45.0, "JD50": 50.0, "JD75": 55.0, "JD100": 60.0,
-    # Drift Switch
-    "DSHIFT10": 50.0, "DSHIFT20": 50.0, "DSHIFT30": 50.0,
+    # Boom/Crash — wide SL due to spikes
+    "BOOM150": 50.0,  "BOOM300": 50.0,
+    "BOOM500": 50.0,  "BOOM1000":50.0,
+    "CRASH150":50.0,  "CRASH300":50.0,
+    "CRASH500":50.0,  "CRASH1000":50.0,
 }
 DEFAULT_STOP_LOSS_PCT = 50.0
 
@@ -279,11 +249,15 @@ MAX_BUY_PER_SECOND     = 3
 # ── RENDER ──────────────────────────────────────────────────
 RENDER_DEPLOY_HOOK_URL = os.environ.get(
     "RENDER_DEPLOY_HOOK_URL","")
-REDEPLOY_EVERY_N_CYCLES = 480  # was reverted to 8 in this upload — that caused
-                                # a full restart (wiping in-memory state) every
-                                # ~2min at a 15s settle-loop tick instead of the
-                                # intended ~2hrs. Confirm this stays 480 — see
-                                # Task 5 of the handoff.
+# REDEPLOY_EVERY_N_CYCLES previously = 8. With SETTLE_WAIT_SECS defaulting to
+# 15s (bot_engine._settle_loop), that was an 8*15=120s cycle-based redeploy —
+# fighting restart_scheduler.py's timer and redeploying roughly every 2
+# minutes instead of every 2 hours. Set high enough that it never fires on
+# its own; restart_scheduler.py's fixed 2-hour timer is now the only
+# redeploy trigger. Lower this back down only if you deliberately want a
+# SECOND, settle-count-based redeploy path in addition to the timer.
+REDEPLOY_EVERY_N_CYCLES = 999999
+SETTLE_WAIT_SECS = 15
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
