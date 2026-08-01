@@ -102,15 +102,22 @@ class SymbolManager:
             self._session_losses[symbol] = self._session_losses.get(symbol, 0) + 1
             loss_count = self._session_losses[symbol]
 
-            if loss_count >= config.SYMBOL_SESSION_BAN_LOSSES:
-                self.suspend(symbol, 59940)
-                logger.warning(
-                    f"SESSION BAN: {symbol} hit {loss_count} losses "
-                    f"this session — banned for remainder of session"
-                )
-            else:
-                self.suspend(symbol, config.SYMBOL_LOSS_SUSPEND_MINS)
-                logger.info(f"RESULT: {symbol} LOST ({loss_count}) | loss-suspend applied")
+            # Escalating ladder (Implementation Brief v2, Requirement 2 /
+            # Fix F): 1st consecutive session loss on a symbol -> ladder[0]
+            # minutes, 2nd -> ladder[1], ..., loss_count beyond the ladder's
+            # length holds at the ladder's last (highest) value. This
+            # counter is reset ONLY by a redeploy (a real process restart,
+            # which reconstructs SymbolManager from scratch) — never by a
+            # UTC-midnight or other calendar boundary. See reset_session()
+            # below, which is no longer called on a day rollover.
+            ladder = getattr(config, "SESSION_LOSS_SUSPEND_LADDER_MINS", [60, 120, 180, 240])
+            idx = min(loss_count, len(ladder)) - 1
+            suspend_mins = ladder[idx]
+            self.suspend(symbol, suspend_mins)
+            logger.info(
+                f"RESULT: {symbol} LOST ({loss_count} consecutive this "
+                f"session) | escalating suspend={suspend_mins}min"
+            )
 
     def get_symbol_score(self, symbol: str) -> float:
         return self._symbol_wins.get(symbol, 0) / max(self._symbol_trades.get(symbol, 1), 1)
@@ -265,10 +272,19 @@ class SymbolManager:
         logger.info(f"Active pool: {len(self._all_active)} symbols")
 
     def reset_session(self) -> None:
+        """
+        NOTE: no longer called automatically on a UTC-midnight (or any
+        other calendar) boundary — see Implementation Brief v2,
+        Requirement 2 / Fix F. The escalating loss-suspension ladder in
+        record_result() must persist across calendar-day changes and be
+        reset ONLY by a redeploy (a real process restart naturally
+        reconstructs a fresh SymbolManager, wiping this in-memory state
+        for free). Kept here only for manual/administrative use.
+        """
         self._session_losses.clear()
         self._symbol_wins.clear()
         self._symbol_trades.clear()
-        logger.info("Session counters reset at UTC midnight (suspensions preserved)")
+        logger.info("Session counters reset (manual reset_session() call — suspensions preserved)")
 
     def get_suspended_list(self) -> list:
         now = time.time()
