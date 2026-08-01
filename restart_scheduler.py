@@ -1,231 +1,180 @@
 """
-restart_scheduler.py – Graceful auto-redeploy on Render.
+restart_scheduler.py – Daily Kenya-midnight redeploy scheduler.
 
-v2 → v3 changes (fixed 2-hour cadence):
+Implementation Brief v2, Requirement 2 / Fix G.
 
-  CHANGED — MIN_INTERVAL / MAX_INTERVAL:
-    Was a random 50-90 min window. Now both constants are set to
-    FIXED_INTERVAL_SECS (2 hours), so random.randint(MIN, MAX) always
-    resolves to exactly 7200s. This is now intended to be the ONLY
-    redeploy trigger — see config.py's REDEPLOY_EVERY_N_CYCLES note:
-    the cycle-based redeploy in bot_engine._settle_loop must be
-    disabled (set to an effectively unreachable count) or you will
-    have TWO independent redeploy triggers fighting each other, which
-    is what was causing redeploys roughly every ~2 minutes instead of
-    every 2 hours.
+Replaces the old fixed 2-hour redeploy timer with a schedule that fires
+exactly once every 24 hours, at 00:00 Africa/Nairobi time (EAT, UTC+3 —
+Kenya does not observe DST, so this is a fixed offset year-round).
 
-v1 → v2 changes (BUG 4):
+Public interface (unchanged contract with bot_engine.py):
+  - is_redeploy_pending() -> bool
+        True once the daily timer has fired and a redeploy is due.
+        bot_engine.py's _main_loop() checks this to pause taking on new
+        trades, and _settle_loop() checks it to know when to start
+        draining open contracts before actually redeploying.
+  - trigger_redeploy() -> None
+        Called by bot_engine.py's _settle_loop() ONLY once every open
+        contract has been actively, confirmably closed (or the drain
+        window has been exceeded and the redeploy is being delayed —
+        in which case this is NOT called, see bot_engine.py Fix G).
+        Actually fires the Render deploy hook and clears the pending flag.
+  - run_scheduler() -> coroutine
+        The daily timer loop itself. Started as a background task by
+        bot_engine.py's run() alongside its other loops.
 
-  NEW — trigger_redeploy():
-    A standalone function called by bot_engine when _cycle_count reaches
-    config.REDEPLOY_EVERY_N_CYCLES.  POSTs to RENDER_DEPLOY_HOOK_URL from
-    the environment.  Wrapped in try/except — logs success or failure, never
-    raises, never crashes the caller.
-
-  UNCHANGED — _scheduler_loop() / start_restart_scheduler():
-    Time-based random-interval redeploy (50–90 min) preserved as-is.
-    The two mechanisms are independent: cycle-count redeploy (BUG 4) is
-    orchestrated from bot_engine; the scheduler provides a time-based fallback.
-
-Cycle (repeats forever):
-  1. Sleep a random interval between MIN_INTERVAL and MAX_INTERVAL.
-  2. Signal the bot to pause new trade entries (sets redeploy_pending = True).
-  3. Wait up to DRAIN_TIMEOUT seconds for all active trades to close.
-  4. POST to RENDER_DEPLOY_HOOK_URL → Render builds a fresh instance.
-  5. The new instance starts with redeploy_pending = False (clean slate).
-
-bot_engine.py integration required (two calls):
-  • Before opening any new trade:
-        from keep_alive import is_redeploy_pending
-        if is_redeploy_pending():
-            return  # skip – redeploy is imminent
-
-  • Whenever your open-position count changes (open OR close a trade):
-        from keep_alive import set_active_trades
-        set_active_trades(len(self.open_positions))  # or equivalent
+Draining coordination lives entirely in bot_engine.py (it owns the open
+contracts and the reconciliation / Multiplier max-hold machinery) — this
+module only owns the schedule and the actual deploy-hook trigger.
 """
 
+import asyncio
 import logging
-import os
-import random
-import threading
 import time
+from datetime import datetime, timedelta, timezone
 
-import requests
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # pragma: no cover - Python <3.9 fallback, not expected here
+    ZoneInfo = None
+
+import aiohttp
+
 import config
-from keep_alive import set_redeploy_pending, get_active_trades
 
 logger = logging.getLogger(__name__)
 
-# ── Tuneable constants ────────────────────────────────────────────────────────
-FIXED_INTERVAL_SECS = 2 * 60 * 60   # 2 hours — fixed redeploy cadence
-MIN_INTERVAL  = FIXED_INTERVAL_SECS   # kept as a separate name so the
-MAX_INTERVAL  = FIXED_INTERVAL_SECS   # randint() call below still works
-                                       # unchanged; MIN==MAX means it always
-                                       # returns exactly 7200s.
-DRAIN_TIMEOUT = 10 * 60   # wait at most 10 min for open trades to close
-DRAIN_POLL    = 5         # poll active-trade count every 5 seconds
-# ─────────────────────────────────────────────────────────────────────────────
+_REDEPLOY_TIMEZONE = getattr(config, "REDEPLOY_TIMEZONE", "Africa/Nairobi")
+
+# ── Module-level scheduler state ────────────────────────────────────────────
+_pending: bool = False
+_last_triggered_at: float = 0.0
+_last_scheduled_at: float = 0.0
 
 
-# ─── BUG 4: on-demand redeploy called by bot_engine ──────────────────────────
+def is_redeploy_pending() -> bool:
+    """True once the daily Kenya-midnight timer has fired and a redeploy
+    is due but hasn't been confirmed-triggered yet."""
+    return _pending
+
+
+def _next_nairobi_midnight(now_utc: datetime) -> datetime:
+    """
+    Given the current UTC time, return the next 00:00 Africa/Nairobi
+    instant, expressed in UTC. Uses zoneinfo so DST-free EAT (UTC+3) stays
+    correct even if that ever changes upstream, rather than hardcoding
+    "21:00 UTC" as a magic number.
+    """
+    if ZoneInfo is not None:
+        tz = ZoneInfo(_REDEPLOY_TIMEZONE)
+        now_local = now_utc.astimezone(tz)
+        next_local_midnight = (now_local + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return next_local_midnight.astimezone(timezone.utc)
+
+    # Fallback: Africa/Nairobi has no DST — fixed UTC+3 — so 00:00 EAT is
+    # always 21:00 UTC the previous day.
+    candidate = now_utc.replace(hour=21, minute=0, second=0, microsecond=0)
+    if candidate <= now_utc:
+        candidate += timedelta(days=1)
+    return candidate
+
+
+async def run_scheduler():
+    """
+    Sleeps until the next Africa/Nairobi midnight, sets the pending flag,
+    then repeats. bot_engine.py's _settle_loop() is responsible for
+    noticing is_redeploy_pending() == True, draining open contracts for
+    real, and calling trigger_redeploy() once that's done.
+    """
+    global _pending, _last_scheduled_at
+
+    while True:
+        try:
+            now_utc = datetime.now(timezone.utc)
+            next_fire = _next_nairobi_midnight(now_utc)
+            sleep_secs = max(1.0, (next_fire - now_utc).total_seconds())
+
+            logger.info(
+                f"REDEPLOY SCHEDULER: next redeploy at {next_fire.isoformat()} "
+                f"(00:00 {_REDEPLOY_TIMEZONE}) — sleeping {sleep_secs:.0f}s"
+            )
+            await asyncio.sleep(sleep_secs)
+
+            _pending = True
+            _last_scheduled_at = time.time()
+            logger.warning(
+                "REDEPLOY DUE: daily Kenya-midnight timer fired — "
+                "waiting for bot_engine to drain open contracts before "
+                "actually redeploying"
+            )
+
+            # Wait here until bot_engine.py's _settle_loop() confirms the
+            # drain completed and calls trigger_redeploy() (which clears
+            # _pending). Poll rather than block indefinitely so a stuck
+            # drain doesn't wedge this loop forever — just keep logging.
+            waited = 0
+            while _pending:
+                await asyncio.sleep(30)
+                waited += 30
+                if waited % 600 == 0:
+                    logger.warning(
+                        f"REDEPLOY STILL PENDING: {waited}s since due — "
+                        f"bot_engine is still draining open contracts "
+                        f"rather than wiping their bookkeeping"
+                    )
+
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error(f"restart_scheduler.run_scheduler: {exc}")
+            await asyncio.sleep(60)
+
 
 def trigger_redeploy() -> None:
     """
-    POST to the Render deploy hook URL to trigger an immediate redeploy.
-
-    Called by bot_engine._main_loop() when _cycle_count reaches
-    config.REDEPLOY_EVERY_N_CYCLES.  This function:
-      • Reads RENDER_DEPLOY_HOOK_URL from the environment (primary) or
-        config (fallback).
-      • POSTs with a 15-second timeout.
-      • Logs success or failure.
-      • NEVER raises — all exceptions are caught so bot_engine is never
-        crashed by a network hiccup or missing env var.
+    Fires the Render deploy hook (if configured) and clears the pending
+    flag. Called by bot_engine.py ONLY after every open contract has been
+    actively, confirmably closed.
     """
-    try:
-        url = (os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
-               or getattr(config, "RENDER_DEPLOY_HOOK_URL", ""))
+    global _pending, _last_triggered_at
 
-        if not url:
-            logger.warning(
-                "trigger_redeploy: RENDER_DEPLOY_HOOK_URL is not set — "
-                "skipping redeploy.  Set the env var in Render → Environment.")
-            return
+    hook_url = getattr(config, "RENDER_DEPLOY_HOOK_URL", "")
+    _last_triggered_at = time.time()
 
-        logger.info("trigger_redeploy: POSTing to Render deploy hook …")
-        r = requests.post(url, timeout=15)
-
-        if r.ok:
-            logger.info(
-                f"trigger_redeploy: deploy triggered ✓ (HTTP {r.status_code}). "
-                "Render is building a fresh instance.")
-        else:
-            logger.error(
-                f"trigger_redeploy: deploy hook returned "
-                f"HTTP {r.status_code}: {r.text[:200]}")
-
-    except Exception as exc:
-        logger.error(
-            f"trigger_redeploy: POST failed — {exc}. "
-            "Bot will continue running; redeploy was not triggered.")
-
-
-# ─── Time-based scheduler loop ────────────────────────────────────────────────
-
-def _scheduler_loop() -> None:
-    # BUG 3 FIX: wrap config attribute access in try/except so a missing or
-    # mis-typed config value never crashes the background scheduler thread.
-    try:
-        url = config.RENDER_DEPLOY_HOOK_URL
-    except AttributeError:
+    if not hook_url:
         logger.warning(
-            "restart_scheduler: config.RENDER_DEPLOY_HOOK_URL is not defined – "
-            "auto-redeploy scheduler is disabled. "
-            "Add RENDER_DEPLOY_HOOK_URL to config.py or as a Render env var."
+            "trigger_redeploy() called but RENDER_DEPLOY_HOOK_URL is not "
+            "set — clearing pending flag without actually redeploying"
         )
+        _pending = False
         return
 
-    if not url:
-        logger.warning(
-            "RENDER_DEPLOY_HOOK_URL is not set – "
-            "auto-redeploy scheduler is disabled. "
-            "Add the env var in Render → Environment to enable it."
-        )
-        return
-
-    logger.info(
-        f"Restart scheduler started "
-        f"(fixed interval {FIXED_INTERVAL_SECS // 60} min, "
-        f"drain timeout {DRAIN_TIMEOUT // 60} min)."
-    )
-
-    while True:
-        # ── 1. Random sleep ──────────────────────────────────────────────────
-        interval = random.randint(MIN_INTERVAL, MAX_INTERVAL)
-        logger.info(
-            f"Restart scheduler: next redeploy in "
-            f"{interval // 60}m {interval % 60}s."
-        )
-        time.sleep(interval)
-
-        # ── 2. Pause new trade entries ────────────────────────────────────────
-        logger.info(
-            "Restart scheduler: signalling bot to pause new trade entries …"
-        )
-        set_redeploy_pending(True)
-
-        # ── 3. Drain open trades ──────────────────────────────────────────────
-        deadline = time.time() + DRAIN_TIMEOUT
-        while time.time() < deadline:
-            active = get_active_trades()
-            if active == 0:
-                logger.info(
-                    "Restart scheduler: all trades closed – proceeding to deploy."
-                )
-                break
-            logger.info(
-                f"Restart scheduler: {active} open trade(s) remaining, "
-                f"waiting …"
-            )
-            time.sleep(DRAIN_POLL)
-        else:
-            logger.warning(
-                f"Restart scheduler: drain timeout – "
-                f"{get_active_trades()} trade(s) still open. Deploying anyway."
-            )
-
-        # ── 4. Trigger Render redeploy ────────────────────────────────────────
-        logger.info("Restart scheduler: POSTing to Render deploy hook …")
+    async def _fire():
         try:
-            # Re-read URL defensively in case config was patched at runtime
-            try:
-                url = config.RENDER_DEPLOY_HOOK_URL
-            except AttributeError:
-                logger.error(
-                    "Restart scheduler: config.RENDER_DEPLOY_HOOK_URL disappeared – "
-                    "clearing pause flag and skipping this redeploy cycle."
-                )
-                set_redeploy_pending(False)
-                continue
+            async with aiohttp.ClientSession() as session:
+                async with session.post(hook_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    body = await resp.text()
+                    if resp.status in (200, 201, 202):
+                        logger.info(f"REDEPLOY HOOK FIRED: HTTP {resp.status}")
+                    else:
+                        logger.error(
+                            f"REDEPLOY HOOK FAILED: HTTP {resp.status} — {body[:500]}"
+                        )
+        except Exception as exc:
+            logger.error(f"REDEPLOY HOOK ERROR: {exc}")
 
-            if not url:
-                logger.warning(
-                    "Restart scheduler: RENDER_DEPLOY_HOOK_URL is empty – "
-                    "skipping redeploy, clearing pause flag."
-                )
-                set_redeploy_pending(False)
-                continue
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_fire())
+    except RuntimeError:
+        # No running loop — fall back to a synchronous best-effort call.
+        try:
+            import requests
+            resp = requests.post(hook_url, timeout=20)
+            logger.info(f"REDEPLOY HOOK FIRED (sync): HTTP {resp.status_code}")
+        except Exception as exc:
+            logger.error(f"REDEPLOY HOOK ERROR (sync fallback): {exc}")
 
-            r = requests.post(url, timeout=15)
-            if r.ok:
-                logger.info(
-                    f"Restart scheduler: deploy triggered ✓ (HTTP {r.status_code}). "
-                    "Render is building a fresh instance."
-                )
-                # Leave redeploy_pending = True – the dying process won't open
-                # any more trades and the new process starts clean (False).
-            else:
-                logger.error(
-                    f"Restart scheduler: deploy hook returned "
-                    f"HTTP {r.status_code}: {r.text[:200]} – "
-                    "clearing pause flag; will retry next cycle."
-                )
-                set_redeploy_pending(False)
-        except requests.RequestException as exc:
-            logger.error(
-                f"Restart scheduler: POST failed – {exc}. "
-                "Clearing pause flag; will retry next cycle."
-            )
-            set_redeploy_pending(False)
-
-
-def start_restart_scheduler() -> None:
-    """Spawn the scheduler as a background daemon thread."""
-    t = threading.Thread(
-        target=_scheduler_loop,
-        name="restart-scheduler",
-        daemon=True,
-    )
-    t.start()
-    logger.info("Restart scheduler thread started ✓")
+    _pending = False
