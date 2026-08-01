@@ -61,7 +61,7 @@ from trade_journal import TradeJournal
 from symbol_manager import SymbolManager
 import indicators as ind
 from keep_alive import (update_status, set_active_trades,
-                        is_redeploy_pending, record_trade,
+                        record_trade,
                         record_signal, record_failure,
                         update_open_contracts, _status)
 from symbols import get_symbol_class
@@ -71,8 +71,18 @@ logger = logging.getLogger(__name__)
 DASHBOARD_PUSH_EVERY  = 5        # push every 5 seconds
 INIT_BATCH_SIZE       = getattr(config, "INIT_BATCH_SIZE", 10)
 
-CONTRACT_MAX_AGE_SECS     = getattr(config, "CONTRACT_MAX_AGE_SECS",      120)
-CONTRACT_FORCE_CLOSE_SECS = getattr(config, "CONTRACT_FORCE_CLOSE_SECS",  300)
+CONTRACT_MAX_AGE_SECS     = getattr(config, "CONTRACT_MAX_AGE_SECS",      900)
+CONTRACT_FORCE_CLOSE_SECS = getattr(config, "CONTRACT_FORCE_CLOSE_SECS", 1350)
+
+# ── Reconciliation (Fix C) ───────────────────────────────────────────────
+RECONCILE_POLL_INTERVAL_SECS = getattr(config, "RECONCILE_POLL_INTERVAL_SECS", 30)
+RECONCILE_MAX_SECS           = getattr(config, "RECONCILE_MAX_SECS",           1800)
+
+# ── Multiplier max-hold (Fix E) ──────────────────────────────────────────
+MULTIPLIER_MAX_HOLD_SECS = getattr(config, "MULTIPLIER_MAX_HOLD_MINS", 30) * 60
+
+# ── Redeploy drain (Fix G) ───────────────────────────────────────────────
+DRAIN_MAX_SECS = getattr(config, "DRAIN_MAX_SECS", 1800)
 
 
 # ─── Result container ──────────────────────────────────────────────────────────
@@ -140,6 +150,12 @@ class BotEngine:
         self._session_start_balance:  float              = 0.0
         self._open_contracts:         dict               = {}
         self._contract_open_times:    dict               = {}
+
+        # ── Contracts past CONTRACT_FORCE_CLOSE_SECS that still haven't
+        #    settled for real — actively re-polled on RECONCILE_POLL_
+        #    INTERVAL_SECS rather than ever being fabricated (Fix C).
+        #    {contract_id: {"reconcile_started_at": epoch, "last_poll": epoch}}
+        self._reconciling:            dict               = {}
 
         self._htf:                    Dict[str, CandlestickBuilder] = {}
         self._mtf:                    Dict[str, CandlestickBuilder] = {}
@@ -361,9 +377,14 @@ class BotEngine:
         except Exception:
             pass
 
-        dash_task    = asyncio.create_task(self._dashboard_loop())
-        settle_task  = asyncio.create_task(self._settle_loop())
+        dash_task     = asyncio.create_task(self._dashboard_loop())
+        settle_task   = asyncio.create_task(self._settle_loop())
         degraded_task = asyncio.create_task(self._degraded_retry_loop())
+        # Fix G: daily Kenya-midnight redeploy timer, replacing the old
+        # fixed 2-hour schedule. Sets restart_scheduler.is_redeploy_pending()
+        # True once every 24h; _settle_loop drains and then calls
+        # restart_scheduler.trigger_redeploy() when draining completes.
+        redeploy_task = asyncio.create_task(restart_scheduler.run_scheduler())
 
         try:
             await self._main_loop()
@@ -375,6 +396,7 @@ class BotEngine:
             dash_task.cancel()
             settle_task.cancel()
             degraded_task.cancel()
+            redeploy_task.cancel()
             ws_task.cancel()
 
     # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
@@ -556,7 +578,39 @@ class BotEngine:
                 self._push_dashboard()
             except Exception:
                 pass
+            try:
+                self._check_tracking_divergence()
+            except Exception:
+                pass
             await asyncio.sleep(DASHBOARD_PUSH_EVERY)
+
+    def _check_tracking_divergence(self) -> None:
+        """
+        Fix D: bot_engine's _open_contracts and deriv_client's own tracking
+        sets (_polling_contracts / _subscribed_contracts) must always
+        describe the same set of contracts. Once Fix C removes the
+        fabrication path this should never happen — treat any occurrence
+        as a bug to investigate, not something to silently absorb.
+        """
+        try:
+            tracked_by_client = self.client.get_tracked_contract_ids()
+        except Exception:
+            return
+
+        ours = set(self._open_contracts.keys())
+        # Contracts in reconcile_pending are still legitimately open even
+        # though the client-side polling entry for them was already
+        # consumed by the mechanism that pushed them into reconciliation —
+        # don't flag those as a divergence.
+        ours_excl_reconciling = ours - set(self._reconciling.keys())
+
+        missing_from_client = ours_excl_reconciling - tracked_by_client
+        if missing_from_client:
+            logger.warning(
+                f"TRACKING DIVERGENCE: {len(missing_from_client)} contract(s) "
+                f"open in bot_engine but not tracked by deriv_client: "
+                f"{missing_from_client}"
+            )
 
     def _push_dashboard(self):
         risk_s  = self.risk.summary()
@@ -625,18 +679,29 @@ class BotEngine:
         while True:
             cycle_start = time.time()
 
-            # 1. UTC day rollover → reset session
+            # 1. UTC day rollover → daily-loss-limit bookkeeping only.
+            #    Per Implementation Brief v2, Requirement 2 / Fix F: the
+            #    escalating per-symbol loss-suspension ladder must NOT
+            #    reset on this (or any other) calendar boundary — only a
+            #    redeploy (real process restart) resets it, which happens
+            #    for free since SymbolManager is reconstructed from
+            #    scratch on startup. self.symbols.reset_session() is
+            #    deliberately no longer called here. The daily-loss-limit
+            #    concept below is separate and legitimate — left on its
+            #    existing UTC-midnight boundary per the brief's open
+            #    question (not moved to Kenya midnight without explicit
+            #    sign-off).
             today = _dt.datetime.utcnow().day
             if today != self._current_utc_day:
-                self.symbols.reset_session()
                 self._confirmed_daily_loss = 0.0
                 self._day_start_balance    = self.client.balance
                 self._current_utc_day      = today
                 logger.info(
-                    f"UTC day changed → session reset | "
+                    f"UTC day changed → daily-loss-limit reset "
+                    f"(symbol suspension ladder NOT reset — redeploy-only) | "
                     f"day_start_balance=${self._day_start_balance:.4f}")
 
-            if is_redeploy_pending():
+            if restart_scheduler.is_redeploy_pending():
                 await asyncio.sleep(scan_sleep)
                 continue
 
@@ -944,21 +1009,21 @@ class BotEngine:
 
         return True
 
-    # ── Contract result callback ───────────────────────────────────────────────
+    # ── Shared settlement interpretation (Fix C.1, Requirement 1) ──────────────
+    #
+    # ONE implementation of "how do we turn a real Deriv settlement response
+    # into a recorded win/loss", used by _on_contract_result() (WS push /
+    # immediate poll), the reconciliation path in _handle_orphans(), and the
+    # Multiplier max-hold close path. Must NEVER be called with a fabricated
+    # or guessed `poc` — every call site is required to have a real
+    # is_sold/is_expired response (or a real sell/profit_table response
+    # reshaped into the same field names) before calling this.
 
-    async def _on_contract_result(self, cid: str, msg: dict):
-        poc = msg.get("proposal_open_contract", {})
-        if not poc.get("is_sold"):
-            return
-
-        info = self._open_contracts.pop(cid, None)
-        self._contract_open_times.pop(cid, None)
-        if not info:
-            return
-
-        symbol      = info["symbol"]
-        stake       = info["stake"]
-        rec         = info.get("rec")
+    async def _apply_settlement(self, cid: str, info: dict, poc: dict,
+                                 close_reason: str = "normal") -> None:
+        symbol = info["symbol"]
+        stake  = info["stake"]
+        rec    = info.get("rec")
 
         sell_price = float(poc.get("sell_price", 0))
         payout     = float(poc.get("payout",     sell_price))
@@ -1015,17 +1080,20 @@ class BotEngine:
         set_active_trades(len(self._open_contracts))
         update_status(streak=self.risk.current_streak)
 
-        record_trade(
-            symbol        = symbol,
-            direction     = info.get("direction", "?"),
-            stake         = stake,
-            pnl           = pnl,
-            balance_after = self.client.balance,
-            won           = won,
-            strategy      = info.get("strategy", ""),
-            multiplier    = info.get("multiplier", None),
-            close_reason  = "normal",
-        )
+        try:
+            record_trade(
+                symbol        = symbol,
+                direction     = info.get("direction", "?"),
+                stake         = stake,
+                pnl           = pnl,
+                balance_after = self.client.balance,
+                won           = won,
+                strategy      = strategy,
+                multiplier    = info.get("multiplier", None),
+                close_reason  = close_reason,
+            )
+        except Exception:
+            pass
 
         try:
             self._push_dashboard()
@@ -1035,17 +1103,37 @@ class BotEngine:
         streak = self.risk.current_streak
         logger.info(
             f"{'✅ WIN' if won else '❌ LOSS'} | "
-            f"{symbol} | {info.get('strategy', '')} | "
+            f"{symbol} | {strategy} | "
             f"pnl=${pnl:+.4f} | "
             f"balance=${self.client.balance:.4f} | "
-            f"streak={streak}")
+            f"streak={streak} | close_reason={close_reason}")
+
+    # ── Contract result callback ───────────────────────────────────────────────
+
+    async def _on_contract_result(self, cid: str, msg: dict):
+        poc = msg.get("proposal_open_contract", {})
+        if not poc.get("is_sold"):
+            return
+
+        info = self._open_contracts.pop(cid, None)
+        self._contract_open_times.pop(cid, None)
+        self._reconciling.pop(cid, None)
+        if not info:
+            return
+
+        try:
+            self.client.stop_tracking(cid)
+        except Exception:
+            pass
+
+        await self._apply_settlement(cid, info, poc, close_reason="normal")
 
     # ── Settle loop — independent of the scan loop ─────────────────────────────
 
     async def _settle_loop(self):
         settle_wait    = getattr(config, "SETTLE_WAIT_SECS", 15)
         redeploy_every = getattr(config, "REDEPLOY_EVERY_N_CYCLES", 6)
-        drain_max_secs = getattr(config, "DRAIN_MAX_SECS", 900)
+        drain_max_secs = DRAIN_MAX_SECS
 
         while True:
             try:
@@ -1055,7 +1143,19 @@ class BotEngine:
                 self._check_confirmed_loss_limit()
 
                 self._cycle_count += 1
-                if self._cycle_count >= redeploy_every:
+
+                # Implementation Brief v2, Fix G: restart_scheduler's daily
+                # Kenya-midnight timer is now the single authoritative
+                # redeploy trigger (is_redeploy_pending() flips True once
+                # per day). REDEPLOY_EVERY_N_CYCLES stays disabled at
+                # 999999 by default (see config.py) — kept only so this
+                # doesn't silently break if it's ever deliberately lowered.
+                redeploy_wanted = (
+                    self._cycle_count >= redeploy_every
+                    or restart_scheduler.is_redeploy_pending()
+                )
+
+                if redeploy_wanted:
                     n_open = len(self._open_contracts)
                     logger.info(
                         f"REDEPLOY TRIGGERED: draining {n_open} open "
@@ -1063,10 +1163,10 @@ class BotEngine:
 
                     drain_started = time.time()
                     while self._open_contracts:
-                        # Keep running the orphan force-close safety net
-                        # while draining — without this, a contract that
-                        # never resolves via WS/poll blocks every future
-                        # redeploy cycle forever.
+                        # Actively try to confirm-close everything
+                        # remaining — reuses the exact same reconciliation
+                        # (Fix C) and Multiplier max-hold (Fix E) machinery
+                        # as normal operation. Never a guess.
                         await self._handle_orphans()
                         if not self._open_contracts:
                             break
@@ -1078,23 +1178,29 @@ class BotEngine:
                                 for cid, info in self._open_contracts.items()
                             ]
                             logger.warning(
-                                f"DRAIN_MAX_SECS ({drain_max_secs}s) exceeded — "
-                                f"force-clearing {len(self._open_contracts)} stuck "
-                                f"contract(s) and proceeding with redeploy: "
-                                f"{', '.join(stuck)}")
-                            self._open_contracts.clear()
-                            self._contract_open_times.clear()
-                            set_active_trades(0)
+                                f"DRAIN_MAX_SECS ({drain_max_secs}s) exceeded "
+                                f"with {len(self._open_contracts)} contract(s) "
+                                f"still not confirmed-closed: {', '.join(stuck)} "
+                                f"— DELAYING the redeploy rather than wiping "
+                                f"their bookkeeping (Requirement 1). Will keep "
+                                f"actively trying to close them and re-check "
+                                f"on the next settle tick."
+                            )
                             break
 
                         logger.info(
                             f"Draining — {len(self._open_contracts)} "
-                            f"contract(s) open")
+                            f"contract(s) open, actively confirming closes")
                         await asyncio.sleep(5)
 
-                    restart_scheduler.trigger_redeploy()
-                    logger.info("Redeploy triggered — standing by")
-                    self._cycle_count = 0
+                    if not self._open_contracts:
+                        restart_scheduler.trigger_redeploy()
+                        logger.info("Redeploy triggered — standing by")
+                        self._cycle_count = 0
+                    # else: redeploy stays pending. We deliberately do NOT
+                    # clear _open_contracts / _contract_open_times here —
+                    # the next settle tick will re-enter this branch and
+                    # keep trying to drain for real.
 
             except asyncio.CancelledError:
                 return
@@ -1105,73 +1211,187 @@ class BotEngine:
 
     async def _handle_orphans(self):
         now = time.time()
+        multiplier_symbols = getattr(config, "MULTIPLIER_SYMBOLS", set())
 
         for cid, info in list(self._open_contracts.items()):
             opened_at = info.get("opened_at", now)
             age       = now - opened_at
+            symbol    = info.get("symbol", "UNKNOWN")
+
+            # Multiplier contracts (no fixed expiry) get their own explicit,
+            # active-close-only path (Fix E) — never the Rise/Fall
+            # age-based logic below.
+            if symbol in multiplier_symbols:
+                await self._handle_multiplier_orphan(cid, info, age)
+                continue
+
+            # Already in the reconcile-pending state from a previous tick —
+            # keep polling on its own cadence rather than re-deriving age.
+            if cid in self._reconciling:
+                await self._reconcile_pending_contract(cid, info)
+                continue
 
             if age >= CONTRACT_FORCE_CLOSE_SECS:
-                symbol = info.get("symbol", "UNKNOWN")
-                stake  = info.get("stake", 0.0)
-                rec    = info.get("rec")
-
-                try:
-                    self.symbols.record_result(symbol, won=False)
-                except Exception:
-                    pass
-                try:
-                    self.risk.register_close(rec, exit_price=0, pnl=-stake)
-                except Exception:
-                    pass
-                self.symbols.record_contract_closed(symbol)
-
-                orphan_strategy = info.get("strategy", "unknown")
-                orphan_score    = float(getattr(info.get("sig"), "score", 0.0))
-                try:
-                    strategy_stats.stats.record_trade(
-                        strategy    = orphan_strategy,
-                        symbol      = symbol,
-                        entry_score = orphan_score,
-                        won         = False,
-                        stake       = stake,
-                        payout      = 0.0,
-                    )
-                except Exception as exc:
-                    logger.warning(f"strategy_stats.record_trade(orphan {symbol}) failed: {exc}")
-                try:
-                    meta_labeling.record_outcome(
-                        strategy=orphan_strategy, symbol=symbol, won=False)
-                except Exception as exc:
-                    logger.warning(f"meta_labeling.record_outcome(orphan {symbol}) failed: {exc}")
-
-                self._open_contracts.pop(cid, None)
-                self._contract_open_times.pop(cid, None)
-                set_active_trades(len(self._open_contracts))
-
-                try:
-                    record_trade(
-                        symbol        = symbol,
-                        direction     = info.get("direction", "?"),
-                        stake         = stake,
-                        pnl           = -stake,
-                        balance_after = self.client.balance,
-                        won           = False,
-                        strategy      = "ORPHAN_TIMEOUT",
-                        multiplier    = info.get("multiplier", None),
-                        close_reason  = "timeout",
-                    )
-                except Exception:
-                    pass
-
-                try:
-                    self._push_dashboard()
-                except Exception:
-                    pass
-
-                logger.error(f"ORPHAN LOSS: {cid} -{stake}")
-
+                await self._begin_reconciliation(cid, info)
             elif age >= CONTRACT_MAX_AGE_SECS:
                 try:
                     await self.client.force_check_contract(cid)
                 except Exception as exc:
                     logger.warning(f"force_check_contract({cid}): {exc}")
+
+    # ── Reconciliation entry point (Fix C) ──────────────────────────────────
+    #
+    # Replaces the old "just declare a loss" ORPHAN_TIMEOUT branch. A
+    # Rise/Fall contract past CONTRACT_FORCE_CLOSE_SECS gets exactly one
+    # more authoritative check; if it's genuinely settled, it's recorded
+    # for real through the shared _apply_settlement() helper (same logic
+    # _on_contract_result() uses). If not, it moves into reconcile_pending
+    # and is retried — it is NEVER marked win/loss on a guess.
+
+    async def _begin_reconciliation(self, cid: str, info: dict) -> None:
+        symbol = info.get("symbol", "UNKNOWN")
+        try:
+            poc = await self.client.force_check_contract(cid)
+        except Exception as exc:
+            logger.warning(f"force_check_contract({cid}) at reconcile-start: {exc}")
+            poc = {}
+
+        if poc.get("is_sold") or poc.get("is_expired"):
+            self._open_contracts.pop(cid, None)
+            self._contract_open_times.pop(cid, None)
+            self._reconciling.pop(cid, None)
+            try:
+                self.client.stop_tracking(cid)
+            except Exception:
+                pass
+            await self._apply_settlement(cid, info, poc, close_reason="normal")
+            return
+
+        now = time.time()
+        self._reconciling[cid] = {"reconcile_started_at": now, "last_poll": now}
+        logger.warning(
+            f"RECONCILE PENDING: {cid} ({symbol}) still open after "
+            f"{CONTRACT_FORCE_CLOSE_SECS}s — polling every "
+            f"{RECONCILE_POLL_INTERVAL_SECS}s until a real result arrives; "
+            f"dashboard keeps it visibly open/pending, never a guessed result"
+        )
+        try:
+            self._push_dashboard()
+        except Exception:
+            pass
+
+    async def _reconcile_pending_contract(self, cid: str, info: dict) -> None:
+        state = self._reconciling.get(cid)
+        if not state:
+            return
+
+        now = time.time()
+        if now - state.get("last_poll", 0) < RECONCILE_POLL_INTERVAL_SECS:
+            return
+        state["last_poll"] = now
+
+        symbol = info.get("symbol", "UNKNOWN")
+        try:
+            poc = await self.client.force_check_contract(cid)
+        except Exception as exc:
+            logger.warning(f"force_check_contract({cid}) during reconcile: {exc}")
+            poc = {}
+
+        elapsed = now - state["reconcile_started_at"]
+
+        if poc.get("is_sold") or poc.get("is_expired"):
+            self._open_contracts.pop(cid, None)
+            self._contract_open_times.pop(cid, None)
+            self._reconciling.pop(cid, None)
+            try:
+                self.client.stop_tracking(cid)
+            except Exception:
+                pass
+            await self._apply_settlement(cid, info, poc, close_reason="reconcile_delayed")
+            return
+
+        if elapsed >= RECONCILE_MAX_SECS:
+            # Last-resort truth source (Fix C.3) — a different real query,
+            # never a guess. If it doesn't find anything either, keep
+            # retrying in the background; the contract stays visibly
+            # open/pending forever if it has to, but never gets a
+            # fabricated win/loss.
+            try:
+                pt = await self.client.profit_table_lookup(cid)
+            except Exception as exc:
+                logger.error(f"profit_table_lookup({cid}) failed: {exc}")
+                pt = {}
+
+            if pt.get("is_sold"):
+                self._open_contracts.pop(cid, None)
+                self._contract_open_times.pop(cid, None)
+                self._reconciling.pop(cid, None)
+                try:
+                    self.client.stop_tracking(cid)
+                except Exception:
+                    pass
+                await self._apply_settlement(cid, info, pt, close_reason="reconcile_delayed")
+                return
+
+            logger.error(
+                f"RECONCILE STILL PENDING: {cid} ({symbol}) unresolved "
+                f"after {elapsed:.0f}s (ceiling {RECONCILE_MAX_SECS}s) — "
+                f"escalating loudly; still NOT recording a guessed result, "
+                f"will keep retrying in the background"
+            )
+
+    # ── Multiplier contracts — explicit, active closing only (Fix E) ───────
+
+    async def _handle_multiplier_orphan(self, cid: str, info: dict, age: float) -> None:
+        if age < MULTIPLIER_MAX_HOLD_SECS:
+            return
+
+        symbol = info.get("symbol", "UNKNOWN")
+        logger.info(
+            f"MULTIPLIER MAX-HOLD: {cid} ({symbol}) held {age:.0f}s >= "
+            f"{MULTIPLIER_MAX_HOLD_SECS}s — actively selling to realize the "
+            f"real current price (never a guess, per Fix E / Requirement 1)"
+        )
+        try:
+            sell_resp = await self.client.sell_contract(cid, price=0)
+        except Exception as exc:
+            logger.error(f"sell_contract({cid}) failed during max-hold close: {exc}")
+            sell_resp = None
+
+        if not sell_resp:
+            # No confirmed close — this contract must NEVER be removed from
+            # _open_contracts without one. Leave it open and tracked; retry
+            # next _handle_orphans tick.
+            logger.warning(
+                f"MULTIPLIER SELL FAILED: {cid} ({symbol}) — still open, "
+                f"will retry active close next cycle (no bookkeeping wiped)"
+            )
+            return
+
+        # One authoritative follow-up check to get profit/sell_price in the
+        # same shape _apply_settlement() expects.
+        try:
+            poc = await self.client.force_check_contract(cid)
+        except Exception:
+            poc = {}
+
+        if not (poc.get("is_sold") or poc.get("is_expired")):
+            # Fall back to the sell response itself — sold_for is a real,
+            # confirmed value even if the follow-up check hasn't caught up.
+            sold_for = float(sell_resp.get("sold_for", 0))
+            stake    = float(info.get("stake", 0.0))
+            poc = {
+                "is_sold":    1,
+                "sell_price": sold_for,
+                "profit":     sold_for - stake,
+                "payout":     sold_for,
+            }
+
+        self._open_contracts.pop(cid, None)
+        self._contract_open_times.pop(cid, None)
+        self._reconciling.pop(cid, None)
+        try:
+            self.client.stop_tracking(cid)
+        except Exception:
+            pass
+        await self._apply_settlement(cid, info, poc, close_reason="time_based_close")
