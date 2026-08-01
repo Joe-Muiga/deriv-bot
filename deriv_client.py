@@ -471,8 +471,8 @@ class DerivClient:
                 poc.get("is_sold") or poc.get("is_expired") or poc.get("status") == "sold"
             )
             if cid and closed:
-                self._subscribed_contracts.discard(cid)
-                info = self._polling_contracts.pop(cid, None)
+                info = self._polling_contracts.get(cid)
+                self.stop_tracking(cid)
                 if info and info.get("callback"):
                     try:
                         cb_result = info["callback"]({"proposal_open_contract": poc})
@@ -506,7 +506,8 @@ class DerivClient:
                 try:
                     result = await self.force_check_contract(cid)
                     if result.get("is_sold") or result.get("is_expired") or result.get("status") == "sold":
-                        info = self._polling_contracts.pop(cid, None)
+                        info = self._polling_contracts.get(cid)
+                        self.stop_tracking(cid)
                         if info and info.get("callback"):
                             cb_result = info["callback"]({"proposal_open_contract": result})
                             if asyncio.iscoroutine(cb_result) or isinstance(cb_result, asyncio.Future):
@@ -515,6 +516,68 @@ class DerivClient:
                     await asyncio.sleep(0.5)
                 except Exception as e:
                     logger.error(f"POLL ERROR {cid}: {e}")
+
+    # ─── Fix D: stop tracking a contract on both resolution paths ────────────
+
+    def stop_tracking(self, contract_id: str) -> None:
+        """
+        Remove *contract_id* from BOTH tracking sets (_polling_contracts and
+        _subscribed_contracts). Whichever side closes a contract first must
+        call this so a late-arriving real result from the other mechanism
+        can never be silently dropped (Implementation Brief v2, Fix D).
+        Safe to call even if the contract isn't tracked by one or either
+        mechanism.
+        """
+        cid = str(contract_id)
+        self._polling_contracts.pop(cid, None)
+        self._subscribed_contracts.discard(cid)
+
+    def get_tracked_contract_ids(self) -> set:
+        """
+        Union of every contract_id currently tracked by either resolution
+        mechanism — used by bot_engine.py's periodic divergence check
+        (Fix D) to confirm its own _open_contracts never drifts out of
+        sync with what deriv_client is actually still watching.
+        """
+        return set(self._polling_contracts.keys()) | set(self._subscribed_contracts)
+
+    # ─── Last-resort truth source (Fix C.3) ───────────────────────────────
+
+    async def profit_table_lookup(self, contract_id: str) -> dict:
+        """
+        Query Deriv's profit_table as a last-resort truth source for a
+        contract that has failed to resolve via force_check_contract for
+        an extended period (Implementation Brief v2, Fix C.3). Scans
+        recent transactions for a matching contract_id.
+
+        Returns a dict with at least is_sold/profit/sell_price when a
+        match is found, or {} if not found / on any failure. Never raises.
+        """
+        try:
+            resp = await self._send(
+                {
+                    "profit_table": 1,
+                    "description": 1,
+                    "limit": 50,
+                    "sort": "DESC",
+                },
+                timeout=20,
+            )
+            transactions = resp.get("profit_table", {}).get("transactions", [])
+            for txn in transactions:
+                if str(txn.get("contract_id", "")) == str(contract_id):
+                    return {
+                        "is_sold":    1,
+                        "contract_id": contract_id,
+                        "profit":     float(txn.get("sell_price", 0)) - float(txn.get("buy_price", 0)),
+                        "sell_price": float(txn.get("sell_price", 0)),
+                        "buy_price":  float(txn.get("buy_price", 0)),
+                        "sold_for":   txn.get("sell_price"),
+                    }
+            return {}
+        except Exception as e:
+            logger.error(f"PROFIT_TABLE LOOKUP ERROR {contract_id}: {e}")
+            return {}
 
     async def subscribe_contract(
         self,
@@ -942,7 +1005,21 @@ class DerivClient:
             self._last_buy_time = time.time()
 
             contract_type = "CALL" if direction == "LONG" else "PUT"
-            logger.info(f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f}")
+
+            # Fix A (Implementation Brief v2): use the configured duration
+            # instead of a hardcoded 5m — this was the literal source of
+            # the "config says 14, bot trades 5" mismatch. Per-symbol
+            # override takes precedence if one is ever confirmed necessary
+            # by a contracts_for audit; falls back to 5m/"m" only if
+            # config doesn't define TRADE_DURATION at all.
+            overrides = getattr(config, "TRADE_DURATION_OVERRIDES", {})
+            duration      = overrides.get(symbol, getattr(config, "TRADE_DURATION", 5))
+            duration_unit = getattr(config, "TRADE_DURATION_UNIT", "m")
+
+            logger.info(
+                f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f} "
+                f"duration={duration}{duration_unit}"
+            )
 
             proposal_req = {
                 "proposal":      1,
@@ -950,8 +1027,8 @@ class DerivClient:
                 "basis":         "stake",
                 "contract_type": contract_type,
                 "currency":      "USD",
-                "duration":      5,
-                "duration_unit": "m",
+                "duration":      duration,
+                "duration_unit": duration_unit,
                 "underlying_symbol": symbol,
             }
             barrier = kwargs.get("barrier")
@@ -1403,8 +1480,7 @@ class DerivClient:
                 f"CONTRACT SOLD: {contract_id} | sold_for=${result.get('sold_for')}"
             )
             # It's closed now — stop tracking it under both resolution paths.
-            self._polling_contracts.pop(str(contract_id), None)
-            self._subscribed_contracts.discard(str(contract_id))
+            self.stop_tracking(contract_id)
             return result
 
         except Exception as e:
