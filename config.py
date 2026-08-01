@@ -356,17 +356,52 @@ ATR_PERIOD            = 14
 BREAKOUT_ATR_MULT     = 1.5
 
 # ── CONTRACT SETTINGS ────────────────────────────────────────
-# Multiplier contracts — keep short to avoid funding fees
-MAX_TRADE_OPEN_MINS   = 30   # force close at 30 min
-CHECK_TRADE_MINS      = 20   # check at 20 min
-CONTRACT_CHECK_SECS   = 1200
-CONTRACT_TIMEOUT_SECS = 1800
+# Real, actively-used constants — bot_engine.py reads these two names
+# directly (previously it read CONTRACT_MAX_AGE_SECS/CONTRACT_FORCE_CLOSE_SECS
+# which didn't exist here at all, silently falling back to unsafe 120s/300s
+# hardcoded defaults against a real 14-minute/840s contract duration — see
+# Implementation Brief v2, Fix B). Derived from TRADE_DURATION (14m = 840s)
+# with a generous margin, per Deriv's documented multi-minute settlement lag.
+CONTRACT_MAX_AGE_SECS     = 900     # trigger a non-destructive poll
+CONTRACT_FORCE_CLOSE_SECS = 1350    # trigger active reconciliation (never a guess)
+
+# Per-symbol Rise/Fall duration overrides (seconds omitted — same unit as
+# TRADE_DURATION_UNIT). Populate here if a contracts_for audit finds a
+# symbol that rejects the default TRADE_DURATION (14m). Empty = every
+# symbol uses TRADE_DURATION/TRADE_DURATION_UNIT unchanged.
+TRADE_DURATION_OVERRIDES = {}
+
+# ── RECONCILIATION (never-fabricate-a-result path, Fix C) ────
+# After CONTRACT_FORCE_CLOSE_SECS, a Rise/Fall contract that still hasn't
+# settled moves to "reconcile_pending" instead of being marked a loss.
+# It keeps polling on this cadence until it resolves for real, or until
+# RECONCILE_MAX_SECS is hit, at which point it's escalated/logged loudly
+# but STILL never assigned a guessed win/loss.
+RECONCILE_POLL_INTERVAL_SECS = 30
+RECONCILE_MAX_SECS           = 1800   # 30 min — far longer than any real
+                                       # settlement should ever take
+
+# ── MULTIPLIER CONTRACTS — explicit max-hold policy (Fix E) ──
+# Multiplier contracts have no fixed expiry. If held this long, the bot
+# actively calls sell_contract() to realize the real price (never a
+# guess) and logs it as a deliberate time-based close — this replaces
+# the old dead MAX_TRADE_OPEN_MINS/CHECK_TRADE_MINS constants, which were
+# never actually read by anything.
+MULTIPLIER_MAX_HOLD_MINS = 30
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 20
-SYMBOL_LOSS_SUSPEND_MINS  = 55
+SYMBOL_WIN_SUSPEND_MINS   = 20     # unchanged — win path untouched
 SYMBOL_MIN_GAP_MINS       = 1
-SYMBOL_SESSION_BAN_LOSSES = 4
+
+# Escalating per-symbol loss suspension ladder (Implementation Brief v2,
+# Requirement 2 / Fix F). Indexed by min(loss_count, len(ladder)) - 1, so
+# 1st consecutive session loss on a symbol -> 60min, 2nd -> 120min,
+# 3rd -> 180min, 4th and every further loss that session -> 240min.
+# This counter/ladder is reset ONLY by a redeploy (a real process
+# restart) — never by a UTC-midnight or other calendar boundary.
+# Replaces the old flat SYMBOL_LOSS_SUSPEND_MINS / SYMBOL_SESSION_BAN_LOSSES
+# (59,940-minute "session ban") scheme entirely.
+SESSION_LOSS_SUSPEND_LADDER_MINS = [60, 120, 180, 240]
 
 # ── RAW TICK BUFFER (feeds tick-based evaluators via evaluate(ticks=...)) ──
 TICK_BUFFER_MAXLEN = 200
@@ -396,13 +431,25 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
     "RENDER_DEPLOY_HOOK_URL","")
 # REDEPLOY_EVERY_N_CYCLES previously = 8. With SETTLE_WAIT_SECS defaulting to
 # 15s (bot_engine._settle_loop), that was an 8*15=120s cycle-based redeploy —
-# fighting restart_scheduler.py's timer and redeploying roughly every 2
-# minutes instead of every 2 hours. Set high enough that it never fires on
-# its own; restart_scheduler.py's fixed 2-hour timer is now the only
-# redeploy trigger. Lower this back down only if you deliberately want a
-# SECOND, settle-count-based redeploy path in addition to the timer.
+# fighting restart_scheduler.py's timer. Set high enough that it never fires
+# on its own; restart_scheduler.py's daily Kenya-midnight timer (see
+# REDEPLOY_TIMEZONE below) is the only authoritative redeploy trigger. Lower
+# this back down only if you deliberately want a SECOND, settle-count-based
+# redeploy path in addition to the daily timer.
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
+
+# restart_scheduler.py fires exactly once every 24h, at 00:00 in this zone
+# (Africa/Nairobi = EAT = UTC+3 year-round, no DST) — replaces the old fixed
+# 2-hour timer per Implementation Brief v2, Requirement 2 / Fix G.
+REDEPLOY_TIMEZONE = "Africa/Nairobi"
+
+# How long bot_engine.py's _settle_loop will wait, actively trying to
+# confirm-close every remaining open contract, once a redeploy has been
+# scheduled, before delaying the redeploy rather than wiping contract
+# bookkeeping (Fix G). With daily (not 2-hourly) redeploys there's much
+# more natural lead time, so this can be generous.
+DRAIN_MAX_SECS = 1800
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
