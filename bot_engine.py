@@ -380,11 +380,12 @@ class BotEngine:
         dash_task     = asyncio.create_task(self._dashboard_loop())
         settle_task   = asyncio.create_task(self._settle_loop())
         degraded_task = asyncio.create_task(self._degraded_retry_loop())
-        # Fix G: daily Kenya-midnight redeploy timer, replacing the old
-        # fixed 2-hour schedule. Sets restart_scheduler.is_redeploy_pending()
-        # True once every 24h; _settle_loop drains and then calls
-        # restart_scheduler.trigger_redeploy() when draining completes.
-        redeploy_task = asyncio.create_task(restart_scheduler.run_scheduler())
+        # NOTE: the daily Kenya-midnight redeploy timer (Fix G) is started
+        # by main.py's existing restart_scheduler.start_restart_scheduler()
+        # call, unchanged — NOT started again here, to avoid two competing
+        # scheduler loops. _settle_loop below just reads
+        # restart_scheduler.is_redeploy_pending() / calls
+        # restart_scheduler.trigger_redeploy().
 
         try:
             await self._main_loop()
@@ -396,7 +397,6 @@ class BotEngine:
             dash_task.cancel()
             settle_task.cancel()
             degraded_task.cancel()
-            redeploy_task.cancel()
             ws_task.cancel()
 
     # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
