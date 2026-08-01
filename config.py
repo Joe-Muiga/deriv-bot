@@ -134,6 +134,44 @@ JUMP_SYMBOLS            = JUMP                                    # alias — sy
 # not defined here — see the notes by DIGIT_SYMBOLS above (deliberately
 # off) and DRIFT above (DSHIFT10/20/30 never audited — not in symbols.py).
 
+# bot_engine.py's _execute() checks `if symbol in config.MULTIPLIER_SYMBOLS`
+# to decide whether a symbol routes to buy_multiplier() instead of
+# buy_contract(). buy_multiplier() now exists in deriv_client.py and is
+# callable. Populated here ONLY with symbols that have a real, confirmed
+# contracts_for audit result AND no conflicting existing route:
+#   BOOM500/BOOM1000/CRASH500/CRASH1000 — confirmed MULTUP/MULTDOWN support
+#   (x100-400 / x100-500 respectively) by the 2026-07-31 audit, and not
+#   traded any other way today (BOOM_CRASH is still empty).
+#
+# Deliberately left OUT, each for a different reason — do not add without
+# resolving the specific blocker noted:
+#   JD10/JD25/JD50/JD75/JD100 — audit confirmed these DO support
+#     Multipliers, but they're also confirmed for CALL/PUT and are
+#     ALREADY live via RISE_FALL_SYMBOLS today. Adding them here would
+#     silently reroute them off a currently-working Rise/Fall path onto
+#     Multipliers (_execute()'s branch is if/else, not both) — that's a
+#     strategy decision, not just a data-confirmation one. Get explicit
+#     sign-off before switching.
+#   DSHIFT10/DSHIFT20/DSHIFT30 — never audited at all (not in symbols.py's
+#     SYNTHETIC list, so symbol_audit.py never queried them). The values
+#     already sitting in MULTIPLIER_MAP for these predate any real check.
+#     Add DSHIFT10/20/30 to symbols.py, re-run the audit, then reconsider.
+#   BOOM300/CRASH300/BOOM150/CRASH150 (un-suffixed) — audit only tested
+#     BOOM300N/CRASH300N (OfferingsInvalidSymbol — believed to be a naming
+#     bug) and never queried BOOM150/CRASH150 at all. Re-run the audit
+#     against the correct un-suffixed codes before adding.
+#   RDBEAR/RDBULL — audit explicitly confirmed NO MULTUP/MULTDOWN support
+#     on either. Will never belong here; they trade via Rise/Fall only.
+#
+# NOTE: adding a symbol here is necessary but not sufficient to make it
+# actually trade — BOOM_CRASH / BOOM_CRASH_SYMBOLS is still [] (see notes
+# above), so BOOM500/BOOM1000/CRASH500/CRASH1000 are not yet in
+# ALL_TRADE_SYMBOLS and won't be scanned by any strategy until that's
+# populated too. That's a signal_engine.py / symbol_manager.py routing
+# decision outside this file — do it deliberately, not as a side effect
+# of this list.
+MULTIPLIER_SYMBOLS = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000"]
+
 # bot_engine._init_all_symbols() reads ALL_TRADE_SYMBOLS (falling back to
 # ALL_SYMBOLS) as the ONLY list of symbols that ever get initialised or
 # scanned — a symbol missing from here never runs through ANY strategy,
@@ -167,11 +205,16 @@ MULTIPLIER_MAP = {
     "R_100":   500, "1HZ100V": 500,
     # 1HZ150V/1HZ200V/1HZ250V entries removed — confirmed invalid symbols,
     # see VOLATILITY_1S note above.
-    # Boom/Crash — moderate (spike risk). Still unused (BOOM_CRASH_SYMBOLS
-    # is empty, blocked on buy_multiplier()) — values below predate the
-    # 2026-07-31 audit and haven't been reconciled against confirmed real
-    # ranges (BOOM500/CRASH500: x100-400, BOOM1000/CRASH1000: x100-500) —
-    # revisit when BOOM_CRASH_SYMBOLS actually gets populated.
+    # Boom/Crash — moderate (spike risk).
+    # BOOM500/BOOM1000/CRASH500/CRASH1000: confirmed via the 2026-07-31
+    # audit (real ranges x100-400 / x100-500), now in MULTIPLIER_SYMBOLS
+    # above, values below (100) sit safely within range. buy_multiplier()
+    # exists, so the method is no longer the blocker — but they still
+    # won't actually trade until BOOM_CRASH_SYMBOLS is populated (still
+    # empty, see BOOM_CRASH note up top) so they land in ALL_TRADE_SYMBOLS
+    # and get routed to a strategy evaluator.
+    # BOOM150/BOOM300/CRASH150/CRASH300 (un-suffixed): still UNAUDITED —
+    # not in MULTIPLIER_SYMBOLS, values below are unverified guesses.
     "BOOM150": 100, "BOOM300": 100,
     "BOOM500": 100, "BOOM1000":100,
     "CRASH150":100, "CRASH300":100,
@@ -179,13 +222,16 @@ MULTIPLIER_MAP = {
     # Others
     "stpRNG":  200,
     # JD10-JD100: not yet in MULTIPLIER_SYMBOLS (Rise/Fall is used for
-    # these right now, see RISE_FALL_SYMBOLS above) — values below predate
-    # the audit; confirmed real ranges are noted by the JUMP list above
-    # (JD10 x100-1000, JD25 x50-500, JD50 x20-200, JD75 x15-150,
-    # JD100 x10-100) for whenever Multiplier routing is added for these.
+    # these right now, see RISE_FALL_SYMBOLS above; see the note by
+    # MULTIPLIER_SYMBOLS for why they haven't been switched over).
+    # Confirmed real ranges (2026-07-31 audit): JD10 x100-1000, JD25
+    # x50-500, JD50 x20-200, JD75 x15-150, JD100 x10-100. JD50/JD75/JD100
+    # below were capped down from 300/400/500 — those older values sat
+    # outside the confirmed valid range and would have been rejected by
+    # Deriv the moment Multiplier routing was ever turned on for them.
     "JD10":    100, "JD25":    200,
-    "JD50":    300, "JD75":    400,
-    "JD100":   500,
+    "JD50":    200, "JD75":    150,
+    "JD100":   100,
     # RDBULL/RDBEAR entries removed — audit confirmed no MULTUP/MULTDOWN
     # support on either; they're traded via Rise/Fall (CALL/PUT) instead,
     # see BEAR_BULL_SYMBOLS above. STOP_LOSS_MAP has no entry for them
