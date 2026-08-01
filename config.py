@@ -37,17 +37,22 @@ VOLATILITY_1S = [
 ]
 
 # Boom & Crash
-# NOTE: Removed from trading — earlier note claimed Boom/Crash don't
-# support CALL/PUT Rise/Fall (OfferingsValidationError). The 2026-07-31
-# audit only checked these for Multiplier support (confirmed: BOOM500/
-# CRASH500 x100-400, BOOM1000/CRASH1000 x100-500 — see MULTIPLIER_MAP) and
-# didn't re-test CALL/PUT specifically. Given the same audit run found the
-# near-identical "OfferingsValidationError" claim for Jump indices was
-# stale (caused by a currency-param bug in contracts_for(), now fixed),
-# don't assume this CALL/PUT claim is still accurate either way — it needs
-# an explicit re-check, not a re-assertion of the old conclusion. Blocked
-# on buy_multiplier() for the confirmed Multiplier path regardless.
-BOOM_CRASH = []
+# ACTIVATED: BOOM500/BOOM1000/CRASH500/CRASH1000 confirmed MULTUP/MULTDOWN
+# by the 2026-07-31 audit (x100-400 / x100-500 — see MULTIPLIER_MAP), all
+# four already sit in MULTIPLIER_SYMBOLS, and buy_multiplier() exists in
+# deriv_client.py. That was everything needed to trade them — this was the
+# last deliberate switch (previously left empty on purpose, see git
+# history / prior comment). Routes to evaluate_boom_crash() via
+# BOOM_CRASH_SYMBOLS below, dispatched to buy_multiplier() by bot_engine.py.
+# CALL/PUT support for these four was never re-tested post the
+# currency-param fix — doesn't matter here since they only trade via
+# Multipliers, but don't assume Rise/Fall works for them without a fresh
+# check if that path is ever wanted.
+# NOT included: BOOM300N/CRASH300N (OfferingsInvalidSymbol — likely a
+# naming bug, config's un-suffixed BOOM300/CRASH300 was never queried) and
+# BOOM150/CRASH150 (never queried at all). Re-run the audit against the
+# un-suffixed codes before adding any of the four.
+BOOM_CRASH = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000"]
 
 # Step Index
 STEP = ["stpRNG"]
@@ -114,25 +119,60 @@ RISE_FALL_SYMBOLS = [
     "RDBEAR","RDBULL",
 ]
 
-# Digit (Match/Differ/Over/Under/Even/Odd) contracts are not used by this bot —
-# only CALL/PUT Rise/Fall is traded — so this stays empty. signal_engine.py
-# checks `if symbol in config.DIGIT_SYMBOLS` to route digit-specific logic;
-# an empty list means that branch is always skipped, as intended.
+# Digit (Match/Differ/Over/Under/Even/Odd) — evaluate_digit() is built and
+# waiting for symbols, but stays empty this pass. Two separate reasons:
+#   1. The 2026-07-31 audit only confirmed digit-contract support for
+#      JD10-JD100 and RDBEAR/RDBULL (bundled under "digit contracts" in the
+#      contracts_for results) — it never tested R_10-R_100, 1HZ10V-100V, or
+#      stpRNG, which are the symbols you'd actually want a digit strategy
+#      on. Don't add those on a guess; re-run the audit against them
+#      specifically.
+#   2. Even the confirmed ones (JD*, RDBEAR/RDBULL) can't go here anyway
+#      without a decision: they're already committed to JUMP_BUILDUP_SYMBOLS
+#      and BEAR_BULL_SYMBOLS respectively, and "every traded symbol routes
+#      to exactly one strategy evaluator" (see STRATEGY ROUTING below) — so
+#      adding them to DIGIT_SYMBOLS too would double-route them. That's a
+#      strategy call, not a data-confirmation one; get explicit sign-off
+#      before reassigning a symbol off its current strategy.
+# signal_engine.py checks `if symbol in config.DIGIT_SYMBOLS`; empty means
+# that branch is always skipped.
 DIGIT_SYMBOLS = []
 
 # ── STRATEGY ROUTING (signal_engine.py) ──────────────────────
 # Every traded symbol is routed to exactly one strategy evaluator.
 MEAN_REVERSION_SYMBOLS = VOLATILITY_STANDARD + VOLATILITY_1S  # all 7 vol indices
-RANGE_BREAK_SYMBOLS    = []                                      # disabled — see RANGE_BREAK note
-BOOM_CRASH_SYMBOLS     = BOOM_CRASH                              # empty — blocked on buy_multiplier()
+RANGE_BREAK_SYMBOLS    = []                                      # disabled — no genuine Range Break
+                                                                   # symbol has ever been confirmed on
+                                                                   # this account (RDBEAR/RDBULL are
+                                                                   # Bear/Bull, not Range Break — see
+                                                                   # RANGE_BREAK note above)
+BOOM_CRASH_SYMBOLS     = BOOM_CRASH                              # BOOM500/BOOM1000/CRASH500/CRASH1000
+                                                                   # — ACTIVATED this pass, see
+                                                                   # BOOM_CRASH note above
 STEP_SYMBOLS           = STEP                                    # stpRNG
 JUMP_BUILDUP_SYMBOLS   = JUMP                                    # JD10-JD100 — see JUMP note above
 JUMP_SYMBOLS            = JUMP                                    # alias — symbol_manager.py's
                                                                    # is_in_session() reads this name
-# BEAR_BULL_SYMBOLS is defined earlier, in its own section above.
-# DIGIT_SYMBOLS / DIGIT_PARITY_SYMBOLS / DRIFT_FADE_SYMBOLS intentionally
-# not defined here — see the notes by DIGIT_SYMBOLS above (deliberately
-# off) and DRIFT above (DSHIFT10/20/30 never audited — not in symbols.py).
+DIGIT_PARITY_SYMBOLS   = []                                      # evaluate_digit_parity() built, no
+                                                                   # symbols wired — same two blockers
+                                                                   # as DIGIT_SYMBOLS above (audit
+                                                                   # never tested the actually-free
+                                                                   # candidates for digit contracts;
+                                                                   # the confirmed ones are already
+                                                                   # claimed by other strategies)
+DRIFT_FADE_SYMBOLS     = []                                      # evaluate_drift_fade() built, no
+                                                                   # symbols wired — DSHIFT10/20/30
+                                                                   # aren't in symbols.py's SYNTHETIC
+                                                                   # list, so the 2026-07-31 audit
+                                                                   # never queried them at all. Add
+                                                                   # them there, re-run the audit,
+                                                                   # then populate this.
+# BEAR_BULL_SYMBOLS is defined earlier, in its own section above (RDBEAR/
+# RDBULL — routed via Rise/Fall, NOT Multipliers; audit confirmed no
+# MULTUP/MULTDOWN support on either, so despite this task's original
+# assumption that Bear/Bull strategies only reach symbols via
+# buy_multiplier(), these two only work through the CALL/PUT path — leave
+# them exactly as already wired above).
 
 # bot_engine.py's _execute() checks `if symbol in config.MULTIPLIER_SYMBOLS`
 # to decide whether a symbol routes to buy_multiplier() instead of
@@ -140,8 +180,11 @@ JUMP_SYMBOLS            = JUMP                                    # alias — sy
 # callable. Populated here ONLY with symbols that have a real, confirmed
 # contracts_for audit result AND no conflicting existing route:
 #   BOOM500/BOOM1000/CRASH500/CRASH1000 — confirmed MULTUP/MULTDOWN support
-#   (x100-400 / x100-500 respectively) by the 2026-07-31 audit, and not
-#   traded any other way today (BOOM_CRASH is still empty).
+#   (x100-400 / x100-500 respectively) by the 2026-07-31 audit, not traded
+#   any other way (BOOM_CRASH_SYMBOLS is now populated too — see STRATEGY
+#   ROUTING above — so these are fully wired end-to-end: MULTIPLIER_SYMBOLS
+#   routes them to buy_multiplier(), BOOM_CRASH_SYMBOLS gets them into
+#   ALL_TRADE_SYMBOLS and evaluate_boom_crash()).
 #
 # Deliberately left OUT, each for a different reason — do not add without
 # resolving the specific blocker noted:
@@ -163,13 +206,6 @@ JUMP_SYMBOLS            = JUMP                                    # alias — sy
 #   RDBEAR/RDBULL — audit explicitly confirmed NO MULTUP/MULTDOWN support
 #     on either. Will never belong here; they trade via Rise/Fall only.
 #
-# NOTE: adding a symbol here is necessary but not sufficient to make it
-# actually trade — BOOM_CRASH / BOOM_CRASH_SYMBOLS is still [] (see notes
-# above), so BOOM500/BOOM1000/CRASH500/CRASH1000 are not yet in
-# ALL_TRADE_SYMBOLS and won't be scanned by any strategy until that's
-# populated too. That's a signal_engine.py / symbol_manager.py routing
-# decision outside this file — do it deliberately, not as a side effect
-# of this list.
 MULTIPLIER_SYMBOLS = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000"]
 
 # bot_engine._init_all_symbols() reads ALL_TRADE_SYMBOLS (falling back to
@@ -180,14 +216,14 @@ MULTIPLIER_SYMBOLS = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000"]
 # nothing outside plain Rise/Fall could ever be scanned even if wired
 # elsewhere. Now a real union of every populated strategy list, so newly
 # routed Jump/Bear-Bull symbols actually get scanned.
-# DIGIT_PARITY_SYMBOLS / DRIFT_FADE_SYMBOLS aren't included below because
-# they aren't defined anywhere in this file yet (both currently empty via
-# signal_engine.py's getattr(..., []) fallback) — add them to this union
-# too, the day either one gets a real symbol list.
+# DIGIT_PARITY_SYMBOLS / DRIFT_FADE_SYMBOLS are now explicitly defined
+# above (both still [] — see STRATEGY ROUTING section) and included below
+# so nothing needs to change here the day either one gets real symbols.
 ALL_TRADE_SYMBOLS = list(dict.fromkeys(
     RISE_FALL_SYMBOLS + MEAN_REVERSION_SYMBOLS + RANGE_BREAK_SYMBOLS
     + BOOM_CRASH_SYMBOLS + STEP_SYMBOLS + JUMP_BUILDUP_SYMBOLS
-    + BEAR_BULL_SYMBOLS + DIGIT_SYMBOLS
+    + BEAR_BULL_SYMBOLS + DIGIT_SYMBOLS + DIGIT_PARITY_SYMBOLS
+    + DRIFT_FADE_SYMBOLS
 ))
 ALL_SYMBOLS        = ALL_TRADE_SYMBOLS
 VOLATILITY_SYMBOLS = ALL_TRADE_SYMBOLS  # alias for compatibility with bot_engine.py
