@@ -178,3 +178,38 @@ def trigger_redeploy() -> None:
             logger.error(f"REDEPLOY HOOK ERROR (sync fallback): {exc}")
 
     _pending = False
+
+
+def start_restart_scheduler():
+    """
+    Entry point called by main.py at startup (unchanged name/contract from
+    before this fix — only the scheduling logic inside run_scheduler()
+    changed, per Implementation Brief v2, Fix G).
+
+    Starts run_scheduler() as a background asyncio task if a loop is
+    already running (the normal case — main.py calls this from inside its
+    async startup), or spins up a dedicated background thread with its
+    own event loop if called from synchronous code before any loop
+    exists. Safe to call exactly once at process startup.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(run_scheduler())
+        logger.info("restart_scheduler: started on the running event loop")
+        return
+    except RuntimeError:
+        pass
+
+    import threading
+
+    def _thread_target():
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(run_scheduler())
+        except Exception as exc:
+            logger.error(f"restart_scheduler thread crashed: {exc}")
+
+    t = threading.Thread(target=_thread_target, name="restart-scheduler", daemon=True)
+    t.start()
+    logger.info("restart_scheduler: started on a dedicated background thread")
