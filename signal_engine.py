@@ -24,7 +24,7 @@ import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -775,16 +775,28 @@ def evaluate_jump_buildup(ticks: Optional[List[Any]], symbol: str) -> SignalResu
 
 
 # ---------------------------------------------------------------------------
-# Strategy 7 — Bear/Bull Trend Shift (new, standalone, tick-based)
+# Strategy 7 — Bear/Bull Trend Shift (candle-based EMA alignment)
 #
-# Holds a directional bias and stop-and-reverses at the post-reset window.
-# Needs state across calls (which direction is currently held); kept as a
-# module-level dict rather than requiring a SymbolManager instance, so the
-# function signature stays (ticks, symbol) as specified. This duplicates
-# the post-reset window math already in symbol_manager.is_post_reset() —
-# both read the same two config keys (BEAR_BULL_SYMBOLS,
-# BEAR_BULL_TREND_SHIFT_MINS) so they should stay in sync, but it is a
-# real duplication — see chat reply.
+# Holds a directional bias and stop-and-reverses at the post-reset window,
+# but (unlike the old tick-slope version) the bias now comes from a
+# 3-EMA alignment check on candles, and is invalidated intra-window the
+# moment price no longer supports it — see evaluate_trend_shift() docstring
+# below for the invalidation rule. Needs state across calls (which
+# direction is currently held); kept as a module-level dict rather than
+# requiring a SymbolManager instance.
+#
+# Post-reset window math: _is_post_reset_local() below duplicates
+# symbol_manager.is_post_reset() (both read BEAR_BULL_SYMBOLS and
+# BEAR_BULL_TREND_SHIFT_MINS independently). Chosen fix here is option
+# (a) from the task — evaluate_trend_shift() now accepts an injected
+# is_post_reset_fn callable, defaulting to _is_post_reset_local for
+# backward compatibility, so the SignalEngine (or any caller) can pass
+# symbol_manager.is_post_reset instead and the duplication collapses to
+# a single source of truth without touching symbol_manager.py. Option
+# (b) — extracting the shared math into indicators.py/time_windows.py —
+# is the more correct long-term fix (removes _is_post_reset_local
+# entirely) but touches symbol_manager.py, which is out of scope for
+# this pass; flagged here rather than silently picked.
 # ---------------------------------------------------------------------------
 
 _trend_shift_state: Dict[str, Dict[str, Any]] = {}
@@ -800,32 +812,90 @@ def _is_post_reset_local(symbol: str) -> bool:
     return minutes_since_reset < window
 
 
-def evaluate_trend_shift(ticks: Optional[List[Any]], symbol: str) -> SignalResult:
+def evaluate_trend_shift(
+    ltf_bars: List[Candle],
+    symbol: str,
+    ticks: Optional[List[Any]] = None,
+    is_post_reset_fn: Optional[Callable[[str], bool]] = None,
+) -> SignalResult:
+    """
+    Bear/Bull stop-and-reverse, now driven by candle EMA alignment instead
+    of a 20-tick slope.
+
+    ASSUMPTION: config.LTF_BARS is currently 30, which is fewer bars than
+    EMA_TREND=50 needs to fully warm up. Depending on how indicators.ema()
+    handles insufficient history (NaN-pad vs. shorter valid series vs.
+    raising), this evaluator may run below full confidence — or never
+    fire — until whatever calls SignalEngine.evaluate() is passing more
+    than LTF_BARS=30 bars for BEAR_BULL_SYMBOLS specifically, or LTF_BARS
+    is raised. Flagging rather than silently reinterpreting LTF_BARS.
+
+    `ticks` is accepted only for call-site/signature compatibility with
+    SignalEngine.evaluate()'s existing `ticks=ticks` call; this evaluator
+    no longer reads raw ticks for direction (item 1 replaces the tick
+    slope entirely), so it's unused here.
+    """
     bear_bull = set(getattr(config, "BEAR_BULL_SYMBOLS", []))
     if symbol not in bear_bull:
         return NONE_RESULT
 
-    if not ticks or len(ticks) < 20:
+    min_bars = max(config.EMA_TREND, config.RSI_PERIOD, config.ATR_PERIOD) + 1
+    if len(ltf_bars) < min_bars:
         return NONE_RESULT
 
-    try:
-        quotes = np.array([_tick_quote(t) for t in ticks], dtype=float)
-    except ValueError:
-        logger.warning(f"TREND_SHIFT: {symbol} could not parse tick quotes — skipping")
+    C, H, L = _arrays(ltf_bars)
+    ema_fast_arr = ind.ema(C, config.EMA_FAST)
+    ema_slow_arr = ind.ema(C, config.EMA_SLOW)
+    ema_trend_arr = ind.ema(C, config.EMA_TREND)
+    rsi_arr = ind.rsi(C, config.RSI_PERIOD)
+    atr_arr = ind.atr(H, L, C, config.ATR_PERIOD)
+
+    ema_fast = _last(ema_fast_arr)
+    ema_slow = _last(ema_slow_arr)
+    ema_trend = _last(ema_trend_arr)
+    last_rsi = _last(rsi_arr)
+    last_atr = _last(atr_arr)
+
+    if any(math.isnan(v) for v in (ema_fast, ema_slow, ema_trend, last_rsi, last_atr)) or last_atr <= 0:
+        logger.debug(f"REJECTED: {symbol} TREND_SHIFT strength=0 score=0.000 — indicators not warmed up")
         return NONE_RESULT
+
+    # Step 1: EMA alignment bias. No forced guess when EMAs aren't aligned.
+    if ema_fast > ema_slow > ema_trend:
+        fresh_dir: Optional[str] = "LONG"
+    elif ema_fast < ema_slow < ema_trend:
+        fresh_dir = "SHORT"
+    else:
+        fresh_dir = None
+
+    post_reset_fn = is_post_reset_fn or _is_post_reset_local
+    post_reset = post_reset_fn(symbol)
 
     now = datetime.now(timezone.utc)
     today = now.date().isoformat()
-    post_reset = _is_post_reset_local(symbol)
-
     state = _trend_shift_state.get(symbol)
 
-    def _slope_bias() -> str:
-        x = np.arange(min(len(quotes), 20), dtype=float)
-        y = quotes[-len(x):]
-        slope = float(np.polyfit(x, y, 1)[0]) if len(x) >= 2 else 0.0
-        return "LONG" if slope >= 0 else "SHORT"
+    # Step 2: live invalidation — on EVERY call, not just at the reset
+    # window. If the held direction no longer matches what price is doing
+    # (either the alignment flipped outright, or fast has crossed back
+    # over the trend EMA against the held direction), drop it immediately
+    # instead of letting a stale bias run until the next reset.
+    if state is not None:
+        held_dir = state.get("direction")
+        contradicted = (
+            (held_dir == "LONG" and (fresh_dir == "SHORT" or ema_fast < ema_trend))
+            or (held_dir == "SHORT" and (fresh_dir == "LONG" or ema_fast > ema_trend))
+        )
+        if contradicted:
+            logger.warning(
+                f"TREND_SHIFT: {symbol} held {held_dir} invalidated — fresh EMA read "
+                f"fast={ema_fast:.5f} slow={ema_slow:.5f} trend={ema_trend:.5f} — clearing state"
+            )
+            _trend_shift_state.pop(symbol, None)
+            return NONE_RESULT
 
+    # Reset-window flip — same stop-and-reverse mechanism as before, but
+    # seeded from the fresh EMA-alignment bias instead of a tick slope.
     if post_reset and (state is None or state.get("reset_day") != today):
         prior_dir = state.get("direction") if state else None
         if prior_dir == "LONG":
@@ -833,33 +903,71 @@ def evaluate_trend_shift(ticks: Optional[List[Any]], symbol: str) -> SignalResul
         elif prior_dir == "SHORT":
             new_dir = "LONG"
         else:
-            new_dir = _slope_bias()
+            new_dir = fresh_dir
+        if new_dir is None:
+            logger.info(f"TREND_SHIFT: {symbol} post-reset window but EMAs not aligned — no bias set")
+            _trend_shift_state.pop(symbol, None)
+            return NONE_RESULT
         _trend_shift_state[symbol] = {"direction": new_dir, "reset_day": today}
         state = _trend_shift_state[symbol]
         logger.info(f"TREND_SHIFT: {symbol} reversed to {new_dir} at post-reset window (prior={prior_dir})")
 
     if state is None:
-        # No reset event observed yet this run — establish an initial bias
-        # from current slope so the strategy isn't NONE until the first
-        # reset window this process happens to be alive for.
-        direction = _slope_bias()
-        _trend_shift_state[symbol] = {"direction": direction, "reset_day": None}
+        # No reset event observed yet this run (and nothing to invalidate)
+        # — establish an initial bias from the current EMA alignment so
+        # the strategy isn't NONE until the first reset window this
+        # process happens to be alive for.
+        if fresh_dir is None:
+            logger.debug(f"REJECTED: {symbol} TREND_SHIFT strength=0 score=0.000 — EMAs not aligned")
+            return NONE_RESULT
+        _trend_shift_state[symbol] = {"direction": fresh_dir, "reset_day": None}
         state = _trend_shift_state[symbol]
-        logger.info(f"TREND_SHIFT: {symbol} initial bias {direction} (no reset observed yet this run)")
+        logger.info(f"TREND_SHIFT: {symbol} initial bias {fresh_dir} (no reset observed yet this run)")
 
     direction = state["direction"]
-    score = 0.75 if post_reset else 0.6
-    strength = 2
+
+    # Step 3: score/strength from real signal quality instead of hardcoded
+    # constants. EMA separation scaled by ATR = how clean/wide the trend
+    # is relative to current volatility; RSI dampens the score if it
+    # contradicts the held direction (e.g. RSI overbought while LONG).
+    separation_atr = abs(ema_fast - ema_slow) / last_atr
+    raw_score = min(separation_atr / 3.0, 1.0)  # 3x ATR separation -> full score; tune with live data
+
+    rsi_overbought = getattr(config, "RSI_OVERBOUGHT", 70)
+    rsi_oversold = getattr(config, "RSI_OVERSOLD", 30)
+    rsi_contradicts = (direction == "LONG" and last_rsi >= rsi_overbought) or (
+        direction == "SHORT" and last_rsi <= rsi_oversold
+    )
+    score = raw_score * 0.6 if rsi_contradicts else raw_score
+    score = max(0.0, min(1.0, score))
+
+    min_score = getattr(config, "MIN_TREND_SHIFT_SCORE", 0.65)
+    if score < min_score:
+        logger.info(
+            f"REJECTED: {symbol} TREND_SHIFT strength=0 score={score:.3f} — "
+            f"below MIN_TREND_SHIFT_SCORE={min_score}"
+        )
+        return SignalResult("NONE", 0, score, "TREND_SHIFT", f"Score {score:.3f} below {min_score}")
+
+    if score >= 0.85:
+        strength = 3
+    else:
+        strength = 2  # gated above min_score, so never falls to 1 here
 
     logger.info(
-        f"SIGNAL: {symbol} {direction} TREND_SHIFT strength={strength} score={score:.3f} post_reset={post_reset}"
+        f"SIGNAL: {symbol} {direction} TREND_SHIFT strength={strength} score={score:.3f} "
+        f"post_reset={post_reset} ema_fast={ema_fast:.5f} ema_slow={ema_slow:.5f} "
+        f"ema_trend={ema_trend:.5f} rsi={last_rsi:.1f} atr={last_atr:.5f} rsi_contradicts={rsi_contradicts}"
     )
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy="TREND_SHIFT",
-        reason=f"Stop-and-reverse hold, post_reset={post_reset}",
+        reason=(
+            f"Stop-and-reverse hold, post_reset={post_reset}, "
+            f"ema_sep/atr={separation_atr:.3f}, rsi={last_rsi:.1f}"
+        ),
     )
 
 
@@ -892,7 +1000,7 @@ class SignalEngine:
         elif symbol in getattr(config, "JUMP_BUILDUP_SYMBOLS", []):
             result = evaluate_jump_buildup(ticks, symbol)
         elif symbol in getattr(config, "BEAR_BULL_SYMBOLS", []):
-            result = evaluate_trend_shift(ticks, symbol)
+            result = evaluate_trend_shift(ltf_bars, symbol, ticks=ticks)
         else:
             logger.debug(f"REJECTED: {symbol} UNROUTED strength=0 score=0.000 — below threshold")
             return NONE_RESULT
