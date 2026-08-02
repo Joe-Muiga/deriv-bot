@@ -299,6 +299,10 @@ STOP_LOSS_MAP = {
 DEFAULT_STOP_LOSS_PCT = 50.0
 
 # Take profit = 2x stop loss (2:1 RR minimum)
+# For Multiplier contracts these remain the static outer boundary set at
+# buy time — see ADAPTIVE EXIT ENGINE near the bottom of this file for
+# the layer that trails stop_loss inside this boundary via
+# contract_update, without changing this ratio itself.
 TAKE_PROFIT_RATIO = 2.0
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
@@ -387,6 +391,11 @@ RECONCILE_MAX_SECS           = 1800   # 30 min — far longer than any real
 # guess) and logs it as a deliberate time-based close — this replaces
 # the old dead MAX_TRADE_OPEN_MINS/CHECK_TRADE_MINS constants, which were
 # never actually read by anything.
+# This remains the outer horizontal barrier either way — see the
+# ADAPTIVE EXIT ENGINE section near the bottom of this file for the
+# active management layer that now operates *inside* this bound
+# (and inside STOP_LOSS_MAP / TAKE_PROFIT_RATIO below), rather than
+# replacing it.
 MULTIPLIER_MAX_HOLD_MINS = 30
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
@@ -566,3 +575,59 @@ SESSION_DOW_WEIGHT_TABLE = {
     },
 }
 SESSION_DOW_WEIGHT_DEFAULT = 1.0  # applied when no table entry matches
+
+# ══════════════════════════════════════════════════════════════
+# ADAPTIVE EXIT ENGINE (Multiplier / non-time-bound contracts only)
+# ══════════════════════════════════════════════════════════════
+# Rise/Fall contracts are untouched by this — they keep using
+# TRADE_DURATION/TRADE_DURATION_UNIT exactly as before (see SESSION /
+# DAY-OF-WEEK section above; do not touch those two constants or
+# TRADE_DURATION_OVERRIDES for this feature).
+#
+# Multipliers (MULTUP/MULTDOWN — MULTIPLIER_SYMBOLS above) have no fixed
+# expiry; today they close only via the static STOP_LOSS_MAP /
+# TAKE_PROFIT_RATIO set at buy time, or the blunt
+# MULTIPLIER_MAX_HOLD_MINS forced close (see MULTIPLIER CONTRACTS
+# section above). This engine actively manages the open contract
+# between those two existing boundaries — trailing the stop-loss up as
+# profit grows, and closing early if profit decays — instead of just
+# waiting for one of the two static limits to fire. It never replaces
+# STOP_LOSS_MAP, TAKE_PROFIT_RATIO, or MULTIPLIER_MAX_HOLD_MINS; those
+# stay in force as the outer vertical/horizontal barriers this engine
+# operates inside of. Lives in exit_engine.py (new file, built
+# separately); revises stop_loss/take_profit on an already-open
+# Multiplier contract via Deriv's contract_update request, wired up in
+# deriv_client.py (also built separately). This section only adds the
+# config surface it needs.
+EXIT_ENGINE_ENABLED         = True
+EXIT_ENGINE_SYMBOLS         = list(MULTIPLIER_SYMBOLS)  # only Multiplier contracts
+
+# Rule-based trailing layer (always active — the ML layer below only ever
+# adds an *earlier* close on top of this, never removes this safety net):
+EXIT_ARM_PROFIT_FRACTION    = 0.30   # start trailing once profit >= 30% of the
+                                      # contract's static take_profit_amount
+EXIT_TRAIL_LOCK_FRACTION    = 0.60   # once armed, ratchet stop_loss to lock in
+                                      # 60% of peak profit seen so far
+EXIT_DECAY_CLOSE_FRACTION   = 0.25   # once armed, close immediately if profit
+                                      # falls back below 25% of peak (rather than
+                                      # waiting for the original static stop_loss)
+EXIT_POLL_INTERVAL_SECS     = 15     # how often the exit engine re-checks each
+                                      # open Multiplier contract (independent of
+                                      # the general 30s orphan-sweep cadence)
+
+# Lightweight ML layer (meta-labeling-inspired; reuses the existing
+# META_LABEL_MIN_TRADES / META_LABEL_RETRAIN_EVERY_N constants defined
+# above under META-LABELING — do not duplicate them here). Below
+# META_LABEL_MIN_TRADES logged Multiplier-contract snapshots this is a
+# strict no-op; only the rule-based layer above runs.
+EXIT_ML_ENABLED             = True
+EXIT_ML_MODEL_PATH          = "exit_model.joblib"  # ephemeral on Render free
+                                                     # tier — resets on redeploy;
+                                                     # acceptable for this
+                                                     # research phase, retrains
+                                                     # from fresh logs each time
+EXIT_ML_FEATURE_WINDOW      = 5      # number of past polls used to compute
+                                      # profit "velocity" as a feature
+EXIT_ML_MIN_CONFIDENCE      = 0.60   # ML must be at least this confident a
+                                      # reversal is coming to override the rule
+                                      # layer's HOLD decision
