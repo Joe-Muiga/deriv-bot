@@ -37,6 +37,7 @@ UNCHANGED:
 import asyncio
 import datetime as _dt
 import logging
+import math
 import random
 import time
 import traceback
@@ -141,6 +142,83 @@ class _ThompsonBandit:
             return 0.5
 
 
+# ─── Per-strategy expectancy tracker (Implementation Brief v3, task 3) ─────────
+
+class _StrategyExpectancyTracker:
+    """
+    Per-strategy (MEAN_REVERSION / STEP / JUMP_BUILDUP / TREND_SHIFT /
+    BOOM_CRASH / ...) win rate, avg win, avg loss, and profit factor,
+    plus a Wilson-score confidence interval on win rate given trade count
+    — this is what turns the account-level aggregate the dashboard already
+    shows (journal.session_summary()) into something that can actually be
+    trusted or distrusted PER STRATEGY, which is the brief's whole point:
+    at n=39 trades total, 61.5% isn't yet distinguishable from breakeven.
+
+    Deliberately a separate, self-contained in-memory tracker rather than
+    an extension of strategy_stats.py — strategy_stats.py's job (feeding
+    the meta-labeling filter and the Thompson bandit) is a different
+    consumer of similar data, and this file only has confirmed sight of
+    its read API (get_win_rate), not its write/storage internals, so
+    bolting new aggregate fields onto it without seeing its source would
+    be a guess. Fed from the exact same _apply_settlement() call site that
+    already calls strategy_stats.stats.record_trade(), so the two never
+    disagree on what a "trade" is. Resets on redeploy along with the rest
+    of this process's in-memory state — acceptable here since the ask is
+    to surface it, not persist it durably across restarts.
+    """
+
+    def __init__(self):
+        self._trades: Dict[str, List[Tuple[bool, float]]] = {}
+
+    def record(self, strategy: str, won: bool, pnl: float) -> None:
+        self._trades.setdefault(strategy, []).append((won, float(pnl)))
+
+    @staticmethod
+    def _wilson_ci(wins: int, n: int, z: float = 1.96) -> Tuple[float, float]:
+        """95% Wilson score interval (z=1.96) on a binomial win rate."""
+        if n == 0:
+            return (0.0, 1.0)
+        phat = wins / n
+        denom = 1.0 + (z * z) / n
+        center = (phat + (z * z) / (2 * n)) / denom
+        margin = (z * math.sqrt((phat * (1 - phat) + (z * z) / (4 * n)) / n)) / denom
+        return (max(0.0, center - margin), min(1.0, center + margin))
+
+    def summary(self) -> Dict[str, dict]:
+        out: Dict[str, dict] = {}
+        for strategy, trades in self._trades.items():
+            n = len(trades)
+            if n == 0:
+                continue
+            win_pnls  = [pnl for won, pnl in trades if won]
+            loss_pnls = [pnl for won, pnl in trades if not won]
+            win_count   = len(win_pnls)
+            loss_count  = len(loss_pnls)
+            gross_win   = sum(win_pnls)
+            gross_loss  = abs(sum(loss_pnls))
+            avg_win     = (gross_win / win_count) if win_count else 0.0
+            avg_loss    = (gross_loss / loss_count) if loss_count else 0.0
+            if gross_loss > 0:
+                profit_factor = gross_win / gross_loss
+            else:
+                profit_factor = None if gross_win == 0 else float("inf")
+            win_rate = win_count / n
+            ci_lo, ci_hi = self._wilson_ci(win_count, n)
+            out[strategy] = {
+                "trades":         n,
+                "win_rate_pct":   round(win_rate * 100, 1),
+                "win_rate_ci_pct": [round(ci_lo * 100, 1), round(ci_hi * 100, 1)],
+                "avg_win":        round(avg_win, 4),
+                "avg_loss":       round(avg_loss, 4),
+                "profit_factor":  (round(profit_factor, 3)
+                                    if profit_factor is not None and math.isfinite(profit_factor)
+                                    else profit_factor),
+                "gross_profit":   round(gross_win, 4),
+                "gross_loss":     round(gross_loss, 4),
+            }
+        return out
+
+
 # ─── Bot engine ────────────────────────────────────────────────────────────────
 
 class BotEngine:
@@ -194,6 +272,11 @@ class BotEngine:
         #    for why this reads through strategy_stats instead of
         #    keeping its own in-memory posterior.
         self._bandit = _ThompsonBandit()
+
+        # ── Per-strategy expectancy tracker (Implementation Brief v3,
+        #    task 3) — fed in _apply_settlement(), surfaced in
+        #    _push_dashboard(). See _StrategyExpectancyTracker docstring.
+        self._strategy_expectancy = _StrategyExpectancyTracker()
 
         self.client  = DerivClient()
         self.risk    = RiskManager(
@@ -617,6 +700,21 @@ class BotEngine:
         risk_s  = self.risk.summary()
         summary = self.journal.session_summary()
 
+        # Implementation Brief v3, task 3 — per-strategy win rate / avg
+        # win / avg loss / profit factor / CI, next to the aggregate stats
+        # already pushed below. Written directly onto the shared `_status`
+        # dict (imported by reference from keep_alive) rather than passed
+        # as a new kwarg to update_status() below, since this file doesn't
+        # have sight of update_status()'s exact parameter list and a typo'd
+        # kwarg there would raise before any of the existing fields get
+        # updated. `_status` is already read/written this way elsewhere in
+        # this function (recent_trades, balance_history), so this follows
+        # the same established pattern.
+        try:
+            _status["strategy_expectancy"] = self._strategy_expectancy.summary()
+        except Exception as exc:
+            logger.warning(f"strategy_expectancy dashboard push failed: {exc}")
+
         oc_list = []
         now_ts  = time.time()
         for cid, info in self._open_contracts.items():
@@ -875,6 +973,13 @@ class BotEngine:
             return False
 
         stake     = await self.risk.calculate_stake()
+        # NOTE: for DIGIT signals (JUMP_BUILDUP) this is "MATCH"/"DIFFER",
+        # not "LONG"/"SHORT" — passed through below to record_signal(),
+        # risk.register_open(), and journal.open_trade() purely as a label.
+        # Those call sites appear to treat it as opaque metadata rather than
+        # branching on the literal value, but this file doesn't have sight
+        # of risk_manager.py/trade_journal.py's internals to confirm that
+        # with certainty — flagging rather than silently assuming.
         direction = sig.direction
 
         record_signal(
@@ -884,12 +989,38 @@ class BotEngine:
             score     = getattr(sig, "score",    0.0),
         )
 
+        # Implementation Brief v3, finding #3 / task 2: JUMP_BUILDUP fires a
+        # digit-contract recommendation (Matches/Differs), not a price
+        # direction — build-up confidence has no LONG/SHORT read, jump
+        # direction is 50/50 by design. Previously this fell through to the
+        # buy_contract() (CALL/PUT) branch below with a hardcoded direction,
+        # i.e. blindly betting a coin flip on a sub-1:1 payout every time it
+        # fired. sig.contract_kind=="DIGIT" (set by evaluate_jump_buildup())
+        # routes it to the real digit-contract path instead — checked before
+        # the Multiplier/Rise-Fall split since it's an orthogonal axis (which
+        # contract family, not which symbol).
+        if getattr(sig, "contract_kind", "RISE_FALL") == "DIGIT":
+            digit = getattr(sig, "digit", None)
+            match_type = getattr(sig, "match_type", None)
+            if digit is None or match_type is None:
+                logger.warning(
+                    f"PLACEMENT SKIPPED: {symbol} DIGIT signal missing "
+                    f"digit/match_type (digit={digit}, match_type={match_type})"
+                )
+                buy_resp = None
+            else:
+                buy_resp = await self.client.buy_digit_contract(
+                    symbol     = symbol,
+                    stake      = stake,
+                    digit      = digit,
+                    match_type = match_type,
+                )
         # Boom/Crash, Jump, and Drift Switch symbols don't support CALL/PUT
         # Rise/Fall on this account — route them to buy_multiplier() instead.
         # config.MULTIPLIER_SYMBOLS is the single source of truth for this
         # split (see config.py's "STRATEGY ROUTING" section); everything
         # else keeps using buy_contract() exactly as before.
-        if symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
+        elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
             buy_resp = await self.client.buy_multiplier(
                 symbol   = symbol,
                 direction= direction,
@@ -1075,6 +1206,14 @@ class BotEngine:
             )
         except Exception as exc:
             logger.warning(f"strategy_stats.record_trade({symbol}) failed: {exc}")
+
+        # Implementation Brief v3, task 3 — same call site as
+        # strategy_stats.stats.record_trade() above, so both always agree
+        # on trade count.
+        try:
+            self._strategy_expectancy.record(strategy=strategy, won=won, pnl=pnl)
+        except Exception as exc:
+            logger.warning(f"strategy_expectancy.record({symbol}) failed: {exc}")
 
         # Backfill the outcome onto the oldest pending meta-label
         # prediction for this pair, for later validation of the filter.
