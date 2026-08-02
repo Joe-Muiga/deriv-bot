@@ -510,6 +510,13 @@ TRADE_DURATION_UNIT = "m"
 # until you populate that list.
 DIGIT_HYBRID_MODE = False
 
+# ── TREND SHIFT STRATEGY (Bear/Bull) ──────────────────────────
+# Minimum composite score (EMA separation scaled by ATR, dampened by
+# RSI contradiction) evaluate_trend_shift() requires before a signal
+# fires. Starting guess, not a validated number — tune against live
+# RDBEAR/RDBULL results.
+MIN_TREND_SHIFT_SCORE = 0.65
+
 # ── ACCUMULATOR SETTINGS ──────────────────────────────────────
 ACCU_GROWTH_RATE_MIN = 1.0   # percent, per-tick growth rate floor
 ACCU_GROWTH_RATE_MAX = 5.0   # percent, per-tick growth rate ceiling
