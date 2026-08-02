@@ -1,6 +1,32 @@
 """
 deriv_client.py – Async Deriv WebSocket client.
 
+v15 — ADAPTIVE EXIT ENGINE SUPPORT (additive, no existing contract logic
+      touched):
+
+  NEW — contract_update(contract_id, stop_loss=None, take_profit=None):
+    - Revises stop_loss and/or take_profit on an already-open Multiplier
+      contract via Deriv's contract_update API, without closing it.
+    - Either parameter may be omitted to leave that side unchanged; the
+      outgoing limit_order dict only includes the params actually passed.
+    - Before sending the update, snapshots the contract via the existing
+      force_check_contract() (reused, not duplicated) and feature-detects
+      an is_valid_to_update / is_valid_to_sell-style flag on the snapshot
+      — never assumes a specific key name. Fails soft (returns None) if
+      the flag isn't clearly true.
+    - Follows this file's standard conventions: verbose logging
+      (CONTRACT UPDATE ATTEMPT / CONTRACT UPDATE RESPONSE / FAILED),
+      never raises, returns None on any failure path.
+    - No new rate-limiting/semaphore logic — call frequency is governed
+      by config.EXIT_POLL_INTERVAL_SECS in bot_engine.py, not here.
+    - Placed near sell_contract() for locality; buy_contract(),
+      buy_multiplier(), force_check_contract(), and sell_contract()
+      themselves are untouched.
+
+  NEW — _snapshot_allows_update(poc): private helper, feature-detects
+      contract-update eligibility on a proposal_open_contract snapshot
+      dict. Used only by contract_update().
+
 v14 — ACCUMULATOR + MATCHES/DIFFERS SUPPORT (additive, no existing
       contract logic touched):
 
@@ -1485,6 +1511,90 @@ class DerivClient:
 
         except Exception as e:
             logger.error(f"FAILED: sell {contract_id} — {e}")
+            return None
+
+    @staticmethod
+    def _snapshot_allows_update(poc: dict) -> bool:
+        """
+        Feature-detect whether a proposal_open_contract snapshot (as
+        returned by force_check_contract()) indicates the contract is
+        currently eligible for contract_update.
+
+        Deriv doesn't document a single stable key name for this, so
+        this inspects the snapshot defensively rather than assuming
+        one — checks a couple of plausible is_valid_to_*-style keys and
+        fails soft (False) if none is present or clearly truthy.
+        """
+        if not poc:
+            return False
+        for key in ("is_valid_to_update", "is_valid_to_sell"):
+            if key in poc:
+                return poc.get(key) in (1, True, "1")
+        return False
+
+    async def contract_update(
+            self,
+            contract_id: str,
+            stop_loss:   float = None,
+            take_profit: float = None) -> Optional[dict]:
+        """
+        Revise stop_loss and/or take_profit on an already-open contract
+        (Multiplier contracts only — the API only supports this for
+        contracts with an active limit_order). Either parameter may be
+        omitted to leave that side unchanged.
+
+        Returns the 'contract_update' response dict on success, None on any
+        failure path (including when the contract isn't currently eligible
+        for an update). Never raises.
+        """
+        limit_order = {}
+        if stop_loss is not None:
+            limit_order["stop_loss"] = stop_loss
+        if take_profit is not None:
+            limit_order["take_profit"] = take_profit
+
+        logger.info(
+            f"CONTRACT UPDATE ATTEMPT: {contract_id} SL={stop_loss} TP={take_profit}"
+        )
+
+        if not limit_order:
+            logger.error(
+                f"FAILED: contract_update {contract_id} — no stop_loss/take_profit "
+                f"given (both None)"
+            )
+            return None
+
+        try:
+            poc = await self.force_check_contract(contract_id)
+            if not self._snapshot_allows_update(poc):
+                logger.error(
+                    f"FAILED: contract_update {contract_id} — not currently "
+                    f"eligible for update (snapshot={poc})"
+                )
+                return None
+
+            req = {
+                "contract_update": 1,
+                "contract_id":     int(contract_id),
+                "limit_order":     limit_order,
+            }
+            resp = await self._send(req)
+            if not resp:
+                logger.error(f"FAILED: contract_update {contract_id} — no response")
+                return None
+            if resp.get("error"):
+                err = resp["error"]
+                logger.error(
+                    f"FAILED: contract_update {contract_id} — {err.get('code')}: "
+                    f"{err.get('message')} | details={err.get('details')}"
+                )
+                return None
+
+            logger.info(f"CONTRACT UPDATE RESPONSE: {resp}")
+            return resp.get("contract_update", {})
+
+        except Exception as e:
+            logger.error(f"FAILED: contract_update {contract_id} — {e}")
             return None
 
     # ─── Matches/Differs (digit) contracts ─────────────────────────────────────
