@@ -47,6 +47,7 @@ from typing import Deque, Dict, List, Optional, Set, Tuple
 import numpy as np
 
 import config
+import exit_engine
 import restart_scheduler
 import symbols as sym_module
 import strategy_stats
@@ -984,6 +985,15 @@ class BotEngine:
         }
         self._contract_open_times[cid] = time.time()
 
+        # ── Adaptive Exit Engine — tighter-cadence per-contract monitor for
+        #    Multiplier contracts only (open-ended risk; Rise/Fall keeps its
+        #    existing fixed-expiry handling untouched). Purely additive: does
+        #    not change how the contract above was registered.
+        if (symbol in getattr(config, "MULTIPLIER_SYMBOLS", set())
+                and getattr(config, "EXIT_ENGINE_ENABLED", False)
+                and symbol in getattr(config, "EXIT_ENGINE_SYMBOLS", set())):
+            asyncio.create_task(self._monitor_exit(cid))
+
         self.symbols.record_trade_placed(symbol)
         set_active_trades(len(self._open_contracts))
 
@@ -1395,3 +1405,146 @@ class BotEngine:
         except Exception:
             pass
         await self._apply_settlement(cid, info, poc, close_reason="time_based_close")
+
+    # ── Adaptive Exit Engine — per-contract monitoring loop ─────────────────
+    #
+    # Runs at config.EXIT_POLL_INTERVAL_SECS (default 15s) — tighter than the
+    # general _handle_orphans sweep (30s) — because exit timing matters more
+    # for open-ended Multiplier risk than the general health-check sweep
+    # does. This is purely additive: _handle_multiplier_orphan's 30-minute
+    # MULTIPLIER_MAX_HOLD_SECS force-close remains the untouched outer safety
+    # bound and still fires if this task ever stops running (e.g. a restart
+    # wipes the task but not yet the open-contract record).
+    #
+    # Never calls _apply_settlement for a natural close (is_sold/is_expired
+    # discovered on a poll) — that's owned by _on_contract_result (WS push)
+    # or the orphan sweep. Only calls it for a close *this method* actively
+    # triggers via sell_contract (CLOSE_NOW), reusing the same shared
+    # settlement path everything else uses.
+
+    async def _monitor_exit(self, cid: str) -> None:
+        poll_interval = getattr(config, "EXIT_POLL_INTERVAL_SECS", 15)
+
+        while cid in self._open_contracts:
+            try:
+                await asyncio.sleep(poll_interval)
+
+                # Re-check after the sleep — the contract may have settled
+                # via the WS push path or the orphan sweep while we waited.
+                info = self._open_contracts.get(cid)
+                if info is None:
+                    return
+
+                try:
+                    poc = await self.client.force_check_contract(cid)
+                except Exception as exc:
+                    logger.warning(f"_monitor_exit force_check_contract({cid}): {exc}")
+                    continue
+
+                if poc.get("is_sold") or poc.get("is_expired"):
+                    # Natural close — the existing settlement path handles
+                    # recording it. Not our job; just stop monitoring.
+                    return
+
+                symbol      = info.get("symbol", "UNKNOWN")
+                opened_at   = info.get("opened_at", time.time())
+                elapsed     = time.time() - opened_at
+                live_profit = float(poc.get("profit", 0.0))
+
+                try:
+                    exit_engine.record_snapshot(
+                        cid,
+                        symbol  = symbol,
+                        profit  = live_profit,
+                        elapsed = elapsed,
+                        poc     = poc,
+                    )
+                    decision = exit_engine.decide_exit(
+                        cid,
+                        symbol  = symbol,
+                        profit  = live_profit,
+                        elapsed = elapsed,
+                        poc     = poc,
+                    )
+                except Exception as exc:
+                    logger.warning(f"exit_engine decision failed for {cid}: {exc}")
+                    continue
+
+                action = getattr(decision, "action", None)
+
+                if action == "TRAIL_UPDATE":
+                    try:
+                        await self.client.contract_update(
+                            cid, stop_loss=decision.new_stop_loss)
+                        logger.info(
+                            f"ADAPTIVE EXIT TRAIL: {cid} ({symbol}) "
+                            f"stop_loss -> {decision.new_stop_loss}")
+                    except Exception as exc:
+                        logger.warning(f"contract_update({cid}) trail failed: {exc}")
+                    continue
+
+                if action == "CLOSE_NOW":
+                    logger.info(
+                        f"ADAPTIVE EXIT CLOSE: {cid} ({symbol}) elapsed="
+                        f"{elapsed:.0f}s profit={live_profit:.4f} — actively "
+                        f"selling to realize the real current price")
+                    try:
+                        sell_resp = await self.client.sell_contract(cid, price=0)
+                    except Exception as exc:
+                        logger.error(f"sell_contract({cid}) failed during adaptive exit: {exc}")
+                        sell_resp = None
+
+                    if not sell_resp:
+                        # No confirmed close — never drop bookkeeping without
+                        # one (same invariant _handle_multiplier_orphan
+                        # follows). Leave it open/tracked; retry next tick.
+                        logger.warning(
+                            f"ADAPTIVE EXIT SELL FAILED: {cid} ({symbol}) — "
+                            f"still open, will retry next tick")
+                        continue
+
+                    # One authoritative follow-up check, same pattern as
+                    # _handle_multiplier_orphan's max-hold close.
+                    try:
+                        close_poc = await self.client.force_check_contract(cid)
+                    except Exception:
+                        close_poc = {}
+
+                    if not (close_poc.get("is_sold") or close_poc.get("is_expired")):
+                        sold_for = float(sell_resp.get("sold_for", 0))
+                        stake    = float(info.get("stake", 0.0))
+                        close_poc = {
+                            "is_sold":    1,
+                            "sell_price": sold_for,
+                            "profit":     sold_for - stake,
+                            "payout":     sold_for,
+                        }
+
+                    final_profit = float(close_poc.get("profit", 0.0))
+
+                    self._open_contracts.pop(cid, None)
+                    self._contract_open_times.pop(cid, None)
+                    self._reconciling.pop(cid, None)
+                    try:
+                        self.client.stop_tracking(cid)
+                    except Exception:
+                        pass
+
+                    await self._apply_settlement(
+                        cid, info, close_poc, close_reason="adaptive_exit")
+
+                    try:
+                        exit_engine.record_closed(cid, final_profit)
+                    except Exception as exc:
+                        logger.warning(f"exit_engine.record_closed({cid}) failed: {exc}")
+
+                    return
+
+                # action == "HOLD" (or anything unrecognized) — do nothing,
+                # keep looping.
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"_monitor_exit({cid}) tick failed: {exc}")
+                continue
