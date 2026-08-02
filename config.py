@@ -97,6 +97,15 @@ DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 BEAR_BULL_SYMBOLS = ["RDBEAR", "RDBULL"]
 BEAR_BULL_TREND_SHIFT_MINS = 20     # 10 / 20 / 30 — unchanged default
 
+# Implementation Brief v3, finding #4: each Daily Reset index holds ONE
+# fixed characteristic trend for its entire 24h cycle (Bull always up,
+# Bear always down, per Deriv's own product description) — this is a
+# static fact, not something signal_engine.py should derive from EMAs or
+# alternate at each reset. evaluate_trend_shift() reads this map directly;
+# BEAR_BULL_TREND_SHIFT_MINS above is used only to gate entry timing
+# (skip trading until the post-reset window closes), never to pick a side.
+BEAR_BULL_DIRECTION = {"RDBULL": "LONG", "RDBEAR": "SHORT"}
+
 # Symbols confirmed via contracts_for to support CALL/PUT Rise/Fall on
 # this account. Last empirically verified: symbol_audit.py run, 2026-07-31.
 #   - 1HZ150V/1HZ200V/1HZ250V removed — confirmed OfferingsInvalidSymbol,
@@ -509,13 +518,6 @@ TRADE_DURATION_UNIT = "m"
 # it fires. DIGIT_SYMBOLS is still empty above, so this is inert
 # until you populate that list.
 DIGIT_HYBRID_MODE = False
-
-# ── TREND SHIFT STRATEGY (Bear/Bull) ──────────────────────────
-# Minimum composite score (EMA separation scaled by ATR, dampened by
-# RSI contradiction) evaluate_trend_shift() requires before a signal
-# fires. Starting guess, not a validated number — tune against live
-# RDBEAR/RDBULL results.
-MIN_TREND_SHIFT_SCORE = 0.65
 
 # ── ACCUMULATOR SETTINGS ──────────────────────────────────────
 ACCU_GROWTH_RATE_MIN = 1.0   # percent, per-tick growth rate floor
