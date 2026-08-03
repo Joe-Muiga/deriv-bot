@@ -30,6 +30,7 @@ import numpy as np
 
 import config
 import indicators as ind
+import strategy_stats
 from candlestick_builder import Candle
 from symbol_manager import SymbolManager
 
@@ -69,6 +70,10 @@ class SignalResult:
     contract_kind: str            = "RISE_FALL"   # "RISE_FALL" | "DIGIT"
     digit:         Optional[int]  = None            # 0-9, DIGIT contracts only
     match_type:    Optional[str]  = None            # "MATCH" | "DIFFER"
+    features: Optional[dict] = None   # feature vector at signal time, for
+                                       # strategy_stats logging / future
+                                       # ML calibration (Implementation
+                                       # Brief v6, PART 3)
 
 
 NONE_RESULT = SignalResult("NONE", 0, 0.0, "NONE", "No signal")
@@ -347,16 +352,47 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
     rsi = ind.rsi(C, 14)
     upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
     roc = ind.roc(C, 10)
+    atr = ind.atr(H, L, C, getattr(config, "ATR_PERIOD", 14))
 
     last_rsi   = _last(rsi)
     last_close = float(C[-1])
+    prev_close = float(C[-2]) if len(C) >= 2 else last_close
     last_upper = _last(upper)
     last_lower = _last(lower)
     last_roc   = _last(roc)
 
+    # ── Regime filter (Implementation Brief v6, root cause #2) ──────────
+    # Fade strategies fail hardest when fired into an expanding/trending
+    # market. Compare a fast (5-bar) ATR average to a slower (20-bar) one;
+    # a ratio above the configured ceiling means the market is expanding,
+    # not ranging, and no fade signal is evaluated this bar.
+    valid_atr = atr[~np.isnan(atr)]
+    if len(valid_atr) >= 20:
+        atr_fast = float(np.mean(valid_atr[-5:]))
+        atr_slow = float(np.mean(valid_atr[-20:]))
+        expansion_ratio = (atr_fast / atr_slow) if atr_slow > 0 else 1.0
+    else:
+        expansion_ratio = 1.0  # not enough ATR history yet -> filter is a no-op
+
+    max_expansion = getattr(config, "MEAN_REV_MAX_ATR_EXPANSION_RATIO", 1.3)
+    if expansion_ratio > max_expansion:
+        logger.debug(
+            f"REJECTED: {symbol} MEAN_REV regime — ATR expanding "
+            f"(fast/slow={expansion_ratio:.2f} > {max_expansion})"
+        )
+        return SignalResult(
+            "NONE", 0, 0.0, "MEAN_REV",
+            f"Regime filter: ATR expanding ({expansion_ratio:.2f} > {max_expansion})",
+        )
+
+    rsi_oversold   = getattr(config, "MEAN_REV_RSI_OVERSOLD", 22)
+    rsi_overbought = getattr(config, "MEAN_REV_RSI_OVERBOUGHT", 78)
+    roc_threshold  = getattr(config, "MEAN_REV_ROC_THRESHOLD", 0.02)
+    require_confirm = getattr(config, "MEAN_REV_REQUIRE_CONFIRMATION", True)
+
     long_score = 0
     long_all = True
-    if last_rsi < 22:
+    if last_rsi < rsi_oversold:
         long_score += 3
     else:
         long_all = False
@@ -364,14 +400,18 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
         long_score += 3
     else:
         long_all = False
-    if last_roc < -0.02:
+    if last_roc < -roc_threshold:
         long_score += 2
     else:
         long_all = False
+    # Confirmation (root cause #2): require the latest closed bar to have
+    # already ticked back toward the mid-band vs. the prior bar, instead
+    # of fading the extreme bar the instant it prints.
+    long_confirmed = (last_close > prev_close) if require_confirm else True
 
     short_score = 0
     short_all = True
-    if last_rsi > 78:
+    if last_rsi > rsi_overbought:
         short_score += 3
     else:
         short_all = False
@@ -379,23 +419,23 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
         short_score += 3
     else:
         short_all = False
-    if last_roc > 0.02:
+    if last_roc > roc_threshold:
         short_score += 2
     else:
         short_all = False
+    short_confirmed = (last_close < prev_close) if require_confirm else True
 
-    if long_score >= 6 and long_score >= short_score:
-        raw = long_score
-        direction = "LONG"
-        all_met = long_all
-    elif short_score >= 6:
-        raw = short_score
-        direction = "SHORT"
-        all_met = short_all
+    if long_score >= 6 and long_score >= short_score and long_confirmed:
+        raw, direction, all_met = long_score, "LONG", long_all
+    elif short_score >= 6 and short_confirmed:
+        raw, direction, all_met = short_score, "SHORT", short_all
     else:
         best = max(long_score, short_score)
-        logger.debug(f"REJECTED: {symbol} MEAN_REV strength=0 score={best/8.0:.3f} — below threshold")
-        return SignalResult("NONE", 0, best / 8.0, "MEAN_REV", "Below entry threshold")
+        awaiting_confirm = (long_score >= 6 and not long_confirmed) or \
+                            (short_score >= 6 and not short_confirmed)
+        reason = "Awaiting confirmation bar" if awaiting_confirm else "Below entry threshold"
+        logger.debug(f"REJECTED: {symbol} MEAN_REV strength=0 score={best/8.0:.3f} — {reason}")
+        return SignalResult("NONE", 0, best / 8.0, "MEAN_REV", reason)
 
     score = raw / 8.0
     strength = 3 if all_met else (2 if score >= 6 / 8.0 else 1)
@@ -404,14 +444,34 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
         return SignalResult("NONE", 0, score, "MEAN_REV", "Below entry threshold")
 
     logger.info(
-        f"SIGNAL: {symbol} {direction} MEAN_REV strength={strength} score={score:.3f}"
+        f"SIGNAL: {symbol} {direction} MEAN_REV strength={strength} "
+        f"score={score:.3f} expansion={expansion_ratio:.2f}"
     )
+
+    try:
+        win_rate, _ci_low, _ci_high, n = strategy_stats.stats.get_win_rate("MEAN_REV", symbol)
+    except Exception:
+        win_rate, n = 0.0, 0
+    win_rate_note = (
+        f"rolling win rate {win_rate * 100:.1f}% over {n} trades" if n > 0
+        else "no trade history yet for this pair"
+    )
+
+    features = {
+        "rsi": round(last_rsi, 2),
+        "roc": round(last_roc, 5),
+        "bb_pct_b": round((last_close - last_lower) / max(last_upper - last_lower, 1e-9), 4),
+        "atr_expansion_ratio": round(expansion_ratio, 3),
+        "hour_utc": datetime.now(timezone.utc).hour,
+    }
+
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy="MEAN_REV",
-        reason=f"MeanRev RSI={last_rsi:.1f} raw={raw}/8 (70.8% documented win rate)",
+        reason=f"MeanRev RSI={last_rsi:.1f} raw={raw}/8 expansion={expansion_ratio:.2f} ({win_rate_note})",
+        features=features,
     )
 
 
