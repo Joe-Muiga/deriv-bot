@@ -97,6 +97,21 @@ DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 BEAR_BULL_SYMBOLS = ["RDBEAR", "RDBULL"]
 BEAR_BULL_TREND_SHIFT_MINS = 20     # 10 / 20 / 30 — unchanged default
 
+# Implementation Brief v5 / A5 — CONFIRMED bug, not just a flagged
+# assumption. bot_engine.py's _init_all_symbols() seeds every symbol
+# (via _init_data()) with LTF_BARS=30 bars regardless of category, and
+# the CandlestickBuilder is capped at ltf_bars + 20 = 50 bars. But
+# evaluate_trend_shift() (signal_engine.py) requires
+# min_bars = max(EMA_TREND=50, RSI_PERIOD=14, ATR_PERIOD=14) + 1 = 51
+# bars before it will evaluate anything — one bar more than the cap can
+# ever hold. TREND_SHIFT has been returning NONE_RESULT on every single
+# call for RDBEAR/RDBULL, contributing zero trades regardless of market
+# conditions. This override raises the seed (and therefore the cap) for
+# BEAR_BULL_SYMBOLS specifically — see the ltf_bars override in
+# bot_engine.py's _init_all_symbols() — without touching LTF_BARS=30 for
+# every other category.
+BEAR_BULL_LTF_BARS = 60
+
 # Implementation Brief v3, finding #4: each Daily Reset index holds ONE
 # fixed characteristic trend for its entire 24h cycle (Bull always up,
 # Bear always down, per Deriv's own product description) — this is a
@@ -542,6 +557,14 @@ META_LABEL_RETRAIN_EVERY_N = 100   # retrain cadence, in newly logged trades
 # 0.25 = quarter-Kelly.
 KELLY_FRACTION_MULTIPLIER = 0.25
 
+# Minimum logged trades a (strategy, symbol) pair needs before the Kelly
+# overlay activates for it (see risk_manager.py compute_kelly_fraction()).
+# Below this, the overlay is a no-op and PLS's stake passes through
+# unchanged. Implementation Brief v5 / A3 — previously an invisible
+# getattr(config, "KELLY_MIN_TRADES", 20) fallback inside risk_manager.py;
+# now explicit and tunable here.
+KELLY_MIN_TRADES = 20
+
 # ── ENSEMBLE MODE ──────────────────────────────────────────────
 # When True, requires 2+ independent strategies to agree within the
 # agreement window before a signal fires.
@@ -566,6 +589,13 @@ ENSEMBLE_MIN_STRATEGIES_AGREEING = 2
 # them (check symbols.py — there's no "jump" branch in get_symbol_class()
 # yet), so these table entries have no effect until that's added. These
 # remain config-only placeholders for now.
+# SUPERSEDED as of Implementation Brief v5 / B2 — bot_engine.py's
+# _session_dow_weight() no longer reads this table. Its category keys
+# never matched anything get_symbol_class() actually returns for this
+# bot's traded symbols, so it was a dead no-op in practice. Left here
+# for reference/rollback only; the live mechanism is now
+# strategy_stats.stats.get_hourly_payout_ratio(), which weights on the
+# bot's own realized win-payout ratio by UTC hour instead of a guess.
 SESSION_DOW_WEIGHT_TABLE = {
     "BOOM600_CRASH900": {
         "hours_utc": (14, 20),   # boosted 14:00-20:00 UTC
@@ -583,7 +613,19 @@ SESSION_DOW_WEIGHT_TABLE = {
         "multiplier": 1.15,
     },
 }
-SESSION_DOW_WEIGHT_DEFAULT = 1.0  # applied when no table entry matches
+SESSION_DOW_WEIGHT_DEFAULT = 1.0  # applied when no table entry matches / not enough data
+
+# ── HOURLY PAYOUT WEIGHTING (Implementation Brief v5 / B2) ────
+# Minimum settled trades required in the CURRENT UTC hour's bucket, and
+# across all hours combined, before _session_dow_weight() trusts the
+# realized data enough to deviate from SESSION_DOW_WEIGHT_DEFAULT. Below
+# these, behavior is a no-op (1.0) — this is deliberately conservative
+# early on and only starts adjusting once real history backs it.
+SESSION_HOURLY_MIN_TRADES = 15
+SESSION_HOURLY_MIN_TOTAL_TRADES = 200
+# Same [0.8, 1.2] bound the old static table used by convention.
+SESSION_HOURLY_WEIGHT_MIN = 0.8
+SESSION_HOURLY_WEIGHT_MAX = 1.2
 
 # ══════════════════════════════════════════════════════════════
 # ADAPTIVE EXIT ENGINE (Multiplier / non-time-bound contracts only)
