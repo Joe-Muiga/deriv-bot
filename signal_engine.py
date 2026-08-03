@@ -30,6 +30,7 @@ import numpy as np
 
 import config
 import indicators as ind
+import strategy_stats
 from candlestick_builder import Candle
 from symbol_manager import SymbolManager
 
@@ -406,12 +407,27 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
     logger.info(
         f"SIGNAL: {symbol} {direction} MEAN_REV strength={strength} score={score:.3f}"
     )
+
+    # Implementation Brief v5 / A6 — the old reason string carried a
+    # static "(70.8% documented win rate)" claim that wasn't computed
+    # from anything; a fabricated-looking number in the audit trail
+    # undermines the "documented rigorously" goal. Pull the pair's real
+    # rolling win rate from strategy_stats instead.
+    try:
+        win_rate, _ci_low, _ci_high, n = strategy_stats.stats.get_win_rate("MEAN_REV", symbol)
+    except Exception:
+        win_rate, n = 0.0, 0
+    win_rate_note = (
+        f"rolling win rate {win_rate * 100:.1f}% over {n} trades" if n > 0
+        else "no trade history yet for this pair"
+    )
+
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy="MEAN_REV",
-        reason=f"MeanRev RSI={last_rsi:.1f} raw={raw}/8 (70.8% documented win rate)",
+        reason=f"MeanRev RSI={last_rsi:.1f} raw={raw}/8 ({win_rate_note})",
     )
 
 
@@ -841,13 +857,17 @@ def evaluate_trend_shift(
     current price action is confirming the known bias (a confidence read),
     and to gate out the post-reset window on timing rather than direction.
 
-    ASSUMPTION: config.LTF_BARS is currently 30, which is fewer bars than
-    EMA_TREND=50 needs to fully warm up. Depending on how indicators.ema()
-    handles insufficient history (NaN-pad vs. shorter valid series vs.
-    raising), this evaluator may run below full confidence — or never
-    fire — until whatever calls SignalEngine.evaluate() is passing more
-    than LTF_BARS=30 bars for BEAR_BULL_SYMBOLS specifically, or LTF_BARS
-    is raised. Flagging rather than silently reinterpreting LTF_BARS.
+    CONFIRMED (Implementation Brief v5 / A5, previously flagged here only
+    as an assumption): the default config.LTF_BARS=30 was one bar short
+    of this function's own min_bars=51 requirement (max(EMA_TREND=50,
+    RSI_PERIOD=14, ATR_PERIOD=14)+1) once bot_engine.py's CandlestickBuilder
+    cap (ltf_bars+20=50) was accounted for — meaning this evaluator
+    returned NONE_RESULT on every call for RDBEAR/RDBULL, contributing
+    zero trades. Fixed upstream: config.BEAR_BULL_LTF_BARS=60 plus a
+    per-category override in bot_engine.py's _init_all_symbols() now
+    seed BEAR_BULL_SYMBOLS with enough bars to clear min_bars below. No
+    change needed in this function itself — the fix is entirely in how
+    many bars it's handed.
 
     `ticks` is accepted only for call-site/signature compatibility with
     SignalEngine.evaluate()'s existing `ticks=ticks` call; unused here.
