@@ -54,6 +54,7 @@ class TradeRecord:
     stake: float
     payout: float
     timestamp: float  # unix epoch seconds
+    features: Optional[str] = None   # JSON-encoded feature dict, or None
 
 
 def _wilson_interval(wins: int, n: int, z: float = 1.96) -> Tuple[float, float]:
@@ -100,10 +101,20 @@ class _SqliteBackend:
                 won INTEGER NOT NULL,
                 stake REAL,
                 payout REAL,
-                timestamp REAL NOT NULL
+                timestamp REAL NOT NULL,
+                features TEXT
             )
             """
         )
+        # Defensive upgrade path for databases created before `features`
+        # existed — CREATE TABLE IF NOT EXISTS above is a no-op against an
+        # already-existing table, so old schemas need this ALTER to gain
+        # the new column without losing history.
+        try:
+            conn.execute("ALTER TABLE trades ADD COLUMN features TEXT")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_strategy_symbol_ts "
             "ON trades (strategy, symbol, timestamp)"
@@ -114,9 +125,9 @@ class _SqliteBackend:
     def insert(self, rec: TradeRecord):
         conn = self._conn()
         conn.execute(
-            "INSERT INTO trades (strategy, symbol, entry_score, won, stake, payout, timestamp) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (rec.strategy, rec.symbol, rec.entry_score, int(rec.won), rec.stake, rec.payout, rec.timestamp),
+            "INSERT INTO trades (strategy, symbol, entry_score, won, stake, payout, timestamp, features) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (rec.strategy, rec.symbol, rec.entry_score, int(rec.won), rec.stake, rec.payout, rec.timestamp, rec.features),
         )
         conn.commit()
 
@@ -152,27 +163,29 @@ class _SqliteBackend:
         cur = conn.execute("SELECT DISTINCT strategy, symbol FROM trades")
         return [(row[0], row[1]) for row in cur.fetchall()]
 
-    def all_trades_full(self, window: Optional[int] = None) -> List[Tuple[str, str, bool, float, float, float]]:
+    def all_trades_full(self, window: Optional[int] = None) -> List[Tuple[str, str, bool, float, float, float, Optional[str]]]:
         """
         All trades (or the most recent `window`) across every (strategy,
-        symbol) pair, as (strategy, symbol, won, stake, payout, timestamp)
-        tuples, newest first. Used by get_hourly_payout_ratio() to bucket
-        realized payout by UTC hour — recent_trades()/recent_results()
-        don't expose timestamp, which this needs.
+        symbol) pair, as (strategy, symbol, won, stake, payout, timestamp,
+        features) tuples, newest first. Used by get_hourly_payout_ratio()
+        to bucket realized payout by UTC hour, and by get_feature_rows()
+        (Implementation Brief v6, PART 3) to decode logged feature
+        vectors — recent_trades()/recent_results() don't expose timestamp
+        or features, which these need.
         """
         conn = self._conn()
         if window:
             cur = conn.execute(
-                "SELECT strategy, symbol, won, stake, payout, timestamp FROM trades "
+                "SELECT strategy, symbol, won, stake, payout, timestamp, features FROM trades "
                 "ORDER BY timestamp DESC LIMIT ?",
                 (window,),
             )
         else:
             cur = conn.execute(
-                "SELECT strategy, symbol, won, stake, payout, timestamp FROM trades "
+                "SELECT strategy, symbol, won, stake, payout, timestamp, features FROM trades "
                 "ORDER BY timestamp DESC"
             )
-        return [(row[0], row[1], bool(row[2]), row[3], row[4], row[5]) for row in cur.fetchall()]
+        return [(row[0], row[1], bool(row[2]), row[3], row[4], row[5], row[6]) for row in cur.fetchall()]
 
 
 class _JsonBackend:
@@ -238,16 +251,16 @@ class _JsonBackend:
                 pairs.append((strategy, symbol))
         return pairs
 
-    def all_trades_full(self, window: Optional[int] = None) -> List[Tuple[str, str, bool, float, float, float]]:
+    def all_trades_full(self, window: Optional[int] = None) -> List[Tuple[str, str, bool, float, float, float, Optional[str]]]:
         """Same contract as _SqliteBackend.all_trades_full() — see there."""
         data = self._read()
-        rows: List[Tuple[str, str, bool, float, float, float]] = []
+        rows: List[Tuple[str, str, bool, float, float, float, Optional[str]]] = []
         for key, entries in data.items():
             if "::" not in key:
                 continue
             strategy, symbol = key.split("::", 1)
             for r in entries:
-                rows.append((strategy, symbol, bool(r["won"]), r["stake"], r["payout"], r["timestamp"]))
+                rows.append((strategy, symbol, bool(r["won"]), r["stake"], r["payout"], r["timestamp"], r.get("features")))
         rows.sort(key=lambda r: r[5], reverse=True)
         if window:
             rows = rows[:window]
@@ -283,6 +296,7 @@ class StrategyStats:
         stake: float,
         payout: float,
         timestamp: Optional[float] = None,
+        features: Optional[dict] = None,
     ) -> None:
         """Record a closed trade outcome. Call this whenever a trade closes."""
         rec = TradeRecord(
@@ -293,6 +307,7 @@ class StrategyStats:
             stake=float(stake),
             payout=float(payout),
             timestamp=float(timestamp) if timestamp is not None else time.time(),
+            features=json.dumps(features) if features is not None else None,
         )
         with self._lock:
             self._backend.insert(rec)
@@ -370,7 +385,7 @@ class StrategyStats:
             rows = self._backend.all_trades_full(window=window)
 
         buckets: Dict[int, List[float]] = {h: [] for h in range(24)}
-        for _strategy, _symbol, won, stake, payout, ts in rows:
+        for _strategy, _symbol, won, stake, payout, ts, _features in rows:
             if not won or stake <= 0:
                 continue
             hour = time.gmtime(ts).tm_hour
@@ -380,6 +395,31 @@ class StrategyStats:
             h: ((sum(ratios) / len(ratios)) if ratios else None, len(ratios))
             for h, ratios in buckets.items()
         }
+
+    def get_feature_rows(self, strategy: str, symbol: str, window: int = 500) -> List[dict]:
+        """
+        Rows with a non-null feature vector, newest first, for training a
+        calibration model (Implementation Brief v6, PART 5). Each dict:
+        {"won": bool, "stake": float, "payout": float, "timestamp": float,
+         **decoded feature dict}. Rows recorded before this field existed
+        are skipped (features is None), not zero-filled.
+        """
+        with self._lock:
+            rows = self._backend.all_trades_full(window=window)
+        out = []
+        for strat, sym, won, stake, payout, ts, features_json in rows:
+            if strat != strategy or sym != symbol:
+                continue
+            if not features_json:
+                continue
+            try:
+                decoded = json.loads(features_json)
+            except (TypeError, ValueError):
+                continue
+            row = {"won": won, "stake": stake, "payout": payout, "timestamp": ts}
+            row.update(decoded)
+            out.append(row)
+        return out
 
     def is_underperforming(self, strategy: str, symbol: str) -> bool:
         """
