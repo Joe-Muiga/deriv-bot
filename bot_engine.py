@@ -947,12 +947,15 @@ class BotEngine:
         # min-trades gating (config.META_LABEL_MIN_TRADES); below that
         # threshold it always returns (True, 1.0) — a pass-through, not
         # a real prediction.
+        ml_input = {
+            "strategy":    strategy,
+            "symbol":      symbol,
+            "entry_score": float(getattr(sig, "score", 0.0)),
+        }
+        if getattr(sig, "features", None):
+            ml_input.update(sig.features)
         try:
-            take, confidence = meta_labeling.predict_take_trade({
-                "strategy":    strategy,
-                "symbol":      symbol,
-                "entry_score": float(getattr(sig, "score", 0.0)),
-            })
+            take, confidence = meta_labeling.predict_take_trade(ml_input)
         except Exception as exc:
             logger.warning(
                 f"meta_labeling.predict_take_trade({symbol}) failed — "
@@ -1189,8 +1192,9 @@ class BotEngine:
         except Exception:
             pass
 
-        strategy    = info.get("strategy", "unknown")
-        entry_score = float(getattr(info.get("sig"), "score", 0.0))
+        strategy       = info.get("strategy", "unknown")
+        entry_score    = float(getattr(info.get("sig"), "score", 0.0))
+        entry_features = getattr(info.get("sig"), "features", None)
 
         # Feed strategy_stats — this is the source of truth the
         # meta-labeling filter and the Thompson bandit both read from,
@@ -1203,6 +1207,7 @@ class BotEngine:
                 won         = won,
                 stake       = stake,
                 payout      = payout,
+                features    = entry_features,
             )
         except Exception as exc:
             logger.warning(f"strategy_stats.record_trade({symbol}) failed: {exc}")
