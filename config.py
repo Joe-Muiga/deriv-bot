@@ -382,7 +382,50 @@ CONTRACT_FORCE_CLOSE_SECS = 1350    # trigger active reconciliation (never a gue
 # TRADE_DURATION_UNIT). Populate here if a contracts_for audit finds a
 # symbol that rejects the default TRADE_DURATION (14m). Empty = every
 # symbol uses TRADE_DURATION/TRADE_DURATION_UNIT unchanged.
-TRADE_DURATION_OVERRIDES = {}
+# ── MEAN-REVERSION DURATION TEST (Implementation Brief v6, root cause #1) ──
+# TRADE_DURATION_OVERRIDES was defined but never populated. The default
+# 14m duration was producing an observed net payout ratio (b) of ~0.13 on
+# MEAN_REV trades — the strategy needed an ~89% win rate just to break
+# even at that ratio. This tests shorter durations, closer to the signal's
+# own 1-minute-candle horizon, on the theory that (a) less time for noise
+# to erase a short-term reversal, and (b) a materially better payout ratio
+# at shorter Rise/Fall durations. VERIFY WITH A FRESH contracts_for AUDIT
+# (symbol_audit.py) BEFORE DEPLOYING — Deriv enforces a per-symbol minimum
+# duration and may reject 3m for some of these; if so, use the smallest
+# confirmed-valid duration instead. Start conservative and compare
+# strategy_stats.get_avg_win_payout_ratio() before/after over a real
+# sample, not a hunch.
+TRADE_DURATION_OVERRIDES = {
+    "R_10": 3, "R_25": 3, "R_50": 3, "R_75": 3, "R_100": 3,
+    "1HZ10V": 3, "1HZ25V": 3, "1HZ50V": 3, "1HZ75V": 3, "1HZ100V": 3,
+}
+# duration_unit stays "m" (TRADE_DURATION_UNIT below) unless the audit
+# finds a symbol that needs tick- or second-based duration instead — if
+# so, that's a per-symbol (duration, unit) pair, which buy_contract()
+# doesn't currently support (only a single global TRADE_DURATION_UNIT).
+# Flag this back rather than guessing at a code change here.
+
+# ── MEAN-REVERSION REGIME / CONFIRMATION FILTER (root cause #2, #3) ────────
+# All read via getattr() with these exact defaults in signal_engine.py, so
+# they're safe to tune later without another code change.
+MEAN_REV_MAX_ATR_EXPANSION_RATIO = 1.3   # fast(5-bar)/slow(20-bar) ATR ratio
+                                          # above this = market expanding/
+                                          # trending, not ranging -> skip
+MEAN_REV_REQUIRE_CONFIRMATION    = True  # require last closed bar to have
+                                          # already turned back toward the
+                                          # mid-band vs. the prior bar,
+                                          # instead of fading the extreme
+                                          # bar itself
+MEAN_REV_RSI_OVERSOLD    = 22
+MEAN_REV_RSI_OVERBOUGHT  = 78
+MEAN_REV_ROC_THRESHOLD   = 0.02
+MEAN_REV_ML_ENABLED      = False         # flips on once PART 3 (feature
+                                          # logging) has accumulated enough
+                                          # rows and a model exists — see
+                                          # PART 5. Leave False for now;
+                                          # the code in PART 2 falls back
+                                          # cleanly to the rule-based gate
+                                          # when this is off.
 
 # ── RECONCILIATION (never-fabricate-a-result path, Fix C) ────
 # After CONTRACT_FORCE_CLOSE_SECS, a Rise/Fall contract that still hasn't
