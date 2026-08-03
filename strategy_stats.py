@@ -152,6 +152,28 @@ class _SqliteBackend:
         cur = conn.execute("SELECT DISTINCT strategy, symbol FROM trades")
         return [(row[0], row[1]) for row in cur.fetchall()]
 
+    def all_trades_full(self, window: Optional[int] = None) -> List[Tuple[str, str, bool, float, float, float]]:
+        """
+        All trades (or the most recent `window`) across every (strategy,
+        symbol) pair, as (strategy, symbol, won, stake, payout, timestamp)
+        tuples, newest first. Used by get_hourly_payout_ratio() to bucket
+        realized payout by UTC hour — recent_trades()/recent_results()
+        don't expose timestamp, which this needs.
+        """
+        conn = self._conn()
+        if window:
+            cur = conn.execute(
+                "SELECT strategy, symbol, won, stake, payout, timestamp FROM trades "
+                "ORDER BY timestamp DESC LIMIT ?",
+                (window,),
+            )
+        else:
+            cur = conn.execute(
+                "SELECT strategy, symbol, won, stake, payout, timestamp FROM trades "
+                "ORDER BY timestamp DESC"
+            )
+        return [(row[0], row[1], bool(row[2]), row[3], row[4], row[5]) for row in cur.fetchall()]
+
 
 class _JsonBackend:
     """
@@ -215,6 +237,21 @@ class _JsonBackend:
                 strategy, symbol = key.split("::", 1)
                 pairs.append((strategy, symbol))
         return pairs
+
+    def all_trades_full(self, window: Optional[int] = None) -> List[Tuple[str, str, bool, float, float, float]]:
+        """Same contract as _SqliteBackend.all_trades_full() — see there."""
+        data = self._read()
+        rows: List[Tuple[str, str, bool, float, float, float]] = []
+        for key, entries in data.items():
+            if "::" not in key:
+                continue
+            strategy, symbol = key.split("::", 1)
+            for r in entries:
+                rows.append((strategy, symbol, bool(r["won"]), r["stake"], r["payout"], r["timestamp"]))
+        rows.sort(key=lambda r: r[5], reverse=True)
+        if window:
+            rows = rows[:window]
+        return rows
 
 
 class StrategyStats:
@@ -303,6 +340,46 @@ class StrategyStats:
         if not ratios:
             return None
         return sum(ratios) / len(ratios)
+
+    def get_hourly_payout_ratio(
+        self, window: int = 5000
+    ) -> Dict[int, Tuple[Optional[float], int]]:
+        """
+        Implementation Brief v5 / B2.
+
+        Realized average win-payout ratio (payout/stake on winning
+        trades), bucketed by UTC hour of trade close (0-23), across ALL
+        (strategy, symbol) pairs and ALL settled trades this backend has
+        (up to the most recent `window` trades overall, to bound cost on
+        the JSON fallback backend).
+
+        Independent payout auditing found off-peak/quiet-session payouts
+        can run meaningfully below the advertised headline rate — a
+        direct hit to the Kelly `b` term (net odds) for every Rise/Fall
+        trade placed during quiet hours, independent of signal quality.
+        This is the cheap way to act on that: the data (payout, stake,
+        timestamp) is already captured on every settled trade, so this
+        just aggregates what's already there instead of guessing.
+
+        Returns {hour: (avg_ratio_or_None, n)}. avg_ratio is None for
+        hours with no winning trades logged yet — callers should treat
+        None (or a low n) as "not enough data, use a neutral weight"
+        rather than as 0.
+        """
+        with self._lock:
+            rows = self._backend.all_trades_full(window=window)
+
+        buckets: Dict[int, List[float]] = {h: [] for h in range(24)}
+        for _strategy, _symbol, won, stake, payout, ts in rows:
+            if not won or stake <= 0:
+                continue
+            hour = time.gmtime(ts).tm_hour
+            buckets[hour].append(payout / stake)
+
+        return {
+            h: ((sum(ratios) / len(ratios)) if ratios else None, len(ratios))
+            for h, ratios in buckets.items()
+        }
 
     def is_underperforming(self, strategy: str, symbol: str) -> bool:
         """
