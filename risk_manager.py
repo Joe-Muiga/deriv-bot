@@ -177,9 +177,9 @@ class RiskManager:
 
         # ── Kelly overlay config ──────────────────────────────────────
         self.kelly_fraction_multiplier = getattr(config, "KELLY_FRACTION_MULTIPLIER", 0.25)
-        # NOTE: config.py does not define KELLY_MIN_TRADES — defaulting
-        # to 20 here. Add an explicit KELLY_MIN_TRADES constant to
-        # config.py to make this tunable instead of hardcoded (see reply).
+        # Implementation Brief v5 / A3 — config.KELLY_MIN_TRADES is now an
+        # explicit, documented constant in config.py; the getattr default
+        # of 20 here is just a defensive fallback if it's ever removed.
         self.kelly_min_trades = getattr(config, "KELLY_MIN_TRADES", 20)
 
         # Live balance — updated by set_balance() and _fetch_live_balance()
