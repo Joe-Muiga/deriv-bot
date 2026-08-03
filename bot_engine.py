@@ -359,67 +359,41 @@ class BotEngine:
 
     def _session_dow_weight(self, symbol: str) -> float:
         """
-        Implementation Brief v5 / B2.
+        Multiplier from config.SESSION_DOW_WEIGHT_TABLE, keyed on the
+        symbol's category (via symbols.get_symbol_class), current UTC
+        hour, and current UTC day-of-week (Mon=0..Sun=6).
 
-        Previously: a multiplier from the static config.SESSION_DOW_WEIGHT_TABLE,
-        keyed on symbol category (via get_symbol_class). That table was a
-        dead no-op in practice — its keys ("BOOM600_CRASH900", "JUMP50",
-        etc.) never matched any category get_symbol_class() actually
-        returns for the symbols this bot trades, so every lookup silently
-        fell through to SESSION_DOW_WEIGHT_DEFAULT=1.0.
-
-        Now: driven by strategy_stats.stats.get_hourly_payout_ratio(),
-        which buckets REALIZED win-payout ratio (payout/stake on settled
-        winning trades) by UTC hour across this bot's own trade history.
-        Independent payout auditing found off-peak/quiet-session payouts
-        can run meaningfully below the advertised headline rate — a
-        direct hit to the Kelly `b` term regardless of signal quality.
-        This replaces a guessed table with the bot's own measured data,
-        which is a strictly better version of a feature that was already
-        wired in but inert.
-
-        The `symbol` argument is accepted for call-site compatibility
-        (and in case a future pass wants to bucket per symbol/category
-        as well as per hour) but the weight itself is currently computed
-        globally across all settled trades, since B2's underlying finding
-        — quiet-hour payout degradation — isn't instrument-specific.
-
-        Falls back to config.SESSION_DOW_WEIGHT_DEFAULT (1.0, neutral)
-        whenever there isn't yet enough settled-trade history to trust
-        the read, so this behaves as a no-op early on and only starts
-        adjusting once real data backs it.
+        NOTE: the table shipped in config.py only has entries for Boom/
+        Crash/Jump categories, none of which are in RISE_FALL_SYMBOLS /
+        TRADE_SYMBOLS right now (BOOM_CRASH=[] and JUMP=[] — disabled,
+        see config comments). Until entries are added for the
+        categories get_symbol_class() actually returns for your traded
+        symbols (volatility indices, stpRNG, drift), every lookup below
+        falls through to SESSION_DOW_WEIGHT_DEFAULT=1.0, i.e. a no-op.
         """
-        default = getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
-        min_per_hour = getattr(config, "SESSION_HOURLY_MIN_TRADES", 15)
-        min_total    = getattr(config, "SESSION_HOURLY_MIN_TOTAL_TRADES", 200)
-        weight_min   = getattr(config, "SESSION_HOURLY_WEIGHT_MIN", 0.8)
-        weight_max   = getattr(config, "SESSION_HOURLY_WEIGHT_MAX", 1.2)
-
         try:
-            hourly = strategy_stats.stats.get_hourly_payout_ratio()
-        except Exception as exc:
-            logger.debug(f"SESSION WEIGHT: hourly payout lookup failed ({exc}) — using default")
-            return default
+            category = get_symbol_class(symbol)
+        except Exception:
+            return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
 
-        total_n = sum(n for (_ratio, n) in hourly.values())
-        if total_n < min_total:
-            return default
+        table = getattr(config, "SESSION_DOW_WEIGHT_TABLE", {})
+        entry = table.get(category)
+        if not entry:
+            return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
 
-        now_hour = _dt.datetime.utcnow().hour
-        ratio, n = hourly.get(now_hour, (None, 0))
-        if ratio is None or n < min_per_hour:
-            return default
+        now = _dt.datetime.utcnow()
 
-        trusted_ratios = [r for (r, cnt) in hourly.values() if r is not None and cnt >= min_per_hour]
-        if not trusted_ratios:
-            return default
-        overall_avg = sum(trusted_ratios) / len(trusted_ratios)
-        if overall_avg <= 0:
-            return default
+        days = entry.get("days")
+        if days is not None and now.weekday() not in days:
+            return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
 
-        weight = ratio / overall_avg
-        weight = max(weight_min, min(weight_max, weight))
-        return round(weight, 4)
+        hours_utc = entry.get("hours_utc")
+        if hours_utc is not None:
+            start, end = hours_utc
+            if not (start <= now.hour <= end):
+                return getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)
+
+        return float(entry.get("multiplier", getattr(config, "SESSION_DOW_WEIGHT_DEFAULT", 1.0)))
 
     # ── Daily loss limit ───────────────────────────────────────────────────────
 
@@ -524,20 +498,8 @@ class BotEngine:
                 "ALL_TRADE_SYMBOLS in config.py")
             return
 
-        # Implementation Brief v5 / A5 — BEAR_BULL_SYMBOLS need more LTF
-        # bars than the default config.LTF_BARS=30 provides (TREND_SHIFT's
-        # min_bars=51 exceeds the default 30+20=50 builder cap — see
-        # config.BEAR_BULL_LTF_BARS for the confirmed bug this fixes).
-        # Every other category keeps using the default (ltf_bars=None ->
-        # config.LTF_BARS inside _init_data()).
-        bear_bull_symbols = set(getattr(config, "BEAR_BULL_SYMBOLS", []))
-        bear_bull_ltf_bars = getattr(config, "BEAR_BULL_LTF_BARS", config.LTF_BARS)
-
         results = await asyncio.gather(
-            *[self._init_data(
-                s,
-                ltf_bars=bear_bull_ltf_bars if s in bear_bull_symbols else None,
-              ) for s in trade_symbols],
+            *[self._init_data(s) for s in trade_symbols],
             return_exceptions=True,
         )
         for s, r in zip(trade_symbols, results):
@@ -980,18 +942,6 @@ class BotEngine:
 
         strategy = getattr(sig, "strategy", "unknown")
 
-        # Implementation Brief v5 / A4 — belt-and-suspenders stats gate.
-        # Coarser than the Kelly overlay in calculate_stake() (uses the
-        # flat config.STRATEGY_WIN_RATE_FLOOR / STRATEGY_WIN_RATE_MIN_TRADES
-        # check rather than full Kelly math), but it's an independent
-        # second check with its own clean log line, and it skips the trade
-        # entirely rather than just zeroing the stake.
-        if strategy_stats.stats.is_underperforming(strategy, symbol):
-            logger.info(
-                f"STATS SKIP: {symbol} | {strategy} | "
-                f"underperforming (win rate below floor)")
-            return False
-
         # Meta-labeling gate — skip execution if the take-trade-or-not
         # filter rejects it. predict_take_trade() has its own internal
         # min-trades gating (config.META_LABEL_MIN_TRADES); below that
@@ -1022,29 +972,7 @@ class BotEngine:
             )
             return False
 
-        stake     = await self.risk.calculate_stake(strategy=strategy, symbol=symbol)
-
-        # Implementation Brief v5 / A2 — Kelly overlay guard. calculate_stake()
-        # now runs the Kelly overlay for this pair (A1 above); once it has
-        # >= config.KELLY_MIN_TRADES logged trades and finds no computable
-        # edge (b <= 0), it forces stake to $0.00. Without this guard a $0
-        # stake would get sent to Deriv as a real buy request, fail the
-        # API's minimum-stake check, and trip the buy-failure circuit
-        # breaker (see below) for the wrong reason — this is a deliberate
-        # skip, not a placement failure.
-        if stake <= 0:
-            logger.info(
-                f"KELLY SKIP: {symbol} | {strategy} | stake=$0.00 — "
-                f"no computable edge, trade skipped")
-            record_failure(
-                symbol    = symbol,
-                direction = sig.direction,
-                stake     = 0.0,
-                strategy  = strategy,
-                reason    = "kelly_zero_edge",
-            )
-            return False
-
+        stake     = await self.risk.calculate_stake()
         # NOTE: for DIGIT signals (JUMP_BUILDUP) this is "MATCH"/"DIFFER",
         # not "LONG"/"SHORT" — passed through below to record_signal(),
         # risk.register_open(), and journal.open_trade() purely as a label.
