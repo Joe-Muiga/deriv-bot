@@ -97,15 +97,6 @@ DRIFT = ["DSHIFT10","DSHIFT20","DSHIFT30"]
 BEAR_BULL_SYMBOLS = ["RDBEAR", "RDBULL"]
 BEAR_BULL_TREND_SHIFT_MINS = 20     # 10 / 20 / 30 — unchanged default
 
-# Implementation Brief v3, finding #4: each Daily Reset index holds ONE
-# fixed characteristic trend for its entire 24h cycle (Bull always up,
-# Bear always down, per Deriv's own product description) — this is a
-# static fact, not something signal_engine.py should derive from EMAs or
-# alternate at each reset. evaluate_trend_shift() reads this map directly;
-# BEAR_BULL_TREND_SHIFT_MINS above is used only to gate entry timing
-# (skip trading until the post-reset window closes), never to pick a side.
-BEAR_BULL_DIRECTION = {"RDBULL": "LONG", "RDBEAR": "SHORT"}
-
 # Symbols confirmed via contracts_for to support CALL/PUT Rise/Fall on
 # this account. Last empirically verified: symbol_audit.py run, 2026-07-31.
 #   - 1HZ150V/1HZ200V/1HZ250V removed — confirmed OfferingsInvalidSymbol,
@@ -215,23 +206,7 @@ DRIFT_FADE_SYMBOLS     = []                                      # evaluate_drif
 #   RDBEAR/RDBULL — audit explicitly confirmed NO MULTUP/MULTDOWN support
 #     on either. Will never belong here; they trade via Rise/Fall only.
 #
-MULTIPLIER_SYMBOLS = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000",
-                       "JD10", "JD25", "JD50", "JD75", "JD100"]
-
-# NOT YET AUDITED for Multiplier (MULTUP/MULTDOWN) support. The 2026-07-31
-# audit only confirmed Rise/Fall (CALL/PUT) for these — it never tested
-# whether Deriv's contracts_for offers Multipliers on this account for them.
-# Do not add any of these to MULTIPLIER_SYMBOLS until a fresh symbol_audit.py
-# run confirms MULTUP/MULTDOWN support — promoting an unverified symbol here
-# reproduces the exact InputValidationFailed failures this project has
-# already fought through elsewhere.
-MULTIPLIER_CANDIDATE_SYMBOLS = [
-    "R_10", "R_25", "R_50", "R_75", "R_100",
-    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
-    "stpRNG",
-    "BOOM150", "BOOM300", "CRASH150", "CRASH300",
-    "DSHIFT10", "DSHIFT20", "DSHIFT30",
-]
+MULTIPLIER_SYMBOLS = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000"]
 
 # bot_engine._init_all_symbols() reads ALL_TRADE_SYMBOLS (falling back to
 # ALL_SYMBOLS) as the ONLY list of symbols that ever get initialised or
@@ -330,30 +305,6 @@ DEFAULT_STOP_LOSS_PCT = 50.0
 # contract_update, without changing this ratio itself.
 TAKE_PROFIT_RATIO = 2.0
 
-# ── TIGHT-LOSS / STAKE-MULTIPLE EXIT MODEL (Multiplier contracts) ──
-# Overrides the STOP_LOSS_MAP percentage-of-stake model above for symbols in
-# MULTIPLIER_SYMBOLS: instead of risking a % of stake, cap the loss at a
-# small fixed dollar amount (broker-side, via limit_order.stop_loss — this
-# is enforced by Deriv's servers even if this bot/Render is offline or
-# disconnected, unlike the polling-based exit_engine.py layer).
-#
-# Target of $0.03 may be rejected by Deriv's minimum stop-distance rule
-# (untested/unconfirmed on this account) — start at $0.05 and let
-# deriv_client.py's retry-widen logic (see deriv_client.py instructions)
-# discover the real per-symbol floor empirically, same audit-driven
-# philosophy as the rest of this file. Tune down toward 0.03 once confirmed.
-STOP_LOSS_FLOOR_USD = 0.05
-STOP_LOSS_FLOOR_USD_MAX = 2.00   # hard ceiling for the retry-widen loop —
-                                  # never silently widen past this
-
-# take_profit_amount = stake * TAKE_PROFIT_STAKE_MULTIPLE. At 1.0, a win
-# returns stake + 100% = 2x stake total, matching the "at least twice the
-# stake" target. Independent of STOP_LOSS_FLOOR_USD on purpose — the old
-# TAKE_PROFIT_RATIO model tied profit target to loss size, which no longer
-# makes sense once the loss side is a tiny fixed floor instead of a % of
-# stake.
-TAKE_PROFIT_STAKE_MULTIPLE = 1.0
-
 # ── STAKE SETTINGS ───────────────────────────────────────────
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
@@ -365,25 +316,6 @@ MAX_STAKE            = 1000.0  # safety backstop only, not the everyday
                                 # $0.35 regardless of balance or the 0.5%
                                 # calculation above. Adjust if you want a
                                 # tighter per-trade ceiling.
-
-# ── AGGRESSIVE STAKE OVERRIDE ────────────────────────────────
-# When set (not None), risk_manager.py uses this instead of BASE_STAKE_PCT
-# for its percentage-of-balance calculation. 0.30 = 30% of current
-# available (uncommitted) balance per trade. This is a deliberately
-# aggressive user-chosen setting — BASE_STAKE_PCT (0.5%) is left untouched
-# above so it's easy to fall back to if this proves too aggressive in
-# practice. See risk_manager.py instructions for how this interacts with
-# the existing Kelly overlay and the new exposure cap below.
-STAKE_PCT_MULTIPLIER = 0.30
-
-# Ceiling on total stake-at-risk across ALL currently open positions,
-# expressed as a fraction of current balance. Required because
-# STAKE_PCT_MULTIPLIER (30%) times more than 2-3 concurrent trades would
-# over-commit past 100% of the account, which is not possible and must be
-# clamped rather than silently allowed to error. See risk_manager.py
-# instructions for the exposure-tracking logic that enforces this.
-EXPOSURE_CEILING_PCT = 0.90
-
 DAILY_LOSS_LIMIT_PCT = 0.15   # NOTE: value is 15%, comment below said 20% — see flags in reply
 DAILY_LOSS_PAUSE_MINS = 30
 
@@ -396,11 +328,7 @@ PLS_WIN_MULTIPLIERS = [1.0, 1.0, 1.0, 1.0, 1.0]
 PLS_WIN_EXTRA_SLOTS = [0,   0,   0,   0,   0   ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 3
-# Lowered from 30 — at STAKE_PCT_MULTIPLIER=0.30 per trade, more than a
-# handful of concurrent positions over-commits the account far past 100%.
-# EXPOSURE_CEILING_PCT above is the hard backstop; this is the soft/normal
-# operating limit.
+MAX_CONCURRENT_TRADES = 30
 
 # ── TIMEFRAMES ───────────────────────────────────────────────
 HTF_GRANULARITY   = 3600   # 1H
@@ -445,50 +373,7 @@ CONTRACT_FORCE_CLOSE_SECS = 1350    # trigger active reconciliation (never a gue
 # TRADE_DURATION_UNIT). Populate here if a contracts_for audit finds a
 # symbol that rejects the default TRADE_DURATION (14m). Empty = every
 # symbol uses TRADE_DURATION/TRADE_DURATION_UNIT unchanged.
-# ── MEAN-REVERSION DURATION TEST (Implementation Brief v6, root cause #1) ──
-# TRADE_DURATION_OVERRIDES was defined but never populated. The default
-# 14m duration was producing an observed net payout ratio (b) of ~0.13 on
-# MEAN_REV trades — the strategy needed an ~89% win rate just to break
-# even at that ratio. This tests shorter durations, closer to the signal's
-# own 1-minute-candle horizon, on the theory that (a) less time for noise
-# to erase a short-term reversal, and (b) a materially better payout ratio
-# at shorter Rise/Fall durations. VERIFY WITH A FRESH contracts_for AUDIT
-# (symbol_audit.py) BEFORE DEPLOYING — Deriv enforces a per-symbol minimum
-# duration and may reject 3m for some of these; if so, use the smallest
-# confirmed-valid duration instead. Start conservative and compare
-# strategy_stats.get_avg_win_payout_ratio() before/after over a real
-# sample, not a hunch.
-TRADE_DURATION_OVERRIDES = {
-    "R_10": 3, "R_25": 3, "R_50": 3, "R_75": 3, "R_100": 3,
-    "1HZ10V": 3, "1HZ25V": 3, "1HZ50V": 3, "1HZ75V": 3, "1HZ100V": 3,
-}
-# duration_unit stays "m" (TRADE_DURATION_UNIT below) unless the audit
-# finds a symbol that needs tick- or second-based duration instead — if
-# so, that's a per-symbol (duration, unit) pair, which buy_contract()
-# doesn't currently support (only a single global TRADE_DURATION_UNIT).
-# Flag this back rather than guessing at a code change here.
-
-# ── MEAN-REVERSION REGIME / CONFIRMATION FILTER (root cause #2, #3) ────────
-# All read via getattr() with these exact defaults in signal_engine.py, so
-# they're safe to tune later without another code change.
-MEAN_REV_MAX_ATR_EXPANSION_RATIO = 1.3   # fast(5-bar)/slow(20-bar) ATR ratio
-                                          # above this = market expanding/
-                                          # trending, not ranging -> skip
-MEAN_REV_REQUIRE_CONFIRMATION    = True  # require last closed bar to have
-                                          # already turned back toward the
-                                          # mid-band vs. the prior bar,
-                                          # instead of fading the extreme
-                                          # bar itself
-MEAN_REV_RSI_OVERSOLD    = 22
-MEAN_REV_RSI_OVERBOUGHT  = 78
-MEAN_REV_ROC_THRESHOLD   = 0.02
-MEAN_REV_ML_ENABLED      = False         # flips on once PART 3 (feature
-                                          # logging) has accumulated enough
-                                          # rows and a model exists — see
-                                          # PART 5. Leave False for now;
-                                          # the code in PART 2 falls back
-                                          # cleanly to the rule-based gate
-                                          # when this is off.
+TRADE_DURATION_OVERRIDES = {}
 
 # ── RECONCILIATION (never-fabricate-a-result path, Fix C) ────
 # After CONTRACT_FORCE_CLOSE_SECS, a Rise/Fall contract that still hasn't
@@ -719,18 +604,13 @@ EXIT_ENGINE_SYMBOLS         = list(MULTIPLIER_SYMBOLS)  # only Multiplier contra
 
 # Rule-based trailing layer (always active — the ML layer below only ever
 # adds an *earlier* close on top of this, never removes this safety net):
-# These three fractions govern how a WINNING trade is managed toward the
-# ~2x-stake target (TAKE_PROFIT_STAKE_MULTIPLE above) — they do NOT cut
-# losing trades early; that job belongs to the broker-side
-# STOP_LOSS_FLOOR_USD set at buy time, which is enforced by Deriv's servers
-# and survives this bot / Render going offline.
-EXIT_ARM_PROFIT_FRACTION    = 0.15   # was 0.30 — arm trailing sooner given
-                                       # the higher stake and the "always get
-                                       # at least 2x" target
-EXIT_TRAIL_LOCK_FRACTION    = 0.75   # was 0.60 — lock in more of the peak
-                                       # profit once armed
-EXIT_DECAY_CLOSE_FRACTION   = 0.20   # was 0.25 — close a winning trade a
-                                       # little sooner if it starts decaying
+EXIT_ARM_PROFIT_FRACTION    = 0.30   # start trailing once profit >= 30% of the
+                                      # contract's static take_profit_amount
+EXIT_TRAIL_LOCK_FRACTION    = 0.60   # once armed, ratchet stop_loss to lock in
+                                      # 60% of peak profit seen so far
+EXIT_DECAY_CLOSE_FRACTION   = 0.25   # once armed, close immediately if profit
+                                      # falls back below 25% of peak (rather than
+                                      # waiting for the original static stop_loss)
 EXIT_POLL_INTERVAL_SECS     = 15     # how often the exit engine re-checks each
                                       # open Multiplier contract (independent of
                                       # the general 30s orphan-sweep cadence)
