@@ -503,7 +503,7 @@ DEAD_ZONE_START_UTC  = 0
 DEAD_ZONE_END_UTC    = 5
 BOOM500_PRIME_START  = 7
 BOOM500_PRIME_END    = 12
-TRADE_DURATION = 14
+TRADE_DURATION = 6
 TRADE_DURATION_UNIT = "m"
 
 # ══════════════════════════════════════════════════════════════
