@@ -262,6 +262,28 @@ def _rule_layer_decide(state: _ContractState, current_profit: float) -> ExitDeci
     arm_threshold = arm_fraction * state.static_tp_amount
 
     if not state.armed:
+        # Stale-loser check: the broker-side static stop_loss already caps
+        # how much this position can lose (see deriv_client.py's
+        # STOP_LOSS_FLOOR_USD wiring) — this rule is not about capping
+        # loss, it's about freeing up exposure (see risk_manager.py's
+        # EXPOSURE_CEILING_PCT) tied up in a position that's gone nowhere.
+        # Only fires while still negative and never armed; a profitable or
+        # already-armed position is untouched by this check.
+        max_hold_secs = getattr(config, "MULTIPLIER_MAX_HOLD_MINS", 30) * 60
+        stale_fraction = getattr(config, "EXIT_STALE_LOSER_FRACTION", 0.5)
+        stale_threshold_secs = max_hold_secs * stale_fraction
+
+        elapsed_secs = state.history[-1].elapsed_secs if state.history else 0.0
+
+        if current_profit < 0 and elapsed_secs >= stale_threshold_secs:
+            return ExitDecision(
+                "CLOSE_NOW", None,
+                f"stale_loser: never armed, profit={current_profit:.2f} "
+                f"after {elapsed_secs:.0f}s (>= {stale_threshold_secs:.0f}s "
+                f"threshold) — freeing exposure rather than waiting out "
+                f"the full max-hold window",
+            )
+
         if current_profit >= arm_threshold:
             state.armed = True
         else:
