@@ -318,7 +318,7 @@ TAKE_PROFIT_RATIO = 2.0
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
-MIN_STAKE            = 0.35    # safety floor — never stake less than this
+MIN_STAKE            = 100    # safety floor — never stake less than this
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday
                                 # driver — was previously == MIN_STAKE,
                                 # which silently capped every trade at
