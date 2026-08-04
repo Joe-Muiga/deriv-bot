@@ -215,7 +215,23 @@ DRIFT_FADE_SYMBOLS     = []                                      # evaluate_drif
 #   RDBEAR/RDBULL — audit explicitly confirmed NO MULTUP/MULTDOWN support
 #     on either. Will never belong here; they trade via Rise/Fall only.
 #
-MULTIPLIER_SYMBOLS = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000"]
+MULTIPLIER_SYMBOLS = ["BOOM500", "BOOM1000", "CRASH500", "CRASH1000",
+                       "JD10", "JD25", "JD50", "JD75", "JD100"]
+
+# NOT YET AUDITED for Multiplier (MULTUP/MULTDOWN) support. The 2026-07-31
+# audit only confirmed Rise/Fall (CALL/PUT) for these — it never tested
+# whether Deriv's contracts_for offers Multipliers on this account for them.
+# Do not add any of these to MULTIPLIER_SYMBOLS until a fresh symbol_audit.py
+# run confirms MULTUP/MULTDOWN support — promoting an unverified symbol here
+# reproduces the exact InputValidationFailed failures this project has
+# already fought through elsewhere.
+MULTIPLIER_CANDIDATE_SYMBOLS = [
+    "R_10", "R_25", "R_50", "R_75", "R_100",
+    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+    "stpRNG",
+    "BOOM150", "BOOM300", "CRASH150", "CRASH300",
+    "DSHIFT10", "DSHIFT20", "DSHIFT30",
+]
 
 # bot_engine._init_all_symbols() reads ALL_TRADE_SYMBOLS (falling back to
 # ALL_SYMBOLS) as the ONLY list of symbols that ever get initialised or
@@ -314,6 +330,30 @@ DEFAULT_STOP_LOSS_PCT = 50.0
 # contract_update, without changing this ratio itself.
 TAKE_PROFIT_RATIO = 2.0
 
+# ── TIGHT-LOSS / STAKE-MULTIPLE EXIT MODEL (Multiplier contracts) ──
+# Overrides the STOP_LOSS_MAP percentage-of-stake model above for symbols in
+# MULTIPLIER_SYMBOLS: instead of risking a % of stake, cap the loss at a
+# small fixed dollar amount (broker-side, via limit_order.stop_loss — this
+# is enforced by Deriv's servers even if this bot/Render is offline or
+# disconnected, unlike the polling-based exit_engine.py layer).
+#
+# Target of $0.03 may be rejected by Deriv's minimum stop-distance rule
+# (untested/unconfirmed on this account) — start at $0.05 and let
+# deriv_client.py's retry-widen logic (see deriv_client.py instructions)
+# discover the real per-symbol floor empirically, same audit-driven
+# philosophy as the rest of this file. Tune down toward 0.03 once confirmed.
+STOP_LOSS_FLOOR_USD = 0.05
+STOP_LOSS_FLOOR_USD_MAX = 2.00   # hard ceiling for the retry-widen loop —
+                                  # never silently widen past this
+
+# take_profit_amount = stake * TAKE_PROFIT_STAKE_MULTIPLE. At 1.0, a win
+# returns stake + 100% = 2x stake total, matching the "at least twice the
+# stake" target. Independent of STOP_LOSS_FLOOR_USD on purpose — the old
+# TAKE_PROFIT_RATIO model tied profit target to loss size, which no longer
+# makes sense once the loss side is a tiny fixed floor instead of a % of
+# stake.
+TAKE_PROFIT_STAKE_MULTIPLE = 1.0
+
 # ── STAKE SETTINGS ───────────────────────────────────────────
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
@@ -325,6 +365,25 @@ MAX_STAKE            = 1000.0  # safety backstop only, not the everyday
                                 # $0.35 regardless of balance or the 0.5%
                                 # calculation above. Adjust if you want a
                                 # tighter per-trade ceiling.
+
+# ── AGGRESSIVE STAKE OVERRIDE ────────────────────────────────
+# When set (not None), risk_manager.py uses this instead of BASE_STAKE_PCT
+# for its percentage-of-balance calculation. 0.30 = 30% of current
+# available (uncommitted) balance per trade. This is a deliberately
+# aggressive user-chosen setting — BASE_STAKE_PCT (0.5%) is left untouched
+# above so it's easy to fall back to if this proves too aggressive in
+# practice. See risk_manager.py instructions for how this interacts with
+# the existing Kelly overlay and the new exposure cap below.
+STAKE_PCT_MULTIPLIER = 0.30
+
+# Ceiling on total stake-at-risk across ALL currently open positions,
+# expressed as a fraction of current balance. Required because
+# STAKE_PCT_MULTIPLIER (30%) times more than 2-3 concurrent trades would
+# over-commit past 100% of the account, which is not possible and must be
+# clamped rather than silently allowed to error. See risk_manager.py
+# instructions for the exposure-tracking logic that enforces this.
+EXPOSURE_CEILING_PCT = 0.90
+
 DAILY_LOSS_LIMIT_PCT = 0.15   # NOTE: value is 15%, comment below said 20% — see flags in reply
 DAILY_LOSS_PAUSE_MINS = 30
 
@@ -337,7 +396,11 @@ PLS_WIN_MULTIPLIERS = [1.0, 1.0, 1.0, 1.0, 1.0]
 PLS_WIN_EXTRA_SLOTS = [0,   0,   0,   0,   0   ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 30
+MAX_CONCURRENT_TRADES = 3
+# Lowered from 30 — at STAKE_PCT_MULTIPLIER=0.30 per trade, more than a
+# handful of concurrent positions over-commits the account far past 100%.
+# EXPOSURE_CEILING_PCT above is the hard backstop; this is the soft/normal
+# operating limit.
 
 # ── TIMEFRAMES ───────────────────────────────────────────────
 HTF_GRANULARITY   = 3600   # 1H
@@ -656,13 +719,18 @@ EXIT_ENGINE_SYMBOLS         = list(MULTIPLIER_SYMBOLS)  # only Multiplier contra
 
 # Rule-based trailing layer (always active — the ML layer below only ever
 # adds an *earlier* close on top of this, never removes this safety net):
-EXIT_ARM_PROFIT_FRACTION    = 0.30   # start trailing once profit >= 30% of the
-                                      # contract's static take_profit_amount
-EXIT_TRAIL_LOCK_FRACTION    = 0.60   # once armed, ratchet stop_loss to lock in
-                                      # 60% of peak profit seen so far
-EXIT_DECAY_CLOSE_FRACTION   = 0.25   # once armed, close immediately if profit
-                                      # falls back below 25% of peak (rather than
-                                      # waiting for the original static stop_loss)
+# These three fractions govern how a WINNING trade is managed toward the
+# ~2x-stake target (TAKE_PROFIT_STAKE_MULTIPLE above) — they do NOT cut
+# losing trades early; that job belongs to the broker-side
+# STOP_LOSS_FLOOR_USD set at buy time, which is enforced by Deriv's servers
+# and survives this bot / Render going offline.
+EXIT_ARM_PROFIT_FRACTION    = 0.15   # was 0.30 — arm trailing sooner given
+                                       # the higher stake and the "always get
+                                       # at least 2x" target
+EXIT_TRAIL_LOCK_FRACTION    = 0.75   # was 0.60 — lock in more of the peak
+                                       # profit once armed
+EXIT_DECAY_CLOSE_FRACTION   = 0.20   # was 0.25 — close a winning trade a
+                                       # little sooner if it starts decaying
 EXIT_POLL_INTERVAL_SECS     = 15     # how often the exit engine re-checks each
                                       # open Multiplier contract (independent of
                                       # the general 30s orphan-sweep cadence)
