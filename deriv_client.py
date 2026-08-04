@@ -1204,15 +1204,8 @@ class DerivClient:
 
             stake = self._cap_stake(stake, symbol)
             contract_type = "MULTUP" if direction == "LONG" else "MULTDOWN"
-
-            floor_usd = getattr(config, "STOP_LOSS_FLOOR_USD", None)
-            tp_multiple = getattr(config, "TAKE_PROFIT_STAKE_MULTIPLE", None)
-            if floor_usd is not None and tp_multiple is not None:
-                stop_loss_amount   = round(floor_usd, 2)
-                take_profit_amount = round(stake * tp_multiple, 2)
-            else:
-                stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
-                take_profit_amount = round(stop_loss_amount * take_profit_ratio, 2)
+            stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
+            take_profit_amount = round(stop_loss_amount * take_profit_ratio, 2)
 
             logger.info(
                 f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f} "
@@ -1220,47 +1213,28 @@ class DerivClient:
                 f"TP=${take_profit_amount:.2f}"
             )
 
-            max_widen_attempts = 5
-            widen_factor = 1.6
-            attempt = 0
-            prop_resp = None
+            proposal_req = {
+                "proposal":      1,
+                "amount":        stake,
+                "basis":         "stake",
+                "contract_type": contract_type,
+                "currency":      "USD",
+                "underlying_symbol": symbol,
+                "multiplier":    multiplier,
+                "limit_order": {
+                    "stop_loss":   stop_loss_amount,
+                    "take_profit": take_profit_amount,
+                },
+            }
 
-            while attempt < max_widen_attempts:
-                proposal_req = {
-                    "proposal":      1,
-                    "amount":        stake,
-                    "basis":         "stake",
-                    "contract_type": contract_type,
-                    "currency":      "USD",
-                    "underlying_symbol": symbol,
-                    "multiplier":    multiplier,
-                    "limit_order": {
-                        "stop_loss":   stop_loss_amount,
-                        "take_profit": take_profit_amount,
-                    },
-                }
-                try:
-                    prop_resp = await self._send(proposal_req)
-                except Exception as e:
-                    logger.error(f"FAILED: {symbol} — {e} | full_req={proposal_req}")
-                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
-                    return None
-
+            try:
+                prop_resp = await self._send(proposal_req)
                 if not prop_resp:
                     logger.error(f"FAILED: {symbol} — no response (multiplier proposal)")
                     self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
                     return None
-
-                err = prop_resp.get("error")
-                if not err:
-                    break  # proposal accepted
-
-                msg = str(err.get("message", "")).lower()
-                is_stop_loss_issue = (
-                    floor_usd is not None
-                    and ("stop_loss" in msg or "stop loss" in msg or "minimum" in msg)
-                )
-                if not is_stop_loss_issue:
+                if prop_resp.get("error"):
+                    err = prop_resp["error"]
                     logger.error(
                         f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
                         f"| details={err.get('details')} | full_req={proposal_req}"
@@ -1268,30 +1242,6 @@ class DerivClient:
                     self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
                     return None
 
-                widened = round(stop_loss_amount * widen_factor, 2)
-                ceiling = getattr(config, "STOP_LOSS_FLOOR_USD_MAX", 2.00)
-                if widened > ceiling:
-                    logger.error(
-                        f"FAILED: {symbol} — stop_loss widening exceeded "
-                        f"STOP_LOSS_FLOOR_USD_MAX (${ceiling}); giving up "
-                        f"| last_req={proposal_req}"
-                    )
-                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
-                    return None
-
-                logger.info(
-                    f"STOP_LOSS TOO TIGHT: {symbol} rejected ${stop_loss_amount:.2f}, "
-                    f"retrying with ${widened:.2f}"
-                )
-                stop_loss_amount = widened
-                attempt += 1
-
-            if prop_resp is None or prop_resp.get("error"):
-                logger.error(f"FAILED: {symbol} — exhausted stop_loss widen attempts")
-                self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
-                return None
-
-            try:
                 proposal = prop_resp.get("proposal", {})
                 logger.info(f"PROPOSAL RESPONSE: {proposal}")
 
