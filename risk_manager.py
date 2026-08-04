@@ -168,7 +168,15 @@ class RiskManager:
         deriv_client=None,
     ):
         # Config resolution
-        self.base_stake_pct = getattr(config, "BASE_STAKE_PCT", 0.01)
+        # STAKE_PCT_MULTIPLIER, when set, is a deliberate user override of
+        # the conservative BASE_STAKE_PCT default — e.g. 0.30 for 30% of
+        # balance per trade. PLS scaling and the Kelly overlay below still
+        # apply on top of whichever value ends up here; neither is bypassed.
+        override_pct = getattr(config, "STAKE_PCT_MULTIPLIER", None)
+        self.base_stake_pct = (
+            override_pct if override_pct is not None
+            else getattr(config, "BASE_STAKE_PCT", 0.01)
+        )
         self.risk_per_trade = risk_per_trade or self.base_stake_pct
         self.min_stake      = min_stake      or getattr(config, "MIN_STAKE",             0.35)
         self.max_stake      = max_stake      or getattr(config, "MAX_STAKE",             50.0)
@@ -493,6 +501,37 @@ class RiskManager:
 
         stake = self._apply_kelly_overlay(pls_stake, self._current_balance, strategy, symbol)
 
+        # Exposure ceiling: never let this trade push total committed stake
+        # across all open positions past EXPOSURE_CEILING_PCT of balance.
+        ceiling_pct = getattr(config, "EXPOSURE_CEILING_PCT", 0.90)
+        exposure_ceiling = self._current_balance * ceiling_pct
+        already_committed = self._committed_exposure()
+        room = exposure_ceiling - already_committed
+
+        if room <= 0:
+            logger.info(
+                f"STAKE: $0.00 — exposure ceiling reached "
+                f"(committed=${already_committed:.4f} >= "
+                f"ceiling=${exposure_ceiling:.4f})"
+                + (f" strategy={strategy} symbol={symbol}" if strategy and symbol else "")
+            )
+            return 0.0
+
+        if stake > room:
+            logger.info(
+                f"STAKE: clamped ${stake:.4f} -> ${room:.4f} — exposure "
+                f"ceiling (committed=${already_committed:.4f}, "
+                f"ceiling=${exposure_ceiling:.4f})"
+            )
+            stake = round(room, 2)
+
+        if stake < self.min_stake:
+            logger.info(
+                f"STAKE: $0.00 — post-clamp stake ${stake:.4f} below "
+                f"MIN_STAKE ${self.min_stake:.2f}"
+            )
+            return 0.0
+
         pair_suffix = f" strategy={strategy} symbol={symbol}" if strategy and symbol else ""
         logger.info(
             f"STAKE: ${stake:.4f} "
@@ -570,6 +609,19 @@ class RiskManager:
             f"Next stake: ${ns:.4f}")
 
     # ── Trade lifecycle ─────────────────────────────────────────────────────────
+
+    def _committed_exposure(self) -> float:
+        """
+        Sum of stake for every currently-open trade (exit_price is None).
+        Used to clamp new stakes so total exposure across concurrent
+        positions can never exceed EXPOSURE_CEILING_PCT of balance —
+        necessary once STAKE_PCT_MULTIPLIER allows large per-trade stakes,
+        where even 2-3 concurrent trades could otherwise over-commit past
+        100% of the account.
+        """
+        return sum(
+            rec.stake for rec in self._trades if rec.exit_price is None
+        )
 
     def register_open(
         self,
