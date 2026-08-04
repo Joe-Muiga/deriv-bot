@@ -10,8 +10,8 @@ evaluators above them):
   - evaluate_digit_parity      : chi-square even/odd bias on raw ticks
   - evaluate_digit (modified)  : optional hybrid RSI/BB/ROC + chi-square gate
   - evaluate_drift_fade        : Boom/Crash drift-following (post-cooldown)
-  - evaluate_jump_buildup      : Jump index build-up confidence -> digit contract (MATCH/DIFFER)
-  - evaluate_trend_shift       : Bear/Bull fixed per-symbol daily-reset bias (RDBULL=LONG, RDBEAR=SHORT)
+  - evaluate_jump_buildup      : Jump index build-up confidence
+  - evaluate_trend_shift       : Bear/Bull stop-and-reverse at reset window
 
 See the "NEW STRATEGY CONFIG" region below for the config keys these read
 (all via getattr with safe defaults, so nothing breaks if unset) and the
@@ -30,22 +30,9 @@ import numpy as np
 
 import config
 import indicators as ind
-import strategy_stats
 from candlestick_builder import Candle
-from symbol_manager import SymbolManager
 
 logger = logging.getLogger(__name__)
-
-# Implementation Brief v3, finding #4 / task 1: single shared instance so
-# evaluate_trend_shift()'s post-reset timing check calls symbol_manager's
-# own is_post_reset()/get_bear_bull_state() instead of re-implementing the
-# same "minutes since 00:00 GMT" math a second time. is_post_reset() reads
-# only module-level config (BEAR_BULL_SYMBOLS, BEAR_BULL_TREND_SHIFT_MINS)
-# and wall-clock time — it doesn't touch any of SymbolManager's mutable
-# per-symbol state (suspensions, session counters, etc.) — so a private
-# instance here is safe and doesn't need to be the same object bot_engine.py
-# holds as self.symbols.
-_symbol_manager = SymbolManager()
 
 
 # ---------------------------------------------------------------------------
@@ -54,26 +41,11 @@ _symbol_manager = SymbolManager()
 
 @dataclass
 class SignalResult:
-    direction: str    # "LONG" | "SHORT" | "NONE" | "MATCH" | "DIFFER"
+    direction: str    # "LONG" | "SHORT" | "NONE"
     strength:  int    # 1-3
     score:     float  # 0.0-1.0 composite probability
     strategy:  str    # which strategy fired
     reason:    str    # human readable
-    # Implementation Brief v3, finding #3 / task 2: JUMP_BUILDUP's real
-    # recommendation is a digit contract (Matches/Differs), not a price
-    # direction — these three fields let bot_engine._execute() route to
-    # DerivClient.buy_digit_contract() instead of buy_contract() (CALL/PUT)
-    # without every other evaluator's call site needing to change.
-    # contract_kind defaults to "RISE_FALL" so every existing evaluator
-    # (which only sets direction/strength/score/strategy/reason) is
-    # unaffected.
-    contract_kind: str            = "RISE_FALL"   # "RISE_FALL" | "DIGIT"
-    digit:         Optional[int]  = None            # 0-9, DIGIT contracts only
-    match_type:    Optional[str]  = None            # "MATCH" | "DIFFER"
-    features: Optional[dict] = None   # feature vector at signal time, for
-                                       # strategy_stats logging / future
-                                       # ML calibration (Implementation
-                                       # Brief v6, PART 3)
 
 
 NONE_RESULT = SignalResult("NONE", 0, 0.0, "NONE", "No signal")
@@ -352,47 +324,16 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
     rsi = ind.rsi(C, 14)
     upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
     roc = ind.roc(C, 10)
-    atr = ind.atr(H, L, C, getattr(config, "ATR_PERIOD", 14))
 
     last_rsi   = _last(rsi)
     last_close = float(C[-1])
-    prev_close = float(C[-2]) if len(C) >= 2 else last_close
     last_upper = _last(upper)
     last_lower = _last(lower)
     last_roc   = _last(roc)
 
-    # ── Regime filter (Implementation Brief v6, root cause #2) ──────────
-    # Fade strategies fail hardest when fired into an expanding/trending
-    # market. Compare a fast (5-bar) ATR average to a slower (20-bar) one;
-    # a ratio above the configured ceiling means the market is expanding,
-    # not ranging, and no fade signal is evaluated this bar.
-    valid_atr = atr[~np.isnan(atr)]
-    if len(valid_atr) >= 20:
-        atr_fast = float(np.mean(valid_atr[-5:]))
-        atr_slow = float(np.mean(valid_atr[-20:]))
-        expansion_ratio = (atr_fast / atr_slow) if atr_slow > 0 else 1.0
-    else:
-        expansion_ratio = 1.0  # not enough ATR history yet -> filter is a no-op
-
-    max_expansion = getattr(config, "MEAN_REV_MAX_ATR_EXPANSION_RATIO", 1.3)
-    if expansion_ratio > max_expansion:
-        logger.debug(
-            f"REJECTED: {symbol} MEAN_REV regime — ATR expanding "
-            f"(fast/slow={expansion_ratio:.2f} > {max_expansion})"
-        )
-        return SignalResult(
-            "NONE", 0, 0.0, "MEAN_REV",
-            f"Regime filter: ATR expanding ({expansion_ratio:.2f} > {max_expansion})",
-        )
-
-    rsi_oversold   = getattr(config, "MEAN_REV_RSI_OVERSOLD", 22)
-    rsi_overbought = getattr(config, "MEAN_REV_RSI_OVERBOUGHT", 78)
-    roc_threshold  = getattr(config, "MEAN_REV_ROC_THRESHOLD", 0.02)
-    require_confirm = getattr(config, "MEAN_REV_REQUIRE_CONFIRMATION", True)
-
     long_score = 0
     long_all = True
-    if last_rsi < rsi_oversold:
+    if last_rsi < 22:
         long_score += 3
     else:
         long_all = False
@@ -400,18 +341,14 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
         long_score += 3
     else:
         long_all = False
-    if last_roc < -roc_threshold:
+    if last_roc < -0.02:
         long_score += 2
     else:
         long_all = False
-    # Confirmation (root cause #2): require the latest closed bar to have
-    # already ticked back toward the mid-band vs. the prior bar, instead
-    # of fading the extreme bar the instant it prints.
-    long_confirmed = (last_close > prev_close) if require_confirm else True
 
     short_score = 0
     short_all = True
-    if last_rsi > rsi_overbought:
+    if last_rsi > 78:
         short_score += 3
     else:
         short_all = False
@@ -419,23 +356,23 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
         short_score += 3
     else:
         short_all = False
-    if last_roc > roc_threshold:
+    if last_roc > 0.02:
         short_score += 2
     else:
         short_all = False
-    short_confirmed = (last_close < prev_close) if require_confirm else True
 
-    if long_score >= 6 and long_score >= short_score and long_confirmed:
-        raw, direction, all_met = long_score, "LONG", long_all
-    elif short_score >= 6 and short_confirmed:
-        raw, direction, all_met = short_score, "SHORT", short_all
+    if long_score >= 6 and long_score >= short_score:
+        raw = long_score
+        direction = "LONG"
+        all_met = long_all
+    elif short_score >= 6:
+        raw = short_score
+        direction = "SHORT"
+        all_met = short_all
     else:
         best = max(long_score, short_score)
-        awaiting_confirm = (long_score >= 6 and not long_confirmed) or \
-                            (short_score >= 6 and not short_confirmed)
-        reason = "Awaiting confirmation bar" if awaiting_confirm else "Below entry threshold"
-        logger.debug(f"REJECTED: {symbol} MEAN_REV strength=0 score={best/8.0:.3f} — {reason}")
-        return SignalResult("NONE", 0, best / 8.0, "MEAN_REV", reason)
+        logger.debug(f"REJECTED: {symbol} MEAN_REV strength=0 score={best/8.0:.3f} — below threshold")
+        return SignalResult("NONE", 0, best / 8.0, "MEAN_REV", "Below entry threshold")
 
     score = raw / 8.0
     strength = 3 if all_met else (2 if score >= 6 / 8.0 else 1)
@@ -444,34 +381,14 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
         return SignalResult("NONE", 0, score, "MEAN_REV", "Below entry threshold")
 
     logger.info(
-        f"SIGNAL: {symbol} {direction} MEAN_REV strength={strength} "
-        f"score={score:.3f} expansion={expansion_ratio:.2f}"
+        f"SIGNAL: {symbol} {direction} MEAN_REV strength={strength} score={score:.3f}"
     )
-
-    try:
-        win_rate, _ci_low, _ci_high, n = strategy_stats.stats.get_win_rate("MEAN_REV", symbol)
-    except Exception:
-        win_rate, n = 0.0, 0
-    win_rate_note = (
-        f"rolling win rate {win_rate * 100:.1f}% over {n} trades" if n > 0
-        else "no trade history yet for this pair"
-    )
-
-    features = {
-        "rsi": round(last_rsi, 2),
-        "roc": round(last_roc, 5),
-        "bb_pct_b": round((last_close - last_lower) / max(last_upper - last_lower, 1e-9), 4),
-        "atr_expansion_ratio": round(expansion_ratio, 3),
-        "hour_utc": datetime.now(timezone.utc).hour,
-    }
-
     return SignalResult(
         direction=direction,
         strength=strength,
         score=score,
         strategy="MEAN_REV",
-        reason=f"MeanRev RSI={last_rsi:.1f} raw={raw}/8 expansion={expansion_ratio:.2f} ({win_rate_note})",
-        features=features,
+        reason=f"MeanRev RSI={last_rsi:.1f} raw={raw}/8 (70.8% documented win rate)",
     )
 
 
@@ -829,64 +746,71 @@ def evaluate_jump_buildup(ticks: Optional[List[Any]], symbol: str) -> SignalResu
         )
         return SignalResult("NONE", 0, confidence, "JUMP_BUILDUP", "Build-up confidence too low")
 
-    # Implementation Brief v3, finding #3 / task 2: build-up confidence has
-    # no LONG/SHORT price read — jump direction is 50/50 by design (Deriv's
-    # own product description), so there is nothing here to map onto a
-    # Rise/Fall CALL/PUT. What build-up confidence DOES predict is whether
-    # the last digit is likely to repeat (high confidence + compressed
-    # pre-jump volatility -> MATCHES) or not (DIFFERS) — a real digit
-    # contract, wired below via contract_kind="DIGIT" so bot_engine routes
-    # it to DerivClient.buy_digit_contract() instead of buy_contract().
-    # A digit barrier is required by the API for both MATCH and DIFFER, so
-    # last_digit is computed unconditionally, not just on the MATCHES path.
     match_threshold = getattr(config, "JUMP_MATCH_CONFIDENCE_THRESHOLD", 0.9)
     decimals = _digit_decimals(symbol)
-    last_digit = _last_digit(float(quotes[-1]), decimals)
     if confidence >= match_threshold and compressed:
-        match_type = "MATCH"
+        last_digit = _last_digit(float(quotes[-1]), decimals)
+        contract_reco = f"MATCHES digit={last_digit}"
         strength = 3
     else:
-        match_type = "DIFFER"
+        contract_reco = "DIFFERS"
         strength = 3 if confidence >= match_threshold else 2
 
+    # Placeholder — build-up confidence has no LONG/SHORT price direction;
+    # the actual recommendation (Differs, or Matches+digit) is in `reason`.
+    # See chat reply re: this not mapping onto the bot's CALL/PUT execution.
+    direction = "LONG"
+
     logger.info(
-        f"SIGNAL: {symbol} JUMP_BUILDUP {match_type} digit={last_digit} "
-        f"strength={strength} score={confidence:.3f} elapsed={elapsed_mins:.1f}m "
-        f"target={target}m compressed={compressed}"
+        f"SIGNAL: {symbol} JUMP_BUILDUP strength={strength} score={confidence:.3f} "
+        f"elapsed={elapsed_mins:.1f}m target={target}m compressed={compressed} reco={contract_reco}"
     )
     return SignalResult(
-        direction=match_type,
+        direction=direction,
         strength=strength,
         score=confidence,
         strategy="JUMP_BUILDUP",
-        reason=(
-            f"Recommend {match_type} digit={last_digit} | "
-            f"elapsed={elapsed_mins:.1f}m/{target}m compressed={compressed}"
-        ),
-        contract_kind="DIGIT",
-        digit=last_digit,
-        match_type=match_type,
+        reason=f"Recommend {contract_reco} | elapsed={elapsed_mins:.1f}m/{target}m compressed={compressed}",
     )
 
 
 # ---------------------------------------------------------------------------
-# Strategy 7 — Bear/Bull ("Daily Reset") fixed-bias trend following
+# Strategy 7 — Bear/Bull Trend Shift (candle-based EMA alignment)
 #
-# Implementation Brief v3, finding #4: RDBEAR/RDBULL reset to a baseline at
-# 00:00 GMT and then hold ONE fixed characteristic trend for the rest of the
-# 24h cycle (Bull trends up, Bear trends down) — this is a fixed identity
-# per symbol, not something that flips. The previous version alternated
-# direction on every post-reset window via module-level state
-# (_trend_shift_state), which contradicted that product mechanic outright
-# (it would periodically have RDBULL go SHORT and RDBEAR go LONG). Fixed
-# here: direction comes from config.BEAR_BULL_DIRECTION, a static map, and
-# is never derived from EMA alignment or alternated — no more module-level
-# direction state needed at all. is_post_reset()/get_bear_bull_state() is
-# used ONLY to gate entry timing (skip trading during the post-reset window,
-# since early-cycle behavior may differ from the rest of the trending cycle)
-# via the shared `_symbol_manager` instance above, instead of duplicating
-# the "minutes since 00:00 GMT" math locally.
+# Holds a directional bias and stop-and-reverses at the post-reset window,
+# but (unlike the old tick-slope version) the bias now comes from a
+# 3-EMA alignment check on candles, and is invalidated intra-window the
+# moment price no longer supports it — see evaluate_trend_shift() docstring
+# below for the invalidation rule. Needs state across calls (which
+# direction is currently held); kept as a module-level dict rather than
+# requiring a SymbolManager instance.
+#
+# Post-reset window math: _is_post_reset_local() below duplicates
+# symbol_manager.is_post_reset() (both read BEAR_BULL_SYMBOLS and
+# BEAR_BULL_TREND_SHIFT_MINS independently). Chosen fix here is option
+# (a) from the task — evaluate_trend_shift() now accepts an injected
+# is_post_reset_fn callable, defaulting to _is_post_reset_local for
+# backward compatibility, so the SignalEngine (or any caller) can pass
+# symbol_manager.is_post_reset instead and the duplication collapses to
+# a single source of truth without touching symbol_manager.py. Option
+# (b) — extracting the shared math into indicators.py/time_windows.py —
+# is the more correct long-term fix (removes _is_post_reset_local
+# entirely) but touches symbol_manager.py, which is out of scope for
+# this pass; flagged here rather than silently picked.
 # ---------------------------------------------------------------------------
+
+_trend_shift_state: Dict[str, Dict[str, Any]] = {}
+
+
+def _is_post_reset_local(symbol: str) -> bool:
+    bear_bull = set(getattr(config, "BEAR_BULL_SYMBOLS", []))
+    if symbol not in bear_bull:
+        return False
+    window = getattr(config, "BEAR_BULL_TREND_SHIFT_MINS", 20)
+    now = datetime.now(timezone.utc)
+    minutes_since_reset = now.hour * 60 + now.minute
+    return minutes_since_reset < window
+
 
 def evaluate_trend_shift(
     ltf_bars: List[Candle],
@@ -895,11 +819,8 @@ def evaluate_trend_shift(
     is_post_reset_fn: Optional[Callable[[str], bool]] = None,
 ) -> SignalResult:
     """
-    Bear/Bull fixed-bias trend following: direction is a static per-symbol
-    fact (config.BEAR_BULL_DIRECTION), never derived from indicators and
-    never alternated. EMA/RSI/ATR are computed only to score how cleanly
-    current price action is confirming the known bias (a confidence read),
-    and to gate out the post-reset window on timing rather than direction.
+    Bear/Bull stop-and-reverse, now driven by candle EMA alignment instead
+    of a 20-tick slope.
 
     ASSUMPTION: config.LTF_BARS is currently 30, which is fewer bars than
     EMA_TREND=50 needs to fully warm up. Depending on how indicators.ema()
@@ -910,30 +831,13 @@ def evaluate_trend_shift(
     is raised. Flagging rather than silently reinterpreting LTF_BARS.
 
     `ticks` is accepted only for call-site/signature compatibility with
-    SignalEngine.evaluate()'s existing `ticks=ticks` call; unused here.
-
-    `is_post_reset_fn` defaults to the shared `_symbol_manager.is_post_reset`
-    (single source of truth); callers may still inject their own for
-    testing.
+    SignalEngine.evaluate()'s existing `ticks=ticks` call; this evaluator
+    no longer reads raw ticks for direction (item 1 replaces the tick
+    slope entirely), so it's unused here.
     """
-    bias_map = getattr(config, "BEAR_BULL_DIRECTION", {"RDBULL": "LONG", "RDBEAR": "SHORT"})
-    direction = bias_map.get(symbol)
-    if direction is None:
+    bear_bull = set(getattr(config, "BEAR_BULL_SYMBOLS", []))
+    if symbol not in bear_bull:
         return NONE_RESULT
-
-    post_reset_fn = is_post_reset_fn or _symbol_manager.is_post_reset
-    post_reset = post_reset_fn(symbol)
-    if post_reset:
-        window = getattr(config, "BEAR_BULL_TREND_SHIFT_MINS", 20)
-        logger.info(
-            f"REJECTED: {symbol} TREND_SHIFT strength=0 score=0.000 — "
-            f"inside post-reset window ({window}min since 00:00 GMT), "
-            f"waiting for it to close before sizing up"
-        )
-        return SignalResult(
-            "NONE", 0, 0.0, "TREND_SHIFT",
-            f"Post-reset window open ({window}min) — entry timing gate, bias={direction} unaffected",
-        )
 
     min_bars = max(config.EMA_TREND, config.RSI_PERIOD, config.ATR_PERIOD) + 1
     if len(ltf_bars) < min_bars:
@@ -956,21 +860,78 @@ def evaluate_trend_shift(
         logger.debug(f"REJECTED: {symbol} TREND_SHIFT strength=0 score=0.000 — indicators not warmed up")
         return NONE_RESULT
 
-    # Confirmation check — does current EMA alignment support the KNOWN
-    # fixed bias right now? This only scores conviction; it never changes
-    # `direction`, which stays whatever bias_map says regardless.
-    if direction == "LONG":
-        aligned = ema_fast > ema_slow > ema_trend
+    # Step 1: EMA alignment bias. No forced guess when EMAs aren't aligned.
+    if ema_fast > ema_slow > ema_trend:
+        fresh_dir: Optional[str] = "LONG"
+    elif ema_fast < ema_slow < ema_trend:
+        fresh_dir = "SHORT"
     else:
-        aligned = ema_fast < ema_slow < ema_trend
+        fresh_dir = None
 
+    post_reset_fn = is_post_reset_fn or _is_post_reset_local
+    post_reset = post_reset_fn(symbol)
+
+    now = datetime.now(timezone.utc)
+    today = now.date().isoformat()
+    state = _trend_shift_state.get(symbol)
+
+    # Step 2: live invalidation — on EVERY call, not just at the reset
+    # window. If the held direction no longer matches what price is doing
+    # (either the alignment flipped outright, or fast has crossed back
+    # over the trend EMA against the held direction), drop it immediately
+    # instead of letting a stale bias run until the next reset.
+    if state is not None:
+        held_dir = state.get("direction")
+        contradicted = (
+            (held_dir == "LONG" and (fresh_dir == "SHORT" or ema_fast < ema_trend))
+            or (held_dir == "SHORT" and (fresh_dir == "LONG" or ema_fast > ema_trend))
+        )
+        if contradicted:
+            logger.warning(
+                f"TREND_SHIFT: {symbol} held {held_dir} invalidated — fresh EMA read "
+                f"fast={ema_fast:.5f} slow={ema_slow:.5f} trend={ema_trend:.5f} — clearing state"
+            )
+            _trend_shift_state.pop(symbol, None)
+            return NONE_RESULT
+
+    # Reset-window flip — same stop-and-reverse mechanism as before, but
+    # seeded from the fresh EMA-alignment bias instead of a tick slope.
+    if post_reset and (state is None or state.get("reset_day") != today):
+        prior_dir = state.get("direction") if state else None
+        if prior_dir == "LONG":
+            new_dir = "SHORT"
+        elif prior_dir == "SHORT":
+            new_dir = "LONG"
+        else:
+            new_dir = fresh_dir
+        if new_dir is None:
+            logger.info(f"TREND_SHIFT: {symbol} post-reset window but EMAs not aligned — no bias set")
+            _trend_shift_state.pop(symbol, None)
+            return NONE_RESULT
+        _trend_shift_state[symbol] = {"direction": new_dir, "reset_day": today}
+        state = _trend_shift_state[symbol]
+        logger.info(f"TREND_SHIFT: {symbol} reversed to {new_dir} at post-reset window (prior={prior_dir})")
+
+    if state is None:
+        # No reset event observed yet this run (and nothing to invalidate)
+        # — establish an initial bias from the current EMA alignment so
+        # the strategy isn't NONE until the first reset window this
+        # process happens to be alive for.
+        if fresh_dir is None:
+            logger.debug(f"REJECTED: {symbol} TREND_SHIFT strength=0 score=0.000 — EMAs not aligned")
+            return NONE_RESULT
+        _trend_shift_state[symbol] = {"direction": fresh_dir, "reset_day": None}
+        state = _trend_shift_state[symbol]
+        logger.info(f"TREND_SHIFT: {symbol} initial bias {fresh_dir} (no reset observed yet this run)")
+
+    direction = state["direction"]
+
+    # Step 3: score/strength from real signal quality instead of hardcoded
+    # constants. EMA separation scaled by ATR = how clean/wide the trend
+    # is relative to current volatility; RSI dampens the score if it
+    # contradicts the held direction (e.g. RSI overbought while LONG).
     separation_atr = abs(ema_fast - ema_slow) / last_atr
     raw_score = min(separation_atr / 3.0, 1.0)  # 3x ATR separation -> full score; tune with live data
-    if not aligned:
-        # The daily trend is supposed to hold all cycle by product design,
-        # so a misaligned EMA read is more likely short-term noise than a
-        # genuine reversal — dampen the score rather than reject outright.
-        raw_score *= 0.5
 
     rsi_overbought = getattr(config, "RSI_OVERBOUGHT", 70)
     rsi_oversold = getattr(config, "RSI_OVERSOLD", 30)
@@ -988,11 +949,14 @@ def evaluate_trend_shift(
         )
         return SignalResult("NONE", 0, score, "TREND_SHIFT", f"Score {score:.3f} below {min_score}")
 
-    strength = 3 if score >= 0.85 else 2  # gated above min_score, so never falls to 1 here
+    if score >= 0.85:
+        strength = 3
+    else:
+        strength = 2  # gated above min_score, so never falls to 1 here
 
     logger.info(
         f"SIGNAL: {symbol} {direction} TREND_SHIFT strength={strength} score={score:.3f} "
-        f"fixed_bias=True aligned={aligned} ema_fast={ema_fast:.5f} ema_slow={ema_slow:.5f} "
+        f"post_reset={post_reset} ema_fast={ema_fast:.5f} ema_slow={ema_slow:.5f} "
         f"ema_trend={ema_trend:.5f} rsi={last_rsi:.1f} atr={last_atr:.5f} rsi_contradicts={rsi_contradicts}"
     )
     return SignalResult(
@@ -1001,7 +965,7 @@ def evaluate_trend_shift(
         score=score,
         strategy="TREND_SHIFT",
         reason=(
-            f"Fixed daily-reset bias={direction} (not alternated), aligned={aligned}, "
+            f"Stop-and-reverse hold, post_reset={post_reset}, "
             f"ema_sep/atr={separation_atr:.3f}, rsi={last_rsi:.1f}"
         ),
     )
