@@ -337,7 +337,15 @@ def _build_features(state: _ContractState, elapsed_secs: float, current_profit: 
         past = hist[0].profit
     else:
         past = current_profit
-    profit_velocity = current_profit - past
+    # Implementation Brief v4 §5.2 — normalize by (stake * multiplier)
+    # rather than raw profit delta. A x4000 R_10 position's profit numbers
+    # are on a wildly different scale from a x100 Boom/Crash position;
+    # EXIT_ML_MIN_CONFIDENCE was tuned against the latter's distribution
+    # only, so leaving this unnormalized would make the new Vol/1Hz/Step
+    # Multiplier family's velocity feature incomparable to what the model
+    # already knows.
+    leverage_basis = stake * (state.multiplier or 1)
+    profit_velocity = (current_profit - past) / leverage_basis if leverage_basis else 0.0
 
     distance_to_static_sl_pct = (current_profit - (-state.static_sl_amount)) / stake
     distance_to_static_tp_pct = (state.static_tp_amount - current_profit) / stake
