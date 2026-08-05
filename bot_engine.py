@@ -942,6 +942,36 @@ class BotEngine:
 
         strategy = getattr(sig, "strategy", "unknown")
 
+        # Implementation Brief v4 §5.1 — leverage-aware meta-labeling
+        # features. multiplier/atr_pct/regime are only meaningful for
+        # config.VOL_MULTIPLIER_SYMBOLS; everything else (old Rise/Fall
+        # rows, Boom/Crash, Jump, Bear/Bull, etc.) passes the neutral
+        # defaults below so the model can distinguish old-regime rows
+        # from new ones rather than crashing on missing fields. regime is
+        # derived from the strategy name directly (VOL_BREAKOUT->TREND,
+        # VOL_REV_MULT->RANGE) rather than recomputing _vol_regime() here,
+        # since signal_engine.py already made that call when it produced
+        # `sig`. Also reused below by the VOL_MULTIPLIER_SYMBOLS buy
+        # branch so the ATR isn't computed twice.
+        ml_multiplier = 0.0
+        ml_atr_pct    = 0.0
+        ml_regime     = "NONE"
+        if symbol in getattr(config, "VOL_MULTIPLIER_SYMBOLS", []):
+            builder = self._ltf.get(symbol)
+            bars = builder.completed_bars if builder else []
+            if len(bars) >= 15:
+                _C = np.array([b.close for b in bars], dtype=float)
+                _H = np.array([b.high  for b in bars], dtype=float)
+                _L = np.array([b.low   for b in bars], dtype=float)
+                _atr_val = ind.atr(_H, _L, _C, config.ATR_PERIOD)
+                _last_atr = float(_atr_val[~np.isnan(_atr_val)][-1]) if len(_atr_val) else 0.0
+                ml_atr_pct = _last_atr / float(_C[-1]) if _C[-1] else 0.0
+            ml_multiplier = float(config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER))
+            if strategy == "VOL_BREAKOUT":
+                ml_regime = "TREND"
+            elif strategy == "VOL_REV_MULT":
+                ml_regime = "RANGE"
+
         # Meta-labeling gate — skip execution if the take-trade-or-not
         # filter rejects it. predict_take_trade() has its own internal
         # min-trades gating (config.META_LABEL_MIN_TRADES); below that
@@ -952,6 +982,9 @@ class BotEngine:
                 "strategy":    strategy,
                 "symbol":      symbol,
                 "entry_score": float(getattr(sig, "score", 0.0)),
+                "multiplier":  ml_multiplier,
+                "atr_pct":     ml_atr_pct,
+                "regime":      ml_regime,
             })
         except Exception as exc:
             logger.warning(
@@ -1020,6 +1053,32 @@ class BotEngine:
         # config.MULTIPLIER_SYMBOLS is the single source of truth for this
         # split (see config.py's "STRATEGY ROUTING" section); everything
         # else keeps using buy_contract() exactly as before.
+        # Implementation Brief v4 §4 / Fix H — the Vol/1Hz/Step Multiplier
+        # family needs a stop_loss_pct computed from live ATR instead of
+        # the static STOP_LOSS_MAP default, since that map was calibrated
+        # for Boom/Crash's ~x100 multiplier and copying it unchanged onto
+        # e.g. R_10's x400 floor gets positions stopped out by tick noise,
+        # not by the market being wrong (see config.py's VOL_MULTIPLIER
+        # section / risk_manager.compute_dynamic_stop_loss_pct()). Checked
+        # before the general MULTIPLIER_SYMBOLS branch since these 11
+        # symbols are now also members of that list.
+        elif (symbol in getattr(config, "VOL_MULTIPLIER_SYMBOLS", [])
+                and getattr(config, "DYNAMIC_STOP_LOSS_ENABLED", False)):
+            # ml_atr_pct / ml_multiplier were already computed above for the
+            # meta-labeling feature dict — reused here so the ATR isn't
+            # calculated twice per trade.
+            dyn_sl_pct = (
+                self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
+                if ml_atr_pct > 0 else None
+            )
+            buy_resp = await self.client.buy_multiplier(
+                symbol        = symbol,
+                direction     = direction,
+                stake         = stake,
+                multiplier    = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+                stop_loss_pct = dyn_sl_pct,
+                strategy      = strategy,
+            )
         elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
             buy_resp = await self.client.buy_multiplier(
                 symbol   = symbol,
@@ -1112,7 +1171,15 @@ class BotEngine:
             "strategy":    getattr(sig, "strategy",    "unknown"),
             "stop_loss":   getattr(sig, "stop_loss",   None),
             "take_profit": getattr(sig, "take_profit", None),
-            "multiplier":  getattr(sig, "multiplier",  None),
+            "multiplier":  ml_multiplier or getattr(sig, "multiplier", None),
+            # Implementation Brief v4 §5.1 — carried through to
+            # _apply_settlement() so strategy_stats.stats.record_trade()
+            # can log them into the `features` JSON column for
+            # meta_labeling.py's leverage-aware training set. Neutral
+            # defaults (0.0 / "NONE") for anything outside
+            # VOL_MULTIPLIER_SYMBOLS — see ml_atr_pct/ml_regime above.
+            "atr_pct":     ml_atr_pct,
+            "regime":      ml_regime,
         }
         self._contract_open_times[cid] = time.time()
 
@@ -1192,6 +1259,20 @@ class BotEngine:
         strategy    = info.get("strategy", "unknown")
         entry_score = float(getattr(info.get("sig"), "score", 0.0))
 
+        # Implementation Brief v4 §5.1 — leverage-aware training data.
+        # multiplier/atr_pct/regime were stashed onto `info` at open time
+        # (see _execute()) and ride into strategy_stats' existing
+        # `features` JSON column here — no schema change needed, and
+        # meta_labeling._load_all_trades() already knows how to decode
+        # them back out. Neutral for anything outside
+        # config.VOL_MULTIPLIER_SYMBOLS (multiplier=0.0, atr_pct=0.0,
+        # regime="NONE"), same as the meta-labeling call site.
+        ml_features = {
+            "multiplier": info.get("multiplier") or 0.0,
+            "atr_pct":    info.get("atr_pct", 0.0),
+            "regime":     info.get("regime", "NONE"),
+        }
+
         # Feed strategy_stats — this is the source of truth the
         # meta-labeling filter and the Thompson bandit both read from,
         # so it has to be populated for either of those to do anything.
@@ -1203,6 +1284,7 @@ class BotEngine:
                 won         = won,
                 stake       = stake,
                 payout      = payout,
+                features    = ml_features,
             )
         except Exception as exc:
             logger.warning(f"strategy_stats.record_trade({symbol}) failed: {exc}")
