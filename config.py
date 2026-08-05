@@ -307,6 +307,100 @@ STOP_LOSS_MAP = {
 }
 DEFAULT_STOP_LOSS_PCT = 50.0
 
+# ── VOLATILITY / STEP FAMILY → MULTIPLIER MIGRATION ──────────
+# Implementation Brief v4. Confirmed via symbol_audit.py, Render
+# "symbol-audit" service, Aug 2026. Real contracts_for multiplier ranges —
+# do not guess new values without re-running that audit; Deriv will reject
+# anything outside [min, max].
+#
+# Moves these 11 symbols off Rise/Fall (CALL/PUT) and off the
+# MEAN_REVERSION strategy entirely, onto Multiplier contracts
+# (MULTUP/MULTDOWN) with the new VOL_BREAKOUT / VOL_REV_MULT strategy set
+# (see signal_engine.py's evaluate_vol_regime() dispatcher). Boom/Crash
+# (already on Multipliers) and Jump/Bear-Bull (deliberately staying on
+# Rise/Fall — see notes above) are out of scope, untouched here.
+VOL_MULTIPLIER_SYMBOLS = [
+    "R_10", "R_25", "R_50", "R_75", "R_100",
+    "1HZ10V", "1HZ25V", "1HZ50V", "1HZ75V", "1HZ100V",
+    "stpRNG",
+]
+
+# Confirmed ranges (min, max) — for validation / future dynamic sizing.
+VOL_MULTIPLIER_RANGES = {
+    "R_10":    (400, 4000), "1HZ10V":  (400, 4000),
+    "R_25":    (160, 1600), "1HZ25V":  (160, 1600),
+    "R_50":    (80,  800),  "1HZ50V":  (80,  800),
+    "R_75":    (50,  500),  "1HZ75V":  (50,  500),
+    "R_100":   (40,  400),  "1HZ100V": (40,  400),
+    "stpRNG":  (750, 7500),
+}
+
+# Phase 1 default = the confirmed FLOOR of each range (least leverage this
+# account allows). Do not raise these without also validating the dynamic
+# stop-loss sizing below handles the new multiplier correctly — the floor
+# is the only value verified safe by hand in the brief.
+for _sym, (_lo, _hi) in VOL_MULTIPLIER_RANGES.items():
+    MULTIPLIER_MAP[_sym] = _lo
+
+# Wire into the existing Multiplier routing gate — bot_engine._execute()
+# already does `if symbol in config.MULTIPLIER_SYMBOLS: buy_multiplier(...)`.
+# This is the ONLY change needed to stop these 11 symbols trading Rise/Fall.
+# NOTE: must run before EXIT_ENGINE_SYMBOLS = list(MULTIPLIER_SYMBOLS)
+# further down this file, so the Adaptive Exit Engine automatically picks
+# up all 11 new symbols with zero additional wiring — it does, this block
+# sits well before that line.
+MULTIPLIER_SYMBOLS = list(dict.fromkeys(MULTIPLIER_SYMBOLS + VOL_MULTIPLIER_SYMBOLS))
+
+# Retire Mean Reversion entirely — MEAN_REVERSION_SYMBOLS was exactly
+# VOLATILITY_STANDARD + VOLATILITY_1S, i.e. these same 10 symbols (stpRNG
+# was never in it). Emptying this list retires the strategy globally
+# without deleting evaluate_mean_reversion() from signal_engine.py (left
+# in place, unrouted, in case it's wanted again later).
+MEAN_REVERSION_SYMBOLS = []
+
+# Pull all 11 out of RISE_FALL_SYMBOLS and out of STEP_SYMBOLS (for
+# stpRNG specifically) so they don't double-route — stpRNG now trades
+# under VOL_MULTIPLIER_SYMBOLS's new evaluator instead of STEP's.
+RISE_FALL_SYMBOLS = [s for s in RISE_FALL_SYMBOLS if s not in VOL_MULTIPLIER_SYMBOLS]
+STEP_SYMBOLS = [s for s in STEP_SYMBOLS if s not in VOL_MULTIPLIER_SYMBOLS]
+
+# ALL_TRADE_SYMBOLS is a derived union (see original definition above) —
+# recomputed here now that RISE_FALL_SYMBOLS / MEAN_REVERSION_SYMBOLS /
+# STEP_SYMBOLS have changed, and with VOL_MULTIPLIER_SYMBOLS added so
+# these 11 symbols keep being scanned instead of dropping out entirely.
+ALL_TRADE_SYMBOLS = list(dict.fromkeys(
+    RISE_FALL_SYMBOLS + MEAN_REVERSION_SYMBOLS + RANGE_BREAK_SYMBOLS
+    + BOOM_CRASH_SYMBOLS + STEP_SYMBOLS + JUMP_BUILDUP_SYMBOLS
+    + BEAR_BULL_SYMBOLS + DIGIT_SYMBOLS + DIGIT_PARITY_SYMBOLS
+    + DRIFT_FADE_SYMBOLS + VOL_MULTIPLIER_SYMBOLS
+))
+ALL_SYMBOLS        = ALL_TRADE_SYMBOLS
+VOLATILITY_SYMBOLS = ALL_TRADE_SYMBOLS  # alias for compatibility with bot_engine.py
+
+# ── DYNAMIC, ATR-NORMALIZED STOP-LOSS (Fix H) ─────────────────
+# See §1 of the brief: STOP_LOSS_MAP's static percentages were calibrated
+# for Boom/Crash's ~x100 multiplier. Copied unchanged onto e.g. R_10's
+# x400 floor, a 30% stop_loss_pct works out to ~0.075% price movement —
+# inside normal tick noise for a 2-second-tick index, so positions would
+# get stopped out by noise, not by the market being wrong. Fix: compute
+# stop_loss_pct from live ATR instead, so the dollar stop always
+# corresponds to a stable number of ATRs of real price movement no
+# matter which multiplier a symbol is forced into. STOP_LOSS_MAP /
+# DEFAULT_STOP_LOSS_PCT stay untouched and keep governing Boom/Crash
+# exactly as before — this only applies to VOL_MULTIPLIER_SYMBOLS (see
+# RiskManager.compute_dynamic_stop_loss_pct() in risk_manager.py and its
+# call site in bot_engine.py's _execute()).
+DYNAMIC_STOP_LOSS_ENABLED   = True
+STOP_ATR_MULT               = 2.0    # stop distance target, in ATRs of price
+DYNAMIC_STOP_LOSS_PCT_MIN   = 15.0   # floor — never set a stop tighter than this
+DYNAMIC_STOP_LOSS_PCT_MAX   = 90.0   # ceiling — leave headroom under Deriv's
+                                      # own 100%-of-stake max-loss cap
+
+# ── VOL REGIME DETECTION (for VOL_BREAKOUT / VOL_REV_MULT, signal_engine.py) ──
+VOL_REGIME_TREND_RATIO = 0.6   # |EMA_fast-EMA_slow| / ATR >= this -> TREND,
+                                # else RANGE. Tune against backtests; not
+                                # empirically derived in this brief.
+
 # Take profit = 2x stop loss (2:1 RR minimum)
 # For Multiplier contracts these remain the static outer boundary set at
 # buy time — see ADAPTIVE EXIT ENGINE near the bottom of this file for
@@ -503,7 +597,7 @@ DEAD_ZONE_START_UTC  = 0
 DEAD_ZONE_END_UTC    = 5
 BOOM500_PRIME_START  = 7
 BOOM500_PRIME_END    = 12
-TRADE_DURATION = 3.5
+TRADE_DURATION = 6
 TRADE_DURATION_UNIT = "m"
 
 # ══════════════════════════════════════════════════════════════
