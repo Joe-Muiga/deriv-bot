@@ -416,6 +416,193 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
 
 
 # ---------------------------------------------------------------------------
+# Strategy 2b — Volatility/Step Multiplier family (Implementation Brief v4)
+# ---------------------------------------------------------------------------
+# Replaces MEAN_REV for config.VOL_MULTIPLIER_SYMBOLS (R_10-R_100, 1HZ10V-
+# 1HZ100V, stpRNG) now that these 11 symbols trade via Multiplier contracts
+# (MULTUP/MULTDOWN) instead of Rise/Fall. Synthetic volatility indices are
+# close to a pure random walk — there's no durable, strong directional edge
+# to lean on — so this needs to (a) only fire when there's a real, currently
+# -forming regime (trend vs range) rather than trading every cycle, and
+# (b) size risk in a way that survives being wrong most of the time (see
+# risk_manager.compute_dynamic_stop_loss_pct()). This is a bigger lever on
+# profit factor than the strategy's win rate alone.
+
+def _vol_regime(ltf_bars: List[Candle]) -> str:
+    """
+    'TREND' or 'RANGE', from EMA(8)/EMA(21) separation normalized by
+    ATR(14). Cheap proxy for trend strength (ADX-equivalent) using only
+    indicators already in indicators.py — no new dependency.
+    """
+    C, H, L = _arrays(ltf_bars)
+    ema_fast = ind.ema(C, config.EMA_FAST)
+    ema_slow = ind.ema(C, config.EMA_SLOW)
+    atr = ind.atr(H, L, C, config.ATR_PERIOD)
+    last_atr = _last(atr) or 1e-9
+    sep = abs(_last(ema_fast) - _last(ema_slow))
+    ratio = sep / last_atr
+    return "TREND" if ratio >= getattr(config, "VOL_REGIME_TREND_RATIO", 0.6) else "RANGE"
+
+
+def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """
+    Donchian-channel breakout + EMA trend alignment + MACD histogram
+    confirmation. Suited to open-ended Multiplier risk (rides continuation
+    rather than betting on a single-candle direction like Rise/Fall did).
+    Fires in TREND regime — see evaluate_vol_regime() dispatcher below.
+    """
+    if len(ltf_bars) < 30:
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    ema_fast = ind.ema(C, config.EMA_FAST)
+    ema_slow = ind.ema(C, config.EMA_SLOW)
+    macd_line, signal_line, hist = ind.macd(C)
+    # ind.donchian() — confirmed name/signature elsewhere in this file
+    # (evaluate_step() uses `ind.donchian(H, L, 20)` → (upper, lower)).
+    upper, lower = ind.donchian(H, L, 20)
+    last_close = float(C[-1])
+
+    long_score, short_score = 0, 0
+    if last_close >= _last(upper):
+        long_score += 3
+    if last_close <= _last(lower):
+        short_score += 3
+    if _last(ema_fast) > _last(ema_slow):
+        long_score += 2
+    else:
+        short_score += 2
+    if _last(hist) > 0:
+        long_score += 2
+    elif _last(hist) < 0:
+        short_score += 2
+
+    if long_score >= 5 and long_score >= short_score:
+        direction, raw = "LONG", long_score
+    elif short_score >= 5:
+        direction, raw = "SHORT", short_score
+    else:
+        best = max(long_score, short_score)
+        logger.debug(f"REJECTED: {symbol} VOL_BREAKOUT strength=0 score={best/7.0:.3f} — no confirmed breakout")
+        return SignalResult("NONE", 0, best / 7.0, "VOL_BREAKOUT", "No confirmed breakout")
+
+    score = raw / 7.0
+    strength = 3 if raw >= 6 else 2
+    logger.info(
+        f"SIGNAL: {symbol} {direction} VOL_BREAKOUT strength={strength} score={score:.3f}"
+    )
+    return SignalResult(
+        direction=direction, strength=strength, score=score,
+        strategy="VOL_BREAKOUT",
+        reason=f"Donchian breakout, EMA-aligned, MACD-hist={_last(hist):.5f}",
+    )
+
+
+def evaluate_vol_reversion_mult(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """
+    Fires in RANGE regime — see evaluate_vol_regime() dispatcher below.
+    Same confluence logic as evaluate_mean_reversion() (RSI extremes +
+    Bollinger touch + ROC), kept as a *separate* named strategy
+    (VOL_REV_MULT) so strategy_stats.py / meta_labeling.py don't conflate
+    its historical performance with the old Rise/Fall version — the payoff
+    structure is now completely different (open-ended + stop/target vs
+    fixed 6-14min expiry), so the old win-rate history doesn't transfer.
+    """
+    if len(ltf_bars) < 25:
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    rsi = ind.rsi(C, 14)
+    upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
+    roc = ind.roc(C, 10)
+
+    last_rsi   = _last(rsi)
+    last_close = float(C[-1])
+    last_upper = _last(upper)
+    last_lower = _last(lower)
+    last_roc   = _last(roc)
+
+    long_score = 0
+    long_all = True
+    if last_rsi < 22:
+        long_score += 3
+    else:
+        long_all = False
+    if last_close <= last_lower:
+        long_score += 3
+    else:
+        long_all = False
+    if last_roc < -0.02:
+        long_score += 2
+    else:
+        long_all = False
+
+    short_score = 0
+    short_all = True
+    if last_rsi > 78:
+        short_score += 3
+    else:
+        short_all = False
+    if last_close >= last_upper:
+        short_score += 3
+    else:
+        short_all = False
+    if last_roc > 0.02:
+        short_score += 2
+    else:
+        short_all = False
+
+    if long_score >= 6 and long_score >= short_score:
+        raw = long_score
+        direction = "LONG"
+        all_met = long_all
+    elif short_score >= 6:
+        raw = short_score
+        direction = "SHORT"
+        all_met = short_all
+    else:
+        best = max(long_score, short_score)
+        logger.debug(f"REJECTED: {symbol} VOL_REV_MULT strength=0 score={best/8.0:.3f} — below threshold")
+        return SignalResult("NONE", 0, best / 8.0, "VOL_REV_MULT", "Below entry threshold")
+
+    score = raw / 8.0
+    strength = 3 if all_met else (2 if score >= 6 / 8.0 else 1)
+    if strength <= 1:
+        logger.info(f"REJECTED: {symbol} VOL_REV_MULT strength=1 score={score:.3f} — below threshold")
+        return SignalResult("NONE", 0, score, "VOL_REV_MULT", "Below entry threshold")
+
+    logger.info(
+        f"SIGNAL: {symbol} {direction} VOL_REV_MULT strength={strength} score={score:.3f}"
+    )
+    return SignalResult(
+        direction=direction,
+        strength=strength,
+        score=score,
+        strategy="VOL_REV_MULT",
+        # NOTE: deliberately does NOT carry over MEAN_REV's old "(70.8%
+        # documented win rate)" claim — that number was measured on
+        # Rise/Fall payoffs and does not apply to this Multiplier-contract
+        # strategy. See strategy_stats.is_underperforming() for live
+        # tracking instead.
+        reason=f"VolRevMult RSI={last_rsi:.1f} raw={raw}/8",
+    )
+
+
+def evaluate_vol_regime(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """
+    Thin regime-selecting dispatcher for config.VOL_MULTIPLIER_SYMBOLS —
+    routes to the trend/breakout evaluator in TREND regime, or the
+    range/reversion evaluator in RANGE regime.
+    """
+    if len(ltf_bars) < 30:
+        return NONE_RESULT
+    regime = _vol_regime(ltf_bars)
+    if regime == "TREND":
+        return evaluate_vol_breakout(ltf_bars, symbol)
+    return evaluate_vol_reversion_mult(ltf_bars, symbol)
+
+
+# ---------------------------------------------------------------------------
 # Strategy 3 — Range Break Retest
 # ---------------------------------------------------------------------------
 
@@ -959,7 +1146,9 @@ class SignalEngine:
     def evaluate(self, ltf_bars: List[Candle], symbol: str, **kwargs) -> SignalResult:
         ticks = kwargs.get("ticks")
 
-        if symbol in config.DIGIT_SYMBOLS:
+        if symbol in getattr(config, "VOL_MULTIPLIER_SYMBOLS", []):
+            result = evaluate_vol_regime(ltf_bars, symbol)
+        elif symbol in config.DIGIT_SYMBOLS:
             result = evaluate_digit(ltf_bars, symbol, ticks=ticks)
         elif symbol in config.MEAN_REVERSION_SYMBOLS:
             result = evaluate_mean_reversion(ltf_bars, symbol)
