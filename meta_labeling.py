@@ -99,24 +99,79 @@ EV_MIN_FEATURE_ROWS = getattr(config, "META_LABEL_EV_MIN_FEATURE_ROWS", 30)
 
 # ── HISTORICAL DATA ACCESS (direct, read-only, no private access) ────
 
-def _load_all_trades() -> List[Tuple[str, str, float, bool, float, float, float]]:
+def _decode_ml_fields(features_raw) -> Tuple[float, float, str]:
+    """
+    strategy_stats.py's `trades` table already has a `features TEXT`
+    column (JSON-encoded dict, see TradeRecord.features / record_trade()'s
+    `features=` kwarg) — Implementation Brief v4 §5.1 rides on that
+    existing column instead of adding new ones. Decodes multiplier/
+    atr_pct/regime out of it, defaulting to (0.0, 0.0, "NONE") for rows
+    with no features blob (old Rise/Fall trades, or any pair recorded
+    before this pass) or a blob that doesn't carry these keys.
+    """
+    if not features_raw:
+        return 0.0, 0.0, "NONE"
+    try:
+        decoded = json.loads(features_raw) if isinstance(features_raw, str) else features_raw
+    except (TypeError, ValueError):
+        return 0.0, 0.0, "NONE"
+    if not isinstance(decoded, dict):
+        return 0.0, 0.0, "NONE"
+    return (
+        float(decoded.get("multiplier", 0.0) or 0.0),
+        float(decoded.get("atr_pct", 0.0) or 0.0),
+        str(decoded.get("regime", "NONE") or "NONE"),
+    )
+
+
+def _load_all_trades() -> List[Tuple[str, str, float, bool, float, float, float, float, float, str]]:
     """
     All logged trades across every (strategy, symbol) pair, sorted
     ascending by timestamp. Each row:
-        (strategy, symbol, entry_score, won, stake, payout, timestamp)
+        (strategy, symbol, entry_score, won, stake, payout, timestamp,
+         multiplier, atr_pct, regime)
+
+    multiplier/atr_pct/regime (Implementation Brief v4 §5.1) are decoded
+    out of the existing `features` JSON blob (see _decode_ml_fields()) —
+    no schema migration needed, since strategy_stats.py's trades table
+    already carries a `features` column and bot_engine.py's
+    record_trade() call now populates it for VOL_MULTIPLIER_SYMBOLS
+    trades. Rows with no features blob default to (0.0, 0.0, "NONE").
     """
-    rows: List[Tuple[str, str, float, bool, float, float, float]] = []
+    rows: List[Tuple[str, str, float, bool, float, float, float, float, float, str]] = []
     if SQLITE_AVAILABLE and os.path.exists(TRADES_SQLITE_PATH):
         import sqlite3
         conn = sqlite3.connect(TRADES_SQLITE_PATH, check_same_thread=False)
         try:
-            cur = conn.execute(
-                "SELECT strategy, symbol, entry_score, won, stake, payout, timestamp "
-                "FROM trades ORDER BY timestamp ASC"
-            )
-            for strategy, symbol, entry_score, won, stake, payout, ts in cur.fetchall():
+            try:
+                cur = conn.execute(
+                    "SELECT strategy, symbol, entry_score, won, stake, payout, timestamp, "
+                    "features FROM trades ORDER BY timestamp ASC"
+                )
+                fetched = cur.fetchall()
+                has_features_col = True
+            except sqlite3.OperationalError:
+                # Pre-Brief-v6 database, before `features` existed at all
+                # (strategy_stats.py's defensive ALTER TABLE normally
+                # prevents this, but stay resilient against an even older
+                # DB file that was never opened through that code path).
+                cur = conn.execute(
+                    "SELECT strategy, symbol, entry_score, won, stake, payout, timestamp "
+                    "FROM trades ORDER BY timestamp ASC"
+                )
+                fetched = cur.fetchall()
+                has_features_col = False
+
+            for row in fetched:
+                if has_features_col:
+                    strategy, symbol, entry_score, won, stake, payout, ts, features_raw = row
+                else:
+                    strategy, symbol, entry_score, won, stake, payout, ts = row
+                    features_raw = None
+                multiplier, atr_pct, regime = _decode_ml_fields(features_raw)
                 rows.append((strategy, symbol, float(entry_score or 0.0), bool(won),
-                             float(stake or 0.0), float(payout or 0.0), float(ts)))
+                             float(stake or 0.0), float(payout or 0.0), float(ts),
+                             multiplier, atr_pct, regime))
         finally:
             conn.close()
     elif os.path.exists(TRADES_JSON_PATH):
@@ -124,9 +179,11 @@ def _load_all_trades() -> List[Tuple[str, str, float, bool, float, float, float]
             data = json.load(f)
         for _key, records in data.items():
             for r in records:
+                multiplier, atr_pct, regime = _decode_ml_fields(r.get("features"))
                 rows.append((r["strategy"], r["symbol"], float(r.get("entry_score") or 0.0),
                              bool(r["won"]), float(r.get("stake") or 0.0),
-                             float(r.get("payout") or 0.0), float(r["timestamp"])))
+                             float(r.get("payout") or 0.0), float(r["timestamp"]),
+                             multiplier, atr_pct, regime))
         rows.sort(key=lambda r: r[6])
     return rows
 
@@ -201,7 +258,19 @@ def _win_rate_and_streak(prior_results_ascending: List[bool], window: int) -> Tu
 
 
 def _feature_dict(strategy: str, symbol: str, entry_score: float, timestamp: float,
-                   recent_win_rate: float, streak: float) -> Dict[str, object]:
+                   recent_win_rate: float, streak: float,
+                   multiplier: float = 0.0, atr_pct: float = 0.0,
+                   regime: str = "NONE") -> Dict[str, object]:
+    """
+    Implementation Brief v4 §5.1 — leverage-aware entry filter. multiplier/
+    atr_pct/regime give the model visibility into which instrument-family
+    a trade is on and how leveraged/volatile it was — all now materially
+    different across e.g. R_10 (x400 floor) vs R_100 (x40 floor), where
+    previously the feature dict had no way to distinguish them. Defaults
+    (0.0, 0.0, "NONE") apply to old Rise/Fall rows and any non-
+    VOL_MULTIPLIER_SYMBOLS trade, so the model can tell old-regime rows
+    apart from new ones rather than crashing on missing fields.
+    """
     hour_sin, hour_cos = _hour_sin_cos(timestamp)
     return {
         "strategy": strategy,          # string value -> one-hot encoded
@@ -211,10 +280,13 @@ def _feature_dict(strategy: str, symbol: str, entry_score: float, timestamp: flo
         "hour_cos": hour_cos,
         "recent_win_rate": float(recent_win_rate),
         "streak": float(streak),
+        "multiplier": float(multiplier),
+        "atr_pct": float(atr_pct),
+        "regime": regime,              # one-hot via _ManualVectorizer, same as strategy/symbol
     }
 
 
-def _build_training_set(rows: List[Tuple[str, str, float, bool, float, float, float]]
+def _build_training_set(rows: List[Tuple[str, str, float, bool, float, float, float, float, float, str]]
                          ) -> Tuple[List[Dict[str, object]], List[int]]:
     """
     rows must already be sorted ascending by timestamp. Each row's
@@ -224,11 +296,12 @@ def _build_training_set(rows: List[Tuple[str, str, float, bool, float, float, fl
     history: Dict[Tuple[str, str], List[bool]] = {}
     X: List[Dict[str, object]] = []
     y: List[int] = []
-    for strategy, symbol, entry_score, won, _stake, _payout, ts in rows:
+    for strategy, symbol, entry_score, won, _stake, _payout, ts, multiplier, atr_pct, regime in rows:
         key = (strategy, symbol)
         prior = history.setdefault(key, [])
         win_rate, streak = _win_rate_and_streak(prior, ROLLING_WINDOW)
-        X.append(_feature_dict(strategy, symbol, entry_score, ts, win_rate, streak))
+        X.append(_feature_dict(strategy, symbol, entry_score, ts, win_rate, streak,
+                                multiplier, atr_pct, regime))
         y.append(1 if won else 0)
         prior.append(bool(won))
     return X, y
@@ -620,9 +693,12 @@ _ev_model = _PairEVModel()  # Implementation Brief v6, PART 5
 def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
     """
     features must contain: "strategy", "symbol", "entry_score".
-    Optional: "timestamp" (defaults to now), and "recent_win_rate" /
-    "streak" if the caller wants to override the live-computed values
-    (useful for offline backtesting against a specific historical point).
+    Optional: "timestamp" (defaults to now), "recent_win_rate" / "streak"
+    if the caller wants to override the live-computed values (useful for
+    offline backtesting against a specific historical point), and
+    "multiplier" / "atr_pct" / "regime" (Implementation Brief v4 §5.1 —
+    default 0.0 / 0.0 / "NONE", only meaningful for
+    config.VOL_MULTIPLIER_SYMBOLS trades).
 
     Returns (take, confidence). confidence is the model's estimated
     P(win) when the filter is active. While the filter is inactive
@@ -633,6 +709,9 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
     symbol = str(features["symbol"])
     entry_score = float(features["entry_score"])
     timestamp = float(features.get("timestamp", time.time()))
+    multiplier = float(features.get("multiplier", 0.0))
+    atr_pct = float(features.get("atr_pct", 0.0))
+    regime = str(features.get("regime", "NONE"))
     enriched = {k: features[k] for k in ENRICHED_FEATURE_KEYS if k in features}
 
     total = _count_all_trades()
@@ -697,7 +776,8 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
             # No realized payout data yet for this pair — fall through to
             # the global model below rather than gating on an unknown b.
 
-    feat = _feature_dict(strategy, symbol, entry_score, timestamp, recent_win_rate, streak)
+    feat = _feature_dict(strategy, symbol, entry_score, timestamp, recent_win_rate, streak,
+                          multiplier, atr_pct, regime)
     prob_win = _model.predict_proba_one(feat)
     take = prob_win >= TAKE_THRESHOLD
     confidence = prob_win
