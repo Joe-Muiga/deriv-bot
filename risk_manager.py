@@ -363,6 +363,25 @@ class RiskManager:
         actual_stake = max(actual_stake, self.min_stake)
         return round(actual_stake, 2)
 
+    # ── Dynamic, ATR-normalized stop-loss (Implementation Brief v4, Fix H) ────
+
+    def compute_dynamic_stop_loss_pct(self, atr_pct: float, multiplier: int) -> float:
+        """
+        Converts a target stop distance of STOP_ATR_MULT * ATR (real price
+        terms) into the stop_loss_pct (% of stake) that buy_multiplier()
+        expects, so the dollar stop stays calibrated to actual volatility
+        regardless of which multiplier a symbol is forced into.
+
+        Only used for config.VOL_MULTIPLIER_SYMBOLS (see bot_engine.py's
+        _execute()) — STOP_LOSS_MAP / DEFAULT_STOP_LOSS_PCT keep governing
+        Boom/Crash and everything else exactly as before.
+        """
+        stop_atr_mult = getattr(config, "STOP_ATR_MULT", 2.0)
+        raw_pct = stop_atr_mult * atr_pct * multiplier * 100.0
+        lo = getattr(config, "DYNAMIC_STOP_LOSS_PCT_MIN", 15.0)
+        hi = getattr(config, "DYNAMIC_STOP_LOSS_PCT_MAX", 90.0)
+        return float(max(lo, min(hi, raw_pct)))
+
     # ── Kelly overlay ────────────────────────────────────────────────────────
 
     def compute_kelly_fraction(self, strategy: str, symbol: str) -> Optional[float]:
