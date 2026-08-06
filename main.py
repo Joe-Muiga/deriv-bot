@@ -5,9 +5,7 @@ Architecture:
   • Thread 1 (main) : Flask web server for Render's health checks
   • Thread 2        : asyncio event loop running the bot engine
   • Thread 3        : self-ping keep-alive (pings /health every 40 s)
-  • Thread 4        : restart scheduler (triggers a fresh deploy every
-                       REDEPLOY_INTERVAL_HOURS, default 6 — see config.py /
-                       restart_scheduler.py)
+  • Thread 4        : restart scheduler (triggers a fresh deploy every 15 min)
 
 Environment variables required:
   DERIV_API_TOKEN        – your Deriv API token (trade + read scope)
