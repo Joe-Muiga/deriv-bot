@@ -77,9 +77,13 @@ PRED_SQLITE_PATH = os.path.join(DATA_DIR, "meta_label_predictions.db")
 PRED_JSON_PATH = os.path.join(DATA_DIR, "meta_label_predictions.json")
 
 ROLLING_WINDOW = strategy_stats.DEFAULT_WINDOW  # same horizon as the dashboard's rolling win rate
-TAKE_THRESHOLD = 0.5  # decision cutoff on predicted P(win) — used only by the
-                       # global entry_score-based model, i.e. when the EV gate
-                       # below isn't active yet for this pair.
+# FIX (profitability audit): was 0.5 — a bare 50% cutoff has zero margin
+# against estimation noise in a logistic model trained on limited, noisy
+# trade data, so it approves roughly half of borderline signals purely by
+# chance. 0.55 requires a real, if modest, edge over coin-flip. Decision
+# cutoff on predicted P(win) — used only by the global entry_score-based
+# model, i.e. when the EV gate below isn't active yet for this pair.
+TAKE_THRESHOLD = 0.55
 
 # ── ENRICHED-FEATURE EV GATE (Implementation Brief v6, PART 5) ───────────
 # Feature keys evaluate_mean_reversion() now attaches to SignalResult.features
@@ -761,7 +765,13 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
             if avg_ratio is not None:
                 b_realized = avg_ratio - 1.0
                 expected_value = p_hat_ev * b_realized - (1.0 - p_hat_ev)
-                take = expected_value > 0
+                # FIX (profitability audit): was `> 0` — a bare-positive EV
+                # gate takes every trade where the point-estimate edge is
+                # even a hair above breakeven, with no allowance for
+                # estimation error in p_hat_ev or in the realized payout
+                # ratio. EV_MARGIN requires a small buffer above breakeven.
+                ev_margin = getattr(config, "META_LABEL_EV_MARGIN", 0.03)
+                take = expected_value > ev_margin
                 confidence = p_hat_ev
                 logger.info(
                     "EV-GATE: %s/%s p_hat=%.3f b=%.3f EV=%.4f -> take=%s",
