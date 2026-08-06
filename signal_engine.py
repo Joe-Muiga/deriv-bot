@@ -30,6 +30,7 @@ import numpy as np
 
 import config
 import indicators as ind
+import strategy_stats
 from candlestick_builder import Candle
 from symbol_manager import SymbolManager
 
@@ -477,9 +478,18 @@ def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     elif _last(hist) < 0:
         short_score += 2
 
-    if long_score >= 5 and long_score >= short_score:
+    # FIX (profitability audit): threshold was >=5/7, satisfied by the
+    # Donchian break (3) plus EITHER the EMA or the MACD-hist confirmation
+    # (2 each) alone. Dashboard trade history shows VOL_BREAKOUT losing on
+    # ~80% of its sampled trades vs. BOOM_CRASH winning consistently — a
+    # single-indicator confirmation on a near-random-walk instrument is too
+    # loose. Raised to >=6 so a breakout needs the Donchian break AND BOTH
+    # EMA-alignment AND MACD-hist agreeing with direction (3+2+2=7 max),
+    # matching the "require multiple confluences" bar VOL_REV_MULT already
+    # uses (>=6/8) just below.
+    if long_score >= 6 and long_score >= short_score:
         direction, raw = "LONG", long_score
-    elif short_score >= 5:
+    elif short_score >= 6:
         direction, raw = "SHORT", short_score
     else:
         best = max(long_score, short_score)
@@ -1171,6 +1181,23 @@ class SignalEngine:
             return NONE_RESULT
 
         if result.strength >= 2:
+            # FIX (profitability audit): strategy_stats.is_underperforming()
+            # existed but was never called anywhere in the codebase — a
+            # (strategy, symbol) pair could keep losing indefinitely with
+            # no automatic throttle. This is the single choke point every
+            # strategy result passes through, so gate here.
+            try:
+                if strategy_stats.stats.is_underperforming(result.strategy, symbol):
+                    logger.info(
+                        f"REJECTED: {symbol} {result.strategy} strength={result.strength} "
+                        f"score={result.score:.3f} — pair flagged underperforming "
+                        f"(win rate below STRATEGY_WIN_RATE_FLOOR over last "
+                        f"STRATEGY_WIN_RATE_MIN_TRADES trades)"
+                    )
+                    return NONE_RESULT
+            except Exception as exc:
+                logger.warning(f"is_underperforming({result.strategy},{symbol}) check failed: {exc}")
+
             logger.info(
                 f"SIGNAL: {symbol} {result.direction} {result.strategy} "
                 f"strength={result.strength} score={result.score:.3f}"
