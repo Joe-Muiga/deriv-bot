@@ -412,14 +412,24 @@ TAKE_PROFIT_RATIO = 2.0
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
-MIN_STAKE            = 100    # safety floor — never stake less than this
-MAX_STAKE            = 1000.0  # safety backstop only, not the everyday
-                                # driver — was previously == MIN_STAKE,
-                                # which silently capped every trade at
-                                # $0.35 regardless of balance or the 0.5%
-                                # calculation above. Adjust if you want a
-                                # tighter per-trade ceiling.
-DAILY_LOSS_LIMIT_PCT = 0.15   # NOTE: value is 15%, comment below said 20% — see flags in reply
+MIN_STAKE            = 5      # safety floor only. FIX (profitability audit):
+                                # was 100, which is ABOVE what 0.5% of a
+                                # typical account (~$8-9k -> $40-45) works
+                                # out to. That meant every single trade was
+                                # silently forced to the $100 floor instead
+                                # of the balance-based/Kelly-adjusted stake —
+                                # dashboard history confirms every logged
+                                # trade was exactly $100.00 regardless of
+                                # signal strength or edge. Set safely below
+                                # BASE_STAKE_PCT × balance for realistic
+                                # account sizes so PLS/Kelly sizing actually
+                                # drives stake again; raise only if you want
+                                # a higher effective per-trade minimum.
+MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
+DAILY_LOSS_LIMIT_PCT = 0.06    # FIX: was 0.15 (15%) — too loose to act as a
+                                # real circuit breaker. 6% is a more typical
+                                # prudent daily stop for leveraged multiplier
+                                # trading; tune to taste but keep well under 15%.
 DAILY_LOSS_PAUSE_MINS = 30
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
@@ -431,7 +441,30 @@ PLS_WIN_MULTIPLIERS = [1.0, 1.0, 1.0, 1.0, 1.0]
 PLS_WIN_EXTRA_SLOTS = [0,   0,   0,   0,   0   ]
 
 # ── CONCURRENT TRADES ────────────────────────────────────────
-MAX_CONCURRENT_TRADES = 30
+# FIX (profitability audit): was 30. With every trade effectively forced to
+# $100 (see MIN_STAKE fix above) that allowed up to $3,000 of simultaneous
+# exposure — a large fraction of account equity open at once, much of it in
+# highly-correlated symbols (e.g. R_10 and 1HZ10V both track the same
+# volatility parameter). Lowered to reduce simultaneous drawdown risk;
+# raise gradually only once live win-rate/profit-factor justify it.
+MAX_CONCURRENT_TRADES = 6
+
+# Correlated-symbol grouping — synthetic indices sharing the same underlying
+# volatility parameter (just different tick generation) move together far
+# more than unrelated symbols do, so treating them as independent slots
+# understates real concurrent risk. Caps how many concurrently-open
+# positions may share a family, on top of MAX_CONCURRENT_TRADES overall.
+# See bot_engine.py's execution loop for the enforcement point.
+SYMBOL_FAMILY_MAP = {
+    "R_10": "VOL10", "1HZ10V": "VOL10",
+    "R_25": "VOL25", "1HZ25V": "VOL25",
+    "R_50": "VOL50", "1HZ50V": "VOL50",
+    "R_75": "VOL75", "1HZ75V": "VOL75",
+    "R_100": "VOL100", "1HZ100V": "VOL100",
+    "BOOM500": "BOOMCRASH500", "CRASH500": "BOOMCRASH500",
+    "BOOM1000": "BOOMCRASH1000", "CRASH1000": "BOOMCRASH1000",
+}
+MAX_CONCURRENT_PER_FAMILY = 2
 
 # ── TIMEFRAMES ───────────────────────────────────────────────
 HTF_GRANULARITY   = 3600   # 1H
@@ -628,14 +661,25 @@ ACCU_GROWTH_RATE_MAX = 5.0   # percent, per-tick growth rate ceiling
 ACCU_EXIT_FRACTION = 0.7
 
 # ── STRATEGY PERFORMANCE MONITORING ───────────────────────────
-# Once a (strategy, symbol) pair has 100+ logged trades, flag it as
-# underperforming if its win rate falls below this floor.
+# Once a (strategy, symbol) pair has this many logged trades, flag it as
+# underperforming if its win rate falls below the floor. FIX (profitability
+# audit): was 100 — is_underperforming() sat completely unused by any
+# execution path (dead code, confirmed by grep across the codebase), so
+# raising this wasn't even the bottleneck; the real fix is wiring it into
+# signal_engine.SignalEngine.evaluate() (done) with a threshold low enough
+# to matter before large losses accumulate. 30 aligns with KELLY_MIN_TRADES's
+# order of magnitude below.
 STRATEGY_WIN_RATE_FLOOR = 0.55
-STRATEGY_WIN_RATE_MIN_TRADES = 100
+STRATEGY_WIN_RATE_MIN_TRADES = 30
 
 # ── META-LABELING (future ML filter) ──────────────────────────
 META_LABEL_MIN_TRADES      = 200   # trades required before the filter is trusted
 META_LABEL_RETRAIN_EVERY_N = 100   # retrain cadence, in newly logged trades
+# FIX (profitability audit): required buffer above breakeven for the EV
+# gate in meta_labeling.predict_take_trade() — was an implicit 0.0, taking
+# any trade with a nominally-positive point estimate regardless of how
+# noisy that estimate was.
+META_LABEL_EV_MARGIN        = 0.03
 
 # ── POSITION SIZING (Kelly) ───────────────────────────────────
 # Conservative multiplier applied to full Kelly-optimal sizing.
