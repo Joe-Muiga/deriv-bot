@@ -873,14 +873,39 @@ class BotEngine:
             ranked: List[ScanResult] = sorted(
                 best_per_symbol.values(), key=lambda r: r.rank_key, reverse=True)
 
-            # 8. Execute top N where N = current_concurrent_limit,
-            #    gated only by concurrent-slot availability
+            # 8. Execute top N where N = current_concurrent_limit, gated by
+            #    concurrent-slot availability AND (FIX, profitability
+            #    audit) a per-symbol-family cap — correlated synthetic
+            #    indices (e.g. R_10/1HZ10V share the same volatility
+            #    parameter) were previously treated as fully independent
+            #    slots, understating real concurrent drawdown risk.
             concurrent_limit = self.risk.current_concurrent_limit
             open_count       = len(self._open_contracts)
             available_slots  = max(0, concurrent_limit - open_count)
 
-            top = ranked[:available_slots] if (
-                available_slots > 0 and not self._confirmed_paused) else []
+            family_map      = getattr(config, "SYMBOL_FAMILY_MAP", {})
+            max_per_family  = getattr(config, "MAX_CONCURRENT_PER_FAMILY", 2)
+            family_open_counts: Dict[str, int] = {}
+            for c in self._open_contracts.values():
+                fam = family_map.get(c.get("symbol"))
+                if fam:
+                    family_open_counts[fam] = family_open_counts.get(fam, 0) + 1
+
+            top: List[ScanResult] = []
+            if available_slots > 0 and not self._confirmed_paused:
+                for r in ranked:
+                    if len(top) >= available_slots:
+                        break
+                    fam = family_map.get(r.symbol)
+                    if fam:
+                        count = family_open_counts.get(fam, 0)
+                        if count >= max_per_family:
+                            logger.debug(
+                                f"SKIP: {r.symbol} — family {fam} at concurrent "
+                                f"cap ({count}/{max_per_family})")
+                            continue
+                        family_open_counts[fam] = count + 1
+                    top.append(r)
 
             # 9. Execute all top signals in parallel
             if top:
@@ -1005,7 +1030,15 @@ class BotEngine:
             )
             return False
 
-        stake     = await self.risk.calculate_stake()
+        # FIX (profitability audit): this call previously passed no
+        # arguments, so RiskManager.calculate_stake()'s Kelly overlay
+        # (compute_kelly_fraction / _apply_kelly_overlay) always hit its
+        # "no pair context supplied" branch and silently no-op'd — the
+        # whole edge-based position-sizing system was dead in production.
+        # Passing strategy/symbol lets stake actually shrink toward $0 for
+        # pairs with no measured edge and scale toward the Kelly-optimal
+        # fraction for pairs that do have one.
+        stake     = await self.risk.calculate_stake(strategy=strategy, symbol=symbol)
         # NOTE: for DIGIT signals (JUMP_BUILDUP) this is "MATCH"/"DIFFER",
         # not "LONG"/"SHORT" — passed through below to record_signal(),
         # risk.register_open(), and journal.open_trade() purely as a label.
