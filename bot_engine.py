@@ -1590,9 +1590,56 @@ class BotEngine:
             sell_resp = None
 
         if not sell_resp:
-            # No confirmed close — this contract must NEVER be removed from
-            # _open_contracts without one. Leave it open and tracked; retry
-            # next _handle_orphans tick.
+            # Sell failed — the classic cause (matches the logs you're
+            # seeing: "ContractNotFound: This contract was not found among
+            # your open positions") is that Deriv already considers this
+            # contract closed — e.g. it hit its own limit_order stop-out,
+            # or the proposal_open_contract close push never reached us
+            # (a subscription dropped/missed across a reconnect) — while
+            # our local bookkeeping never got the memo. Retrying a sell on
+            # a contract that no longer exists is a guaranteed infinite
+            # loop: it fails the same way forever, age keeps climbing, and
+            # the position sits "open" in our books indefinitely (this is
+            # what produced the 15-16h "stuck" positions). Before giving up
+            # for this cycle, run one authoritative check — same
+            # force_check_contract → profit_table_lookup fallback Fix C
+            # already uses for Rise/Fall — and settle for real if Deriv
+            # confirms it's actually closed.
+            try:
+                poc = await self.client.force_check_contract(cid)
+            except Exception as exc:
+                logger.warning(f"force_check_contract({cid}) after failed sell: {exc}")
+                poc = {}
+
+            if not (poc.get("is_sold") or poc.get("is_expired")):
+                try:
+                    poc = await self.client.profit_table_lookup(cid)
+                except Exception as exc:
+                    logger.warning(f"profit_table_lookup({cid}) after failed sell: {exc}")
+                    poc = {}
+
+            if poc.get("is_sold") or poc.get("is_expired"):
+                logger.info(
+                    f"MULTIPLIER ALREADY CLOSED: {cid} ({symbol}) — sell "
+                    f"failed because Deriv already considers it closed; "
+                    f"settling from the authoritative check instead of "
+                    f"retrying a sell forever."
+                )
+                self._open_contracts.pop(cid, None)
+                self._contract_open_times.pop(cid, None)
+                self._reconciling.pop(cid, None)
+                try:
+                    self.client.stop_tracking(cid)
+                except Exception:
+                    pass
+                await self._apply_settlement(cid, info, poc, close_reason="orphan_already_closed")
+                return
+
+            # Genuinely still open and the sell call itself failed for some
+            # other (presumably transient) reason — this contract must
+            # NEVER be removed from _open_contracts without a confirmed
+            # close. Leave it open and tracked; retry next
+            # _handle_orphans tick.
             logger.warning(
                 f"MULTIPLIER SELL FAILED: {cid} ({symbol}) — still open, "
                 f"will retry active close next cycle (no bookkeeping wiped)"
@@ -1716,6 +1763,49 @@ class BotEngine:
                         sell_resp = None
 
                     if not sell_resp:
+                        # Same failure mode as _handle_multiplier_orphan's
+                        # max-hold close (ContractNotFound because Deriv
+                        # already considers this closed — its own
+                        # limit_order stop-out fired, or a WS close push
+                        # was dropped across a reconnect). Run the same
+                        # authoritative check before assuming it's still
+                        # open, or this retries a dead sell forever exactly
+                        # like the max-hold path did.
+                        try:
+                            check_poc = await self.client.force_check_contract(cid)
+                        except Exception as exc:
+                            logger.warning(f"force_check_contract({cid}) after failed adaptive-exit sell: {exc}")
+                            check_poc = {}
+
+                        if not (check_poc.get("is_sold") or check_poc.get("is_expired")):
+                            try:
+                                check_poc = await self.client.profit_table_lookup(cid)
+                            except Exception as exc:
+                                logger.warning(f"profit_table_lookup({cid}) after failed adaptive-exit sell: {exc}")
+                                check_poc = {}
+
+                        if check_poc.get("is_sold") or check_poc.get("is_expired"):
+                            logger.info(
+                                f"ADAPTIVE EXIT ALREADY CLOSED: {cid} ({symbol}) "
+                                f"— sell failed because Deriv already considers "
+                                f"it closed; settling from the authoritative "
+                                f"check instead of retrying a sell forever."
+                            )
+                            self._open_contracts.pop(cid, None)
+                            self._contract_open_times.pop(cid, None)
+                            self._reconciling.pop(cid, None)
+                            try:
+                                self.client.stop_tracking(cid)
+                            except Exception:
+                                pass
+                            await self._apply_settlement(
+                                cid, info, check_poc, close_reason="adaptive_exit_already_closed")
+                            try:
+                                exit_engine.record_closed(cid, float(check_poc.get("profit", 0.0)))
+                            except Exception as exc:
+                                logger.warning(f"exit_engine.record_closed({cid}) failed: {exc}")
+                            return
+
                         # No confirmed close — never drop bookkeeping without
                         # one (same invariant _handle_multiplier_orphan
                         # follows). Leave it open/tracked; retry next tick.
