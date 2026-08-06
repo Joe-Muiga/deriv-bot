@@ -1,14 +1,15 @@
 """
-restart_scheduler.py – 6-hourly Kenya-midnight-anchored redeploy scheduler.
+restart_scheduler.py – Daily Kenya-midnight redeploy scheduler.
 
-Implementation Brief v2, Requirement 2 / Fix G. Widened from once-daily to
-every REDEPLOY_INTERVAL_HOURS (config.py, default 6) on request, still
-anchored to 00:00 Africa/Nairobi — so with the default that's four fires a
-day at 00:00 / 06:00 / 12:00 / 18:00 EAT (UTC+3, no DST) instead of one.
+Implementation Brief v2, Requirement 2 / Fix G.
+
+Replaces the old fixed 2-hour redeploy timer with a schedule that fires
+exactly once every 24 hours, at 00:00 Africa/Nairobi time (EAT, UTC+3 —
+Kenya does not observe DST, so this is a fixed offset year-round).
 
 Public interface (unchanged contract with bot_engine.py):
   - is_redeploy_pending() -> bool
-        True once the timer has fired and a redeploy is due.
+        True once the daily timer has fired and a redeploy is due.
         bot_engine.py's _main_loop() checks this to pause taking on new
         trades, and _settle_loop() checks it to know when to start
         draining open contracts before actually redeploying.
@@ -19,7 +20,7 @@ Public interface (unchanged contract with bot_engine.py):
         in which case this is NOT called, see bot_engine.py Fix G).
         Actually fires the Render deploy hook and clears the pending flag.
   - run_scheduler() -> coroutine
-        The timer loop itself. Started as a background task by
+        The daily timer loop itself. Started as a background task by
         bot_engine.py's run() alongside its other loops.
 
 Draining coordination lives entirely in bot_engine.py (it owns the open
@@ -45,11 +46,6 @@ logger = logging.getLogger(__name__)
 
 _REDEPLOY_TIMEZONE = getattr(config, "REDEPLOY_TIMEZONE", "Africa/Nairobi")
 
-# How often the timer fires, anchored to local midnight — e.g. 6 means
-# 00:00/06:00/12:00/18:00 local. Any positive value works (doesn't need
-# to divide 24 evenly); see _next_scheduled_fire().
-_REDEPLOY_INTERVAL_HOURS = getattr(config, "REDEPLOY_INTERVAL_HOURS", 6)
-
 # ── Module-level scheduler state ────────────────────────────────────────────
 _pending: bool = False
 _last_triggered_at: float = 0.0
@@ -57,66 +53,59 @@ _last_scheduled_at: float = 0.0
 
 
 def is_redeploy_pending() -> bool:
-    """True once the redeploy timer has fired and a redeploy is due but
-    hasn't been confirmed-triggered yet."""
+    """True once the daily Kenya-midnight timer has fired and a redeploy
+    is due but hasn't been confirmed-triggered yet."""
     return _pending
 
 
-def _next_scheduled_fire(now_utc: datetime) -> datetime:
+def _next_nairobi_midnight(now_utc: datetime) -> datetime:
     """
-    Given the current UTC time, return the next scheduled redeploy
-    instant, expressed in UTC — a boundary every
-    _REDEPLOY_INTERVAL_HOURS hours, anchored to local (Africa/Nairobi)
-    midnight (00:00/06:00/12:00/18:00 for the default interval of 6).
-    Uses zoneinfo so DST-free EAT (UTC+3) stays correct even if that ever
-    changes upstream, rather than hardcoding UTC offsets as magic numbers.
+    Given the current UTC time, return the next 00:00 Africa/Nairobi
+    instant, expressed in UTC. Uses zoneinfo so DST-free EAT (UTC+3) stays
+    correct even if that ever changes upstream, rather than hardcoding
+    "21:00 UTC" as a magic number.
     """
-    interval = _REDEPLOY_INTERVAL_HOURS
     if ZoneInfo is not None:
         tz = ZoneInfo(_REDEPLOY_TIMEZONE)
         now_local = now_utc.astimezone(tz)
-        boundary_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-        while boundary_local <= now_local:
-            boundary_local += timedelta(hours=interval)
-        return boundary_local.astimezone(timezone.utc)
+        next_local_midnight = (now_local + timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        return next_local_midnight.astimezone(timezone.utc)
 
-    # Fallback: Africa/Nairobi has no DST — fixed UTC+3 — so this can be
-    # computed with a plain offset instead of zoneinfo. Do the "local
-    # wall clock" arithmetic on naive datetimes, then reattach UTC at the
-    # end so the +3h/-3h offset only ever gets applied once each way.
-    now_local_naive = now_utc.replace(tzinfo=None) + timedelta(hours=3)
-    boundary_local_naive = now_local_naive.replace(hour=0, minute=0, second=0, microsecond=0)
-    while boundary_local_naive <= now_local_naive:
-        boundary_local_naive += timedelta(hours=interval)
-    return (boundary_local_naive - timedelta(hours=3)).replace(tzinfo=timezone.utc)
+    # Fallback: Africa/Nairobi has no DST — fixed UTC+3 — so 00:00 EAT is
+    # always 21:00 UTC the previous day.
+    candidate = now_utc.replace(hour=21, minute=0, second=0, microsecond=0)
+    if candidate <= now_utc:
+        candidate += timedelta(days=1)
+    return candidate
 
 
 async def run_scheduler():
     """
-    Sleeps until the next scheduled fire (_next_scheduled_fire), sets the
-    pending flag, then repeats. bot_engine.py's _settle_loop() is
-    responsible for noticing is_redeploy_pending() == True, draining open
-    contracts for real, and calling trigger_redeploy() once that's done.
+    Sleeps until the next Africa/Nairobi midnight, sets the pending flag,
+    then repeats. bot_engine.py's _settle_loop() is responsible for
+    noticing is_redeploy_pending() == True, draining open contracts for
+    real, and calling trigger_redeploy() once that's done.
     """
     global _pending, _last_scheduled_at
 
     while True:
         try:
             now_utc = datetime.now(timezone.utc)
-            next_fire = _next_scheduled_fire(now_utc)
+            next_fire = _next_nairobi_midnight(now_utc)
             sleep_secs = max(1.0, (next_fire - now_utc).total_seconds())
 
             logger.info(
                 f"REDEPLOY SCHEDULER: next redeploy at {next_fire.isoformat()} "
-                f"(every {_REDEPLOY_INTERVAL_HOURS}h from 00:00 "
-                f"{_REDEPLOY_TIMEZONE}) — sleeping {sleep_secs:.0f}s"
+                f"(00:00 {_REDEPLOY_TIMEZONE}) — sleeping {sleep_secs:.0f}s"
             )
             await asyncio.sleep(sleep_secs)
 
             _pending = True
             _last_scheduled_at = time.time()
             logger.warning(
-                "REDEPLOY DUE: scheduled redeploy timer fired — "
+                "REDEPLOY DUE: daily Kenya-midnight timer fired — "
                 "waiting for bot_engine to drain open contracts before "
                 "actually redeploying"
             )
