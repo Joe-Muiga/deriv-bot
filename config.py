@@ -551,16 +551,22 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
 
-# restart_scheduler.py fires exactly once every 24h, at 00:00 in this zone
-# (Africa/Nairobi = EAT = UTC+3 year-round, no DST) — replaces the old fixed
-# 2-hour timer per Implementation Brief v2, Requirement 2 / Fix G.
+# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
+# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
+# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
+# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
+# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
+# _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
+REDEPLOY_INTERVAL_HOURS = 6
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
 # scheduled, before delaying the redeploy rather than wiping contract
-# bookkeeping (Fix G). With daily (not 2-hourly) redeploys there's much
-# more natural lead time, so this can be generous.
+# bookkeeping (Fix G). Kept generous even at 4x/day — 30min of drain
+# headroom out of every 6h window is still cheap, and a redeploy that's
+# delayed a few minutes because a contract is still confirming its close
+# is far better than one that guesses.
 DRAIN_MAX_SECS = 1800
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
