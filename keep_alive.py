@@ -78,8 +78,6 @@ _state: dict = {
     "redeploy_pending":      False,
     "active_trades":         0,
     "all_trades":            [],
-    "all_trades_count":      0,   # true lifetime count — kept separate from
-                                   # len(all_trades) below, which is capped
     "hourly_pnl":            {},
     "daily_pnl_history":     [],
     "weekly_pnl":            0.0,
@@ -100,18 +98,6 @@ _state: dict = {
     "signal_log":            [],   # last 20 emitted signals
     "failure_log":           [],   # last 50 failed placements
     "session_start_balance": 0.0,  # set once on first trade or bot start
-    # ── Risk metrics (max drawdown + daily Sharpe) — computed live in
-    #    _compute_risk_metrics(), called from record_trade(). See that
-    #    function's docstring for the "resets on every process restart"
-    #    caveat — this is a since-last-restart window, not a lifetime
-    #    figure, given REDEPLOY_INTERVAL_HOURS restarts this process
-    #    (config.py, default every 6h).
-    "peak_balance":          0.0,
-    "max_drawdown_abs":      0.0,
-    "max_drawdown_pct":      0.0,
-    "current_drawdown_pct":  0.0,
-    "sharpe_ratio":          None,
-    "sharpe_sample_days":    0,
 }
 
 _status = _state   # alias for bot_engine imports
@@ -187,78 +173,6 @@ def _check_period_resets(now: datetime.datetime, balance_after: float) -> None:
         _status["month_start_balance"] = current_balance
 
 
-# ── Risk metrics: max drawdown + daily Sharpe ───────────────────────────────
-#
-# Computed live off this process's own in-memory balance_history /
-# daily_pnl_history — no external dependency, so it works the moment
-# trades start coming in.
-#
-# CAVEAT (also shown on the dashboard itself, see _render_dashboard()):
-# _state is in-memory only and is wiped on every process restart —
-# including the scheduled restart_scheduler.py redeploys
-# (config.REDEPLOY_INTERVAL_HOURS, default every 6h). These numbers are
-# therefore "since last restart", not lifetime-of-account figures. If a
-# true long-horizon drawdown/Sharpe is ever needed, strategy_stats.py's
-# SQLite/JSON backend has the durable per-trade history to compute one
-# from — though per trade_journal.py's own docstring, Render's free tier
-# disk isn't guaranteed to survive a redeploy either without a persistent
-# disk mounted, so even that isn't a guaranteed long archive by default.
-def _compute_risk_metrics() -> None:
-    balance_hist = _status.get("balance_history", [])
-    peak = None
-    max_dd_abs = 0.0
-    max_dd_pct = 0.0
-    for point in balance_hist:
-        try:
-            bal = float(point.get("balance", 0.0))
-        except (TypeError, ValueError, AttributeError):
-            continue
-        if peak is None or bal > peak:
-            peak = bal
-        if peak and peak > 0:
-            dd_abs = peak - bal
-            dd_pct = (dd_abs / peak) * 100
-            if dd_abs > max_dd_abs:
-                max_dd_abs = dd_abs
-            if dd_pct > max_dd_pct:
-                max_dd_pct = dd_pct
-
-    current_balance = float(_status.get("balance", 0.0))
-    if peak and peak > 0:
-        current_dd_pct = max(0.0, (peak - current_balance) / peak * 100)
-    else:
-        current_dd_pct = 0.0
-
-    _status["peak_balance"]         = round(peak, 4) if peak is not None else current_balance
-    _status["max_drawdown_abs"]     = round(max_dd_abs, 4)
-    _status["max_drawdown_pct"]     = round(max_dd_pct, 2)
-    _status["current_drawdown_pct"] = round(current_dd_pct, 2)
-
-    # Daily Sharpe — mean/stdev of COMPLETED days' $ P&L only
-    # (daily_pnl_history, appended by _check_period_resets on each day
-    # rollover). Deliberately never annualized: these are synthetic
-    # indices trading 24/7/365 with irregular per-day trade counts, so a
-    # "√252 trading days" stock-market annualization would be fabricated
-    # precision, not real precision. Needs >= 2 completed days to define
-    # a stdev at all — sample_days is always surfaced alongside the
-    # number (see stats_route() / _render_dashboard()) so a 2-day Sharpe
-    # is never mistaken for a stable one, same "don't hide small-sample
-    # uncertainty" convention strategy_stats.py's Wilson CIs use.
-    daily_pnls = [
-        float(d.get("pnl", 0.0)) for d in _status.get("daily_pnl_history", [])
-        if isinstance(d, dict) and "pnl" in d
-    ]
-    n = len(daily_pnls)
-    if n >= 2:
-        mean = sum(daily_pnls) / n
-        variance = sum((x - mean) ** 2 for x in daily_pnls) / (n - 1)
-        stdev = variance ** 0.5
-        _status["sharpe_ratio"] = round(mean / stdev, 3) if stdev > 0 else None
-    else:
-        _status["sharpe_ratio"] = None
-    _status["sharpe_sample_days"] = n
-
-
 # ── Trade / signal recording ────────────────────────────────────────────────────
 
 def record_trade(symbol, direction, stake, pnl,
@@ -286,14 +200,7 @@ def record_trade(symbol, direction, stake, pnl,
 
     _status["recent_trades"].insert(0, trade)
     _status["recent_trades"] = _status["recent_trades"][:200]
-    # Unlike recent_trades/balance_history, this had no cap at all — pure
-    # unbounded memory growth for a value nothing ever reads besides its
-    # length. Cap the list; track the true lifetime count separately so
-    # all_trades_count doesn't silently start under-reporting once the
-    # list itself gets capped.
     _status["all_trades"].append(trade)
-    _status["all_trades"] = _status["all_trades"][-2000:]
-    _status["all_trades_count"] = int(_status.get("all_trades_count", 0)) + 1
 
     _status["balance_history"].append({
         "time":         trade["time"],
@@ -364,8 +271,6 @@ def record_trade(symbol, direction, stake, pnl,
             float(_status.get("funding_fees_total", 0.0)) + abs(pnl_f), 4)
 
     _status["balance"] = float(balance_after)
-
-    _compute_risk_metrics()
 
 
 def record_signal(symbol, direction, strategy, score, timestamp=None):
@@ -696,23 +601,6 @@ def _render_dashboard() -> str:
 
         open_list    = s.get("open_contracts", [])
         open_count   = int(s.get("open_contracts_count", len(open_list)))
-
-        # ── Risk metrics (max drawdown + daily Sharpe) — see
-        #    _compute_risk_metrics()'s docstring for the "since last
-        #    restart, not lifetime" caveat, surfaced below via card_sub.
-        max_dd_pct     = float(s.get("max_drawdown_pct", 0.0))
-        max_dd_abs     = float(s.get("max_drawdown_abs", 0.0))
-        current_dd_pct = float(s.get("current_drawdown_pct", 0.0))
-        sharpe         = s.get("sharpe_ratio")
-        sharpe_days    = int(s.get("sharpe_sample_days", 0))
-        dd_color       = "green" if max_dd_pct < 5 else "yellow" if max_dd_pct < 15 else "red"
-        sharpe_color   = ("green"  if (sharpe is not None and sharpe >= 1.0) else
-                           "yellow" if (sharpe is not None and sharpe >= 0)   else
-                           "red"    if sharpe is not None else "yellow")
-        sharpe_disp    = f"{sharpe:.3f}" if sharpe is not None else "—"
-        sharpe_sub     = (f"{sharpe_days} completed day(s) since last restart"
-                           if sharpe_days >= 2 else
-                           f"Need ≥2 completed days ({sharpe_days} so far)")
 
         loss_pct     = max(-daily_pnl_pct, 0.0)
         loss_bar     = min(loss_pct / 15.0 * 100, 100)
@@ -1095,18 +983,6 @@ def _render_dashboard() -> str:
     <div class="card-sub">Active right now</div>
   </div>
 
-  <div class="card">
-    <div class="card-title">Max Drawdown</div>
-    <div class="card-value {dd_color}">{max_dd_pct:.2f}%</div>
-    <div class="card-sub">${max_dd_abs:.4f} · current {current_dd_pct:.2f}% · since last restart</div>
-  </div>
-
-  <div class="card">
-    <div class="card-title">Sharpe Ratio (daily)</div>
-    <div class="card-value {sharpe_color}">{sharpe_disp}</div>
-    <div class="card-sub">{sharpe_sub}</div>
-  </div>
-
 </div>
 
 <!-- ── 4. Balance Curve ── -->
@@ -1353,12 +1229,6 @@ def stats_route():
         "funding_fees_total": round(float(s.get("funding_fees_total", 0.0)), 4),
         "open_contracts":     s.get("open_contracts", []),
         "open_contracts_count": int(s.get("open_contracts_count", 0)),
-        "peak_balance":         round(float(s.get("peak_balance", 0.0)), 4),
-        "max_drawdown_abs":     round(float(s.get("max_drawdown_abs", 0.0)), 4),
-        "max_drawdown_pct":     round(float(s.get("max_drawdown_pct", 0.0)), 2),
-        "current_drawdown_pct": round(float(s.get("current_drawdown_pct", 0.0)), 2),
-        "sharpe_ratio":         s.get("sharpe_ratio"),
-        "sharpe_sample_days":   int(s.get("sharpe_sample_days", 0)),
         "streak":             int(s.get("streak", 0)),
         "streak_label":       str(s.get("streak_label", "—")),
         "paused":             bool(s.get("paused_for_loss_limit", False)),
@@ -1371,7 +1241,7 @@ def stats_route():
         "suspended_symbols":  s.get("suspended_symbols", []),
         "hourly_pnl":         s.get("hourly_pnl", {}),
         "daily_pnl_history":  s.get("daily_pnl_history", []),
-        "all_trades_count":   int(s.get("all_trades_count", len(s.get("all_trades", [])))),
+        "all_trades_count":   len(s.get("all_trades", [])),
         "signal_log":         s.get("signal_log", []),
         "failure_log":        s.get("failure_log", []),
     })
@@ -1386,7 +1256,7 @@ def strategy_stats_route():
 def trades_route():
     return jsonify({
         "recent_trades":    _state.get("recent_trades", []),
-        "all_trades_count": int(_state.get("all_trades_count", len(_state.get("all_trades", [])))),
+        "all_trades_count": len(_state.get("all_trades", [])),
     })
 
 
