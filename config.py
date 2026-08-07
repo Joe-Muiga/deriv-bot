@@ -408,6 +408,27 @@ VOL_REGIME_TREND_RATIO = 0.6   # |EMA_fast-EMA_slow| / ATR >= this -> TREND,
 # contract_update, without changing this ratio itself.
 TAKE_PROFIT_RATIO = 2.0
 
+# ── DONKEY STRATEGY (directional-inversion overlay) ──────────
+# Derived from 1000 logged live trades (217W/783L) where stop-loss hit
+# rate ran >0.75 vs. ~0.2 for take-profit — i.e. the directional read was
+# the broken part, not entry timing or exit management. See
+# donkey_strategy.py: applied as the last step in signal_engine.py's
+# SignalEngine.evaluate(), after every existing evaluator, the
+# underperformance gate, and normal SIGNAL logging have already run
+# unchanged — only the returned direction (and, for Multiplier
+# contracts, SL/TP sizing at buy time) is affected.
+DONKEY_STRATEGY_ENABLED     = True
+# None = every RISE_FALL-contract strategy is eligible for inversion.
+# Set to an explicit list (e.g. ["VOL_BREAKOUT"]) to scope it down.
+DONKEY_STRATEGIES           = None
+# Strategies to always leave un-inverted regardless of DONKEY_STRATEGIES
+# (e.g. ones with too little sample history yet to trust the inversion).
+DONKEY_EXCLUDED_STRATEGIES  = []
+# Multiplier-contract sizing for inverted trades: tight stop, wide target.
+DONKEY_SL_TIGHTEN_FRACTION  = 0.35   # applied to the base stop_loss_pct
+DONKEY_MIN_SL_PCT           = 8.0    # floor, never tighter than this
+DONKEY_TAKE_PROFIT_RATIO    = 6.0    # replaces TAKE_PROFIT_RATIO
+
 # ── STAKE SETTINGS ───────────────────────────────────────────
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
