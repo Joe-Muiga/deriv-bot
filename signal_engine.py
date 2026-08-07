@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 import config
+import donkey_strategy
 import indicators as ind
 import strategy_stats
 from candlestick_builder import Candle
@@ -1202,7 +1203,11 @@ class SignalEngine:
                 f"SIGNAL: {symbol} {result.direction} {result.strategy} "
                 f"strength={result.strength} score={result.score:.3f}"
             )
-            return result
+            # Single choke point (see donkey_strategy.py docstring) — every
+            # evaluator, the underperformance gate, and the SIGNAL log line
+            # above have already run against the untouched result; only the
+            # returned direction may still change here.
+            return donkey_strategy.maybe_invert(result)
 
         logger.info(
             f"REJECTED: {symbol} {result.strategy} strength={result.strength} "
