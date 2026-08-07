@@ -29,7 +29,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import numpy as np
 
 import config
-import donkey_strategy
 import indicators as ind
 import strategy_stats
 from candlestick_builder import Candle
@@ -435,15 +434,34 @@ def _vol_regime(ltf_bars: List[Candle]) -> str:
     'TREND' or 'RANGE', from EMA(8)/EMA(21) separation normalized by
     ATR(14). Cheap proxy for trend strength (ADX-equivalent) using only
     indicators already in indicators.py — no new dependency.
+
+    ENHANCEMENT (win-rate pass, Aug 2026): a single-bar ratio read let one
+    noisy tick flip the regime to TREND for a cycle, routing straight into
+    evaluate_vol_breakout() with no real trend behind it — the dominant
+    source of losing trades on the dashboard. Now requires the ratio to
+    clear VOL_REGIME_TREND_RATIO on VOL_REGIME_CONFIRM_BARS consecutive
+    completed bars (default 2) before calling it TREND. Same inputs, same
+    ratio formula — only the "is this real" bar is raised.
     """
     C, H, L = _arrays(ltf_bars)
-    ema_fast = ind.ema(C, config.EMA_FAST)
-    ema_slow = ind.ema(C, config.EMA_SLOW)
-    atr = ind.atr(H, L, C, config.ATR_PERIOD)
-    last_atr = _last(atr) or 1e-9
-    sep = abs(_last(ema_fast) - _last(ema_slow))
-    ratio = sep / last_atr
-    return "TREND" if ratio >= getattr(config, "VOL_REGIME_TREND_RATIO", 0.6) else "RANGE"
+    ema_fast_arr = ind.ema(C, config.EMA_FAST)
+    ema_slow_arr = ind.ema(C, config.EMA_SLOW)
+    atr_arr = ind.atr(H, L, C, config.ATR_PERIOD)
+
+    trend_ratio = getattr(config, "VOL_REGIME_TREND_RATIO", 0.6)
+    confirm_bars = max(1, int(getattr(config, "VOL_REGIME_CONFIRM_BARS", 1)))
+
+    ratios: List[float] = []
+    for back in range(1, confirm_bars + 1):
+        a = _last(atr_arr, back)
+        f = _last(ema_fast_arr, back)
+        s = _last(ema_slow_arr, back)
+        if any(math.isnan(v) for v in (a, f, s)) or a <= 0:
+            return "RANGE"  # insufficient history -> default to the more
+                             # conservative (reversion) evaluator
+        ratios.append(abs(f - s) / a)
+
+    return "TREND" if all(r >= trend_ratio for r in ratios) else "RANGE"
 
 
 def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
@@ -452,6 +470,15 @@ def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     confirmation. Suited to open-ended Multiplier risk (rides continuation
     rather than betting on a single-candle direction like Rise/Fall did).
     Fires in TREND regime — see evaluate_vol_regime() dispatcher below.
+
+    ENHANCEMENT (win-rate pass, Aug 2026): the break condition previously
+    fired on `last_close >= upper` — a single tick clipping the channel
+    edge counts as a full breakout even by 1 pip, which on 2s/1m synthetic
+    ticks is frequently just noise. Now requires (a) the close to clear
+    the channel by BREAKOUT_MARGIN_ATR × ATR, a real distance rather than
+    a marginal touch, and (b) the prior bar to already be at/through that
+    level, so one spike tick can't fire it alone. Scoring model (Donchian
+    + EMA + MACD, >=6/7 to fire) is unchanged.
     """
     if len(ltf_bars) < 30:
         return NONE_RESULT
@@ -463,12 +490,25 @@ def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     # ind.donchian() — confirmed name/signature elsewhere in this file
     # (evaluate_step() uses `ind.donchian(H, L, 20)` → (upper, lower)).
     upper, lower = ind.donchian(H, L, 20)
+    atr = ind.atr(H, L, C, config.ATR_PERIOD)
     last_close = float(C[-1])
+    prev_close = _last(C, 2) if len(C) >= 2 else float("nan")
+    last_atr = _last(atr)
+    last_upper = _last(upper)
+    last_lower = _last(lower)
+
+    if any(math.isnan(v) for v in (prev_close, last_atr, last_upper, last_lower)) or last_atr <= 0:
+        logger.debug(f"REJECTED: {symbol} VOL_BREAKOUT strength=0 score=0.000 — indicators not warmed up")
+        return NONE_RESULT
+
+    margin = getattr(config, "BREAKOUT_MARGIN_ATR", 0.15) * last_atr
+    long_break  = (last_close >= last_upper + margin) and (prev_close >= last_upper - margin)
+    short_break = (last_close <= last_lower - margin) and (prev_close <= last_lower + margin)
 
     long_score, short_score = 0, 0
-    if last_close >= _last(upper):
+    if long_break:
         long_score += 3
-    if last_close <= _last(lower):
+    if short_break:
         short_score += 3
     if _last(ema_fast) > _last(ema_slow):
         long_score += 2
@@ -518,6 +558,13 @@ def evaluate_vol_reversion_mult(ltf_bars: List[Candle], symbol: str) -> SignalRe
     its historical performance with the old Rise/Fall version — the payoff
     structure is now completely different (open-ended + stop/target vs
     fixed 6-14min expiry), so the old win-rate history doesn't transfer.
+
+    ENHANCEMENT (win-rate pass, Aug 2026): when config.MEAN_REV_REQUIRE_TURN
+    is True (default), an extreme RSI/BB/ROC read alone is no longer
+    enough — price must have already ticked back toward the mean vs. the
+    prior close before entry, so the strategy stops catching a falling
+    knife mid-extension. Zone/indicator thresholds themselves are
+    untouched.
     """
     if len(ltf_bars) < 25:
         return NONE_RESULT
@@ -529,6 +576,7 @@ def evaluate_vol_reversion_mult(ltf_bars: List[Candle], symbol: str) -> SignalRe
 
     last_rsi   = _last(rsi)
     last_close = float(C[-1])
+    prev_close = _last(C, 2) if len(C) >= 2 else float("nan")
     last_upper = _last(upper)
     last_lower = _last(lower)
     last_roc   = _last(roc)
@@ -575,6 +623,20 @@ def evaluate_vol_reversion_mult(ltf_bars: List[Candle], symbol: str) -> SignalRe
         best = max(long_score, short_score)
         logger.debug(f"REJECTED: {symbol} VOL_REV_MULT strength=0 score={best/8.0:.3f} — below threshold")
         return SignalResult("NONE", 0, best / 8.0, "VOL_REV_MULT", "Below entry threshold")
+
+    if getattr(config, "MEAN_REV_REQUIRE_TURN", True) and not math.isnan(prev_close):
+        turned = (direction == "LONG" and last_close > prev_close) or (
+            direction == "SHORT" and last_close < prev_close
+        )
+        if not turned:
+            logger.info(
+                f"REJECTED: {symbol} VOL_REV_MULT strength=0 score={raw/8.0:.3f} — "
+                f"extreme reached but price not yet turning back toward the mean"
+            )
+            return SignalResult(
+                "NONE", 0, raw / 8.0, "VOL_REV_MULT",
+                "Extreme reached, awaiting reversal confirmation",
+            )
 
     score = raw / 8.0
     strength = 3 if all_met else (2 if score >= 6 / 8.0 else 1)
@@ -1203,11 +1265,7 @@ class SignalEngine:
                 f"SIGNAL: {symbol} {result.direction} {result.strategy} "
                 f"strength={result.strength} score={result.score:.3f}"
             )
-            # Single choke point (see donkey_strategy.py docstring) — every
-            # evaluator, the underperformance gate, and the SIGNAL log line
-            # above have already run against the untouched result; only the
-            # returned direction may still change here.
-            return donkey_strategy.maybe_invert(result)
+            return result
 
         logger.info(
             f"REJECTED: {symbol} {result.strategy} strength={result.strength} "
