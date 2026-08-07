@@ -56,6 +56,7 @@ import meta_labeling
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
+import donkey_strategy
 from signal_engine import SignalEngine, SignalResult
 from risk_manager import RiskManager
 from news_filter import NewsFilter
@@ -262,6 +263,20 @@ class BotEngine:
         self._day_start_balance:      float              = 0.0
         self._confirmed_paused:       bool               = False
         self._current_utc_day:        int                = -1
+
+        # ── Global consecutive-loss circuit breaker (profitability audit,
+        #    round 2). RiskManager's own loss_streak is hardwired to 0/1 —
+        #    "PLS tracks only win streaks" — and the per-symbol suspension
+        #    ladder in symbol_manager.py is scoped to one symbol at a time,
+        #    so nothing previously stopped the bot from taking trade after
+        #    trade account-wide during a bad run within a single day
+        #    (5 of 7 trades lost the session this was added in response
+        #    to) short of the much coarser DAILY_LOSS_LIMIT_PCT. This adds
+        #    a fast-acting, session-wide pause after N consecutive losses
+        #    regardless of symbol/strategy, independent of the % based
+        #    daily limit.
+        self._global_consecutive_losses: int              = 0
+        self._loss_streak_paused_until:  float             = 0.0
 
         # ── Ensemble voting: per-symbol rolling history of (strategy,
         #    direction, timestamp) tuples for every signal produced by
@@ -715,6 +730,17 @@ class BotEngine:
         except Exception as exc:
             logger.warning(f"strategy_expectancy dashboard push failed: {exc}")
 
+        # Surface the new global consecutive-loss cooldown the same
+        # low-risk way (direct _status write) rather than guessing at
+        # update_status()'s exact kwarg list.
+        try:
+            remaining = max(0.0, self._loss_streak_paused_until - time.time())
+            _status["paused_for_consecutive_losses"] = remaining > 0
+            _status["consecutive_loss_pause_mins_remaining"] = round(remaining / 60, 1)
+            _status["global_consecutive_losses"] = self._global_consecutive_losses
+        except Exception as exc:
+            logger.warning(f"consecutive-loss status push failed: {exc}")
+
         oc_list = []
         now_ts  = time.time()
         for cid, info in self._open_contracts.items():
@@ -891,8 +917,15 @@ class BotEngine:
                 if fam:
                     family_open_counts[fam] = family_open_counts.get(fam, 0) + 1
 
+            in_loss_streak_pause = time.time() < self._loss_streak_paused_until
+            if in_loss_streak_pause and available_slots > 0:
+                remaining = (self._loss_streak_paused_until - time.time()) / 60
+                logger.info(
+                    f"PAUSED: global consecutive-loss cooldown — "
+                    f"{remaining:.1f}min remaining, no new entries")
+
             top: List[ScanResult] = []
-            if available_slots > 0 and not self._confirmed_paused:
+            if available_slots > 0 and not self._confirmed_paused and not in_loss_streak_pause:
                 for r in ranked:
                     if len(top) >= available_slots:
                         break
@@ -1104,20 +1137,32 @@ class BotEngine:
                 self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
                 if ml_atr_pct > 0 else None
             )
+            # donkey_strategy only adjusts sizing for pairs it actually
+            # inverted (see donkey_strategy.is_donkey_symbol_strategy) —
+            # no-ops back to the base value for everything else, so this
+            # call site's behavior is unchanged unless the donkey overlay
+            # fired on this strategy.
+            if dyn_sl_pct is not None:
+                dyn_sl_pct = donkey_strategy.stop_loss_pct(strategy, dyn_sl_pct)
+            tp_ratio = donkey_strategy.take_profit_ratio(strategy, config.TAKE_PROFIT_RATIO)
             buy_resp = await self.client.buy_multiplier(
-                symbol        = symbol,
-                direction     = direction,
-                stake         = stake,
-                multiplier    = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
-                stop_loss_pct = dyn_sl_pct,
-                strategy      = strategy,
+                symbol            = symbol,
+                direction         = direction,
+                stake             = stake,
+                multiplier        = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+                stop_loss_pct     = dyn_sl_pct,
+                take_profit_ratio = tp_ratio,
+                strategy          = strategy,
             )
         elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
+            base_sl_pct = config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
             buy_resp = await self.client.buy_multiplier(
-                symbol   = symbol,
-                direction= direction,
-                stake    = stake,
-                strategy = strategy,
+                symbol            = symbol,
+                direction         = direction,
+                stake             = stake,
+                stop_loss_pct     = donkey_strategy.stop_loss_pct(strategy, base_sl_pct),
+                take_profit_ratio = donkey_strategy.take_profit_ratio(strategy, config.TAKE_PROFIT_RATIO),
+                strategy          = strategy,
             )
         else:
             buy_resp = await self.client.buy_contract(
@@ -1340,6 +1385,20 @@ class BotEngine:
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
         self._check_confirmed_loss_limit()
+
+        # ── Global consecutive-loss circuit breaker ─────────────────────
+        if won:
+            self._global_consecutive_losses = 0
+        else:
+            self._global_consecutive_losses += 1
+            limit = getattr(config, "GLOBAL_CONSECUTIVE_LOSS_LIMIT", 4)
+            if self._global_consecutive_losses >= limit:
+                pause_mins = getattr(config, "GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS", 45)
+                self._loss_streak_paused_until = time.time() + pause_mins * 60
+                logger.warning(
+                    f"GLOBAL CONSECUTIVE LOSS LIMIT HIT — {self._global_consecutive_losses} "
+                    f"losses in a row across all symbols/strategies — pausing all new "
+                    f"entries for {pause_mins}min")
 
         set_active_trades(len(self._open_contracts))
         update_status(streak=self.risk.current_streak)
