@@ -397,37 +397,58 @@ DYNAMIC_STOP_LOSS_PCT_MAX   = 90.0   # ceiling — leave headroom under Deriv's
                                       # own 100%-of-stake max-loss cap
 
 # ── VOL REGIME DETECTION (for VOL_BREAKOUT / VOL_REV_MULT, signal_engine.py) ──
-VOL_REGIME_TREND_RATIO = 0.6   # |EMA_fast-EMA_slow| / ATR >= this -> TREND,
-                                # else RANGE. Tune against backtests; not
-                                # empirically derived in this brief.
+# ENHANCEMENT (win-rate pass, Aug 2026): dashboard trade history showed
+# VOL_BREAKOUT losing on the large majority of its trades while carrying
+# a healthy win/loss $ ratio — i.e. the direction/exit logic is fine, the
+# entries firing on noise are the problem. Root cause: a single-bar
+# ratio>=0.6 read let a transient EMA wiggle flip the regime to TREND for
+# one cycle, routing straight into a breakout evaluator with no real
+# trend behind it. Raised the ratio and added a persistence requirement
+# (VOL_REGIME_CONFIRM_BARS below) rather than changing which evaluator
+# handles which regime — same two strategies, stricter gate on which one
+# fires.
+VOL_REGIME_TREND_RATIO = 0.85  # |EMA_fast-EMA_slow| / ATR >= this -> TREND,
+                                # else RANGE. Was 0.6 — too easily satisfied
+                                # by single-bar noise on a near-random-walk
+                                # instrument.
+VOL_REGIME_CONFIRM_BARS = 2    # the ratio must clear VOL_REGIME_TREND_RATIO
+                                # on this many consecutive completed bars
+                                # (not just the latest) before the regime
+                                # is called TREND. Any NaN/insufficient
+                                # history in the window defaults to RANGE
+                                # (the more conservative evaluator).
 
-# Take profit = 2x stop loss (2:1 RR minimum)
+# ── VOL_BREAKOUT ENTRY CONFIRMATION (win-rate pass, Aug 2026) ─────────────
+# A close that merely touches the Donchian channel edge was being scored
+# as a full breakout — on 2s/1m synthetic ticks that's frequently just
+# noise. BREAKOUT_MARGIN_ATR requires the close to clear the channel by a
+# real distance (in ATRs), and evaluate_vol_breakout() additionally
+# requires the prior bar to already be sitting at/through the level, so a
+# single spike tick can't fire it alone. Same Donchian+EMA+MACD scoring
+# model as before — this only tightens what counts as "broke the level".
+BREAKOUT_MARGIN_ATR = 0.15
+
+# ── VOL_REV_MULT ENTRY CONFIRMATION (win-rate pass, Aug 2026) ────────────
+# When True, evaluate_vol_reversion_mult() requires the latest close to
+# have already ticked back toward the mean vs. the prior close (not just
+# RSI/BB/ROC sitting at an extreme) before firing — cuts entries taken
+# while price is still accelerating into the extreme ("catching a falling
+# knife"). Does not change the RSI/Bollinger/ROC thresholds that define
+# the setup itself.
+MEAN_REV_REQUIRE_TURN = True
+
+# Take profit = stop loss × this ratio.
+# ENHANCEMENT (win-rate pass, Aug 2026): raised 2.0 -> 2.5. Dashboard
+# history already shows winners running several multiples larger than
+# losers ($ magnitude) — this gives the exit engine's trailing layer
+# (below) more room to ride a genuine winner before the static outer
+# boundary force-closes it, without touching the stop-loss side (and
+# therefore without changing per-trade downside risk).
 # For Multiplier contracts these remain the static outer boundary set at
 # buy time — see ADAPTIVE EXIT ENGINE near the bottom of this file for
 # the layer that trails stop_loss inside this boundary via
 # contract_update, without changing this ratio itself.
-TAKE_PROFIT_RATIO = 2.0
-
-# ── DONKEY STRATEGY (directional-inversion overlay) ──────────
-# Derived from 1000 logged live trades (217W/783L) where stop-loss hit
-# rate ran >0.75 vs. ~0.2 for take-profit — i.e. the directional read was
-# the broken part, not entry timing or exit management. See
-# donkey_strategy.py: applied as the last step in signal_engine.py's
-# SignalEngine.evaluate(), after every existing evaluator, the
-# underperformance gate, and normal SIGNAL logging have already run
-# unchanged — only the returned direction (and, for Multiplier
-# contracts, SL/TP sizing at buy time) is affected.
-DONKEY_STRATEGY_ENABLED     = True
-# None = every RISE_FALL-contract strategy is eligible for inversion.
-# Set to an explicit list (e.g. ["VOL_BREAKOUT"]) to scope it down.
-DONKEY_STRATEGIES           = None
-# Strategies to always leave un-inverted regardless of DONKEY_STRATEGIES
-# (e.g. ones with too little sample history yet to trust the inversion).
-DONKEY_EXCLUDED_STRATEGIES  = []
-# Multiplier-contract sizing for inverted trades: tight stop, wide target.
-DONKEY_SL_TIGHTEN_FRACTION  = 0.35   # applied to the base stop_loss_pct
-DONKEY_MIN_SL_PCT           = 8.0    # floor, never tighter than this
-DONKEY_TAKE_PROFIT_RATIO    = 6.0    # replaces TAKE_PROFIT_RATIO
+TAKE_PROFIT_RATIO = 2.5
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
@@ -787,13 +808,22 @@ EXIT_ENGINE_SYMBOLS         = list(MULTIPLIER_SYMBOLS)  # only Multiplier contra
 
 # Rule-based trailing layer (always active — the ML layer below only ever
 # adds an *earlier* close on top of this, never removes this safety net):
-EXIT_ARM_PROFIT_FRACTION    = 0.30   # start trailing once profit >= 30% of the
+# ENHANCEMENT (win-rate pass, Aug 2026): retuned all three fractions.
+# 30%-to-arm / 60%-lock / 25%-decay was letting a lot of paper profit
+# round-trip back into a loss (or a much smaller win) on a low-win-rate
+# strategy before the trailing layer ever engaged. Arming earlier and
+# locking a bigger share of peak profit banks more of every winner —
+# raises effective win/loss $ skew without touching entry logic.
+EXIT_ARM_PROFIT_FRACTION    = 0.15   # start trailing once profit >= 15% of the
                                       # contract's static take_profit_amount
-EXIT_TRAIL_LOCK_FRACTION    = 0.60   # once armed, ratchet stop_loss to lock in
-                                      # 60% of peak profit seen so far
-EXIT_DECAY_CLOSE_FRACTION   = 0.25   # once armed, close immediately if profit
-                                      # falls back below 25% of peak (rather than
+                                      # (was 0.30 — armed too late)
+EXIT_TRAIL_LOCK_FRACTION    = 0.75   # once armed, ratchet stop_loss to lock in
+                                      # 75% of peak profit seen so far
+                                      # (was 0.60 — gave back too much)
+EXIT_DECAY_CLOSE_FRACTION   = 0.20   # once armed, close immediately if profit
+                                      # falls back below 20% of peak (rather than
                                       # waiting for the original static stop_loss)
+                                      # (was 0.25)
 EXIT_POLL_INTERVAL_SECS     = 15     # how often the exit engine re-checks each
                                       # open Multiplier contract (independent of
                                       # the general 30s orphan-sweep cadence)
