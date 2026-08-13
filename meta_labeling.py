@@ -718,22 +718,6 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
     regime = str(features.get("regime", "NONE"))
     enriched = {k: features[k] for k in ENRICHED_FEATURE_KEYS if k in features}
 
-    total = _count_all_trades()
-    if total < config.META_LABEL_MIN_TRADES:
-        logger.info(
-            "insufficient data, meta-filter inactive (%d/%d trades logged)",
-            total, config.META_LABEL_MIN_TRADES,
-        )
-        take, confidence = True, 1.0
-        _prediction_log.insert(
-            strategy=strategy, symbol=symbol, entry_score=entry_score,
-            recent_win_rate=None, streak=None, take=take, confidence=confidence,
-            bypassed=True, timestamp=timestamp,
-        )
-        return take, confidence
-
-    _model.maybe_retrain()  # cheap no-op unless a retrain is actually due
-
     if "recent_win_rate" in features and "streak" in features:
         recent_win_rate = float(features["recent_win_rate"])
         streak = float(features["streak"])
@@ -749,6 +733,15 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
     # Below that row count, or with no realized payout data yet, this
     # falls straight through to the existing global entry_score-based
     # model + fixed TAKE_THRESHOLD, unchanged.
+    #
+    # CORRECTION (win-rate pass, Aug 2026): this branch used to sit after
+    # the `total < config.META_LABEL_MIN_TRADES` global early-return below,
+    # which meant it could never run until the whole bot had logged 200
+    # trades — defeating the entire point of a per-pair model designed to
+    # need far less data than that. It's evaluated first now, and only
+    # falls through to the global-model / pass-through logic when this
+    # pair itself doesn't have enough enriched rows yet (handled inside
+    # _ev_model.predict_proba() via EV_MIN_FEATURE_ROWS).
     if enriched:
         try:
             p_hat_ev = _ev_model.predict_proba(strategy, symbol, enriched)
@@ -785,6 +778,25 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
                 return take, confidence
             # No realized payout data yet for this pair — fall through to
             # the global model below rather than gating on an unknown b.
+
+    # ── Global entry_score-based model — unchanged, still gated behind
+    # config.META_LABEL_MIN_TRADES total logged trades bot-wide. This is
+    # the fallback for pairs the EV gate above hasn't picked up yet.
+    total = _count_all_trades()
+    if total < config.META_LABEL_MIN_TRADES:
+        logger.info(
+            "insufficient data, meta-filter inactive (%d/%d trades logged)",
+            total, config.META_LABEL_MIN_TRADES,
+        )
+        take, confidence = True, 1.0
+        _prediction_log.insert(
+            strategy=strategy, symbol=symbol, entry_score=entry_score,
+            recent_win_rate=None, streak=None, take=take, confidence=confidence,
+            bypassed=True, timestamp=timestamp,
+        )
+        return take, confidence
+
+    _model.maybe_retrain()  # cheap no-op unless a retrain is actually due
 
     feat = _feature_dict(strategy, symbol, entry_score, timestamp, recent_win_rate, streak,
                           multiplier, atr_pct, regime)
