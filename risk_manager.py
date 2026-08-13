@@ -202,6 +202,14 @@ class RiskManager:
         # PLS win-streak counter (never goes negative; loss resets to 0)
         self._win_streak: int = 0
 
+        # ── Equity curve stabilization state (win-rate/drawdown pass, Aug
+        # 2026) — see config.py's EQUITY CURVE STABILIZATION section.
+        # Separate from PLS's _win_streak: PLS already resets to 0 on any
+        # loss but that only tells you "not currently winning", not "how
+        # many losses in a row" — this counter tracks the latter.
+        self._peak_balance: float = 0.0
+        self._loss_streak:  int   = 0
+
         # Explicit PLS state mirrors (used for immediate reset on loss)
         self._multiplier:  float = 1.0
         self._extra_slots: int   = 0
@@ -256,6 +264,8 @@ class RiskManager:
         self._current_balance = balance
         if self._day_start_balance == 0:
             self._day_start_balance = balance
+        if balance > self._peak_balance:
+            self._peak_balance = balance
         logger.info(f"BALANCE UPDATED: ${balance:.4f}")
         self._balance_cycle   = self._current_cycle
         self._handle_day_rollover(balance)
@@ -276,6 +286,8 @@ class RiskManager:
             balance = await self._deriv_client.get_balance()
             if balance is not None and balance >= 0:
                 self._current_balance = float(balance)
+                if self._current_balance > self._peak_balance:
+                    self._peak_balance = self._current_balance
                 self._balance_cycle   = self._current_cycle
                 self._handle_day_rollover(self._current_balance)
         except Exception:
@@ -481,6 +493,42 @@ class RiskManager:
 
         return final_stake
 
+    # ── Equity curve stabilization dampener ─────────────────────────────────
+
+    def _stability_dampener_mult(self, balance: float) -> float:
+        """
+        Continuous stake multiplier in (0, 1] combining two signals — takes
+        whichever is more conservative rather than multiplying them (see
+        config.py's EQUITY CURVE STABILIZATION comment for why). Returns
+        1.0 (no-op) when both features are disabled or the required
+        peak-balance history isn't available yet.
+        """
+        mult = 1.0
+
+        if getattr(config, "DRAWDOWN_DAMPENER_ENABLED", False) and self._peak_balance > 0:
+            drawdown_pct = max(0.0, (self._peak_balance - balance) / self._peak_balance)
+            start_pct = getattr(config, "DRAWDOWN_DAMPENER_START_PCT", 0.015)
+            full_pct  = getattr(config, "DRAWDOWN_DAMPENER_FULL_PCT", 0.06)
+            floor     = getattr(config, "DRAWDOWN_DAMPENER_FLOOR", 0.40)
+            if drawdown_pct <= start_pct:
+                dd_mult = 1.0
+            elif drawdown_pct >= full_pct or full_pct <= start_pct:
+                dd_mult = floor
+            else:
+                # Linear ramp from 1.0 at start_pct down to floor at full_pct.
+                span = (drawdown_pct - start_pct) / (full_pct - start_pct)
+                dd_mult = 1.0 - span * (1.0 - floor)
+            mult = min(mult, dd_mult)
+
+        if getattr(config, "LOSS_STREAK_DAMPENER_ENABLED", False):
+            ls_mult = 1.0
+            for streak_count, tier_mult in getattr(config, "LOSS_STREAK_DAMPENER_TABLE", []):
+                if self._loss_streak >= streak_count:
+                    ls_mult = tier_mult
+            mult = min(mult, ls_mult)
+
+        return mult
+
     def next_stake_for(self, strategy: str, symbol: str) -> float:
         """
         Synchronous preview of the stake that would be used for the very
@@ -519,6 +567,22 @@ class RiskManager:
         pls_stake = max(pls_stake, self.min_stake)
 
         stake = self._apply_kelly_overlay(pls_stake, self._current_balance, strategy, symbol)
+
+        # Equity curve stabilization — see config.py's EQUITY CURVE
+        # STABILIZATION section and _stability_dampener_mult() above.
+        # Applied after Kelly (which is per-pair edge sizing) and before
+        # the exposure ceiling (which is a hard portfolio-wide cap) — this
+        # sits between them as a soft, account-wide "how rough has it
+        # been lately" throttle.
+        dampener = self._stability_dampener_mult(self._current_balance)
+        if dampener < 1.0:
+            damped_stake = round(stake * dampener, 2)
+            logger.info(
+                f"STABILITY DAMPENER: ${stake:.4f} -> ${damped_stake:.4f} "
+                f"(×{dampener:.2f} | drawdown_from_peak=${max(0.0, self._peak_balance - self._current_balance):.4f} "
+                f"| loss_streak={self._loss_streak})"
+            )
+            stake = damped_stake
 
         # Exposure ceiling: never let this trade push total committed stake
         # across all open positions past EXPOSURE_CEILING_PCT of balance.
@@ -606,12 +670,14 @@ class RiskManager:
         if won:
             self.wins        += 1
             self._win_streak += 1
+            self._loss_streak = 0
             self._update_multiplier()
         else:
             self.losses          += 1
             self._win_streak      = 0
             self._multiplier      = 1.0
             self._extra_slots     = 0
+            self._loss_streak    += 1
 
         balance = self._current_balance if self._current_balance > 0 else self.min_stake
         ns      = self._compute_stake(balance)
@@ -733,6 +799,13 @@ class RiskManager:
             "next_stake":         self.next_stake,
             "concurrent_limit":   self.current_concurrent_limit,
             "bot_state":          self._bot_state.name,
+            # Equity curve stabilization (see config.py / _stability_dampener_mult)
+            "peak_balance":            round(self._peak_balance, 4),
+            "drawdown_from_peak_pct":  round(
+                ((self._peak_balance - self._current_balance) / self._peak_balance * 100)
+                if self._peak_balance > 0 else 0.0, 2),
+            "loss_streak":             self._loss_streak,
+            "stability_dampener_mult": round(self._stability_dampener_mult(self._current_balance), 3),
         }
 
 
