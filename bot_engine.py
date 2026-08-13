@@ -56,8 +56,7 @@ import meta_labeling
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
-import donkey_strategy
-from signal_engine import SignalEngine, SignalResult
+from signal_engine import SignalEngine, SignalResult, compute_enriched_features
 from risk_manager import RiskManager
 from news_filter import NewsFilter
 from trade_journal import TradeJournal
@@ -1030,11 +1029,33 @@ class BotEngine:
             elif strategy == "VOL_REV_MULT":
                 ml_regime = "RANGE"
 
+        # ENHANCEMENT (win-rate pass, Aug 2026): meta_labeling.py's per-pair
+        # EV model (_PairEVModel, Implementation Brief v6 PART 5) needs
+        # ENRICHED_FEATURE_KEYS = (rsi, roc, bb_pct_b, atr_expansion_ratio,
+        # hour_utc) — nothing in the codebase ever computed or passed
+        # these, so that model was permanently starved regardless of trade
+        # count. signal_engine.compute_enriched_features() (PART 2/3,
+        # newly added) fills that gap here, from whatever candle history
+        # is already being tracked for this symbol — works for any
+        # candle-based strategy, not just VOL_MULTIPLIER_SYMBOLS. Reused
+        # unchanged at settlement (_apply_settlement) so the same values
+        # get logged for training as were used for this gate decision.
+        enriched_features: Dict[str, float] = {}
+        try:
+            _builder = self._ltf.get(symbol)
+            _bars = _builder.completed_bars if _builder else []
+            if _bars:
+                enriched_features = compute_enriched_features(_bars)
+        except Exception as exc:
+            logger.debug(f"compute_enriched_features({symbol}) failed: {exc}")
+
         # Meta-labeling gate — skip execution if the take-trade-or-not
         # filter rejects it. predict_take_trade() has its own internal
         # min-trades gating (config.META_LABEL_MIN_TRADES); below that
         # threshold it always returns (True, 1.0) — a pass-through, not
-        # a real prediction.
+        # a real prediction. The per-pair EV branch (enriched features
+        # below) can activate independently and sooner — see
+        # meta_labeling.predict_take_trade()'s docstring.
         try:
             take, confidence = meta_labeling.predict_take_trade({
                 "strategy":    strategy,
@@ -1043,6 +1064,7 @@ class BotEngine:
                 "multiplier":  ml_multiplier,
                 "atr_pct":     ml_atr_pct,
                 "regime":      ml_regime,
+                **enriched_features,
             })
         except Exception as exc:
             logger.warning(
@@ -1137,32 +1159,20 @@ class BotEngine:
                 self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
                 if ml_atr_pct > 0 else None
             )
-            # donkey_strategy only adjusts sizing for pairs it actually
-            # inverted (see donkey_strategy.is_donkey_symbol_strategy) —
-            # no-ops back to the base value for everything else, so this
-            # call site's behavior is unchanged unless the donkey overlay
-            # fired on this strategy.
-            if dyn_sl_pct is not None:
-                dyn_sl_pct = donkey_strategy.stop_loss_pct(strategy, dyn_sl_pct)
-            tp_ratio = donkey_strategy.take_profit_ratio(strategy, config.TAKE_PROFIT_RATIO)
             buy_resp = await self.client.buy_multiplier(
-                symbol            = symbol,
-                direction         = direction,
-                stake             = stake,
-                multiplier        = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
-                stop_loss_pct     = dyn_sl_pct,
-                take_profit_ratio = tp_ratio,
-                strategy          = strategy,
+                symbol        = symbol,
+                direction     = direction,
+                stake         = stake,
+                multiplier    = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+                stop_loss_pct = dyn_sl_pct,
+                strategy      = strategy,
             )
         elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
-            base_sl_pct = config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
             buy_resp = await self.client.buy_multiplier(
-                symbol            = symbol,
-                direction         = direction,
-                stake             = stake,
-                stop_loss_pct     = donkey_strategy.stop_loss_pct(strategy, base_sl_pct),
-                take_profit_ratio = donkey_strategy.take_profit_ratio(strategy, config.TAKE_PROFIT_RATIO),
-                strategy          = strategy,
+                symbol   = symbol,
+                direction= direction,
+                stake    = stake,
+                strategy = strategy,
             )
         else:
             buy_resp = await self.client.buy_contract(
@@ -1258,6 +1268,11 @@ class BotEngine:
             # VOL_MULTIPLIER_SYMBOLS — see ml_atr_pct/ml_regime above.
             "atr_pct":     ml_atr_pct,
             "regime":      ml_regime,
+            # Same dict used for the meta-label gate decision above — ride
+            # through to _apply_settlement() so strategy_stats.record_trade()
+            # logs the exact features this trade was evaluated on, not a
+            # freshly recomputed (and by settlement time, stale) snapshot.
+            "enriched_features": enriched_features,
         }
         self._contract_open_times[cid] = time.time()
 
@@ -1349,6 +1364,8 @@ class BotEngine:
             "multiplier": info.get("multiplier") or 0.0,
             "atr_pct":    info.get("atr_pct", 0.0),
             "regime":     info.get("regime", "NONE"),
+            # See _execute() — same values the meta-label gate decided on.
+            **info.get("enriched_features", {}),
         }
 
         # Feed strategy_stats — this is the source of truth the
