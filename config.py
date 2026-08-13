@@ -403,14 +403,19 @@ DYNAMIC_STOP_LOSS_PCT_MAX   = 90.0   # ceiling — leave headroom under Deriv's
 # entries firing on noise are the problem. Root cause: a single-bar
 # ratio>=0.6 read let a transient EMA wiggle flip the regime to TREND for
 # one cycle, routing straight into a breakout evaluator with no real
-# trend behind it. Raised the ratio and added a persistence requirement
-# (VOL_REGIME_CONFIRM_BARS below) rather than changing which evaluator
-# handles which regime — same two strategies, stricter gate on which one
-# fires.
-VOL_REGIME_TREND_RATIO = 0.85  # |EMA_fast-EMA_slow| / ATR >= this -> TREND,
-                                # else RANGE. Was 0.6 — too easily satisfied
-                                # by single-bar noise on a near-random-walk
-                                # instrument.
+# trend behind it. Added a persistence requirement (VOL_REGIME_CONFIRM_BARS
+# below) rather than changing which evaluator handles which regime — same
+# two strategies, stricter gate on which one fires.
+# CORRECTION (same pass, second iteration): the ratio itself was first
+# raised 0.6 -> 0.85 alongside the persistence requirement — stacking both
+# knobs at once turned out to suppress TREND classification almost
+# entirely (dashboard went quiet across all 11 VOL_MULTIPLIER_SYMBOLS,
+# leaving only BOOM_CRASH visible). 0.6 was never really the problem —
+# no persistence requirement was. Reverted the ratio to its original
+# value and kept persistence as the only added lever.
+VOL_REGIME_TREND_RATIO = 0.6   # |EMA_fast-EMA_slow| / ATR >= this -> TREND,
+                                # else RANGE. Back to its original value —
+                                # see CORRECTION note above.
 VOL_REGIME_CONFIRM_BARS = 2    # the ratio must clear VOL_REGIME_TREND_RATIO
                                 # on this many consecutive completed bars
                                 # (not just the latest) before the regime
@@ -422,10 +427,15 @@ VOL_REGIME_CONFIRM_BARS = 2    # the ratio must clear VOL_REGIME_TREND_RATIO
 # A close that merely touches the Donchian channel edge was being scored
 # as a full breakout — on 2s/1m synthetic ticks that's frequently just
 # noise. BREAKOUT_MARGIN_ATR requires the close to clear the channel by a
-# real distance (in ATRs), and evaluate_vol_breakout() additionally
-# requires the prior bar to already be sitting at/through the level, so a
-# single spike tick can't fire it alone. Same Donchian+EMA+MACD scoring
+# real distance (in ATRs) before it counts. Same Donchian+EMA+MACD scoring
 # model as before — this only tightens what counts as "broke the level".
+# CORRECTION (same pass, second iteration): an earlier version of this
+# fix also required the *prior* bar to already be sitting near the
+# channel edge, on the theory that would filter single-tick spikes.
+# In practice that blocks the sharp, decisive candle a real breakout
+# often is — it only let through slow grinding moves that were already
+# extended, which is backwards for an entry strategy. Removed; the ATR
+# margin alone is the filter now.
 BREAKOUT_MARGIN_ATR = 0.15
 
 # ── VOL_REV_MULT ENTRY CONFIRMATION (win-rate pass, Aug 2026) ────────────
@@ -482,6 +492,45 @@ DAILY_LOSS_PAUSE_MINS = 30
 # threshold. See BotEngine._global_consecutive_losses.
 GLOBAL_CONSECUTIVE_LOSS_LIMIT = 4
 GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS = 45
+
+# ── EQUITY CURVE STABILIZATION (win-rate/drawdown pass, Aug 2026) ─────────
+# The circuit breaker above is binary: trading stops entirely for
+# GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS once it trips, then resumes at full
+# size. Between "nothing" and "fully paused" there was no way for stake
+# to ease down smoothly during a rough patch and ease back up as it
+# recovers — every red dot on the balance curve landed at the same $
+# size as every green one, which is what makes the curve zig-zag.
+# RiskManager._stability_dampener_mult() (risk_manager.py) applies a
+# continuous multiplier on top of PLS/Kelly, driven by two signals, and
+# takes whichever is more conservative rather than multiplying them
+# (they're correlated — a loss streak IS a drawdown — so multiplying
+# would double-punish the same event):
+#   1. Distance below the balance high-water mark (drawdown %)
+#   2. Consecutive losses since the last win
+# Both recover automatically as balance/streak improve — no separate
+# "unpause" event needed, unlike the hard breaker above.
+DRAWDOWN_DAMPENER_ENABLED  = True
+DRAWDOWN_DAMPENER_START_PCT = 0.015  # below this drawdown from peak balance,
+                                       # no throttling at all (1.0x)
+DRAWDOWN_DAMPENER_FULL_PCT  = 0.06   # drawdown at which the floor multiplier
+                                       # is reached — matches DAILY_LOSS_LIMIT_PCT
+                                       # so the dampener has fully engaged by the
+                                       # time the hard daily-loss breaker would trip
+DRAWDOWN_DAMPENER_FLOOR     = 0.40   # stake never shrinks below 40% of normal
+                                       # from this signal alone
+
+LOSS_STREAK_DAMPENER_ENABLED = True
+# (consecutive losses since last win) -> stake multiplier. First entry is
+# the implicit 0-1 loss baseline (no throttle); each tuple after that is
+# (streak_count, multiplier), checked in order, last match wins.
+LOSS_STREAK_DAMPENER_TABLE = [
+    (2, 0.85),
+    (3, 0.70),
+    (4, 0.55),  # GLOBAL_CONSECUTIVE_LOSS_LIMIT=4 hard-pauses right after
+                # this tier — the floor here is deliberately close to
+                # LOSS_STREAK_DAMPENER's own floor rather than needing a
+                # tier of its own beyond this point.
+]
 
 # ── AGGRESSIVE COMPOUNDING ───────────────────────────────────
 # Disabled per user request — stake no longer scales up on win streaks.
