@@ -94,6 +94,78 @@ def _last(arr: np.ndarray, back: int = 1) -> float:
 
 
 # ---------------------------------------------------------------------------
+# Enriched features for meta_labeling.py's per-pair EV model
+# (Implementation Brief v6, PART 2/3 — this was referenced by meta_labeling.py
+# but never actually built: ENRICHED_FEATURE_KEYS = ("rsi", "roc", "bb_pct_b",
+# "atr_expansion_ratio", "hour_utc") existed as a consumer-side contract with
+# no producer anywhere in the codebase, so _PairEVModel never had a single
+# real feature row to train on regardless of trade count. This is that
+# producer. Called once per execution from bot_engine.py._execute() (entry
+# time, for the meta-label gate) and reused at settlement (for logging) —
+# same values both times since features are computed from the same closed
+# bars, not re-fetched.
+# ---------------------------------------------------------------------------
+
+def compute_enriched_features(ltf_bars: List[Candle], timestamp: Optional[float] = None) -> Dict[str, float]:
+    """
+    Returns {"rsi", "roc", "bb_pct_b", "atr_expansion_ratio", "hour_utc"} —
+    exactly meta_labeling.ENRICHED_FEATURE_KEYS — or {} if there isn't
+    enough bar history yet (caller should log/pass through an empty dict
+    in that case, not fabricate values; meta_labeling.py already treats a
+    missing/empty enriched dict as "fall back to the global model").
+
+    rsi                  : RSI(14), last closed bar
+    roc                  : ROC(10), last closed bar
+    bb_pct_b             : Bollinger %B = (close - lower) / (upper - lower),
+                            BB(20, 2.0) — 0.0 at the lower band, 1.0 at the
+                            upper band, can exceed [0,1] on a strong move
+    atr_expansion_ratio   : ATR(14) now / ATR(14) 10 bars ago — >1 means
+                            volatility is expanding, <1 means contracting
+    hour_utc              : UTC hour (0-23) of `timestamp` (defaults to now)
+    """
+    if len(ltf_bars) < 30:
+        return {}
+
+    C, H, L = _arrays(ltf_bars)
+    rsi_arr = ind.rsi(C, 14)
+    roc_arr = ind.roc(C, 10)
+    upper, mid, lower = ind.bollinger_bands(C, 20, 2.0)
+    atr_arr = ind.atr(H, L, C, config.ATR_PERIOD)
+
+    last_rsi   = _last(rsi_arr)
+    last_roc   = _last(roc_arr)
+    last_upper = _last(upper)
+    last_lower = _last(lower)
+    atr_now    = _last(atr_arr, 1)
+    atr_prior  = _last(atr_arr, 10)
+
+    band_width = last_upper - last_lower
+    bb_pct_b = (
+        (float(C[-1]) - last_lower) / band_width
+        if band_width > 0 and not math.isnan(band_width) else float("nan")
+    )
+    atr_expansion_ratio = (
+        atr_now / atr_prior if atr_prior and not math.isnan(atr_prior) and atr_prior > 0
+        else float("nan")
+    )
+
+    ts = timestamp if timestamp is not None else datetime.now(timezone.utc).timestamp()
+    hour_utc = datetime.fromtimestamp(ts, tz=timezone.utc).hour
+
+    feat = {
+        "rsi": last_rsi,
+        "roc": last_roc,
+        "bb_pct_b": bb_pct_b,
+        "atr_expansion_ratio": atr_expansion_ratio,
+        "hour_utc": float(hour_utc),
+    }
+    # Drop any NaN entries rather than shipping them into a JSON column —
+    # _PairEVModel._numeric_subset() only keeps int/float, and a NaN would
+    # silently poison DictVectorizer/LogisticRegression's training set.
+    return {k: v for k, v in feat.items() if not (isinstance(v, float) and math.isnan(v))}
+
+
+# ---------------------------------------------------------------------------
 # Helpers — raw ticks (new)
 #
 # ASSUMPTION: no tick-buffer type is defined anywhere in the three files
@@ -474,11 +546,18 @@ def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     ENHANCEMENT (win-rate pass, Aug 2026): the break condition previously
     fired on `last_close >= upper` — a single tick clipping the channel
     edge counts as a full breakout even by 1 pip, which on 2s/1m synthetic
-    ticks is frequently just noise. Now requires (a) the close to clear
-    the channel by BREAKOUT_MARGIN_ATR × ATR, a real distance rather than
-    a marginal touch, and (b) the prior bar to already be at/through that
-    level, so one spike tick can't fire it alone. Scoring model (Donchian
-    + EMA + MACD, >=6/7 to fire) is unchanged.
+    ticks is frequently just noise. Now requires the close to clear the
+    channel by BREAKOUT_MARGIN_ATR × ATR, a real distance rather than a
+    marginal touch. Scoring model (Donchian + EMA + MACD, >=6/7 to fire)
+    is unchanged.
+
+    CORRECTION (same pass, second iteration): an earlier version also
+    required the *prior* bar to already be at/through the level (a
+    2-bar-confirmation attempt at filtering spike ticks). That backfired —
+    it only let through moves that were already extended and blocked the
+    sharp, one-candle break a real breakout usually is, which silenced
+    this evaluator almost entirely. Removed; the ATR margin alone is the
+    noise filter now.
     """
     if len(ltf_bars) < 30:
         return NONE_RESULT
@@ -492,18 +571,17 @@ def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     upper, lower = ind.donchian(H, L, 20)
     atr = ind.atr(H, L, C, config.ATR_PERIOD)
     last_close = float(C[-1])
-    prev_close = _last(C, 2) if len(C) >= 2 else float("nan")
     last_atr = _last(atr)
     last_upper = _last(upper)
     last_lower = _last(lower)
 
-    if any(math.isnan(v) for v in (prev_close, last_atr, last_upper, last_lower)) or last_atr <= 0:
+    if any(math.isnan(v) for v in (last_atr, last_upper, last_lower)) or last_atr <= 0:
         logger.debug(f"REJECTED: {symbol} VOL_BREAKOUT strength=0 score=0.000 — indicators not warmed up")
         return NONE_RESULT
 
     margin = getattr(config, "BREAKOUT_MARGIN_ATR", 0.15) * last_atr
-    long_break  = (last_close >= last_upper + margin) and (prev_close >= last_upper - margin)
-    short_break = (last_close <= last_lower - margin) and (prev_close <= last_lower + margin)
+    long_break  = last_close >= last_upper + margin
+    short_break = last_close <= last_lower - margin
 
     long_score, short_score = 0, 0
     if long_break:
