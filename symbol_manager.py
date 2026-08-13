@@ -96,27 +96,40 @@ class SymbolManager:
 
         if won:
             self._symbol_wins[symbol] = self._symbol_wins.get(symbol, 0) + 1
+            # BUG FIX (drawdown pass, Aug 2026): a win must clear this
+            # symbol's consecutive-loss count. Previously _session_losses
+            # only ever incremented and was never reset on a win (despite
+            # being named/commented as a "consecutive" counter) — it was
+            # actually a lifetime count since the last redeploy. On a
+            # multi-day unattended run, once a symbol crossed 4 total
+            # losses EVER it got the ladder's max 240min suspension on
+            # every single subsequent loss, permanently, for the rest of
+            # that run — which is what was producing multi-hour dead
+            # stretches on the dashboard despite no crash/hang anywhere.
+            self._session_losses[symbol] = 0
             self.suspend(symbol, config.SYMBOL_WIN_SUSPEND_MINS)
-            logger.info(f"RESULT: {symbol} WON | win-suspend applied")
+            logger.info(f"RESULT: {symbol} WON | win-suspend applied | consecutive-loss count reset")
         else:
             self._session_losses[symbol] = self._session_losses.get(symbol, 0) + 1
             loss_count = self._session_losses[symbol]
 
             # Escalating ladder (Implementation Brief v2, Requirement 2 /
-            # Fix F): 1st consecutive session loss on a symbol -> ladder[0]
-            # minutes, 2nd -> ladder[1], ..., loss_count beyond the ladder's
-            # length holds at the ladder's last (highest) value. This
-            # counter is reset ONLY by a redeploy (a real process restart,
-            # which reconstructs SymbolManager from scratch) — never by a
-            # UTC-midnight or other calendar boundary. See reset_session()
-            # below, which is no longer called on a day rollover.
+            # Fix F): 1st CONSECUTIVE loss on a symbol (since its last win,
+            # or since process start) -> ladder[0] minutes, 2nd -> ladder[1],
+            # ..., loss_count beyond the ladder's length holds at the
+            # ladder's last (highest) value. A win resets this to 0 (see
+            # above) — that reset is what makes it consecutive rather than
+            # lifetime. The suspension *timestamps* themselves still persist
+            # across calendar-day boundaries (reset_session() is manual-only,
+            # unchanged) — only what counts as "still on a losing streak"
+            # was the bug.
             ladder = getattr(config, "SESSION_LOSS_SUSPEND_LADDER_MINS", [60, 120, 180, 240])
             idx = min(loss_count, len(ladder)) - 1
             suspend_mins = ladder[idx]
             self.suspend(symbol, suspend_mins)
             logger.info(
-                f"RESULT: {symbol} LOST ({loss_count} consecutive this "
-                f"session) | escalating suspend={suspend_mins}min"
+                f"RESULT: {symbol} LOST ({loss_count} consecutive) | "
+                f"escalating suspend={suspend_mins}min"
             )
 
     def get_symbol_score(self, symbol: str) -> float:
