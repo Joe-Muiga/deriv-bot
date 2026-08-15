@@ -436,7 +436,22 @@ class MetaLabelingModel:
             if SKLEARN_AVAILABLE:
                 vectorizer = DictVectorizer(sparse=True)
                 Xv = vectorizer.fit_transform(X_dicts)
-                clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+                # BUG FIX (win-rate/drawdown pass, Aug 2026): class_weight=
+                # "balanced" reweights the loss function so both classes
+                # contribute equally regardless of their true frequency —
+                # appropriate when you want a rare class not to be ignored,
+                # wrong here, where predict_proba()'s output feeds directly
+                # into an EV calculation (p*b - (1-p)) that needs p to be a
+                # genuine calibrated probability, not a class-balance-
+                # adjusted one. Verified directly: on a 35-trade sample
+                # with a real 77% empirical win rate, "balanced" predicted
+                # 0.512 (useless, ~coin-flip) for the exact same query that
+                # the unweighted model correctly predicted 0.776 for. This
+                # was silently defeating the whole EV gate — with p always
+                # pulled toward 0.5, EV always landed near breakeven,
+                # never confidently clearing META_LABEL_EV_MARGIN either
+                # direction, regardless of how strong the real signal was.
+                clf = LogisticRegression(max_iter=1000)
                 clf.fit(Xv, y)
             else:
                 vectorizer = _ManualVectorizer()
@@ -517,7 +532,11 @@ class _PairEVModel:
         if SKLEARN_AVAILABLE:
             vectorizer = DictVectorizer(sparse=True)
             Xv = vectorizer.fit_transform(X_dicts)
-            clf = LogisticRegression(max_iter=1000, class_weight="balanced")
+            # BUG FIX — see the identical fix + full explanation on
+            # MetaLabelingModel.maybe_retrain()'s LogisticRegression above.
+            # This is the model predict_take_trade() actually consults, so
+            # this instance is the one that mattered most.
+            clf = LogisticRegression(max_iter=1000)
             clf.fit(Xv, y)
         else:
             vectorizer = _ManualVectorizer()
@@ -718,16 +737,24 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
 
     Returns (action, confidence):
       action "TAKE"   — follow the signal's original direction
-      action "SKIP"   — sit this one out
       action "INVERT" — take the OPPOSITE direction from the same entry
                          (see config.py's SIGNAL DIRECTION INVERSION section)
 
-    confidence is the model's estimated P(win) for whichever direction
-    `action` describes (i.e. for INVERT it's P(win | inverted), not
-    P(win | original)). While the filter is inactive (insufficient data),
-    confidence is 1.0 and action is always "TAKE" — that 1.0 is a
-    pass-through marker, not a calibrated probability. INVERT is never
-    returned in that inactive state — see the EV-gate block below.
+    Every strategy has a DEFAULT action (config.META_LABEL_DEFAULT_ACTION,
+    fallback config.META_LABEL_DEFAULT_ACTION_FALLBACK) — currently "TAKE"
+    for BOOM_CRASH, "INVERT" for everything else. A trade is never skipped
+    outright; the gate only ever chooses between the pair's default action
+    and its opposite. The gate only moves off the default once the per-pair
+    EV model has enough history (META_LABEL_EV_MIN_FEATURE_ROWS rows) to
+    show real evidence the opposite is the better bet AND that evidence
+    clears its confidence bar (TAKE_MIN_CONFIDENCE / INVERT_MIN_CONFIDENCE,
+    whichever applies). Below that data threshold, this always returns the
+    pair's default action at confidence 1.0 — a pass-through/policy marker,
+    not a calibrated probability. See config.py's per-strategy default
+    section for why INVERT is the default for non-BOOM_CRASH strategies —
+    that starting posture is a deliberate choice informed by already-
+    observed aggregate performance, not something derived from this
+    specific pair's own (as-yet insufficient) history.
     """
     strategy = str(features["strategy"])
     symbol = str(features["symbol"])
@@ -737,6 +764,12 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     atr_pct = float(features.get("atr_pct", 0.0))
     regime = str(features.get("regime", "NONE"))
     enriched = {k: features[k] for k in ENRICHED_FEATURE_KEYS if k in features}
+
+    default_action = getattr(config, "META_LABEL_DEFAULT_ACTION", {}).get(
+        strategy, getattr(config, "META_LABEL_DEFAULT_ACTION_FALLBACK", "TAKE"))
+    override_action = "INVERT" if default_action == "TAKE" else "TAKE"
+    override_min_conf = getattr(
+        config, "INVERT_MIN_CONFIDENCE" if override_action == "INVERT" else "TAKE_MIN_CONFIDENCE", 0.65)
 
     if "recent_win_rate" in features and "streak" in features:
         recent_win_rate = float(features["recent_win_rate"])
@@ -751,17 +784,12 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     # — p_hat * b_realized - (1 - p_hat), using the realized win-payout
     # ratio from strategy_stats — instead of a fixed confidence cutoff.
     # Below that row count, or with no realized payout data yet, this
-    # falls straight through to the existing global entry_score-based
-    # model + fixed TAKE_THRESHOLD, unchanged.
+    # falls straight through to the pass-through/global-model logic below.
     #
-    # CORRECTION (win-rate pass, Aug 2026): this branch used to sit after
-    # the `total < config.META_LABEL_MIN_TRADES` global early-return below,
-    # which meant it could never run until the whole bot had logged 200
-    # trades — defeating the entire point of a per-pair model designed to
-    # need far less data than that. It's evaluated first now, and only
-    # falls through to the global-model / pass-through logic when this
-    # pair itself doesn't have enough enriched rows yet (handled inside
-    # _ev_model.predict_proba() via EV_MIN_FEATURE_ROWS).
+    # p_hat_ev is always P(win | ORIGINAL direction) — that's what the
+    # model is trained on (see _PairEVModel._fit()'s inverted-label
+    # correction). p_hat for whichever direction is TAKE vs INVERT is
+    # derived from that single estimate below.
     if enriched:
         try:
             p_hat_ev = _ev_model.predict_proba(strategy, symbol, enriched)
@@ -777,81 +805,72 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
 
             if avg_ratio is not None:
                 b_realized = avg_ratio - 1.0
-                ev_take = p_hat_ev * b_realized - (1.0 - p_hat_ev)
-                # FIX (profitability audit): was `> 0` — a bare-positive EV
-                # gate takes every trade where the point-estimate edge is
-                # even a hair above breakeven, with no allowance for
-                # estimation error in p_hat_ev or in the realized payout
-                # ratio. EV_MARGIN requires a small buffer above breakeven.
+                p_hat_take = p_hat_ev
+                p_hat_invert = 1.0 - p_hat_ev
+                ev_take = p_hat_take * b_realized - (1.0 - p_hat_take)
+                # SIGNAL DIRECTION INVERSION (see config.py): ev_invert
+                # approximates the inverted direction's expected value
+                # using p_hat_invert and the SAME realized payout ratio as
+                # the original direction — an approximation, see config.py.
+                ev_invert = p_hat_invert * b_realized - (1.0 - p_hat_invert)
                 ev_margin = getattr(config, "META_LABEL_EV_MARGIN", 0.03)
 
-                if ev_take > ev_margin:
-                    action, confidence = "TAKE", p_hat_ev
+                p_hat_override = p_hat_invert if override_action == "INVERT" else p_hat_take
+                ev_override = ev_invert if override_action == "INVERT" else ev_take
+                invert_enabled = getattr(config, "META_LABEL_INVERT_ENABLED", False)
+
+                if (override_action == "TAKE" or invert_enabled) and \
+                        ev_override > ev_margin and p_hat_override >= override_min_conf:
+                    action, confidence = override_action, p_hat_override
                 else:
-                    # SIGNAL DIRECTION INVERSION (see config.py): the
-                    # original direction doesn't clear EV — check whether
-                    # the OPPOSITE direction would. p_hat_inv approximates
-                    # P(win | inverted) as (1 - p_hat_ev); b_realized is
-                    # borrowed from the original direction's measured
-                    # payout ratio (see config.py comment on why this is
-                    # an approximation, not exact).
-                    invert_enabled = getattr(config, "META_LABEL_INVERT_ENABLED", False)
-                    p_hat_inv = 1.0 - p_hat_ev
-                    ev_invert = p_hat_inv * b_realized - (1.0 - p_hat_inv)
-                    invert_min_conf = getattr(config, "INVERT_MIN_CONFIDENCE", 0.65)
-                    if invert_enabled and ev_invert > ev_margin and p_hat_inv >= invert_min_conf:
-                        action, confidence = "INVERT", p_hat_inv
-                    else:
-                        action, confidence = "SKIP", p_hat_ev
+                    action = default_action
+                    confidence = p_hat_take if default_action == "TAKE" else p_hat_invert
 
                 logger.info(
-                    "EV-GATE: %s/%s p_hat=%.3f b=%.3f EV_take=%.4f -> action=%s",
-                    strategy, symbol, p_hat_ev, b_realized, ev_take, action,
+                    "EV-GATE: %s/%s default=%s p_hat_take=%.3f p_hat_invert=%.3f "
+                    "ev_take=%.4f ev_invert=%.4f -> action=%s",
+                    strategy, symbol, default_action, p_hat_take, p_hat_invert,
+                    ev_take, ev_invert, action,
                 )
                 _prediction_log.insert(
                     strategy=strategy, symbol=symbol, entry_score=entry_score,
                     recent_win_rate=recent_win_rate, streak=streak,
-                    take=(action != "SKIP"), confidence=confidence,
+                    take=True, confidence=confidence,
                     bypassed=False, timestamp=timestamp,
                 )
                 return action, confidence
             # No realized payout data yet for this pair — fall through to
-            # the global model below rather than gating on an unknown b.
+            # the pass-through logic below rather than gating on an
+            # unknown b.
 
-    # ── Global entry_score-based model — unchanged, still gated behind
-    # config.META_LABEL_MIN_TRADES total logged trades bot-wide. This is
-    # the fallback for pairs the EV gate above hasn't picked up yet.
-    # Never returns INVERT — the global model isn't per-pair/per-feature
-    # enough to justify betting against the strategy's own signal.
-    total = _count_all_trades()
-    if total < config.META_LABEL_MIN_TRADES:
-        logger.info(
-            "insufficient data, meta-filter inactive (%d/%d trades logged)",
-            total, config.META_LABEL_MIN_TRADES,
-        )
-        action, confidence = "TAKE", 1.0
-        _prediction_log.insert(
-            strategy=strategy, symbol=symbol, entry_score=entry_score,
-            recent_win_rate=None, streak=None, take=True, confidence=confidence,
-            bypassed=True, timestamp=timestamp,
-        )
-        return action, confidence
-
-    _model.maybe_retrain()  # cheap no-op unless a retrain is actually due
-
-    feat = _feature_dict(strategy, symbol, entry_score, timestamp, recent_win_rate, streak,
-                          multiplier, atr_pct, regime)
-    prob_win = _model.predict_proba_one(feat)
-    take = prob_win >= TAKE_THRESHOLD
-    action = "TAKE" if take else "SKIP"
-    confidence = prob_win
-
+    # ── Insufficient per-pair data — return this pair's default action
+    # (see config.py's META_LABEL_DEFAULT_ACTION). confidence=1.0 is a
+    # pass-through/policy marker here, not a calibrated probability — see
+    # this function's docstring for why INVERT-by-default is a directional
+    # choice, not a data-driven one, until enough history exists.
+    #
+    # CORRECTION (win-rate pass, Aug 2026): this branch used to also check
+    # `total < config.META_LABEL_MIN_TRADES` (a bot-wide trade count) and
+    # fall through to a separate global entry-score-based classifier above
+    # that threshold. That global model predates the per-strategy default
+    # concept and only ever knew how to return TAKE/SKIP, never INVERT —
+    # keeping it would have meant a non-BOOM_CRASH pair briefly defaulting
+    # to INVERT below 200 bot-wide trades, then silently reverting to a
+    # TAKE/SKIP-only global model above that count, before the per-pair EV
+    # model (which does know about defaults) had enough of ITS OWN data.
+    # Simpler and more consistent: below EV_MIN_FEATURE_ROWS for this
+    # specific pair, always the pair's stated default — one rule, no
+    # in-between model with different semantics.
+    logger.info(
+        "insufficient per-pair data for %s/%s — using default action=%s",
+        strategy, symbol, default_action,
+    )
     _prediction_log.insert(
         strategy=strategy, symbol=symbol, entry_score=entry_score,
-        recent_win_rate=recent_win_rate, streak=streak, take=take,
-        confidence=confidence, bypassed=False, timestamp=timestamp,
+        recent_win_rate=None, streak=None, take=True, confidence=1.0,
+        bypassed=True, timestamp=timestamp,
     )
-    return action, confidence
+    return default_action, 1.0
 
 
 def record_outcome(strategy: str, symbol: str, won: bool,
