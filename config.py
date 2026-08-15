@@ -645,7 +645,7 @@ RECONCILE_MAX_SECS           = 1800   # 30 min — far longer than any real
 MULTIPLIER_MAX_HOLD_MINS = 30
 
 # ── SYMBOL SUSPENSION (minutes) ──────────────────────────────
-SYMBOL_WIN_SUSPEND_MINS   = 20     # unchanged — win path untouched
+SYMBOL_WIN_SUSPEND_MINS   = 30     # was 20 — increased by 10min per user request
 SYMBOL_MIN_GAP_MINS       = 1
 
 # Escalating per-symbol loss suspension ladder (Implementation Brief v2,
@@ -656,7 +656,7 @@ SYMBOL_MIN_GAP_MINS       = 1
 # restart) — never by a UTC-midnight or other calendar boundary.
 # Replaces the old flat SYMBOL_LOSS_SUSPEND_MINS / SYMBOL_SESSION_BAN_LOSSES
 # (59,940-minute "session ban") scheme entirely.
-SESSION_LOSS_SUSPEND_LADDER_MINS = [60, 120, 180, 240]
+SESSION_LOSS_SUSPEND_LADDER_MINS = [70, 130, 190, 250]  # was [60,120,180,240] — +10min per tier per user request
 
 # ── RAW TICK BUFFER (feeds tick-based evaluators via evaluate(ticks=...)) ──
 TICK_BUFFER_MAXLEN = 200
@@ -843,10 +843,24 @@ INVERT_MIN_CONFIDENCE     = 0.65  # only invert when the OPPOSITE direction's
 # Built from the symbol lists above rather than hand-typed, so this can
 # never silently drift out of sync with VOL_MULTIPLIER_SYMBOLS/BOOM_CRASH
 # if either list changes later.
+#
+# REFINEMENT (win-rate/drawdown pass, Aug 2026): R_10/R_100 moved back to
+# TAKE and 1HZ10V/1HZ100V moved to INVERT — a deliberate per-user swap on
+# top of the general "H... symbols TAKE, others INVERT" rule below, not a
+# correction of it. Built as an explicit override dict applied after the
+# general rule so the exception is easy to find and won't get silently
+# regenerated away if the base rule above is ever rebuilt from the symbol
+# lists again.
 META_LABEL_DEFAULT_ACTION_BY_SYMBOL: dict = {
     **{s: "TAKE" for s in VOL_MULTIPLIER_SYMBOLS if s.startswith("1HZ")},
     **{s: "INVERT" for s in BOOM_CRASH},
     **{s: "INVERT" for s in VOL_MULTIPLIER_SYMBOLS if not s.startswith("1HZ")},
+    # Explicit per-symbol overrides (see REFINEMENT note above) — applied
+    # last so they win regardless of the general rules above.
+    "R_10":     "TAKE",
+    "R_100":    "TAKE",
+    "1HZ10V":   "INVERT",
+    "1HZ100V":  "INVERT",
 }
 # Fallback for any symbol not explicitly listed above (e.g. JD10-JD100,
 # RDBEAR/RDBULL — strategies where INVERT isn't even applicable, see
