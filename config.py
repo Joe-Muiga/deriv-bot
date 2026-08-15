@@ -436,7 +436,17 @@ VOL_REGIME_CONFIRM_BARS = 2    # the ratio must clear VOL_REGIME_TREND_RATIO
 # often is — it only let through slow grinding moves that were already
 # extended, which is backwards for an entry strategy. Removed; the ATR
 # margin alone is the filter now.
-BREAKOUT_MARGIN_ATR = 0.15
+# CORRECTION (win-rate pass, Aug 2026, third iteration): live Render logs
+# showed VOL_BREAKOUT consistently landing at 4/7 (EMA+MACD agree, break
+# condition alone fails) across many different VOL_MULTIPLIER_SYMBOLS,
+# never reaching the 6/7 fire threshold — for 8+ days straight, zero
+# VOL_BREAKOUT trades. A fresh 20-bar Donchian high on a near-random-walk
+# instrument typically only clears the prior high by a small fraction of
+# ATR, not 15% of it — 0.15 was still too strict even after already being
+# implicated once in this same pass. Lowered to 0.05: still requires a
+# real move past the level (not a bare 1-tick touch, the original bug),
+# just not an unrealistically large one.
+BREAKOUT_MARGIN_ATR = 0.05
 
 # ── VOL_REV_MULT ENTRY CONFIRMATION (win-rate pass, Aug 2026) ────────────
 # When True, evaluate_vol_reversion_mult() requires the latest close to
