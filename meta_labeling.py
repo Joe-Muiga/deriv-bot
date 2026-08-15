@@ -499,7 +499,19 @@ class _PairEVModel:
             if not feat:
                 continue
             X_dicts.append(feat)
-            y.append(1 if r.get("won") else 0)
+            # SIGNAL DIRECTION INVERSION (see config.py): this model's
+            # features always describe the ORIGINAL signal direction, so
+            # its label must too. For a row where bot_engine._execute()
+            # inverted the executed trade, r["won"] reflects the INVERTED
+            # trade's real outcome — flip it back here so the label stays
+            # "did the original direction win", consistent with what the
+            # features actually describe. Without this, INVERT trades
+            # would silently corrupt the exact model that decided to
+            # invert them in the first place.
+            won_original = bool(r.get("won"))
+            if r.get("inverted"):
+                won_original = not won_original
+            y.append(1 if won_original else 0)
         if len(X_dicts) < EV_MIN_FEATURE_ROWS or len(set(y)) < 2:
             return None  # not enough rows, or only one outcome class so far
         if SKLEARN_AVAILABLE:
@@ -694,7 +706,7 @@ _ev_model = _PairEVModel()  # Implementation Brief v6, PART 5
 
 # ── PUBLIC API ──────────────────────────────────────────────────────────
 
-def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
+def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     """
     features must contain: "strategy", "symbol", "entry_score".
     Optional: "timestamp" (defaults to now), "recent_win_rate" / "streak"
@@ -704,10 +716,18 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
     default 0.0 / 0.0 / "NONE", only meaningful for
     config.VOL_MULTIPLIER_SYMBOLS trades).
 
-    Returns (take, confidence). confidence is the model's estimated
-    P(win) when the filter is active. While the filter is inactive
-    (insufficient data), confidence is 1.0 and take is always True —
-    that 1.0 is a pass-through marker, not a calibrated probability.
+    Returns (action, confidence):
+      action "TAKE"   — follow the signal's original direction
+      action "SKIP"   — sit this one out
+      action "INVERT" — take the OPPOSITE direction from the same entry
+                         (see config.py's SIGNAL DIRECTION INVERSION section)
+
+    confidence is the model's estimated P(win) for whichever direction
+    `action` describes (i.e. for INVERT it's P(win | inverted), not
+    P(win | original)). While the filter is inactive (insufficient data),
+    confidence is 1.0 and action is always "TAKE" — that 1.0 is a
+    pass-through marker, not a calibrated probability. INVERT is never
+    returned in that inactive state — see the EV-gate block below.
     """
     strategy = str(features["strategy"])
     symbol = str(features["symbol"])
@@ -757,44 +777,65 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
 
             if avg_ratio is not None:
                 b_realized = avg_ratio - 1.0
-                expected_value = p_hat_ev * b_realized - (1.0 - p_hat_ev)
+                ev_take = p_hat_ev * b_realized - (1.0 - p_hat_ev)
                 # FIX (profitability audit): was `> 0` — a bare-positive EV
                 # gate takes every trade where the point-estimate edge is
                 # even a hair above breakeven, with no allowance for
                 # estimation error in p_hat_ev or in the realized payout
                 # ratio. EV_MARGIN requires a small buffer above breakeven.
                 ev_margin = getattr(config, "META_LABEL_EV_MARGIN", 0.03)
-                take = expected_value > ev_margin
-                confidence = p_hat_ev
+
+                if ev_take > ev_margin:
+                    action, confidence = "TAKE", p_hat_ev
+                else:
+                    # SIGNAL DIRECTION INVERSION (see config.py): the
+                    # original direction doesn't clear EV — check whether
+                    # the OPPOSITE direction would. p_hat_inv approximates
+                    # P(win | inverted) as (1 - p_hat_ev); b_realized is
+                    # borrowed from the original direction's measured
+                    # payout ratio (see config.py comment on why this is
+                    # an approximation, not exact).
+                    invert_enabled = getattr(config, "META_LABEL_INVERT_ENABLED", False)
+                    p_hat_inv = 1.0 - p_hat_ev
+                    ev_invert = p_hat_inv * b_realized - (1.0 - p_hat_inv)
+                    invert_min_conf = getattr(config, "INVERT_MIN_CONFIDENCE", 0.65)
+                    if invert_enabled and ev_invert > ev_margin and p_hat_inv >= invert_min_conf:
+                        action, confidence = "INVERT", p_hat_inv
+                    else:
+                        action, confidence = "SKIP", p_hat_ev
+
                 logger.info(
-                    "EV-GATE: %s/%s p_hat=%.3f b=%.3f EV=%.4f -> take=%s",
-                    strategy, symbol, p_hat_ev, b_realized, expected_value, take,
+                    "EV-GATE: %s/%s p_hat=%.3f b=%.3f EV_take=%.4f -> action=%s",
+                    strategy, symbol, p_hat_ev, b_realized, ev_take, action,
                 )
                 _prediction_log.insert(
                     strategy=strategy, symbol=symbol, entry_score=entry_score,
-                    recent_win_rate=recent_win_rate, streak=streak, take=take,
-                    confidence=confidence, bypassed=False, timestamp=timestamp,
+                    recent_win_rate=recent_win_rate, streak=streak,
+                    take=(action != "SKIP"), confidence=confidence,
+                    bypassed=False, timestamp=timestamp,
                 )
-                return take, confidence
+                return action, confidence
             # No realized payout data yet for this pair — fall through to
             # the global model below rather than gating on an unknown b.
 
     # ── Global entry_score-based model — unchanged, still gated behind
     # config.META_LABEL_MIN_TRADES total logged trades bot-wide. This is
     # the fallback for pairs the EV gate above hasn't picked up yet.
+    # Never returns INVERT — the global model isn't per-pair/per-feature
+    # enough to justify betting against the strategy's own signal.
     total = _count_all_trades()
     if total < config.META_LABEL_MIN_TRADES:
         logger.info(
             "insufficient data, meta-filter inactive (%d/%d trades logged)",
             total, config.META_LABEL_MIN_TRADES,
         )
-        take, confidence = True, 1.0
+        action, confidence = "TAKE", 1.0
         _prediction_log.insert(
             strategy=strategy, symbol=symbol, entry_score=entry_score,
-            recent_win_rate=None, streak=None, take=take, confidence=confidence,
+            recent_win_rate=None, streak=None, take=True, confidence=confidence,
             bypassed=True, timestamp=timestamp,
         )
-        return take, confidence
+        return action, confidence
 
     _model.maybe_retrain()  # cheap no-op unless a retrain is actually due
 
@@ -802,6 +843,7 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
                           multiplier, atr_pct, regime)
     prob_win = _model.predict_proba_one(feat)
     take = prob_win >= TAKE_THRESHOLD
+    action = "TAKE" if take else "SKIP"
     confidence = prob_win
 
     _prediction_log.insert(
@@ -809,7 +851,7 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[bool, float]:
         recent_win_rate=recent_win_rate, streak=streak, take=take,
         confidence=confidence, bypassed=False, timestamp=timestamp,
     )
-    return take, confidence
+    return action, confidence
 
 
 def record_outcome(strategy: str, symbol: str, won: bool,
