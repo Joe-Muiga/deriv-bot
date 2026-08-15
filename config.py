@@ -816,6 +816,41 @@ INVERT_MIN_CONFIDENCE     = 0.65  # only invert when the OPPOSITE direction's
                                     # inverting is a stronger claim than
                                     # simply not trusting the original signal
 
+# Strategies in this set always execute their raw/original signal — the
+# meta-label gate is never allowed to SKIP them outright, only redirect
+# them to the opposite direction once it has enough confidence to.
+# BOOM_CRASH keeps trading exactly as its own strategy logic decides
+# (that's the "initial strategy" being trusted as the default), with
+# AI/ML acting purely as a direction override once it has learned enough
+# about that pair.
+META_LABEL_NO_SKIP_STRATEGIES = {"BOOM_CRASH"}
+
+# ── PER-STRATEGY DEFAULT DIRECTION (win-rate/drawdown pass, Aug 2026) ────
+# User-directed design: for every strategy NOT in META_LABEL_NO_SKIP_STRATEGIES
+# — i.e. everything except BOOM_CRASH, meaning VOL_BREAKOUT/VOL_REV_MULT and
+# any future volatility-index strategy — the trading default flips to
+# INVERT (fade the raw signal) rather than TAKE it as generated. AI/ML only
+# steers back to the ORIGINAL direction once the per-pair EV model has
+# accumulated enough evidence (META_LABEL_EV_MIN_FEATURE_ROWS rows) that
+# doing so is actually the better bet.
+#
+# IMPORTANT HONESTY NOTE, read before changing DEFAULT_ACTION_FALLBACK:
+# below that per-pair data threshold there is no real evidence either way
+# — defaulting to INVERT at zero data is a directional bet the user chose
+# deliberately (informed by the aggregate loss-heavy pattern already
+# observed across VOL_BREAKOUT symbols), not something the model
+# calculated. Once a pair crosses the data threshold, the choice becomes
+# genuinely evidence-based and can swing back to TAKE.
+META_LABEL_DEFAULT_ACTION = {
+    "BOOM_CRASH": "TAKE",
+}
+META_LABEL_DEFAULT_ACTION_FALLBACK = "INVERT"  # applies to any strategy not
+                                                 # explicitly listed above
+TAKE_MIN_CONFIDENCE = 0.65  # mirror of INVERT_MIN_CONFIDENCE below, for
+                             # strategies whose default is INVERT: only
+                             # override back to the ORIGINAL direction once
+                             # its estimated win probability clears this
+
 
 # ── POSITION SIZING (Kelly) ───────────────────────────────────
 # Conservative multiplier applied to full Kelly-optimal sizing.
