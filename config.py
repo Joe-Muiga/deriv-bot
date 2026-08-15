@@ -791,6 +791,32 @@ META_LABEL_RETRAIN_EVERY_N = 100   # retrain cadence, in newly logged trades
 # noisy that estimate was.
 META_LABEL_EV_MARGIN        = 0.03
 
+# ── SIGNAL DIRECTION INVERSION (win-rate/drawdown pass, Aug 2026) ────────
+# meta_labeling.predict_take_trade() can return "INVERT" in addition to
+# "TAKE"/"SKIP": once a (strategy, symbol) pair's per-pair EV model has
+# enough history (META_LABEL_EV_MIN_FEATURE_ROWS rows, config below) to
+# produce a real estimate of p(win | features) for the signal's ORIGINAL
+# direction, and that estimate is low enough that the OPPOSITE direction
+# has the better expected value, bot_engine._execute() flips sig.direction
+# before placing the order — same entry price, same ATR-based stop/target
+# sizing (already symmetric for LONG vs SHORT), just the side is flipped.
+# This cannot fire for a pair until it has real evidence — below
+# META_LABEL_EV_MIN_FEATURE_ROWS this always returns TAKE, never a guess.
+# Simplifying assumption: the inverted direction's win probability is
+# approximated as (1 - p_hat_original) and its payout ratio as the same
+# avg_ratio already measured for the original direction. Real
+# execution/spread asymmetries mean this is an approximation, not exact —
+# worth revisiting once enough inverted trades exist to measure their own
+# realized payout ratio directly instead of borrowing the original's.
+META_LABEL_INVERT_ENABLED = True
+INVERT_MIN_CONFIDENCE     = 0.65  # only invert when the OPPOSITE direction's
+                                    # estimated win probability clears this —
+                                    # deliberately higher than the plain
+                                    # META_LABEL_EV_MARGIN skip bar, since
+                                    # inverting is a stronger claim than
+                                    # simply not trusting the original signal
+
+
 # ── POSITION SIZING (Kelly) ───────────────────────────────────
 # Conservative multiplier applied to full Kelly-optimal sizing.
 # 0.25 = quarter-Kelly.
