@@ -572,8 +572,21 @@ def evaluate_vol_breakout(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     atr = ind.atr(H, L, C, config.ATR_PERIOD)
     last_close = float(C[-1])
     last_atr = _last(atr)
-    last_upper = _last(upper)
-    last_lower = _last(lower)
+    # BUG FIX (win-rate pass, Aug 2026, fourth iteration): live logs showed
+    # every VOL_MULTIPLIER_SYMBOLS breakout attempt landing on an identical
+    # 4/7 (0.571) score, forever, regardless of BREAKOUT_MARGIN_ATR (tried
+    # 0.15, then 0.05 — no change). Root cause: ind.donchian()'s window
+    # includes the *current* bar, so last_upper/last_lower were always at
+    # least as extreme as this bar's own high/low — which is always at
+    # least as extreme as this bar's own close. `close >= upper + margin`
+    # was therefore false for any margin > 0, structurally, no matter how
+    # small. Comparing against the *prior* bar's channel instead (which
+    # excludes the current bar) is both the fix and the textbook-correct
+    # definition of a breakout — "did this close clear the level as it
+    # stood before this bar", not "does it exceed a channel this bar's own
+    # high already extended".
+    last_upper = _last(upper, 2)
+    last_lower = _last(lower, 2)
 
     if any(math.isnan(v) for v in (last_atr, last_upper, last_lower)) or last_atr <= 0:
         logger.debug(f"REJECTED: {symbol} VOL_BREAKOUT strength=0 score=0.000 — indicators not warmed up")
