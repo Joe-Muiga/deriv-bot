@@ -740,21 +740,25 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
       action "INVERT" — take the OPPOSITE direction from the same entry
                          (see config.py's SIGNAL DIRECTION INVERSION section)
 
-    Every strategy has a DEFAULT action (config.META_LABEL_DEFAULT_ACTION,
+    Every SYMBOL has a DEFAULT action (config.META_LABEL_DEFAULT_ACTION_BY_SYMBOL,
     fallback config.META_LABEL_DEFAULT_ACTION_FALLBACK) — currently "TAKE"
-    for BOOM_CRASH, "INVERT" for everything else. A trade is never skipped
-    outright; the gate only ever chooses between the pair's default action
-    and its opposite. The gate only moves off the default once the per-pair
-    EV model has enough history (META_LABEL_EV_MIN_FEATURE_ROWS rows) to
-    show real evidence the opposite is the better bet AND that evidence
-    clears its confidence bar (TAKE_MIN_CONFIDENCE / INVERT_MIN_CONFIDENCE,
+    for the "1HZ..." volatility symbols, "INVERT" for BOOM/CRASH symbols
+    and the remaining VOL_MULTIPLIER_SYMBOLS (R_xx, stpRNG). This is a
+    per-SYMBOL default, not per-strategy — 1HZ50V and R_50 both trade
+    under VOL_BREAKOUT/VOL_REV_MULT but can (and currently do) have
+    different defaults. A trade is never skipped outright; the gate only
+    ever chooses between the symbol's default action and its opposite.
+    The gate only moves off the default once the per-pair EV model has
+    enough history (META_LABEL_EV_MIN_FEATURE_ROWS rows) to show real
+    evidence the opposite is the better bet AND that evidence clears its
+    confidence bar (TAKE_MIN_CONFIDENCE / INVERT_MIN_CONFIDENCE,
     whichever applies). Below that data threshold, this always returns the
-    pair's default action at confidence 1.0 — a pass-through/policy marker,
-    not a calibrated probability. See config.py's per-strategy default
-    section for why INVERT is the default for non-BOOM_CRASH strategies —
+    symbol's default action at confidence 1.0 — a pass-through/policy marker,
+    not a calibrated probability. See config.py's per-symbol default
+    section for why INVERT is the default for most volatility symbols —
     that starting posture is a deliberate choice informed by already-
     observed aggregate performance, not something derived from this
-    specific pair's own (as-yet insufficient) history.
+    specific symbol's own (as-yet insufficient) history.
     """
     strategy = str(features["strategy"])
     symbol = str(features["symbol"])
@@ -765,8 +769,8 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     regime = str(features.get("regime", "NONE"))
     enriched = {k: features[k] for k in ENRICHED_FEATURE_KEYS if k in features}
 
-    default_action = getattr(config, "META_LABEL_DEFAULT_ACTION", {}).get(
-        strategy, getattr(config, "META_LABEL_DEFAULT_ACTION_FALLBACK", "TAKE"))
+    default_action = getattr(config, "META_LABEL_DEFAULT_ACTION_BY_SYMBOL", {}).get(
+        symbol, getattr(config, "META_LABEL_DEFAULT_ACTION_FALLBACK", "TAKE"))
     override_action = "INVERT" if default_action == "TAKE" else "TAKE"
     override_min_conf = getattr(
         config, "INVERT_MIN_CONFIDENCE" if override_action == "INVERT" else "TAKE_MIN_CONFIDENCE", 0.65)
@@ -843,23 +847,23 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
             # the pass-through logic below rather than gating on an
             # unknown b.
 
-    # ── Insufficient per-pair data — return this pair's default action
-    # (see config.py's META_LABEL_DEFAULT_ACTION). confidence=1.0 is a
-    # pass-through/policy marker here, not a calibrated probability — see
-    # this function's docstring for why INVERT-by-default is a directional
-    # choice, not a data-driven one, until enough history exists.
+    # ── Insufficient per-pair data — return this symbol's default action
+    # (see config.py's META_LABEL_DEFAULT_ACTION_BY_SYMBOL). confidence=1.0
+    # is a pass-through/policy marker here, not a calibrated probability —
+    # see this function's docstring for why INVERT-by-default is a
+    # directional choice, not a data-driven one, until enough history exists.
     #
     # CORRECTION (win-rate pass, Aug 2026): this branch used to also check
     # `total < config.META_LABEL_MIN_TRADES` (a bot-wide trade count) and
     # fall through to a separate global entry-score-based classifier above
-    # that threshold. That global model predates the per-strategy default
+    # that threshold. That global model predates the per-symbol default
     # concept and only ever knew how to return TAKE/SKIP, never INVERT —
-    # keeping it would have meant a non-BOOM_CRASH pair briefly defaulting
-    # to INVERT below 200 bot-wide trades, then silently reverting to a
+    # keeping it would have meant a symbol briefly defaulting correctly
+    # below 200 bot-wide trades, then silently reverting to a
     # TAKE/SKIP-only global model above that count, before the per-pair EV
-    # model (which does know about defaults) had enough of ITS OWN data.
-    # Simpler and more consistent: below EV_MIN_FEATURE_ROWS for this
-    # specific pair, always the pair's stated default — one rule, no
+    # model (which does know about per-symbol defaults) had enough of ITS
+    # OWN data. Simpler and more consistent: below EV_MIN_FEATURE_ROWS for
+    # this specific symbol, always its stated default — one rule, no
     # in-between model with different semantics.
     logger.info(
         "insufficient per-pair data for %s/%s — using default action=%s",
