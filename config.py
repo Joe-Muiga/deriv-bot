@@ -816,38 +816,45 @@ INVERT_MIN_CONFIDENCE     = 0.65  # only invert when the OPPOSITE direction's
                                     # inverting is a stronger claim than
                                     # simply not trusting the original signal
 
-# Strategies in this set always execute their raw/original signal — the
-# meta-label gate is never allowed to SKIP them outright, only redirect
-# them to the opposite direction once it has enough confidence to.
-# BOOM_CRASH keeps trading exactly as its own strategy logic decides
-# (that's the "initial strategy" being trusted as the default), with
-# AI/ML acting purely as a direction override once it has learned enough
-# about that pair.
-META_LABEL_NO_SKIP_STRATEGIES = {"BOOM_CRASH"}
+# NOTE: an earlier iteration of this design had a separate
+# META_LABEL_NO_SKIP_STRATEGIES set (BOOM_CRASH only) alongside a
+# strategy-level default-action map. Superseded by the per-symbol default
+# map below — no symbol is ever skipped outright now (the gate always
+# picks between a symbol's default and its opposite), so a standalone
+# no-skip list is redundant with that design and has been removed.
 
-# ── PER-STRATEGY DEFAULT DIRECTION (win-rate/drawdown pass, Aug 2026) ────
-# User-directed design: for every strategy NOT in META_LABEL_NO_SKIP_STRATEGIES
-# — i.e. everything except BOOM_CRASH, meaning VOL_BREAKOUT/VOL_REV_MULT and
-# any future volatility-index strategy — the trading default flips to
-# INVERT (fade the raw signal) rather than TAKE it as generated. AI/ML only
-# steers back to the ORIGINAL direction once the per-pair EV model has
+# ── PER-SYMBOL DEFAULT DIRECTION (win-rate/drawdown pass, Aug 2026) ──────
+# User-directed design, refined from a strategy-level default to a
+# symbol-level one: the "H..." volatility symbols (1HZ10V/25V/50V/75V/100V)
+# default to TAKE (their own coded strategy, un-inverted); BOOM/CRASH
+# symbols default to INVERT; the remaining VOL_MULTIPLIER_SYMBOLS — the
+# plain R_xx symbols and stpRNG — also default to INVERT. AI/ML only
+# steers a symbol off its default once the per-pair EV model has
 # accumulated enough evidence (META_LABEL_EV_MIN_FEATURE_ROWS rows) that
 # doing so is actually the better bet.
 #
-# IMPORTANT HONESTY NOTE, read before changing DEFAULT_ACTION_FALLBACK:
-# below that per-pair data threshold there is no real evidence either way
-# — defaulting to INVERT at zero data is a directional bet the user chose
-# deliberately (informed by the aggregate loss-heavy pattern already
-# observed across VOL_BREAKOUT symbols), not something the model
-# calculated. Once a pair crosses the data threshold, the choice becomes
-# genuinely evidence-based and can swing back to TAKE.
-META_LABEL_DEFAULT_ACTION = {
-    "BOOM_CRASH": "TAKE",
+# IMPORTANT HONESTY NOTE, read before changing these defaults: below the
+# per-pair data threshold there is no real evidence either way for that
+# SPECIFIC symbol — every one of these starting postures is a directional
+# choice the user made deliberately, not something any model calculated.
+# Once a symbol crosses the data threshold, its action becomes genuinely
+# evidence-based and can move off its default.
+#
+# Built from the symbol lists above rather than hand-typed, so this can
+# never silently drift out of sync with VOL_MULTIPLIER_SYMBOLS/BOOM_CRASH
+# if either list changes later.
+META_LABEL_DEFAULT_ACTION_BY_SYMBOL: dict = {
+    **{s: "TAKE" for s in VOL_MULTIPLIER_SYMBOLS if s.startswith("1HZ")},
+    **{s: "INVERT" for s in BOOM_CRASH},
+    **{s: "INVERT" for s in VOL_MULTIPLIER_SYMBOLS if not s.startswith("1HZ")},
 }
-META_LABEL_DEFAULT_ACTION_FALLBACK = "INVERT"  # applies to any strategy not
-                                                 # explicitly listed above
+# Fallback for any symbol not explicitly listed above (e.g. JD10-JD100,
+# RDBEAR/RDBULL — strategies where INVERT isn't even applicable, see
+# bot_engine._execute()'s contract_kind guard) — TAKE, i.e. behave as
+# though this whole feature didn't exist for them.
+META_LABEL_DEFAULT_ACTION_FALLBACK = "TAKE"
 TAKE_MIN_CONFIDENCE = 0.65  # mirror of INVERT_MIN_CONFIDENCE below, for
-                             # strategies whose default is INVERT: only
+                             # symbols whose default is INVERT: only
                              # override back to the ORIGINAL direction once
                              # its estimated win probability clears this
 
