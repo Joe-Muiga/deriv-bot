@@ -1057,7 +1057,7 @@ class BotEngine:
         # below) can activate independently and sooner — see
         # meta_labeling.predict_take_trade()'s docstring.
         try:
-            take, confidence = meta_labeling.predict_take_trade({
+            action, confidence = meta_labeling.predict_take_trade({
                 "strategy":    strategy,
                 "symbol":      symbol,
                 "entry_score": float(getattr(sig, "score", 0.0)),
@@ -1070,9 +1070,31 @@ class BotEngine:
             logger.warning(
                 f"meta_labeling.predict_take_trade({symbol}) failed — "
                 f"passing signal through: {exc}")
-            take, confidence = True, 1.0
+            action, confidence = "TAKE", 1.0
 
-        if not take:
+        inverted = False
+        if action == "INVERT":
+            # SIGNAL DIRECTION INVERSION (see config.py / meta_labeling.py).
+            # Only meaningful for a price-direction bet — JUMP_BUILDUP's
+            # DIGIT contracts (Matches/Differs) don't have a LONG/SHORT to
+            # flip, so treat INVERT as SKIP there rather than silently
+            # taking the un-invertable original (which the EV gate already
+            # decided didn't clear the bar).
+            if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL" or sig.direction not in ("LONG", "SHORT"):
+                logger.info(
+                    f"META-INVERT SKIPPED: {symbol} | {strategy} | INVERT isn't "
+                    f"applicable to contract_kind={getattr(sig, 'contract_kind', 'RISE_FALL')} — treating as SKIP")
+                action = "SKIP"
+            else:
+                original_direction = sig.direction
+                sig.direction = "SHORT" if sig.direction == "LONG" else "LONG"
+                inverted = True
+                logger.info(
+                    f"META-INVERT: {symbol} | {strategy} | {original_direction} -> "
+                    f"{sig.direction} | P(win inverted)={confidence:.3f}"
+                )
+
+        if action == "SKIP":
             logger.info(
                 f"META-LABEL SKIP: {symbol} | {strategy} | "
                 f"P(win)={confidence:.3f} < threshold")
@@ -1273,6 +1295,12 @@ class BotEngine:
             # logs the exact features this trade was evaluated on, not a
             # freshly recomputed (and by settlement time, stale) snapshot.
             "enriched_features": enriched_features,
+            # SIGNAL DIRECTION INVERSION: whether _execute() flipped
+            # sig.direction before placing this order. _apply_settlement()
+            # needs this to record the outcome meta_labeling trains on
+            # against the ORIGINAL direction, not the executed one — see
+            # the comment there for why.
+            "inverted": inverted,
         }
         self._contract_open_times[cid] = time.time()
 
@@ -1366,6 +1394,10 @@ class BotEngine:
             "regime":     info.get("regime", "NONE"),
             # See _execute() — same values the meta-label gate decided on.
             **info.get("enriched_features", {}),
+            # SIGNAL DIRECTION INVERSION: _PairEVModel._fit() (meta_labeling.py)
+            # reads this back out to flip the training label for inverted
+            # trades — see the comment there for why that matters.
+            "inverted": bool(info.get("inverted", False)),
         }
 
         # Feed strategy_stats — this is the source of truth the
