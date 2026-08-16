@@ -852,15 +852,26 @@ INVERT_MIN_CONFIDENCE     = 0.65  # only invert when the OPPOSITE direction's
 # regenerated away if the base rule above is ever rebuilt from the symbol
 # lists again.
 META_LABEL_DEFAULT_ACTION_BY_SYMBOL: dict = {
-    **{s: "TAKE" for s in VOL_MULTIPLIER_SYMBOLS if s.startswith("1HZ")},
+    **{s: "TAKE" for s in VOL_MULTIPLIER_SYMBOLS if s.startswith("1HZ") and s != "1HZ50V"},
     **{s: "INVERT" for s in BOOM_CRASH},
-    **{s: "INVERT" for s in VOL_MULTIPLIER_SYMBOLS if not s.startswith("1HZ")},
+    **{s: "INVERT" for s in VOL_MULTIPLIER_SYMBOLS if not s.startswith("1HZ") and s != "R_75"},
     # Explicit per-symbol overrides (see REFINEMENT note above) — applied
-    # last so they win regardless of the general rules above.
-    "R_10":     "TAKE",
+    # last so they win regardless of the general rules above. This is the
+    # current, final state (not a diff/history of prior rounds):
+    "R_10":     "INVERT",
+    "R_25":     "TAKE",
+    "1HZ10V":   "TAKE",
+    "1HZ25V":   "INVERT",
+    "1HZ75V":   "INVERT",
+    "1HZ100V":  "TAKE",
+    # R_100 not listed here -> falls through to the general VOL_MULTIPLIER
+    # rule above (INVERT)... except R_100 was itself previously set to
+    # TAKE by explicit user request and this message didn't mention it,
+    # so it's carried forward explicitly rather than silently reverting:
     "R_100":    "TAKE",
-    "1HZ10V":   "INVERT",
-    "1HZ100V":  "INVERT",
+    # R_75 and 1HZ50V are deliberately absent from this map — see the ALT
+    # METHOD section below. Neither TAKE nor INVERT is hardcoded as their
+    # default; they're decided live, every second, by rule-based analysis.
 }
 # Fallback for any symbol not explicitly listed above (e.g. JD10-JD100,
 # RDBEAR/RDBULL — strategies where INVERT isn't even applicable, see
@@ -871,6 +882,45 @@ TAKE_MIN_CONFIDENCE = 0.65  # mirror of INVERT_MIN_CONFIDENCE below, for
                              # symbols whose default is INVERT: only
                              # override back to the ORIGINAL direction once
                              # its estimated win probability clears this
+
+# ── ALT METHOD (win-rate/drawdown pass, Aug 2026) ─────────────────────────
+# User-directed design for R_75 and 1HZ50V specifically: per the user's
+# own review, these two symbols show roughly 50/50 performance under both
+# TAKE and INVERT — i.e. neither default has a real edge for them, unlike
+# every other symbol above. So they get NEITHER a static default NOR the
+# AI/ML EV-gate (that needs far more history than exists yet). Instead:
+# once a trade is open on one of these two symbols, bot_engine.py's
+# _monitor_alt_method() polls it every ALT_METHOD_POLL_INTERVAL_SECS and,
+# using purely deterministic/statistical rules (explicitly NOT AI/ML —
+# the user's own distinction: "ALT method", reserved for AI/ML once there
+# is sufficient data), closes the position early and immediately reopens
+# the OPPOSITE direction the moment there's a real, sustained sign the
+# current position is failing. Two conditions must BOTH hold before this
+# ever fires — see _monitor_alt_method()'s docstring for the exact math:
+#   1. loss_fraction (how much of the position's stop-loss budget is
+#      already consumed) clears ALT_METHOD_LOSS_FRACTION_TRIGGER — a
+#      fresh trade wobbling near breakeven is never touched.
+#   2. Over the last ALT_METHOD_TREND_WINDOW_SECS of 1-second snapshots,
+#      the fraction of consecutive profit deltas that are negative clears
+#      ALT_METHOD_NEGATIVE_SLOPE_MAJORITY — one noisy downtick doesn't
+#      trigger this, a sustained slide does.
+# Capped at ALT_METHOD_MAX_REVERSALS_PER_TRADE reversals per original
+# entry so a genuinely choppy market can't whipsaw the account through
+# repeated flips, each one paying the spread/slippage cost again.
+ALT_METHOD_SYMBOLS = {"R_75", "1HZ50V"}
+ALT_METHOD_POLL_INTERVAL_SECS       = 1     # "every second", as requested
+ALT_METHOD_LOSS_FRACTION_TRIGGER    = 0.50  # must be at least half-way to
+                                              # the static stop-loss before
+                                              # anything else is considered
+ALT_METHOD_TREND_WINDOW_SECS        = 8     # lookback window for the
+                                              # sustained-decline check
+ALT_METHOD_MIN_SAMPLES              = 5     # minimum snapshots in that
+                                              # window before trusting it
+ALT_METHOD_NEGATIVE_SLOPE_MAJORITY  = 0.70  # >=70% of deltas in the window
+                                              # must be negative
+ALT_METHOD_MAX_REVERSALS_PER_TRADE  = 1     # hard cap — never chain a
+                                              # second reversal off a
+                                              # reversal
 
 
 # ── POSITION SIZING (Kelly) ───────────────────────────────────
