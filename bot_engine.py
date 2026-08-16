@@ -1308,7 +1308,17 @@ class BotEngine:
         #    Multiplier contracts only (open-ended risk; Rise/Fall keeps its
         #    existing fixed-expiry handling untouched). Purely additive: does
         #    not change how the contract above was registered.
-        if (symbol in getattr(config, "MULTIPLIER_SYMBOLS", set())
+        #
+        # ALT METHOD (see config.py's ALT METHOD section): R_75 and
+        # 1HZ50V get a dedicated, tighter-cadence monitor with fundamentally
+        # different behavior (close-and-reverse, not profit-locking
+        # trailing) instead of the general exit engine below — running
+        # both against the same contract would risk conflicting
+        # contract_update/sell calls from two decision layers pursuing
+        # different goals at once.
+        if symbol in getattr(config, "ALT_METHOD_SYMBOLS", set()):
+            asyncio.create_task(self._monitor_alt_method(cid))
+        elif (symbol in getattr(config, "MULTIPLIER_SYMBOLS", set())
                 and getattr(config, "EXIT_ENGINE_ENABLED", False)
                 and symbol in getattr(config, "EXIT_ENGINE_SYMBOLS", set())):
             asyncio.create_task(self._monitor_exit(cid))
@@ -1860,20 +1870,51 @@ class BotEngine:
                 elapsed     = time.time() - opened_at
                 live_profit = float(poc.get("profit", 0.0))
 
+                # BUG FIX (found while implementing the ALT method below,
+                # unrelated to any of this session's other changes): these
+                # calls never matched exit_engine.record_snapshot()'s /
+                # decide_exit()'s actual parameter names (elapsed_secs,
+                # stake, current_profit, static_sl_amount, static_tp_amount,
+                # multiplier — not symbol/profit/elapsed/poc). Every call
+                # has been raising TypeError and getting silently swallowed
+                # by the except block below since this was written — the
+                # entire rule-based trailing layer and its ML layer have
+                # been inert this whole time, independent of the
+                # EXIT_ARM_PROFIT_FRACTION / EXIT_TRAIL_LOCK_FRACTION /
+                # EXIT_DECAY_CLOSE_FRACTION retuning done earlier this
+                # session, which was correct but had nothing to act on.
+                # static_sl/tp_amount come from the contract's own live
+                # limit_order (ground truth from Deriv, not a
+                # recomputation that could drift from what was actually
+                # set) — poc.get("limit_order") is documented Deriv API
+                # behavior for contracts with a limit_order attached.
+                stake = float(info.get("stake", 0.0))
+                multiplier = int(info.get("multiplier")
+                                  or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER))
+                limit_order = poc.get("limit_order") or {}
+                static_sl_amount = float(limit_order.get("stop_loss") or 0.0)
+                static_tp_amount = float(limit_order.get("take_profit") or 0.0)
+
                 try:
                     exit_engine.record_snapshot(
                         cid,
-                        symbol  = symbol,
-                        profit  = live_profit,
-                        elapsed = elapsed,
-                        poc     = poc,
+                        symbol            = symbol,
+                        elapsed_secs      = elapsed,
+                        stake             = stake,
+                        current_profit    = live_profit,
+                        static_sl_amount  = static_sl_amount,
+                        static_tp_amount  = static_tp_amount,
+                        multiplier        = multiplier,
                     )
                     decision = exit_engine.decide_exit(
                         cid,
-                        symbol  = symbol,
-                        profit  = live_profit,
-                        elapsed = elapsed,
-                        poc     = poc,
+                        symbol            = symbol,
+                        elapsed_secs      = elapsed,
+                        stake             = stake,
+                        current_profit    = live_profit,
+                        static_sl_amount  = static_sl_amount,
+                        static_tp_amount  = static_tp_amount,
+                        multiplier        = multiplier,
                     )
                 except Exception as exc:
                     logger.warning(f"exit_engine decision failed for {cid}: {exc}")
@@ -2000,3 +2041,268 @@ class BotEngine:
             except Exception as exc:
                 logger.error(f"_monitor_exit({cid}) tick failed: {exc}")
                 continue
+
+    # ── ALT METHOD — per-contract monitor for config.ALT_METHOD_SYMBOLS ─────
+    #
+    # User-directed design (see config.py's ALT METHOD section for the full
+    # rationale and tunable constants): R_75 and 1HZ50V show no real edge
+    # either TAKE or INVERT, so neither is hardcoded as their default (see
+    # META_LABEL_DEFAULT_ACTION_BY_SYMBOL — these two are deliberately
+    # absent from it, falling through to plain TAKE at entry). Instead,
+    # once a trade is open on one of these two symbols, this polls every
+    # ALT_METHOD_POLL_INTERVAL_SECS (default 1s — "every second", as
+    # requested) and closes the position early + immediately reopens the
+    # OPPOSITE direction the moment there's a real, sustained sign the
+    # position is failing.
+    #
+    # Explicitly NOT AI/ML — the user's own distinction, reserved for once
+    # there's sufficient data. This is deterministic/statistical: two
+    # conditions must BOTH hold before anything fires —
+    #   1. loss_fraction (how much of the position's stop-loss budget is
+    #      already consumed, read live from the contract's own limit_order
+    #      — ground truth from Deriv, not a recomputation) clears
+    #      ALT_METHOD_LOSS_FRACTION_TRIGGER.
+    #   2. Over the trailing ALT_METHOD_TREND_WINDOW_SECS of 1-second
+    #      profit snapshots (needs at least ALT_METHOD_MIN_SAMPLES of
+    #      them), the fraction of consecutive snapshot-to-snapshot deltas
+    #      that are negative clears ALT_METHOD_NEGATIVE_SLOPE_MAJORITY —
+    #      a sustained slide, not one noisy downtick.
+    # Capped at ALT_METHOD_MAX_REVERSALS_PER_TRADE reversals per original
+    # entry (the reversed contract re-arms this monitor but the cap
+    # travels with it via info["alt_reversals"], so it can only ever fire
+    # once more before refusing forever) — never chains a second reversal
+    # off a reversal, so a genuinely choppy market can't whipsaw the
+    # account through repeated flips each paying the spread again.
+    #
+    # Deliberately separate from _monitor_exit() above rather than a mode
+    # of it — profit-locking trailing (protect a winner) and
+    # close-and-reverse (escape a forming loser) are different goals, and
+    # running both against the same contract risks conflicting
+    # contract_update/sell calls. See the mutually-exclusive spawn guard
+    # in _execute() (ALT_METHOD_SYMBOLS vs. the general exit engine).
+
+    async def _monitor_alt_method(self, cid: str) -> None:
+        poll_interval = getattr(config, "ALT_METHOD_POLL_INTERVAL_SECS", 1)
+        loss_trigger  = getattr(config, "ALT_METHOD_LOSS_FRACTION_TRIGGER", 0.50)
+        window_secs   = getattr(config, "ALT_METHOD_TREND_WINDOW_SECS", 8)
+        min_samples   = getattr(config, "ALT_METHOD_MIN_SAMPLES", 5)
+        neg_majority  = getattr(config, "ALT_METHOD_NEGATIVE_SLOPE_MAJORITY", 0.70)
+        max_reversals = getattr(config, "ALT_METHOD_MAX_REVERSALS_PER_TRADE", 1)
+
+        while cid in self._open_contracts:
+            try:
+                await asyncio.sleep(poll_interval)
+
+                info = self._open_contracts.get(cid)
+                if info is None:
+                    return
+
+                try:
+                    poc = await self.client.force_check_contract(cid)
+                except Exception as exc:
+                    logger.warning(f"_monitor_alt_method force_check_contract({cid}): {exc}")
+                    continue
+
+                if poc.get("is_sold") or poc.get("is_expired"):
+                    # Natural close — the existing settlement path handles
+                    # recording it. Not our job; just stop monitoring.
+                    return
+
+                symbol      = info.get("symbol", "UNKNOWN")
+                live_profit = float(poc.get("profit", 0.0))
+                now         = time.time()
+
+                # ── Maintain the rolling snapshot window on the contract's
+                # own info dict — no separate module-level state needed,
+                # unlike exit_engine.py's _contract_states (this monitor
+                # doesn't need to survive contract close for any training
+                # purpose the way that module's ML layer does).
+                snaps: list = info.setdefault("alt_snapshots", [])
+                snaps.append((now, live_profit))
+                cutoff = now - window_secs
+                while snaps and snaps[0][0] < cutoff:
+                    snaps.pop(0)
+                if len(snaps) > 200:  # bound memory even in pathological cases
+                    del snaps[:-200]
+
+                limit_order = poc.get("limit_order") or {}
+                static_sl_amount = float(limit_order.get("stop_loss") or 0.0)
+                if static_sl_amount <= 0:
+                    # Can't compute loss_fraction without a real SL budget
+                    # to measure against — safe no-op, try again next tick.
+                    continue
+
+                loss_fraction = max(0.0, -live_profit) / static_sl_amount
+                if loss_fraction < loss_trigger:
+                    continue
+
+                if len(snaps) < min_samples:
+                    continue
+
+                deltas = [snaps[i][1] - snaps[i - 1][1] for i in range(1, len(snaps))]
+                if not deltas:
+                    continue
+                negative_frac = sum(1 for d in deltas if d < 0) / len(deltas)
+                if negative_frac < neg_majority:
+                    continue
+
+                reversals_done = int(info.get("alt_reversals", 0))
+                if reversals_done >= max_reversals:
+                    # Already used this trade's one reversal — hold and let
+                    # the static stop-loss / normal settlement handle it
+                    # from here, rather than flipping again.
+                    continue
+
+                # ── Trigger: close early, reverse ────────────────────────
+                original_direction = info.get("direction", "LONG")
+                reversed_direction = "SHORT" if original_direction == "LONG" else "LONG"
+                logger.info(
+                    f"ALT METHOD TRIGGER: {cid} ({symbol}) "
+                    f"loss_fraction={loss_fraction:.2f} "
+                    f"negative_frac={negative_frac:.2f} over {len(deltas)} samples "
+                    f"— closing early, reversing {original_direction} -> {reversed_direction}"
+                )
+
+                try:
+                    sell_resp = await self.client.sell_contract(cid, price=0)
+                except Exception as exc:
+                    logger.error(f"ALT METHOD sell_contract({cid}) failed: {exc}")
+                    continue  # retry next tick rather than losing the position silently
+
+                if not sell_resp:
+                    logger.warning(f"ALT METHOD: sell_contract({cid}) returned no response, will retry")
+                    continue
+
+                try:
+                    close_poc = await self.client.force_check_contract(cid)
+                except Exception:
+                    close_poc = {}
+                if not (close_poc.get("is_sold") or close_poc.get("is_expired")):
+                    sold_for = float(sell_resp.get("sold_for", 0))
+                    stake    = float(info.get("stake", 0.0))
+                    close_poc = {
+                        "is_sold":    1,
+                        "sell_price": sold_for,
+                        "profit":     sold_for - stake,
+                        "payout":     sold_for,
+                    }
+
+                self._open_contracts.pop(cid, None)
+                self._contract_open_times.pop(cid, None)
+                self._reconciling.pop(cid, None)
+                try:
+                    self.client.stop_tracking(cid)
+                except Exception:
+                    pass
+
+                await self._apply_settlement(cid, info, close_poc, close_reason="alt_method_early_exit")
+
+                await self._alt_method_open_reversed(
+                    symbol         = symbol,
+                    direction      = reversed_direction,
+                    strategy       = info.get("strategy", "ALT_METHOD"),
+                    stake          = float(info.get("stake", 0.0)),
+                    reversals_done = reversals_done + 1,
+                )
+                return
+
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"_monitor_alt_method({cid}) tick failed: {exc}")
+                continue
+
+    async def _alt_method_open_reversed(
+        self, symbol: str, direction: str, strategy: str, stake: float, reversals_done: int
+    ) -> None:
+        """
+        Places the reversed-direction position after _monitor_alt_method()
+        closes a failing one early. Reuses the SAME stake as the original
+        (a size the user's own risk sizing already approved for this
+        account state right now) rather than recalculating fresh — this is
+        a same-moment direction correction, not a new independent entry
+        decision that should go through position sizing again.
+
+        Mirrors _execute()'s VOL_MULTIPLIER_SYMBOLS buy path (dynamic
+        ATR-based stop-loss) since both ALT_METHOD_SYMBOLS are members of
+        that family — duplicated here rather than factored out of
+        _execute() to avoid touching that already-exercised code path.
+        """
+        try:
+            ml_atr_pct = 0.0
+            ml_multiplier = float(config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER))
+            builder = self._ltf.get(symbol)
+            bars = builder.completed_bars if builder else []
+            if len(bars) >= 15:
+                _C = np.array([b.close for b in bars], dtype=float)
+                _H = np.array([b.high  for b in bars], dtype=float)
+                _L = np.array([b.low   for b in bars], dtype=float)
+                _atr_val = ind.atr(_H, _L, _C, config.ATR_PERIOD)
+                _last_atr = float(_atr_val[~np.isnan(_atr_val)][-1]) if len(_atr_val) else 0.0
+                ml_atr_pct = _last_atr / float(_C[-1]) if _C[-1] else 0.0
+
+            dyn_sl_pct = (
+                self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
+                if ml_atr_pct > 0 else None
+            )
+
+            buy_resp = await self.client.buy_multiplier(
+                symbol        = symbol,
+                direction     = direction,
+                stake         = stake,
+                multiplier    = int(ml_multiplier),
+                stop_loss_pct = dyn_sl_pct,
+                strategy      = strategy,
+            )
+        except Exception as exc:
+            logger.error(f"ALT METHOD reversal buy failed for {symbol}: {exc}")
+            return
+
+        if not buy_resp or not buy_resp.get("contract_id"):
+            logger.error(
+                f"ALT METHOD reversal buy for {symbol} returned no contract_id "
+                f"— position NOT reopened, account is now flat on this symbol"
+            )
+            return
+
+        cid = str(buy_resp["contract_id"])
+        self._open_contracts[cid] = {
+            "symbol":            symbol,
+            "direction":         direction,
+            "strategy":          strategy,
+            "stake":             stake,
+            "opened_at":         time.time(),
+            "multiplier":        ml_multiplier,
+            "atr_pct":           ml_atr_pct,
+            "regime":            "NONE",
+            "enriched_features": {},
+            # This reversed contract didn't go through the meta-label
+            # TAKE/INVERT gate — _monitor_alt_method already made the
+            # direction decision. "inverted" here means something
+            # different (meta_labeling's training-label correction) than
+            # what triggered this trade, so it's left False; alt_origin
+            # below is the accurate marker for this contract's real origin.
+            "inverted":          False,
+            "alt_reversals":     reversals_done,
+            "alt_origin":        True,
+        }
+        self._contract_open_times[cid] = time.time()
+        self.symbols.record_trade_placed(symbol)
+        set_active_trades(len(self._open_contracts))
+
+        logger.info(
+            f"ALT METHOD REVERSED: {symbol} -> {direction} | ${stake:.2f} | "
+            f"reversal #{reversals_done} | new cid={cid}"
+        )
+
+        try:
+            await self.client.subscribe_contract(
+                cid,
+                lambda msg, _cid=cid: asyncio.create_task(self._on_contract_result(_cid, msg)))
+        except Exception as exc:
+            logger.warning(f"subscribe_contract({cid}) for ALT reversal: {exc}")
+
+        # Re-arm the ALT method watch on the NEW contract too — it will
+        # refuse to reverse again since alt_reversals already reflects the
+        # cap (see max_reversals check at the top of _monitor_alt_method).
+        asyncio.create_task(self._monitor_alt_method(cid))
