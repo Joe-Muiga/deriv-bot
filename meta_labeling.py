@@ -43,6 +43,7 @@ import json
 import logging
 import math
 import os
+import random
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -717,6 +718,57 @@ class PredictionLog:
             )
 
 
+# ── BAYESIAN TAKE/INVERT BANDIT (win-rate pass, Aug 2026) ────────────────
+# User-directed replacement for the enriched-feature EV-gate below: build
+# purely from this account's own realized TAKE-vs-INVERT outcomes per
+# symbol (strategy_stats.get_take_invert_stats()) — no other data, no
+# generic priors borrowed from elsewhere. A Beta(1,1) prior is the
+# standard maximally-uncertain starting point (uniform over [0,1]), not a
+# borrowed opinion about what a "good" win rate looks like.
+#
+# Why this replaces the old 30-row logistic-regression EV-gate for this
+# specific decision: that model needed EV_MIN_FEATURE_ROWS=30 rows before
+# it would even attempt a fit, and evaluated a 5-feature (rsi/roc/etc.)
+# regression — appropriate for a richer "should I take THIS specific
+# setup" question, but overkill and slow for the simpler binary question
+# "does TAKE or INVERT perform better on this symbol overall". A
+# Beta-Bernoulli comparison needs far less data to say something useful
+# (naturally humble — wide, low-confidence posteriors — with a handful of
+# trades; naturally confident once enough accumulate), with no feature
+# vector required at all, matching the user's repeated ask for faster
+# reaction to real evidence. The old EV-gate/_PairEVModel infrastructure
+# is left in place (unused by this decision now) rather than deleted, in
+# case a richer model is worth revisiting once far more data exists.
+
+def _beta_posterior_mean(wins: int, losses: int) -> float:
+    """Beta(1,1) uniform prior -> posterior mean = (1+wins)/(2+wins+losses)."""
+    alpha = 1 + wins
+    beta = 1 + losses
+    return alpha / (alpha + beta)
+
+
+def _prob_a_beats_b(wins_a: int, losses_a: int, wins_b: int, losses_b: int,
+                     n_samples: int = 4000) -> float:
+    """
+    Monte Carlo estimate of P(p_a > p_b), where p_a ~ Beta(1+wins_a,
+    1+losses_a) and p_b ~ Beta(1+wins_b, 1+losses_b) are independent
+    Beta(1,1)-prior posteriors over each mode's true win rate. This is
+    "how confident can we be that mode A's real win rate exceeds mode
+    B's, given only the trades observed so far" — wide posteriors (few
+    trades) naturally pull this toward 0.5 regardless of the point
+    estimate; narrow posteriors (many trades) let it approach 0 or 1.
+    No hand-tuned sample-size cliff — the uncertainty is priced in
+    directly by the shape of each Beta distribution.
+    """
+    alpha_a, beta_a = 1 + wins_a, 1 + losses_a
+    alpha_b, beta_b = 1 + wins_b, 1 + losses_b
+    a_wins = 0
+    for _ in range(n_samples):
+        if random.betavariate(alpha_a, beta_a) > random.betavariate(alpha_b, beta_b):
+            a_wins += 1
+    return a_wins / n_samples
+
+
 # ── MODULE-LEVEL SINGLETONS ────────────────────────────────────────────
 _model = MetaLabelingModel()
 _prediction_log = PredictionLog()
@@ -729,11 +781,7 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     """
     features must contain: "strategy", "symbol", "entry_score".
     Optional: "timestamp" (defaults to now), "recent_win_rate" / "streak"
-    if the caller wants to override the live-computed values (useful for
-    offline backtesting against a specific historical point), and
-    "multiplier" / "atr_pct" / "regime" (Implementation Brief v4 §5.1 —
-    default 0.0 / 0.0 / "NONE", only meaningful for
-    config.VOL_MULTIPLIER_SYMBOLS trades).
+    if the caller wants to override the live-computed values.
 
     Returns (action, confidence):
       action "TAKE"   — follow the signal's original direction
@@ -741,39 +789,40 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
                          (see config.py's SIGNAL DIRECTION INVERSION section)
 
     Every SYMBOL has a DEFAULT action (config.META_LABEL_DEFAULT_ACTION_BY_SYMBOL,
-    fallback config.META_LABEL_DEFAULT_ACTION_FALLBACK) — currently "TAKE"
-    for the "1HZ..." volatility symbols, "INVERT" for BOOM/CRASH symbols
-    and the remaining VOL_MULTIPLIER_SYMBOLS (R_xx, stpRNG). This is a
-    per-SYMBOL default, not per-strategy — 1HZ50V and R_50 both trade
-    under VOL_BREAKOUT/VOL_REV_MULT but can (and currently do) have
-    different defaults. A trade is never skipped outright; the gate only
-    ever chooses between the symbol's default action and its opposite.
-    The gate only moves off the default once the per-pair EV model has
-    enough history (META_LABEL_EV_MIN_FEATURE_ROWS rows) to show real
-    evidence the opposite is the better bet AND that evidence clears its
-    confidence bar (TAKE_MIN_CONFIDENCE / INVERT_MIN_CONFIDENCE,
-    whichever applies). Below that data threshold, this always returns the
-    symbol's default action at confidence 1.0 — a pass-through/policy marker,
-    not a calibrated probability. See config.py's per-symbol default
-    section for why INVERT is the default for most volatility symbols —
-    that starting posture is a deliberate choice informed by already-
-    observed aggregate performance, not something derived from this
-    specific symbol's own (as-yet insufficient) history.
+    fallback config.META_LABEL_DEFAULT_ACTION_FALLBACK). A trade is never
+    skipped outright; this only ever chooses between the symbol's default
+    action and its opposite.
+
+    REWRITTEN (win-rate pass, Aug 2026): per user request, this now uses a
+    Bayesian Beta-Bernoulli bandit (see _beta_posterior_mean() /
+    _prob_a_beats_b() above) built ONLY from this symbol's own realized
+    TAKE-vs-INVERT outcomes (strategy_stats.get_take_invert_stats()) —
+    replacing the old enriched-feature EV-gate (_ev_model /
+    _PairEVModel), which needed 30 feature rows before attempting
+    anything. The bandit needs far less data to say something useful,
+    with uncertainty priced in automatically by each mode's Beta
+    posterior width rather than a hand-tuned row-count cliff:
+      1. Pull (wins_take, losses_take, wins_invert, losses_invert) for
+         this symbol across all strategies that trade it.
+      2. If the OVERRIDE mode (whichever ISN'T the default) has at least
+         BAYESIAN_MIN_SAMPLES_FOR_OVERRIDE trades, compute
+         P(override mode's true win rate > default mode's) via Monte
+         Carlo sampling from both Beta posteriors.
+      3. Switch to the override mode only if that probability clears
+         BAYESIAN_OVERRIDE_CONFIDENCE. Otherwise stay on the default.
+    Below the minimum sample count, always returns the default at
+    confidence 1.0 — a pass-through/policy marker, not a calibrated
+    probability. No enriched features, no external data — purely this
+    symbol's own win/loss history.
     """
     strategy = str(features["strategy"])
     symbol = str(features["symbol"])
     entry_score = float(features["entry_score"])
     timestamp = float(features.get("timestamp", time.time()))
-    multiplier = float(features.get("multiplier", 0.0))
-    atr_pct = float(features.get("atr_pct", 0.0))
-    regime = str(features.get("regime", "NONE"))
-    enriched = {k: features[k] for k in ENRICHED_FEATURE_KEYS if k in features}
 
     default_action = getattr(config, "META_LABEL_DEFAULT_ACTION_BY_SYMBOL", {}).get(
         symbol, getattr(config, "META_LABEL_DEFAULT_ACTION_FALLBACK", "TAKE"))
     override_action = "INVERT" if default_action == "TAKE" else "TAKE"
-    override_min_conf = getattr(
-        config, "INVERT_MIN_CONFIDENCE" if override_action == "INVERT" else "TAKE_MIN_CONFIDENCE", 0.65)
 
     if "recent_win_rate" in features and "streak" in features:
         recent_win_rate = float(features["recent_win_rate"])
@@ -782,99 +831,49 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
         results_desc = _load_recent_results_for_pair(strategy, symbol, ROLLING_WINDOW)
         recent_win_rate, streak = _win_rate_and_streak(list(reversed(results_desc)), ROLLING_WINDOW)
 
-    # ── Expected-value gate on enriched features (Implementation Brief v6,
-    # PART 5). Once this (strategy, symbol) pair has logged enough feature
-    # rows (EV_MIN_FEATURE_ROWS) to fit a model on, gate on expected value
-    # — p_hat * b_realized - (1 - p_hat), using the realized win-payout
-    # ratio from strategy_stats — instead of a fixed confidence cutoff.
-    # Below that row count, or with no realized payout data yet, this
-    # falls straight through to the pass-through/global-model logic below.
-    #
-    # p_hat_ev is always P(win | ORIGINAL direction) — that's what the
-    # model is trained on (see _PairEVModel._fit()'s inverted-label
-    # correction). p_hat for whichever direction is TAKE vs INVERT is
-    # derived from that single estimate below.
-    if enriched:
-        try:
-            p_hat_ev = _ev_model.predict_proba(strategy, symbol, enriched)
-        except Exception as exc:
-            logger.warning(f"EV meta-model failed for {strategy}/{symbol}: {exc}")
-            p_hat_ev = None
+    action, confidence, bypassed = default_action, 1.0, True
 
-        if p_hat_ev is not None:
-            try:
-                avg_ratio = strategy_stats.stats.get_avg_win_payout_ratio(strategy, symbol)
-            except Exception:
-                avg_ratio = None
+    try:
+        tis = strategy_stats.stats.get_take_invert_stats(symbol)
+        wins_take, losses_take = tis["wins_take"], tis["losses_take"]
+        wins_invert, losses_invert = tis["wins_invert"], tis["losses_invert"]
+        n_override = (wins_invert + losses_invert) if override_action == "INVERT" \
+            else (wins_take + losses_take)
+        min_samples = getattr(config, "BAYESIAN_MIN_SAMPLES_FOR_OVERRIDE", 8)
 
-            if avg_ratio is not None:
-                b_realized = avg_ratio - 1.0
-                p_hat_take = p_hat_ev
-                p_hat_invert = 1.0 - p_hat_ev
-                ev_take = p_hat_take * b_realized - (1.0 - p_hat_take)
-                # SIGNAL DIRECTION INVERSION (see config.py): ev_invert
-                # approximates the inverted direction's expected value
-                # using p_hat_invert and the SAME realized payout ratio as
-                # the original direction — an approximation, see config.py.
-                ev_invert = p_hat_invert * b_realized - (1.0 - p_hat_invert)
-                ev_margin = getattr(config, "META_LABEL_EV_MARGIN", 0.03)
+        if n_override >= min_samples:
+            if override_action == "INVERT":
+                prob_override_better = _prob_a_beats_b(wins_invert, losses_invert, wins_take, losses_take)
+            else:
+                prob_override_better = _prob_a_beats_b(wins_take, losses_take, wins_invert, losses_invert)
 
-                p_hat_override = p_hat_invert if override_action == "INVERT" else p_hat_take
-                ev_override = ev_invert if override_action == "INVERT" else ev_take
-                invert_enabled = getattr(config, "META_LABEL_INVERT_ENABLED", False)
+            override_min_conf = getattr(config, "BAYESIAN_OVERRIDE_CONFIDENCE", 0.80)
+            bypassed = False
+            if prob_override_better >= override_min_conf:
+                action, confidence = override_action, prob_override_better
+            else:
+                action = default_action
+                confidence = _beta_posterior_mean(wins_take, losses_take) if default_action == "TAKE" \
+                    else _beta_posterior_mean(wins_invert, losses_invert)
 
-                if (override_action == "TAKE" or invert_enabled) and \
-                        ev_override > ev_margin and p_hat_override >= override_min_conf:
-                    action, confidence = override_action, p_hat_override
-                else:
-                    action = default_action
-                    confidence = p_hat_take if default_action == "TAKE" else p_hat_invert
+            logger.info(
+                "BAYESIAN BANDIT: %s default=%s override=%s p(override_better)=%.3f "
+                "(take:%dW/%dL invert:%dW/%dL) -> action=%s",
+                symbol, default_action, override_action, prob_override_better,
+                wins_take, losses_take, wins_invert, losses_invert, action,
+            )
+        # else: override mode doesn't have enough of its own trades yet —
+        # stay on default, confidence stays the 1.0 pass-through marker.
+    except Exception as exc:
+        logger.warning(f"Bayesian TAKE/INVERT bandit failed for {symbol}: {exc}")
+        action, confidence, bypassed = default_action, 1.0, True
 
-                logger.info(
-                    "EV-GATE: %s/%s default=%s p_hat_take=%.3f p_hat_invert=%.3f "
-                    "ev_take=%.4f ev_invert=%.4f -> action=%s",
-                    strategy, symbol, default_action, p_hat_take, p_hat_invert,
-                    ev_take, ev_invert, action,
-                )
-                _prediction_log.insert(
-                    strategy=strategy, symbol=symbol, entry_score=entry_score,
-                    recent_win_rate=recent_win_rate, streak=streak,
-                    take=True, confidence=confidence,
-                    bypassed=False, timestamp=timestamp,
-                )
-                return action, confidence
-            # No realized payout data yet for this pair — fall through to
-            # the pass-through logic below rather than gating on an
-            # unknown b.
-
-    # ── Insufficient per-pair data — return this symbol's default action
-    # (see config.py's META_LABEL_DEFAULT_ACTION_BY_SYMBOL). confidence=1.0
-    # is a pass-through/policy marker here, not a calibrated probability —
-    # see this function's docstring for why INVERT-by-default is a
-    # directional choice, not a data-driven one, until enough history exists.
-    #
-    # CORRECTION (win-rate pass, Aug 2026): this branch used to also check
-    # `total < config.META_LABEL_MIN_TRADES` (a bot-wide trade count) and
-    # fall through to a separate global entry-score-based classifier above
-    # that threshold. That global model predates the per-symbol default
-    # concept and only ever knew how to return TAKE/SKIP, never INVERT —
-    # keeping it would have meant a symbol briefly defaulting correctly
-    # below 200 bot-wide trades, then silently reverting to a
-    # TAKE/SKIP-only global model above that count, before the per-pair EV
-    # model (which does know about per-symbol defaults) had enough of ITS
-    # OWN data. Simpler and more consistent: below EV_MIN_FEATURE_ROWS for
-    # this specific symbol, always its stated default — one rule, no
-    # in-between model with different semantics.
-    logger.info(
-        "insufficient per-pair data for %s/%s — using default action=%s",
-        strategy, symbol, default_action,
-    )
     _prediction_log.insert(
         strategy=strategy, symbol=symbol, entry_score=entry_score,
-        recent_win_rate=None, streak=None, take=True, confidence=1.0,
-        bypassed=True, timestamp=timestamp,
+        recent_win_rate=recent_win_rate, streak=streak,
+        take=True, confidence=confidence, bypassed=bypassed, timestamp=timestamp,
     )
-    return default_action, 1.0
+    return action, confidence
 
 
 def record_outcome(strategy: str, symbol: str, won: bool,
