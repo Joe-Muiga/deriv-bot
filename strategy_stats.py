@@ -476,6 +476,199 @@ class StrategyStats:
         out.sort(key=lambda d: (d["strategy"], d["symbol"]))
         return out
 
+    def get_take_invert_stats(self, symbol: str, window: int = 500) -> dict:
+        """
+        Aggregates realized win/loss counts for `symbol`, split by whether
+        each trade was executed as TAKE (features["inverted"] is False or
+        missing) or INVERT (features["inverted"] is True) — across ALL
+        strategies that trade this symbol, since
+        config.META_LABEL_DEFAULT_ACTION_BY_SYMBOL is a per-symbol (not
+        per-strategy) default and the same symbol can trade under more
+        than one strategy (e.g. VOL_BREAKOUT vs VOL_REV_MULT for the same
+        VOL_MULTIPLIER_SYMBOLS entry, depending on regime).
+
+        Used by meta_labeling.py's Bayesian TAKE-vs-INVERT bandit — this
+        is the ONLY data it trains on (no borrowed/generic priors, no
+        other symbols' data, just this symbol's own realized outcomes).
+        Rows with no features JSON (pre-dating the "inverted" field) are
+        skipped rather than guessed at.
+
+        Returns {"wins_take", "losses_take", "wins_invert", "losses_invert"}.
+        """
+        with self._lock:
+            rows = self._backend.all_trades_full(window=window)
+        wins_take = losses_take = wins_invert = losses_invert = 0
+        for (_strategy, sym, won, _stake, _payout, _ts, features_json) in rows:
+            if sym != symbol or not features_json:
+                continue
+            try:
+                decoded = json.loads(features_json)
+            except (TypeError, ValueError):
+                continue
+            if "inverted" not in decoded:
+                continue
+            if bool(decoded["inverted"]):
+                if won:
+                    wins_invert += 1
+                else:
+                    losses_invert += 1
+            else:
+                if won:
+                    wins_take += 1
+                else:
+                    losses_take += 1
+        return {
+            "wins_take": wins_take, "losses_take": losses_take,
+            "wins_invert": wins_invert, "losses_invert": losses_invert,
+        }
+
+    def get_dashboard_analytics(
+        self,
+        scaled_account_balance: float = 20.0,
+        scaled_stake: float = 1.0,
+    ) -> dict:
+        """
+        Dashboard analytics requested by the user (Aug 2026): a %P&L-of-
+        staked figure/graph, a profit-factor graph, and a "what if I were
+        trading a $20 account staking $1/trade" projection. Computed fresh
+        from full trade history each call — fine at demo-account trade
+        volumes, not optimized for high-frequency re-polling at scale.
+
+        Returns:
+          total_trades, total_staked, total_pnl
+          pct_pnl_of_staked: (total_pnl / total_staked) * 100, exactly as
+            requested. NOT the same as return-on-balance — this is P&L
+            relative to money actually put at risk across all trades,
+            which differs from balance growth % whenever stake size
+            varies trade to trade (it does here — stake scales with
+            balance/Kelly).
+          profit_factor_series: [{"timestamp", "profit_factor"}, ...] —
+            the CUMULATIVE profit factor (gross profit / gross loss) as
+            of each trade's close, in chronological order. A single
+            point-in-time number isn't a graph; this is the running value
+            so the dashboard can chart its trend over time.
+          scaled_account: a replay of the REAL trade sequence — same wins
+            and losses, in the same order — at a fixed $`scaled_stake`
+            per trade against a starting balance of
+            $`scaled_account_balance`. Each trade's real payout RATIO
+            (payout / stake, e.g. 1.9x) is applied to the fixed scaled
+            stake, so a trade that returned 1.9x on its real ~$40 stake
+            also returns 1.9x on the $1 scaled stake — a faithful replay
+            of what actually happened, not a resimulated/hypothetical
+            market. Compounds: each trade's scaled P&L is added to the
+            running scaled balance before the next trade, matching "if
+            I'm not withdrawing profits".
+          growth_projection: LINEAR extrapolation of the scaled account's
+            OBSERVED average $ P&L per trade x observed trades/day
+            (computed from real trade timestamps) out to 1 day/week/month.
+            This is explicitly not a forecast or guarantee — it assumes
+            future trades behave statistically like past ones, which
+            isn't certain, and win rate/edge can and does change over
+            time, especially on this little history. See its "basis"
+            field, which restates this every time it's read.
+        """
+        with self._lock:
+            rows = self._backend.all_trades_full()  # newest-first
+
+        if not rows:
+            return {
+                "total_trades": 0, "total_staked": 0.0, "total_pnl": 0.0,
+                "pct_pnl_of_staked": 0.0, "pct_pnl_series": [], "profit_factor_series": [],
+                "scaled_account": None, "growth_projection": None,
+                "note": "No trade history yet.",
+            }
+
+        rows_chrono = list(reversed(rows))  # oldest-first for time-series work
+
+        total_staked = sum(r[3] for r in rows_chrono)
+        total_pnl = sum((r[4] - r[3]) for r in rows_chrono)
+        pct_pnl_of_staked = (total_pnl / total_staked * 100.0) if total_staked > 0 else 0.0
+
+        # ── Cumulative profit-factor AND %P&L-of-staked series ────────
+        # Both computed in the same pass since they walk the same
+        # chronological trade list.
+        profit_factor_series = []
+        pct_pnl_series = []
+        cum_gp, cum_gl = 0.0, 0.0
+        cum_staked, cum_pnl = 0.0, 0.0
+        for (_strategy, _symbol, _won, stake, payout, ts, _features) in rows_chrono:
+            pnl = payout - stake
+            if pnl > 0:
+                cum_gp += pnl
+            else:
+                cum_gl += -pnl
+            pf = (cum_gp / cum_gl) if cum_gl > 0 else (float("inf") if cum_gp > 0 else 0.0)
+            profit_factor_series.append({"timestamp": ts, "profit_factor": pf})
+
+            cum_staked += stake
+            cum_pnl += pnl
+            pct = (cum_pnl / cum_staked * 100.0) if cum_staked > 0 else 0.0
+            pct_pnl_series.append({"timestamp": ts, "pct_pnl_of_staked": round(pct, 4)})
+
+        # ── Scaled $20 / $1-per-trade replay ─────────────────────────
+        scaled_balance = scaled_account_balance
+        scaled_series = [{"timestamp": rows_chrono[0][5], "balance": round(scaled_balance, 4)}]
+        scaled_pnl_total = 0.0
+        for (_strategy, _symbol, _won, stake, payout, ts, _features) in rows_chrono:
+            ratio = (payout / stake) if stake > 0 else 0.0
+            scaled_pnl = (scaled_stake * ratio) - scaled_stake
+            scaled_balance += scaled_pnl
+            scaled_pnl_total += scaled_pnl
+            scaled_series.append({"timestamp": ts, "balance": round(scaled_balance, 4)})
+
+        scaled_pct_return = (
+            (scaled_pnl_total / scaled_account_balance * 100.0)
+            if scaled_account_balance > 0 else 0.0
+        )
+
+        # ── Growth projection — linear extrapolation of the observed rate
+        first_ts = rows_chrono[0][5]
+        last_ts = rows_chrono[-1][5]
+        span_days = max((last_ts - first_ts) / 86400.0, 1.0 / 1440.0)  # floor ~1min, avoid /0
+        trades_per_day = len(rows_chrono) / span_days
+        avg_pnl_per_trade_scaled = scaled_pnl_total / len(rows_chrono)
+        avg_daily_pnl_scaled = avg_pnl_per_trade_scaled * trades_per_day
+
+        growth_projection = {
+            "basis": (
+                "Linear extrapolation of this account's OBSERVED average $ "
+                "P&L per trade x observed trades/day over the logged history. "
+                "Not a forecast or guarantee — assumes future trades behave "
+                "statistically like past ones."
+            ),
+            "observed_trades_per_day": round(trades_per_day, 2),
+            "observed_avg_pnl_per_trade_usd": round(avg_pnl_per_trade_scaled, 4),
+            "projected_pnl_1_day":   round(avg_daily_pnl_scaled, 4),
+            "projected_pnl_1_week":  round(avg_daily_pnl_scaled * 7, 4),
+            "projected_pnl_1_month": round(avg_daily_pnl_scaled * 30, 4),
+            # Floored at 0 — a real account can't go negative; at the
+            # current observed rate this projection can imply a wipeout
+            # well before 1 month, which is itself an important thing for
+            # the dashboard to show plainly rather than a misleading
+            # negative number.
+            "projected_balance_1_day":   round(max(0.0, scaled_balance + avg_daily_pnl_scaled), 4),
+            "projected_balance_1_week":  round(max(0.0, scaled_balance + avg_daily_pnl_scaled * 7), 4),
+            "projected_balance_1_month": round(max(0.0, scaled_balance + avg_daily_pnl_scaled * 30), 4),
+        }
+
+        return {
+            "total_trades": len(rows_chrono),
+            "total_staked": round(total_staked, 4),
+            "total_pnl": round(total_pnl, 4),
+            "pct_pnl_of_staked": round(pct_pnl_of_staked, 4),
+            "pct_pnl_series": pct_pnl_series,
+            "profit_factor_series": profit_factor_series,
+            "scaled_account": {
+                "starting_balance": scaled_account_balance,
+                "stake_per_trade": scaled_stake,
+                "final_balance": round(scaled_balance, 4),
+                "total_pnl": round(scaled_pnl_total, 4),
+                "pct_return": round(scaled_pct_return, 4),
+                "balance_series": scaled_series,
+            },
+            "growth_projection": growth_projection,
+        }
+
     @property
     def backend_name(self) -> str:
         return self._backend_name
