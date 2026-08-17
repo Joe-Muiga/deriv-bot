@@ -10,13 +10,18 @@ Implements a rolling, live version of the triple-barrier / meta-labeling
 method (Lopez de Prado, *Advances in Financial Machine Learning*):
 
   1. Rule-based trailing layer (always active, needs no training data):
+     - Early loss cap (Aug 2026): independent of arm state — once past a
+       short grace window, forces CLOSE_NOW if the loss reaches
+       EXIT_LOSS_CAP_FRACTION * static_sl_amount, realizing a small
+       fraction of the worst-case static loss instead of riding it out
+       in full. Checked first, every tick.
      - Arms once profit crosses EXIT_ARM_PROFIT_FRACTION * static_tp_amount.
      - Once armed, proposes tighter stop-loss updates that lock in
        EXIT_TRAIL_LOCK_FRACTION * peak_profit (never loosens risk).
      - Once armed, forces CLOSE_NOW if profit decays to
        EXIT_DECAY_CLOSE_FRACTION * peak_profit.
-     - Before arming, this layer is a no-op; the static SL/TP set at buy
-       time are the only bounds in effect.
+     - Before arming and above the loss cap, this layer is a no-op; the
+       static SL/TP set at buy time are the only other bounds in effect.
 
   2. Lightweight ML layer (inert until META_LABEL_MIN_TRADES closed
      contracts have been logged by this module):
@@ -235,7 +240,7 @@ def decide_exit(
             )
             state = _contract_states[contract_id]
 
-        rule_decision = _rule_layer_decide(state, current_profit)
+        rule_decision = _rule_layer_decide(state, current_profit, elapsed_secs)
 
         final_decision = rule_decision
         if rule_decision.action != "CLOSE_NOW":
@@ -254,10 +259,31 @@ def decide_exit(
         return ExitDecision("HOLD", None, f"error_fallback: {exc}")
 
 
-def _rule_layer_decide(state: _ContractState, current_profit: float) -> ExitDecision:
+def _rule_layer_decide(state: _ContractState, current_profit: float, elapsed_secs: float) -> ExitDecision:
     arm_fraction = config.EXIT_ARM_PROFIT_FRACTION
     lock_fraction = config.EXIT_TRAIL_LOCK_FRACTION
     decay_fraction = config.EXIT_DECAY_CLOSE_FRACTION
+
+    # ── Early loss cap (user-directed, Aug 2026: "take low losses, keep
+    # the magnitude minimal"). Runs BEFORE the arm gate below and applies
+    # whether or not the trade ever arms — previously a losing trade that
+    # never reached profit had zero active management here and could ride
+    # all the way out to the full static_sl_amount (STOP_LOSS_MAP's
+    # 30-70% of stake). This closes it early once the loss reaches a
+    # small fraction of that static budget instead. Never loosens or
+    # overrides the static stop-loss itself — only ever exits SOONER.
+    if getattr(config, "EXIT_LOSS_CAP_ENABLED", False) and current_profit < 0:
+        grace_secs = getattr(config, "EXIT_LOSS_CAP_GRACE_SECS", 20)
+        if elapsed_secs >= grace_secs and state.static_sl_amount > 0:
+            loss_cap_fraction = getattr(config, "EXIT_LOSS_CAP_FRACTION", 0.25)
+            loss_cap_amount = loss_cap_fraction * state.static_sl_amount
+            if current_profit <= -loss_cap_amount:
+                return ExitDecision(
+                    "CLOSE_NOW", None,
+                    f"loss_cap: profit={current_profit:.2f} <= "
+                    f"-{loss_cap_fraction:.2f}*static_sl({state.static_sl_amount:.2f})"
+                    f"={-loss_cap_amount:.2f}",
+                )
 
     arm_threshold = arm_fraction * state.static_tp_amount
 
