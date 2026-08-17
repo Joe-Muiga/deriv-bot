@@ -474,19 +474,28 @@ TAKE_PROFIT_RATIO = 2.5
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
-MIN_STAKE            = 5      # safety floor only. FIX (profitability audit):
-                                # was 100, which is ABOVE what 0.5% of a
-                                # typical account (~$8-9k -> $40-45) works
-                                # out to. That meant every single trade was
-                                # silently forced to the $100 floor instead
-                                # of the balance-based/Kelly-adjusted stake —
-                                # dashboard history confirms every logged
-                                # trade was exactly $100.00 regardless of
-                                # signal strength or edge. Set safely below
-                                # BASE_STAKE_PCT × balance for realistic
-                                # account sizes so PLS/Kelly sizing actually
-                                # drives stake again; raise only if you want
-                                # a higher effective per-trade minimum.
+MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
+                                # IMPORTANT — read before assuming this is a
+                                # harmless safety floor: base_stake =
+                                # max(BASE_STAKE_PCT × balance, MIN_STAKE),
+                                # so this isn't just a backstop for a small
+                                # account — on the current ~$8.7-8.9k demo
+                                # balance, 0.5% works out to ~$43-45, which
+                                # is BELOW $100, so every single trade will
+                                # now be forced to exactly $100 flat,
+                                # overriding the balance/Kelly-adjusted size
+                                # entirely — the exact failure mode this
+                                # comment previously warned about when this
+                                # was last set to 100 (see git history /
+                                # prior comment: "every logged trade was
+                                # exactly $100.00 regardless of signal
+                                # strength or edge"). Implemented as
+                                # instructed since the request was explicit,
+                                # but flagged here so it's an informed choice
+                                # rather than a surprise the next time this
+                                # file is read. If flat $100 stakes weren't
+                                # the intent, lower this back down and let
+                                # BASE_STAKE_PCT/Kelly drive sizing instead.
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
 DAILY_LOSS_LIMIT_PCT = 0.06    # FIX: was 0.15 (15%) — too loose to act as a
                                 # real circuit breaker. 6% is a more typical
@@ -852,75 +861,72 @@ INVERT_MIN_CONFIDENCE     = 0.65  # only invert when the OPPOSITE direction's
 # regenerated away if the base rule above is ever rebuilt from the symbol
 # lists again.
 META_LABEL_DEFAULT_ACTION_BY_SYMBOL: dict = {
-    **{s: "TAKE" for s in VOL_MULTIPLIER_SYMBOLS if s.startswith("1HZ") and s != "1HZ50V"},
-    **{s: "INVERT" for s in BOOM_CRASH},
-    **{s: "INVERT" for s in VOL_MULTIPLIER_SYMBOLS if not s.startswith("1HZ") and s != "R_75"},
-    # Explicit per-symbol overrides (see REFINEMENT note above) — applied
-    # last so they win regardless of the general rules above. This is the
-    # current, final state (not a diff/history of prior rounds):
+    **{s: "TAKE" for s in VOL_MULTIPLIER_SYMBOLS if s.startswith("1HZ")},
+    # REVERTED (win-rate pass, Aug 2026): BOOM_CRASH was set to INVERT by
+    # explicit user request earlier this session. Fresh trade data since
+    # then (uploaded dashboard screenshots) shows BOOM_CRASH at ~28.6%
+    # win rate (2W/5L) under INVERT — a stark reversal from the ~73.3%
+    # win rate (11W/4L) it had under TAKE earlier in this same session,
+    # before any of these changes. That's exactly the signature you'd
+    # expect if the original BOOM_CRASH signal has genuine positive edge:
+    # inverting a strategy that's actually skilled turns a good edge into
+    # a bad one. Reverted back to TAKE on that evidence. (Small sample
+    # either way — ~8-15 trades per period — so keep an eye on this as
+    # more data accumulates, but the direction and size of the swing is a
+    # strong enough signal to act on now rather than wait.)
+    **{s: "TAKE" for s in BOOM_CRASH},
+    **{s: "INVERT" for s in VOL_MULTIPLIER_SYMBOLS if not s.startswith("1HZ")},
+    # Explicit per-symbol overrides — applied last so they win regardless
+    # of the general rules above. This is the current, final state (not a
+    # diff/history of prior rounds):
     "R_10":     "INVERT",
     "R_25":     "TAKE",
     "1HZ10V":   "TAKE",
     "1HZ25V":   "INVERT",
     "1HZ75V":   "INVERT",
     "1HZ100V":  "TAKE",
-    # R_100 not listed here -> falls through to the general VOL_MULTIPLIER
-    # rule above (INVERT)... except R_100 was itself previously set to
-    # TAKE by explicit user request and this message didn't mention it,
-    # so it's carried forward explicitly rather than silently reverting:
     "R_100":    "TAKE",
-    # R_75 and 1HZ50V are deliberately absent from this map — see the ALT
-    # METHOD section below. Neither TAKE nor INVERT is hardcoded as their
-    # default; they're decided live, every second, by rule-based analysis.
+    # ALT METHOD REMOVED (win-rate pass, Aug 2026, per explicit user
+    # request: "strictly either take or invert, no ALT"). R_75 and
+    # 1HZ50V now get plain defaults like every other symbol, same as the
+    # general VOL_MULTIPLIER_SYMBOLS rule above would already give them
+    # (R_75 -> INVERT via the non-"1HZ" branch, 1HZ50V -> TAKE via the
+    # "1HZ" branch) — listed explicitly here anyway so the fact that they
+    # WERE special-cased is visible in the diff rather than silently
+    # disappearing. The Bayesian bandit below (not the old ALT method)
+    # is what now gets a chance to move either of these off its default,
+    # same mechanism as every other symbol, once it has its own evidence.
+    "R_75":     "INVERT",
+    "1HZ50V":   "TAKE",
 }
 # Fallback for any symbol not explicitly listed above (e.g. JD10-JD100,
 # RDBEAR/RDBULL — strategies where INVERT isn't even applicable, see
 # bot_engine._execute()'s contract_kind guard) — TAKE, i.e. behave as
 # though this whole feature didn't exist for them.
 META_LABEL_DEFAULT_ACTION_FALLBACK = "TAKE"
-TAKE_MIN_CONFIDENCE = 0.65  # mirror of INVERT_MIN_CONFIDENCE below, for
-                             # symbols whose default is INVERT: only
-                             # override back to the ORIGINAL direction once
-                             # its estimated win probability clears this
 
-# ── ALT METHOD (win-rate/drawdown pass, Aug 2026) ─────────────────────────
-# User-directed design for R_75 and 1HZ50V specifically: per the user's
-# own review, these two symbols show roughly 50/50 performance under both
-# TAKE and INVERT — i.e. neither default has a real edge for them, unlike
-# every other symbol above. So they get NEITHER a static default NOR the
-# AI/ML EV-gate (that needs far more history than exists yet). Instead:
-# once a trade is open on one of these two symbols, bot_engine.py's
-# _monitor_alt_method() polls it every ALT_METHOD_POLL_INTERVAL_SECS and,
-# using purely deterministic/statistical rules (explicitly NOT AI/ML —
-# the user's own distinction: "ALT method", reserved for AI/ML once there
-# is sufficient data), closes the position early and immediately reopens
-# the OPPOSITE direction the moment there's a real, sustained sign the
-# current position is failing. Two conditions must BOTH hold before this
-# ever fires — see _monitor_alt_method()'s docstring for the exact math:
-#   1. loss_fraction (how much of the position's stop-loss budget is
-#      already consumed) clears ALT_METHOD_LOSS_FRACTION_TRIGGER — a
-#      fresh trade wobbling near breakeven is never touched.
-#   2. Over the last ALT_METHOD_TREND_WINDOW_SECS of 1-second snapshots,
-#      the fraction of consecutive profit deltas that are negative clears
-#      ALT_METHOD_NEGATIVE_SLOPE_MAJORITY — one noisy downtick doesn't
-#      trigger this, a sustained slide does.
-# Capped at ALT_METHOD_MAX_REVERSALS_PER_TRADE reversals per original
-# entry so a genuinely choppy market can't whipsaw the account through
-# repeated flips, each one paying the spread/slippage cost again.
-ALT_METHOD_SYMBOLS = {"R_75", "1HZ50V"}
-ALT_METHOD_POLL_INTERVAL_SECS       = 1     # "every second", as requested
-ALT_METHOD_LOSS_FRACTION_TRIGGER    = 0.50  # must be at least half-way to
-                                              # the static stop-loss before
-                                              # anything else is considered
-ALT_METHOD_TREND_WINDOW_SECS        = 8     # lookback window for the
-                                              # sustained-decline check
-ALT_METHOD_MIN_SAMPLES              = 5     # minimum snapshots in that
-                                              # window before trusting it
-ALT_METHOD_NEGATIVE_SLOPE_MAJORITY  = 0.70  # >=70% of deltas in the window
-                                              # must be negative
-ALT_METHOD_MAX_REVERSALS_PER_TRADE  = 1     # hard cap — never chain a
-                                              # second reversal off a
-                                              # reversal
+# ── BAYESIAN TAKE/INVERT BANDIT (win-rate pass, Aug 2026) ─────────────────
+# User-directed replacement for the old enriched-feature EV-gate AND for
+# the ALT method (both removed): meta_labeling.py's predict_take_trade()
+# now compares each symbol's own realized TAKE vs INVERT win/loss counts
+# (strategy_stats.get_take_invert_stats() — no other data, no borrowed
+# priors) via a Beta-Bernoulli posterior comparison, and only switches a
+# symbol off its default once there's real, appropriately-humble
+# statistical confidence the other mode is actually better. See
+# meta_labeling.py's _prob_a_beats_b() for the exact math.
+BAYESIAN_MIN_SAMPLES_FOR_OVERRIDE = 8     # the OVERRIDE mode (not the
+                                            # default) needs at least this
+                                            # many of its own trades before
+                                            # its posterior is trusted at all
+BAYESIAN_OVERRIDE_CONFIDENCE      = 0.80  # P(override mode's true win rate
+                                            # > default mode's) must clear
+                                            # this before switching — a real
+                                            # posterior probability, not a
+                                            # raw point-estimate threshold,
+                                            # so it's automatically stricter
+                                            # with fewer trades and looser
+                                            # with more, no separate
+                                            # sample-size rule needed
 
 
 # ── POSITION SIZING (Kelly) ───────────────────────────────────
