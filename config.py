@@ -879,13 +879,17 @@ META_LABEL_DEFAULT_ACTION_BY_SYMBOL: dict = {
     # Explicit per-symbol overrides — applied last so they win regardless
     # of the general rules above. This is the current, final state (not a
     # diff/history of prior rounds):
-    "R_10":     "INVERT",
+    # UPDATED (Aug 2026, explicit user request): R_10 -> TAKE, 1HZ25V ->
+    # TAKE, R_100 -> INVERT. This flips R_10/R_100 back from their prior
+    # swap earlier this session and moves 1HZ25V off the general "1HZ ->
+    # TAKE" rule above.
+    "R_10":     "TAKE",
     "R_25":     "TAKE",
     "1HZ10V":   "TAKE",
-    "1HZ25V":   "INVERT",
+    "1HZ25V":   "TAKE",
     "1HZ75V":   "INVERT",
     "1HZ100V":  "TAKE",
-    "R_100":    "TAKE",
+    "R_100":    "INVERT",
     # ALT METHOD REMOVED (win-rate pass, Aug 2026, per explicit user
     # request: "strictly either take or invert, no ALT"). R_75 and
     # 1HZ50V now get plain defaults like every other symbol, same as the
@@ -904,6 +908,32 @@ META_LABEL_DEFAULT_ACTION_BY_SYMBOL: dict = {
 # bot_engine._execute()'s contract_kind guard) — TAKE, i.e. behave as
 # though this whole feature didn't exist for them.
 META_LABEL_DEFAULT_ACTION_FALLBACK = "TAKE"
+
+# ── "JANJA" RULE (sequential TAKE/INVERT alternator, Aug 2026) ───────────
+# User-directed rule, separate from and taking priority over the Bayesian
+# bandit below for the symbols listed here. Not a statistical model —
+# purely "what just happened on this symbol's last trade":
+#   - Won on TAKE   -> next trade on this symbol uses INVERT.
+#   - Won on INVERT -> next trade on this symbol uses TAKE.
+#   - Lost (either mode), or no prior trade logged yet -> next trade
+#     reverts to this symbol's normal default
+#     (META_LABEL_DEFAULT_ACTION_BY_SYMBOL above).
+# Implemented in meta_labeling.py's predict_take_trade() /
+# _janja_action(), reading strategy_stats.get_last_trade_action().
+#
+# SYMBOL NAMES — the user's original list was [R75, 1HZ100V, 1H250V, R50,
+# CRASH100, CRASH5OO]; three of these needed confirmation and are now
+# resolved: CRASH100/CRASH5OO -> CRASH1000/CRASH500 (confirmed), 1H250V
+# -> 1HZ50V (confirmed; NOT 1HZ250V, which doesn't exist on this account
+# — see VOLATILITY_1S note up top).
+JANJA_SYMBOLS = [
+    "R_75",
+    "1HZ100V",
+    "1HZ50V",
+    "R_50",
+    "CRASH1000",
+    "CRASH500",
+]
 
 # ── BAYESIAN TAKE/INVERT BANDIT (win-rate pass, Aug 2026) ─────────────────
 # User-directed replacement for the old enriched-feature EV-gate AND for
@@ -1024,6 +1054,30 @@ EXIT_DECAY_CLOSE_FRACTION   = 0.20   # once armed, close immediately if profit
 EXIT_POLL_INTERVAL_SECS     = 15     # how often the exit engine re-checks each
                                       # open Multiplier contract (independent of
                                       # the general 30s orphan-sweep cadence)
+
+# EARLY LOSS CAP (Aug 2026, user-directed: "take low losses, minimal
+# magnitude"). Before this, a LOSING contract had zero active management
+# from this engine — the arm/trail/decay logic above only ever engages
+# once profit is positive (>= EXIT_ARM_PROFIT_FRACTION * static_tp_amount).
+# An unarmed, losing trade rode all the way out to the FULL static
+# stop-loss (STOP_LOSS_MAP — 30-70% of stake) before anything closed it.
+# This adds a second, independent rule-layer check that runs regardless
+# of arm state: once past a short grace window (to avoid closing on
+# ordinary entry noise/spread), close immediately if the loss reaches
+# EXIT_LOSS_CAP_FRACTION of the contract's own static stop-loss budget —
+# i.e. realize a small fraction of the worst-case loss instead of the
+# whole thing. This can only make losses SMALLER than STOP_LOSS_MAP
+# already caps them at; it never overrides or loosens that static bound.
+EXIT_LOSS_CAP_ENABLED       = True
+EXIT_LOSS_CAP_FRACTION      = 0.25   # close once loss >= 25% of this
+                                      # contract's static_sl_amount, e.g.
+                                      # on a symbol with a 50%-of-stake
+                                      # static SL, the realized loss caps
+                                      # out around 12.5% of stake instead
+EXIT_LOSS_CAP_GRACE_SECS    = 20     # ignore the loss cap for this many
+                                      # seconds after open (~1 poll cycle)
+                                      # so normal entry spread/noise
+                                      # doesn't trigger an instant exit
 
 # Lightweight ML layer (meta-labeling-inspired; reuses the existing
 # META_LABEL_MIN_TRADES / META_LABEL_RETRAIN_EVERY_N constants defined
