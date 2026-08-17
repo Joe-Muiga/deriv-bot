@@ -522,6 +522,38 @@ class StrategyStats:
             "wins_invert": wins_invert, "losses_invert": losses_invert,
         }
 
+    def get_last_trade_action(self, symbol: str, window: int = 500) -> Optional[Tuple[str, bool]]:
+        """
+        (action, won) for `symbol`'s single most recent CLOSED trade that
+        carries an "inverted" flag in its features JSON — across ALL
+        strategies, same cross-strategy scope as get_take_invert_stats()
+        (a symbol's default/override action is per-symbol, not
+        per-strategy). Rows with no features blob, or a blob predating
+        the "inverted" field, are skipped rather than guessed at.
+
+        Returns None if this symbol has no such trade within `window`
+        (including: never traded at all).
+
+        Used by meta_labeling.py's JANJA RULE (config.JANJA_SYMBOLS) — a
+        sequential TAKE/INVERT alternator that only cares about this
+        symbol's single most recent outcome, not an aggregate like
+        get_take_invert_stats() above.
+        """
+        with self._lock:
+            rows = self._backend.all_trades_full(window=window)  # newest first
+        for (_strategy, sym, won, _stake, _payout, _ts, features_json) in rows:
+            if sym != symbol or not features_json:
+                continue
+            try:
+                decoded = json.loads(features_json)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(decoded, dict) or "inverted" not in decoded:
+                continue
+            action = "INVERT" if bool(decoded["inverted"]) else "TAKE"
+            return action, bool(won)
+        return None
+
     def get_dashboard_analytics(
         self,
         scaled_account_balance: float = 20.0,
