@@ -819,7 +819,18 @@ def _cross_dir(now_a: float, now_b: float, prev_a: float, prev_b: float) -> Opti
 
 
 def evaluate_popular_indicator(ltf_bars: List[Candle], symbol: str) -> SignalResult:
-    min_bars = max(60, getattr(config, "POPULAR_ICHIMOKU_SENKOU_B", 52) + 8)
+    # BUGFIX (Aug 2026): this previously required 60 bars (to fully
+    # mature Ichimoku's default 52-period Senkou Span B), but
+    # bot_engine.py's _init_symbol_data() only ever provisions
+    # config.LTF_BARS (30) bars on startup, capped at LTF_BARS + 20 (50)
+    # by the CandlestickBuilder's max_bars — so 60 was never reachable
+    # and this strategy could never fire a single trade. Every other
+    # evaluator in this file gates on 20-35 bars for the same reason;
+    # ind.ichimoku() (like every function in indicators.py) already
+    # degrades gracefully on short history via a growing window instead
+    # of requiring the full period, so there's no correctness need for
+    # the higher bar count either.
+    min_bars = 35
     if len(ltf_bars) < min_bars:
         return NONE_RESULT
 
