@@ -752,6 +752,237 @@ def evaluate_vol_reversion_mult(ltf_bars: List[Candle], symbol: str) -> SignalRe
     )
 
 
+# ---------------------------------------------------------------------------
+# Strategy — Popular Indicator Confluence (user-directed, Aug 2026)
+#
+# Replaces evaluate_vol_regime()/evaluate_boom_crash() as the strategy
+# routed to every symbol in config.MULTIPLIER_SYMBOLS (see SignalEngine
+# below). Built entirely from technical indicators and read-conventions
+# that are, per general trading-community usage (moving averages, RSI,
+# MACD, Bollinger Bands, Stochastic, ADX/DMI, Parabolic SAR, Ichimoku
+# Cloud, CCI, Williams %R, Supertrend), among the most widely used by
+# traders generally — chosen for how commonly they're used, not for any
+# backtested edge on these specific synthetic indices. See
+# config.py's "POPULAR INDICATOR CONFLUENCE STRATEGY" section for every
+# tunable used below.
+#
+# Two "cutting edge" computational additions sit on top of the classic
+# indicator set: a Kalman filter adaptive trend/velocity estimate (its
+# own gain adapts every bar to recent price noise, rather than using a
+# fixed lookback window like a moving average) contributes one more vote,
+# and a Hurst exponent regime read (rescaled-range analysis over the
+# recent window) is used to dynamically re-weight the trend-following
+# indicators against the oscillator/mean-reversion indicators depending
+# on whether the market is currently behaving in a trending/persistent
+# (H > 0.5) or mean-reverting/anti-persistent (H < 0.5) fashion, instead
+# of weighting every indicator equally regardless of regime.
+#
+# Each indicator below casts one vote for LONG (+weight) or SHORT
+# (-weight), or abstains (weight 0) when it has no real opinion (e.g.
+# ADX below its trend-strength floor, price inside the Ichimoku cloud,
+# an oscillator sitting in its neutral middle zone). The composite
+# direction is whichever side collects the larger weighted total, and it
+# only fires if that side's share of all weight in play clears
+# config.POPULAR_CONFLUENCE_MIN_SCORE.
+#
+# NOTE: this function only ever computes the "as-read" popular-consensus
+# direction. The user-directed universal signal inversion (see
+# config.INVERT_ALL_SIGNALS) is applied later, once, at the single
+# execution choke point in bot_engine.py — not here — so this function's
+# `direction` output is the un-inverted textbook reading of these
+# indicators, exactly as "many people" would read them.
+# ---------------------------------------------------------------------------
+
+def evaluate_popular_confluence(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    min_bars = max(60, getattr(config, "POPULAR_ICHIMOKU_SENKOU_B", 52) + 8)
+    if len(ltf_bars) < min_bars:
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    if len(C) == 0 or math.isnan(float(C[-1])):
+        return NONE_RESULT
+    last_close = float(C[-1])
+
+    votes: List[Tuple[str, float, float]] = []  # (label, direction[-1/0/1], weight)
+
+    # 1) SMA crossover — one of the single most widely used indicators.
+    sma_fast = ind.sma(C, config.POPULAR_SMA_FAST_PERIOD)
+    sma_slow = ind.sma(C, config.POPULAR_SMA_SLOW_PERIOD)
+    sma_dir = 1.0 if _last(sma_fast) > _last(sma_slow) else -1.0
+    votes.append(("SMA_CROSS", sma_dir, 1.0))
+
+    # 2) EMA crossover.
+    ema_fast = ind.ema(C, config.POPULAR_EMA_FAST_PERIOD)
+    ema_slow = ind.ema(C, config.POPULAR_EMA_SLOW_PERIOD)
+    ema_dir = 1.0 if _last(ema_fast) > _last(ema_slow) else -1.0
+    votes.append(("EMA_CROSS", ema_dir, 1.0))
+
+    # 3) RSI — centerline read (>50 bullish momentum, <50 bearish), the
+    #    standard popular usage alongside the classic 70/30 zones.
+    rsi_vals = ind.rsi(C, config.POPULAR_RSI_PERIOD)
+    last_rsi = _last(rsi_vals)
+    rsi_dir = 1.0 if last_rsi >= 50.0 else -1.0
+    votes.append(("RSI", rsi_dir, 1.0))
+
+    # 4) MACD histogram sign.
+    macd_line, macd_signal, macd_hist = ind.macd(
+        C, config.POPULAR_MACD_FAST, config.POPULAR_MACD_SLOW, config.POPULAR_MACD_SIGNAL)
+    last_hist = _last(macd_hist)
+    macd_dir = 1.0 if last_hist >= 0.0 else -1.0
+    votes.append(("MACD_HIST", macd_dir, 1.0))
+
+    # 5) Bollinger Bands — classic mean-reversion touch read (only has an
+    #    opinion when price is actually at/through a band).
+    bb_upper, bb_mid, bb_lower = ind.bollinger_bands(
+        C, config.POPULAR_BB_PERIOD, config.POPULAR_BB_STD)
+    band_width = _last(bb_upper) - _last(bb_lower)
+    pct_b = ((last_close - _last(bb_lower)) / band_width) if band_width > 0 else 0.5
+    if pct_b <= 0.05:
+        votes.append(("BOLLINGER", 1.0, 1.0))    # at/through lower band -> reversion up
+    elif pct_b >= 0.95:
+        votes.append(("BOLLINGER", -1.0, 1.0))   # at/through upper band -> reversion down
+    else:
+        votes.append(("BOLLINGER", 0.0, 0.0))    # no opinion mid-band
+
+    # 6) Stochastic Oscillator.
+    stoch_k, stoch_d = ind.stochastic(
+        H, L, C, config.POPULAR_STOCH_K_PERIOD, config.POPULAR_STOCH_D_PERIOD)
+    last_k, last_d = _last(stoch_k), _last(stoch_d)
+    if last_k <= config.POPULAR_STOCH_OVERSOLD:
+        votes.append(("STOCHASTIC", 1.0, 1.0))
+    elif last_k >= config.POPULAR_STOCH_OVERBOUGHT:
+        votes.append(("STOCHASTIC", -1.0, 1.0))
+    else:
+        votes.append(("STOCHASTIC", 1.0 if last_k > last_d else -1.0, 0.5))
+
+    # 7) ADX/DMI — direction from +DI/-DI, but only when ADX itself
+    #    confirms a real trend is present (standard popular usage: ignore
+    #    DI direction when ADX is low/choppy).
+    adx_vals, plus_di, minus_di = ind.adx(H, L, C, config.POPULAR_ADX_PERIOD)
+    last_adx = _last(adx_vals)
+    if last_adx >= config.POPULAR_ADX_TREND_MIN:
+        votes.append(("ADX_DMI", 1.0 if _last(plus_di) > _last(minus_di) else -1.0, 1.0))
+    else:
+        votes.append(("ADX_DMI", 0.0, 0.0))
+
+    # 8) Parabolic SAR.
+    sar_vals = ind.parabolic_sar(H, L, config.POPULAR_SAR_STEP, config.POPULAR_SAR_MAX_STEP)
+    sar_dir = 1.0 if last_close > _last(sar_vals) else -1.0
+    votes.append(("PARABOLIC_SAR", sar_dir, 1.0))
+
+    # 9) & 10) Ichimoku Cloud — cloud position (only has an opinion once
+    #    price is clearly outside the cloud) plus the Tenkan/Kijun cross.
+    tenkan, kijun, senkou_a, senkou_b = ind.ichimoku(
+        H, L, C, config.POPULAR_ICHIMOKU_TENKAN, config.POPULAR_ICHIMOKU_KIJUN,
+        config.POPULAR_ICHIMOKU_SENKOU_B)
+    cloud_top = max(_last(senkou_a), _last(senkou_b))
+    cloud_bottom = min(_last(senkou_a), _last(senkou_b))
+    if last_close > cloud_top:
+        votes.append(("ICHIMOKU_CLOUD", 1.0, 1.0))
+    elif last_close < cloud_bottom:
+        votes.append(("ICHIMOKU_CLOUD", -1.0, 1.0))
+    else:
+        votes.append(("ICHIMOKU_CLOUD", 0.0, 0.0))
+    votes.append(("ICHIMOKU_TK_CROSS", 1.0 if _last(tenkan) > _last(kijun) else -1.0, 1.0))
+
+    # 11) CCI.
+    cci_vals = ind.cci(H, L, C, config.POPULAR_CCI_PERIOD)
+    last_cci = _last(cci_vals)
+    if last_cci <= config.POPULAR_CCI_OVERSOLD:
+        votes.append(("CCI", 1.0, 1.0))
+    elif last_cci >= config.POPULAR_CCI_OVERBOUGHT:
+        votes.append(("CCI", -1.0, 1.0))
+    else:
+        votes.append(("CCI", 1.0 if last_cci > 0 else -1.0, 0.5))
+
+    # 12) Williams %R — mirror-image cousin of the Stochastic Oscillator.
+    wr_vals = ind.williams_r(H, L, C, config.POPULAR_WILLIAMS_R_PERIOD)
+    last_wr = _last(wr_vals)
+    if last_wr <= -80.0:
+        votes.append(("WILLIAMS_R", 1.0, 1.0))
+    elif last_wr >= -20.0:
+        votes.append(("WILLIAMS_R", -1.0, 1.0))
+    else:
+        votes.append(("WILLIAMS_R", 1.0 if last_wr > -50.0 else -1.0, 0.5))
+
+    # 13) Supertrend.
+    st_line, st_dir_arr = ind.supertrend(
+        H, L, C, config.POPULAR_SUPERTREND_PERIOD, config.POPULAR_SUPERTREND_MULT)
+    votes.append(("SUPERTREND", 1.0 if _last(st_dir_arr) > 0 else -1.0, 1.0))
+
+    # 14) Kalman filter adaptive trend velocity ("cutting edge" addition).
+    kalman_level, kalman_vel = ind.kalman_trend(
+        C, config.POPULAR_KALMAN_PROCESS_VAR, config.POPULAR_KALMAN_MEASURE_VAR)
+    last_vel = _last(kalman_vel)
+    votes.append(("KALMAN_TREND", 1.0 if last_vel >= 0.0 else -1.0, 1.0))
+
+    # Hurst exponent regime read ("cutting edge" addition) — re-weights
+    # trend-following votes vs oscillator/mean-reversion votes rather
+    # than treating every vote as equally trustworthy regardless of
+    # regime.
+    hurst_lookback = min(len(C), config.POPULAR_HURST_LOOKBACK)
+    h = ind.hurst_exponent(C[-hurst_lookback:]) if len(C) >= config.POPULAR_HURST_MIN_BARS else 0.5
+
+    trend_labels = {
+        "SMA_CROSS", "EMA_CROSS", "MACD_HIST", "ADX_DMI", "PARABOLIC_SAR",
+        "ICHIMOKU_CLOUD", "ICHIMOKU_TK_CROSS", "SUPERTREND", "KALMAN_TREND",
+    }
+    reversion_labels = {"RSI", "BOLLINGER", "STOCHASTIC", "CCI", "WILLIAMS_R"}
+
+    if h >= 0.55:
+        trend_mult, reversion_mult = 1.3, 0.7        # trending/persistent regime
+    elif h <= 0.45:
+        trend_mult, reversion_mult = 0.7, 1.3         # mean-reverting/anti-persistent regime
+    else:
+        trend_mult, reversion_mult = 1.0, 1.0          # ~random walk, no regime edge
+
+    long_weight = 0.0
+    short_weight = 0.0
+    total_weight = 0.0
+    detail_parts = []
+    for label, vote_dir, weight in votes:
+        mult = trend_mult if label in trend_labels else (
+            reversion_mult if label in reversion_labels else 1.0)
+        w = weight * mult
+        total_weight += w
+        if vote_dir > 0:
+            long_weight += w
+        elif vote_dir < 0:
+            short_weight += w
+        detail_parts.append(f"{label}={'L' if vote_dir>0 else ('S' if vote_dir<0 else '-')}")
+
+    if total_weight <= 0:
+        return NONE_RESULT
+
+    if long_weight >= short_weight:
+        direction, side_weight = "LONG", long_weight
+    else:
+        direction, side_weight = "SHORT", short_weight
+
+    score = side_weight / total_weight
+    min_score = getattr(config, "POPULAR_CONFLUENCE_MIN_SCORE", 0.55)
+
+    if score < min_score:
+        logger.debug(
+            f"REJECTED: {symbol} POPULAR_CONFLUENCE strength=0 score={score:.3f} "
+            f"— below threshold ({min_score})")
+        return SignalResult("NONE", 0, score, "POPULAR_CONFLUENCE", "Confluence below threshold")
+
+    strength = 3 if score >= 0.75 else 2
+    reason = (
+        f"regime=H{h:.2f}({'TREND' if h>=0.55 else ('REVERT' if h<=0.45 else 'FLAT')}) "
+        f"RSI={last_rsi:.1f} MACDh={last_hist:.5f} ADX={last_adx:.1f} "
+        f"votes[{', '.join(detail_parts)}]"
+    )
+    logger.info(
+        f"SIGNAL: {symbol} {direction} POPULAR_CONFLUENCE strength={strength} score={score:.3f}"
+    )
+    return SignalResult(
+        direction=direction, strength=strength, score=score,
+        strategy="POPULAR_CONFLUENCE", reason=reason,
+    )
+
+
 def evaluate_vol_regime(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     """
     Thin regime-selecting dispatcher for config.VOL_MULTIPLIER_SYMBOLS —
@@ -1310,8 +1541,16 @@ class SignalEngine:
     def evaluate(self, ltf_bars: List[Candle], symbol: str, **kwargs) -> SignalResult:
         ticks = kwargs.get("ticks")
 
-        if symbol in getattr(config, "VOL_MULTIPLIER_SYMBOLS", []):
-            result = evaluate_vol_regime(ltf_bars, symbol)
+        # Popular Indicator Confluence (user-directed, Aug 2026) now
+        # covers every symbol that trades via Multiplier contracts —
+        # both the Volatility/1Hz/Step family and the Boom/Crash family
+        # (both routed to buy_multiplier() in bot_engine.py/deriv_client.py)
+        # — replacing evaluate_vol_regime()/evaluate_boom_crash() for
+        # direction-selection purposes. Those two evaluators are left in
+        # place above, unrouted, the same way this file already retires
+        # strategies (see evaluate_mean_reversion/evaluate_range_break).
+        if symbol in getattr(config, "MULTIPLIER_SYMBOLS", []):
+            result = evaluate_popular_confluence(ltf_bars, symbol)
         elif symbol in config.DIGIT_SYMBOLS:
             result = evaluate_digit(ltf_bars, symbol, ticks=ticks)
         elif symbol in config.MEAN_REVERSION_SYMBOLS:
