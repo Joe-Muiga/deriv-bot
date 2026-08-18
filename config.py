@@ -470,6 +470,98 @@ MEAN_REV_REQUIRE_TURN = True
 # contract_update, without changing this ratio itself.
 TAKE_PROFIT_RATIO = 2.5
 
+# ── UNIVERSAL SIGNAL INVERSION (user-directed, Aug 2026) ─────────────────
+# Replaces the old sequential TAKE/INVERT alternator and the meta_labeling
+# Bayesian TAKE/INVERT
+# bandit's role in choosing trade direction. This is unconditional and
+# applies to every symbol, every strategy, every trade: whatever direction
+# the strategy layer (see POPULAR INDICATOR CONFLUENCE below) computes as
+# its price prediction is flipped — a computed BUY is placed as a SELL,
+# a computed SELL is placed as a BUY — immediately before the order is
+# sent. No per-symbol table, no win-rate gating, no opt-out list. See
+# bot_engine.py's execution path for the single choke point that applies
+# this (search "UNIVERSAL SIGNAL INVERSION").
+INVERT_ALL_SIGNALS = True
+
+# ── TP/SL SWAP FOR MULTIPLIER CONTRACTS (user-directed, Aug 2026) ────────
+# Applies only where Multiplier contracts carry an explicit stop_loss /
+# take_profit limit_order (deriv_client.buy_multiplier()). The distance
+# that would normally have been used for the stop-loss is placed as the
+# take-profit instead, and the distance that would normally have been
+# the take-profit is placed as the stop-loss instead — i.e. the two
+# amounts are swapped after being computed exactly as before (stake ×
+# stop_loss_pct, then × TAKE_PROFIT_RATIO). Not applicable to Rise/Fall
+# (CALL/PUT) contracts, which have no limit_order concept.
+TP_SL_SWAP_ENABLED = True
+
+# ── POPULAR INDICATOR CONFLUENCE STRATEGY (user-directed, Aug 2026) ──────
+# Replaces the strategy used to trade every symbol in MULTIPLIER_SYMBOLS
+# (Volatility/1Hz/Step family via VOL_MULTIPLIER_SYMBOLS, and the
+# Boom/Crash family) with a single composite evaluator
+# (signal_engine.evaluate_popular_confluence()) built only from the
+# technical indicators and approaches most widely used by retail and
+# algorithmic traders generally — chosen for popularity of use, not for
+# any backtested edge on these specific instruments. Old strategy-specific
+# evaluators (evaluate_vol_breakout, evaluate_vol_reversion_mult,
+# evaluate_boom_crash) are left in signal_engine.py, unrouted, the same
+# way this codebase already retires strategies (see MEAN_REVERSION_SYMBOLS
+# above) rather than deleting the code.
+#
+# Each indicator below casts one vote for LONG or SHORT (or abstains).
+# The composite direction is whichever side has the larger weighted vote
+# total; POPULAR_CONFLUENCE_MIN_SCORE is the minimum fraction of total
+# available weight that side must reach to fire at all.
+POPULAR_CONFLUENCE_MIN_SCORE = 0.55
+
+# Trend-following (moving averages, ADX/DMI, Parabolic SAR, Supertrend,
+# Ichimoku) and momentum/oscillator (RSI, MACD, Stochastic, CCI,
+# Williams %R, Bollinger Bands) indicator periods — standard textbook
+# defaults, the same defaults most charting platforms ship with, since
+# those defaults are themselves a large part of why these indicators are
+# "the ones many people use".
+POPULAR_SMA_FAST_PERIOD   = 10
+POPULAR_SMA_SLOW_PERIOD   = 30
+POPULAR_EMA_FAST_PERIOD   = 12
+POPULAR_EMA_SLOW_PERIOD   = 26
+POPULAR_RSI_PERIOD        = 14
+POPULAR_RSI_OVERBOUGHT    = 70.0
+POPULAR_RSI_OVERSOLD      = 30.0
+POPULAR_MACD_FAST         = 12
+POPULAR_MACD_SLOW         = 26
+POPULAR_MACD_SIGNAL       = 9
+POPULAR_BB_PERIOD         = 20
+POPULAR_BB_STD            = 2.0
+POPULAR_STOCH_K_PERIOD    = 14
+POPULAR_STOCH_D_PERIOD    = 3
+POPULAR_STOCH_OVERBOUGHT  = 80.0
+POPULAR_STOCH_OVERSOLD    = 20.0
+POPULAR_ADX_PERIOD        = 14
+POPULAR_ADX_TREND_MIN     = 20.0   # ADX below this = indicator abstains
+POPULAR_SAR_STEP          = 0.02
+POPULAR_SAR_MAX_STEP      = 0.20
+POPULAR_ICHIMOKU_TENKAN   = 9
+POPULAR_ICHIMOKU_KIJUN    = 26
+POPULAR_ICHIMOKU_SENKOU_B = 52
+POPULAR_CCI_PERIOD        = 20
+POPULAR_CCI_OVERBOUGHT    = 100.0
+POPULAR_CCI_OVERSOLD      = -100.0
+POPULAR_WILLIAMS_R_PERIOD = 14
+POPULAR_SUPERTREND_PERIOD = 10
+POPULAR_SUPERTREND_MULT   = 3.0
+
+# "Cutting edge" computational additions layered on top of the classic
+# indicator set above: a Kalman filter (adaptive trend/velocity estimate,
+# reacts faster in high-volatility regimes and slower in calm ones without
+# needing a fixed lookback window) and a Hurst exponent regime read
+# (rescaled-range analysis — H > 0.5 trending/persistent, H < 0.5
+# mean-reverting/anti-persistent) used to dynamically re-weight the
+# trend-following indicators against the mean-reversion/oscillator ones
+# rather than weighting every indicator equally regardless of regime.
+POPULAR_KALMAN_PROCESS_VAR  = 1e-5
+POPULAR_KALMAN_MEASURE_VAR  = 1e-2
+POPULAR_HURST_LOOKBACK      = 100
+POPULAR_HURST_MIN_BARS      = 40
+
 # ── STAKE SETTINGS ───────────────────────────────────────────
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
@@ -908,32 +1000,6 @@ META_LABEL_DEFAULT_ACTION_BY_SYMBOL: dict = {
 # bot_engine._execute()'s contract_kind guard) — TAKE, i.e. behave as
 # though this whole feature didn't exist for them.
 META_LABEL_DEFAULT_ACTION_FALLBACK = "TAKE"
-
-# ── "JANJA" RULE (sequential TAKE/INVERT alternator, Aug 2026) ───────────
-# User-directed rule, separate from and taking priority over the Bayesian
-# bandit below for the symbols listed here. Not a statistical model —
-# purely "what just happened on this symbol's last trade":
-#   - Won on TAKE   -> next trade on this symbol uses INVERT.
-#   - Won on INVERT -> next trade on this symbol uses TAKE.
-#   - Lost (either mode), or no prior trade logged yet -> next trade
-#     reverts to this symbol's normal default
-#     (META_LABEL_DEFAULT_ACTION_BY_SYMBOL above).
-# Implemented in meta_labeling.py's predict_take_trade() /
-# _janja_action(), reading strategy_stats.get_last_trade_action().
-#
-# SYMBOL NAMES — the user's original list was [R75, 1HZ100V, 1H250V, R50,
-# CRASH100, CRASH5OO]; three of these needed confirmation and are now
-# resolved: CRASH100/CRASH5OO -> CRASH1000/CRASH500 (confirmed), 1H250V
-# -> 1HZ50V (confirmed; NOT 1HZ250V, which doesn't exist on this account
-# — see VOLATILITY_1S note up top).
-JANJA_SYMBOLS = [
-    "R_75",
-    "1HZ100V",
-    "1HZ50V",
-    "R_50",
-    "CRASH1000",
-    "CRASH500",
-]
 
 # ── BAYESIAN TAKE/INVERT BANDIT (win-rate pass, Aug 2026) ─────────────────
 # User-directed replacement for the old enriched-feature EV-gate AND for
