@@ -1049,63 +1049,36 @@ class BotEngine:
         except Exception as exc:
             logger.debug(f"compute_enriched_features({symbol}) failed: {exc}")
 
-        # Meta-labeling gate — skip execution if the take-trade-or-not
-        # filter rejects it. predict_take_trade() has its own internal
-        # min-trades gating (config.META_LABEL_MIN_TRADES); below that
-        # threshold it always returns (True, 1.0) — a pass-through, not
-        # a real prediction. The per-pair EV branch (enriched features
-        # below) can activate independently and sooner — see
-        # meta_labeling.predict_take_trade()'s docstring.
-        try:
-            action, confidence = meta_labeling.predict_take_trade({
-                "strategy":    strategy,
-                "symbol":      symbol,
-                "entry_score": float(getattr(sig, "score", 0.0)),
-                "multiplier":  ml_multiplier,
-                "atr_pct":     ml_atr_pct,
-                "regime":      ml_regime,
-                **enriched_features,
-            })
-        except Exception as exc:
-            logger.warning(
-                f"meta_labeling.predict_take_trade({symbol}) failed — "
-                f"passing signal through: {exc}")
-            action, confidence = "TAKE", 1.0
-
+        # UNIVERSAL SIGNAL INVERSION (user-directed, Aug 2026) — replaces
+        # the old sequential TAKE/INVERT alternator and the meta_labeling
+        # Bayesian TAKE/INVERT
+        # bandit's role in choosing trade direction (see
+        # config.INVERT_ALL_SIGNALS). Unconditional: every symbol, every
+        # strategy, every trade. Whatever direction the strategy layer
+        # computed as its price prediction is flipped immediately before
+        # the order goes out — a computed LONG is placed as SHORT and a
+        # computed SHORT is placed as LONG. meta_labeling.predict_take_trade()
+        # is no longer called from this path (its TAKE/INVERT decision
+        # would only ever be overridden by the rule below anyway); the
+        # module and its win/loss bookkeeping are left intact for
+        # logging/dashboard use — see meta_labeling.py's
+        # predict_take_trade() docstring.
         inverted = False
-        if action == "INVERT":
-            # SIGNAL DIRECTION INVERSION (see config.py / meta_labeling.py).
-            # Only meaningful for a price-direction bet — JUMP_BUILDUP's
-            # DIGIT contracts (Matches/Differs) don't have a LONG/SHORT to
-            # flip, so treat INVERT as SKIP there rather than silently
-            # taking the un-invertable original (which the EV gate already
-            # decided didn't clear the bar).
-            if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL" or sig.direction not in ("LONG", "SHORT"):
-                logger.info(
-                    f"META-INVERT SKIPPED: {symbol} | {strategy} | INVERT isn't "
-                    f"applicable to contract_kind={getattr(sig, 'contract_kind', 'RISE_FALL')} — treating as SKIP")
-                action = "SKIP"
-            else:
-                original_direction = sig.direction
-                sig.direction = "SHORT" if sig.direction == "LONG" else "LONG"
-                inverted = True
-                logger.info(
-                    f"META-INVERT: {symbol} | {strategy} | {original_direction} -> "
-                    f"{sig.direction} | P(win inverted)={confidence:.3f}"
-                )
-
-        if action == "SKIP":
+        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL" or sig.direction not in ("LONG", "SHORT"):
+            # No LONG/SHORT to flip (e.g. JUMP_BUILDUP's DIGIT
+            # Matches/Differs contracts) — nothing to invert, trade
+            # through exactly as computed.
+            logger.debug(
+                f"INVERT SKIPPED: {symbol} | {strategy} | inversion isn't "
+                f"applicable to contract_kind={getattr(sig, 'contract_kind', 'RISE_FALL')}")
+        else:
+            original_direction = sig.direction
+            sig.direction = "SHORT" if sig.direction == "LONG" else "LONG"
+            inverted = True
             logger.info(
-                f"META-LABEL SKIP: {symbol} | {strategy} | "
-                f"P(win)={confidence:.3f} < threshold")
-            record_failure(
-                symbol    = symbol,
-                direction = sig.direction,
-                stake     = 0.0,
-                strategy  = strategy,
-                reason    = f"meta_label_reject(conf={confidence:.3f})",
+                f"SIGNAL INVERTED: {symbol} | {strategy} | {original_direction} -> "
+                f"{sig.direction} (universal inversion, config.INVERT_ALL_SIGNALS)"
             )
-            return False
 
         # FIX (profitability audit): this call previously passed no
         # arguments, so RiskManager.calculate_stake()'s Kelly overlay
@@ -1311,11 +1284,12 @@ class BotEngine:
         #
         # ALT METHOD REMOVED (win-rate pass, Aug 2026, per explicit user
         # request: "strictly either take or invert, no ALT"). R_75 and
-        # 1HZ50V now flow through the same general exit engine as every
-        # other Multiplier symbol below — see config.py's per-symbol
-        # default map and the Bayesian TAKE/INVERT bandit
-        # (meta_labeling.predict_take_trade()) for how their direction is
-        # decided instead.
+        # 1HZ50V flow through the same general exit engine as every other
+        # Multiplier symbol below. Direction for every Multiplier symbol
+        # is now decided by the Popular Indicator Confluence strategy
+        # (signal_engine.evaluate_popular_confluence()) plus the
+        # unconditional universal inversion applied above — see
+        # config.INVERT_ALL_SIGNALS.
         if (symbol in getattr(config, "MULTIPLIER_SYMBOLS", set())
                 and getattr(config, "EXIT_ENGINE_ENABLED", False)
                 and symbol in getattr(config, "EXIT_ENGINE_SYMBOLS", set())):
