@@ -10,6 +10,7 @@ Architectural contract (enforced throughout):
   • All outputs are numpy arrays (or scalars/tuples where documented).
 """
 
+import math
 import numpy as np
 from typing import List, Optional, Tuple, Union
 
@@ -536,6 +537,477 @@ def find_rsi_divergence(
         return 0
     except Exception:
         return 0
+
+
+# ─── SMA ────────────────────────────────────────────────────────────────────
+
+def sma(closes: ArrayLike, period: int) -> np.ndarray:
+    """
+    Simple Moving Average — one of the single most widely used technical
+    indicators. Growing-window for series shorter than period (no NaN).
+    """
+    try:
+        p = _to(closes)
+        return _sma(p, max(int(period), 1))
+    except Exception:
+        p = _to(closes)
+        return _fill(len(p), _safe_last(p))
+
+
+# ─── ADX / +DI / -DI (Wilder's Directional Movement System) ─────────────────
+
+def adx(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    closes: ArrayLike,
+    period: int = 14,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns (adx, plus_di, minus_di) — Welles Wilder's Average Directional
+    Index plus its two directional components. One of the most cited
+    trend-strength/trend-direction indicators in general use. Same
+    never-raises / no-NaN / same-length-as-input contract as the rest of
+    this module.
+    """
+    try:
+        H, L, C = _to(highs), _to(lows), _to(closes)
+        n = len(C)
+        if n == 0:
+            return (np.array([], dtype=np.float64),) * 3
+        if len(H) != n:
+            H = C.copy()
+        if len(L) != n:
+            L = C.copy()
+        if n < period + 1:
+            z = _fill(n, 0.0)
+            return z.copy(), z.copy(), z.copy()
+
+        up_move = np.zeros(n, dtype=np.float64)
+        down_move = np.zeros(n, dtype=np.float64)
+        tr = np.zeros(n, dtype=np.float64)
+        for i in range(1, n):
+            um = float(H[i]) - float(H[i - 1])
+            dm = float(L[i - 1]) - float(L[i])
+            up_move[i] = um if (um > dm and um > 0) else 0.0
+            down_move[i] = dm if (dm > um and dm > 0) else 0.0
+            tr[i] = max(
+                float(H[i]) - float(L[i]),
+                abs(float(H[i]) - float(C[i - 1])),
+                abs(float(L[i]) - float(C[i - 1])),
+            )
+        tr[0] = float(H[0]) - float(L[0])
+
+        atr_w = _fill(n, 0.0)
+        plus_dm_w = _fill(n, 0.0)
+        minus_dm_w = _fill(n, 0.0)
+        atr_w[period] = float(np.sum(tr[1:period + 1]))
+        plus_dm_w[period] = float(np.sum(up_move[1:period + 1]))
+        minus_dm_w[period] = float(np.sum(down_move[1:period + 1]))
+        for i in range(period + 1, n):
+            atr_w[i] = atr_w[i - 1] - (atr_w[i - 1] / period) + tr[i]
+            plus_dm_w[i] = plus_dm_w[i - 1] - (plus_dm_w[i - 1] / period) + up_move[i]
+            minus_dm_w[i] = minus_dm_w[i - 1] - (minus_dm_w[i - 1] / period) + down_move[i]
+
+        plus_di = _fill(n, 0.0)
+        minus_di = _fill(n, 0.0)
+        for i in range(period, n):
+            if atr_w[i] > 0:
+                plus_di[i] = 100.0 * plus_dm_w[i] / atr_w[i]
+                minus_di[i] = 100.0 * minus_dm_w[i] / atr_w[i]
+
+        dx = _fill(n, 0.0)
+        for i in range(period, n):
+            s = plus_di[i] + minus_di[i]
+            dx[i] = 100.0 * abs(plus_di[i] - minus_di[i]) / s if s > 0 else 0.0
+
+        adx_out = _fill(n, 0.0)
+        first_adx_idx = min(2 * period, n - 1)
+        if first_adx_idx > period:
+            adx_out[first_adx_idx] = float(np.mean(dx[period:first_adx_idx + 1]))
+            for i in range(first_adx_idx + 1, n):
+                adx_out[i] = (adx_out[i - 1] * (period - 1) + dx[i]) / period
+        return adx_out, plus_di, minus_di
+    except Exception:
+        C = _to(closes)
+        z = _fill(len(C), 0.0)
+        return z.copy(), z.copy(), z.copy()
+
+
+# ─── Parabolic SAR ────────────────────────────────────────────────────────
+
+def parabolic_sar(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    step: float = 0.02,
+    max_step: float = 0.20,
+) -> np.ndarray:
+    """
+    Wilder's Parabolic SAR — classic trend-following stop-and-reverse dot
+    series, extremely widely used for trailing stops and trend direction
+    (price above SAR = uptrend, below = downtrend). Returns array same
+    length as highs.
+    """
+    try:
+        H, L = _to(highs), _to(lows)
+        n = len(H)
+        if len(L) != n:
+            L = H.copy()
+        if n < 3:
+            return H.copy()
+
+        sar = np.empty(n, dtype=np.float64)
+        uptrend = H[1] >= H[0]
+        af = step
+        ep = float(H[0]) if uptrend else float(L[0])
+        sar[0] = float(L[0]) if uptrend else float(H[0])
+
+        for i in range(1, n):
+            prev_sar = sar[i - 1]
+            new_sar = prev_sar + af * (ep - prev_sar)
+
+            if uptrend:
+                new_sar = min(new_sar, float(L[i - 1]), float(L[max(0, i - 2)]))
+                if float(L[i]) < new_sar:
+                    uptrend = False
+                    new_sar = ep
+                    ep = float(L[i])
+                    af = step
+                else:
+                    if float(H[i]) > ep:
+                        ep = float(H[i])
+                        af = min(af + step, max_step)
+            else:
+                new_sar = max(new_sar, float(H[i - 1]), float(H[max(0, i - 2)]))
+                if float(H[i]) > new_sar:
+                    uptrend = True
+                    new_sar = ep
+                    ep = float(H[i])
+                    af = step
+                else:
+                    if float(L[i]) < ep:
+                        ep = float(L[i])
+                        af = min(af + step, max_step)
+
+            sar[i] = new_sar
+        return sar
+    except Exception:
+        H = _to(highs)
+        return _fill(len(H), _safe_last(H))
+
+
+# ─── Ichimoku Cloud ─────────────────────────────────────────────────────────
+
+def ichimoku(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    closes: ArrayLike,
+    tenkan_period: int = 9,
+    kijun_period: int = 26,
+    senkou_b_period: int = 52,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Returns (tenkan_sen, kijun_sen, senkou_span_a, senkou_span_b), each
+    same length as closes and NOT shifted forward (i.e. these are the
+    cloud values as of the current bar, for "is price above/below the
+    cloud right now" reads rather than plotting the traditional
+    26-bar-forward-shifted cloud). One of the most widely used
+    all-in-one trend systems, especially in FX and index trading.
+    """
+    try:
+        H, L, C = _to(highs), _to(lows), _to(closes)
+        n = len(C)
+        if len(H) != n:
+            H = C.copy()
+        if len(L) != n:
+            L = C.copy()
+        if n == 0:
+            return (np.array([], dtype=np.float64),) * 4
+
+        def _mid(period: int) -> np.ndarray:
+            out = np.empty(n, dtype=np.float64)
+            for i in range(n):
+                start = max(0, i - period + 1)
+                out[i] = (float(np.max(H[start:i + 1])) + float(np.min(L[start:i + 1]))) / 2.0
+            return out
+
+        tenkan = _mid(tenkan_period)
+        kijun = _mid(kijun_period)
+        senkou_a = (tenkan + kijun) / 2.0
+        senkou_b = _mid(senkou_b_period)
+        return tenkan, kijun, senkou_a, senkou_b
+    except Exception:
+        C = _to(closes)
+        neutral = _safe_last(C)
+        a = _fill(len(C), neutral)
+        return a.copy(), a.copy(), a.copy(), a.copy()
+
+
+# ─── CCI (Commodity Channel Index) ───────────────────────────────────────────
+
+def cci(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    closes: ArrayLike,
+    period: int = 20,
+) -> np.ndarray:
+    """
+    Commodity Channel Index. >100 = overbought, <-100 = oversold. Same
+    never-raises contract as the rest of this module.
+    """
+    try:
+        H, L, C = _to(highs), _to(lows), _to(closes)
+        n = len(C)
+        if len(H) != n:
+            H = C.copy()
+        if len(L) != n:
+            L = C.copy()
+        if n == 0:
+            return np.array([], dtype=np.float64)
+
+        tp = (H + L + C) / 3.0
+        sma_tp = _sma(tp, period)
+        mean_dev = np.empty(n, dtype=np.float64)
+        for i in range(n):
+            start = max(0, i - period + 1)
+            window = tp[start:i + 1]
+            mean_dev[i] = float(np.mean(np.abs(window - sma_tp[i])))
+
+        out = np.zeros(n, dtype=np.float64)
+        for i in range(n):
+            if mean_dev[i] > 0:
+                out[i] = (tp[i] - sma_tp[i]) / (0.015 * mean_dev[i])
+        return out
+    except Exception:
+        C = _to(closes)
+        return _fill(len(C), 0.0)
+
+
+# ─── Williams %R ──────────────────────────────────────────────────────────
+
+def williams_r(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    closes: ArrayLike,
+    period: int = 14,
+) -> np.ndarray:
+    """
+    Williams %R, -100..0. Above -20 = overbought, below -80 = oversold.
+    Mirror-image cousin of the Stochastic Oscillator and just as widely
+    used.
+    """
+    try:
+        H, L, C = _to(highs), _to(lows), _to(closes)
+        n = len(C)
+        if len(H) != n:
+            H = C.copy()
+        if len(L) != n:
+            L = C.copy()
+        if n == 0:
+            return np.array([], dtype=np.float64)
+
+        out = _fill(n, -50.0)
+        for i in range(n):
+            start = max(0, i - period + 1)
+            hh = float(np.max(H[start:i + 1]))
+            ll = float(np.min(L[start:i + 1]))
+            if hh == ll:
+                out[i] = -50.0
+            else:
+                out[i] = -100.0 * (hh - float(C[i])) / (hh - ll)
+        return out
+    except Exception:
+        C = _to(closes)
+        return _fill(len(C), -50.0)
+
+
+# ─── Supertrend ───────────────────────────────────────────────────────────
+
+def supertrend(
+    highs: ArrayLike,
+    lows: ArrayLike,
+    closes: ArrayLike,
+    period: int = 10,
+    multiplier: float = 3.0,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Returns (supertrend_line, direction) where direction[i] is +1.0
+    (uptrend, line sits below price) or -1.0 (downtrend, line sits above
+    price). One of the most popular single-line ATR-based trend-following
+    overlays on modern charting platforms.
+    """
+    try:
+        H, L, C = _to(highs), _to(lows), _to(closes)
+        n = len(C)
+        if len(H) != n:
+            H = C.copy()
+        if len(L) != n:
+            L = C.copy()
+        if n == 0:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+        atr_vals = atr(H, L, C, period)
+        hl2 = (H + L) / 2.0
+        upper_basic = hl2 + multiplier * atr_vals
+        lower_basic = hl2 - multiplier * atr_vals
+
+        upper_final = np.empty(n, dtype=np.float64)
+        lower_final = np.empty(n, dtype=np.float64)
+        st = np.empty(n, dtype=np.float64)
+        direction = np.empty(n, dtype=np.float64)
+
+        upper_final[0] = upper_basic[0]
+        lower_final[0] = lower_basic[0]
+        direction[0] = 1.0
+        st[0] = lower_final[0]
+
+        for i in range(1, n):
+            upper_final[i] = (upper_basic[i] if (upper_basic[i] < upper_final[i - 1]
+                               or float(C[i - 1]) > upper_final[i - 1]) else upper_final[i - 1])
+            lower_final[i] = (lower_basic[i] if (lower_basic[i] > lower_final[i - 1]
+                               or float(C[i - 1]) < lower_final[i - 1]) else lower_final[i - 1])
+
+            if direction[i - 1] == 1.0:
+                direction[i] = -1.0 if float(C[i]) < lower_final[i] else 1.0
+            else:
+                direction[i] = 1.0 if float(C[i]) > upper_final[i] else -1.0
+
+            st[i] = lower_final[i] if direction[i] == 1.0 else upper_final[i]
+
+        return st, direction
+    except Exception:
+        C = _to(closes)
+        z = _fill(len(C), 0.0)
+        return z.copy(), _fill(len(C), 1.0)
+
+
+# ─── Pivot Points (classic/floor) ────────────────────────────────────────
+
+def pivot_points(
+    prior_high: float,
+    prior_low: float,
+    prior_close: float,
+) -> Tuple[float, float, float, float, float]:
+    """
+    Classic floor-trader pivot points from the prior period's H/L/C.
+    Returns (pivot, r1, s1, r2, s2). One of the most widely used
+    support/resistance frameworks, especially intraday.
+    """
+    try:
+        p = (float(prior_high) + float(prior_low) + float(prior_close)) / 3.0
+        r1 = 2.0 * p - float(prior_low)
+        s1 = 2.0 * p - float(prior_high)
+        r2 = p + (float(prior_high) - float(prior_low))
+        s2 = p - (float(prior_high) - float(prior_low))
+        return p, r1, s1, r2, s2
+    except Exception:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+
+# ─── Kalman Filter adaptive trend estimate ("cutting edge" addition) ────────
+
+def kalman_trend(
+    closes: ArrayLike,
+    process_var: float = 1e-5,
+    measure_var: float = 1e-2,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    1-D constant-velocity Kalman filter over price. Returns (level,
+    velocity) arrays, same length as closes. Unlike a fixed-lookback
+    moving average, the filter's own gain adapts every bar to how noisy
+    recent price has actually been, so it tracks genuine trend changes
+    faster in choppy/high-volatility conditions and smooths harder in
+    calm ones. velocity[i] > 0 reads as an up-trending state estimate,
+    velocity[i] < 0 as down-trending — used here as one confluence vote
+    plus (via its magnitude) a confidence weight.
+    """
+    try:
+        p = _to(closes)
+        n = len(p)
+        if n == 0:
+            return np.array([], dtype=np.float64), np.array([], dtype=np.float64)
+
+        # State: [level, velocity]. Constant-velocity motion model.
+        x = np.array([p[0], 0.0], dtype=np.float64)
+        P = np.eye(2, dtype=np.float64) * 1.0
+        F = np.array([[1.0, 1.0], [0.0, 1.0]], dtype=np.float64)
+        Q = np.array([[process_var, 0.0], [0.0, process_var]], dtype=np.float64)
+        H_mat = np.array([[1.0, 0.0]], dtype=np.float64)
+        R = np.array([[measure_var]], dtype=np.float64)
+
+        levels = np.empty(n, dtype=np.float64)
+        velocities = np.empty(n, dtype=np.float64)
+        levels[0] = x[0]
+        velocities[0] = x[1]
+
+        for i in range(1, n):
+            # Predict
+            x = F @ x
+            P = F @ P @ F.T + Q
+            # Update
+            z = float(p[i])
+            y = z - float(H_mat @ x)
+            S = float(H_mat @ P @ H_mat.T) + float(R[0, 0])
+            if S <= 0:
+                S = 1e-9
+            K = (P @ H_mat.T) / S  # 2x1 Kalman gain
+            x = x + (K.flatten() * y)
+            P = (np.eye(2) - K @ H_mat) @ P
+
+            levels[i] = x[0]
+            velocities[i] = x[1]
+
+        return levels, velocities
+    except Exception:
+        p = _to(closes)
+        z = _fill(len(p), _safe_last(p))
+        return z, _fill(len(p), 0.0)
+
+
+# ─── Hurst Exponent regime detector ("cutting edge" addition) ───────────────
+
+def hurst_exponent(closes: ArrayLike, min_lag: int = 2, max_lag: int = 20) -> float:
+    """
+    Rescaled-range-style Hurst exponent estimate over the full series
+    passed in (caller controls the lookback by slicing). H > 0.5 implies
+    a trending/persistent series (momentum/trend-following indicators
+    should be trusted more), H < 0.5 implies mean-reverting/anti-
+    persistent behaviour (oscillator/mean-reversion indicators should be
+    trusted more), H ~= 0.5 implies a random walk (no regime edge either
+    way). Returns 0.5 (neutral) on any error or insufficient data —
+    never raises, never returns None.
+    """
+    try:
+        p = _to(closes)
+        n = len(p)
+        if n < max(20, max_lag * 2):
+            return 0.5
+
+        lags = range(min_lag, min(max_lag, n // 2))
+        tau = []
+        used_lags = []
+        for lag in lags:
+            diffs = p[lag:] - p[:-lag]
+            if len(diffs) < 2:
+                continue
+            std = float(np.std(diffs))
+            if std > 0:
+                tau.append(std)
+                used_lags.append(lag)
+
+        if len(tau) < 2:
+            return 0.5
+
+        log_lags = np.log(np.array(used_lags, dtype=np.float64))
+        log_tau = np.log(np.array(tau, dtype=np.float64))
+        # Slope of log(tau) vs log(lag) ≈ Hurst exponent (standard
+        # variance-scaling estimator: Var(lag) ~ lag^(2H)).
+        slope, _intercept = np.polyfit(log_lags, log_tau, 1)
+        h = float(slope)
+        if math.isnan(h) or math.isinf(h):
+            return 0.5
+        return max(0.0, min(1.0, h))
+    except Exception:
+        return 0.5
 
 
 # ─── Compatibility aliases ───────────────────────────────────────────────────
