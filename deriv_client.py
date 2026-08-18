@@ -1165,9 +1165,14 @@ class DerivClient:
         the proposal, rather than a duration/duration_unit pair.
         stop_loss_pct defaults to config.STOP_LOSS_MAP[symbol] (falling
         back to config.DEFAULT_STOP_LOSS_PCT); take_profit_ratio defaults
-        to config.TAKE_PROFIT_RATIO. Both are expressed relative to stake:
+        to config.TAKE_PROFIT_RATIO. Both are first computed exactly as
+        before, relative to stake:
           stop_loss_amount   = stake * (stop_loss_pct / 100)
           take_profit_amount = stop_loss_amount * take_profit_ratio
+        ...and then, per config.TP_SL_SWAP_ENABLED (user-directed, Aug
+        2026), SWAPPED before being sent: the limit_order's take_profit
+        is set to the computed stop_loss_amount, and its stop_loss is
+        set to the computed take_profit_amount.
 
         strategy identifies the signal/strategy that produced this trade,
         used as the second half of the circuit-breaker key (symbol,
@@ -1204,8 +1209,23 @@ class DerivClient:
 
             stake = self._cap_stake(stake, symbol)
             contract_type = "MULTUP" if direction == "LONG" else "MULTDOWN"
-            stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
-            take_profit_amount = round(stop_loss_amount * take_profit_ratio, 2)
+
+            # TP/SL SWAP (user-directed, Aug 2026 — see
+            # config.TP_SL_SWAP_ENABLED). Computed exactly as before —
+            # stake x stop_loss_pct for the stop distance, then x
+            # take_profit_ratio for the take-profit distance — and then
+            # the two amounts are swapped before being sent: the take
+            # profit is placed where the stop-loss would otherwise have
+            # gone, and the stop-loss is placed where the take-profit
+            # would otherwise have gone.
+            _computed_stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
+            _computed_take_profit_amount = round(_computed_stop_loss_amount * take_profit_ratio, 2)
+            if getattr(config, "TP_SL_SWAP_ENABLED", True):
+                stop_loss_amount   = _computed_take_profit_amount
+                take_profit_amount = _computed_stop_loss_amount
+            else:
+                stop_loss_amount   = _computed_stop_loss_amount
+                take_profit_amount = _computed_take_profit_amount
 
             logger.info(
                 f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f} "
