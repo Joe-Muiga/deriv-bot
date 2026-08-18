@@ -769,50 +769,6 @@ def _prob_a_beats_b(wins_a: int, losses_a: int, wins_b: int, losses_b: int,
     return a_wins / n_samples
 
 
-def _janja_action(symbol: str, default_action: str) -> Tuple[str, float, bool]:
-    """
-    JANJA RULE (user-directed, Aug 2026): a sequential TAKE/INVERT
-    alternator for config.JANJA_SYMBOLS — NOT a statistical model, and
-    deliberately bypasses the Bayesian bandit entirely for these symbols.
-    Only cares about this symbol's single most recent trade:
-
-      - Won on TAKE   -> this trade uses INVERT.
-      - Won on INVERT -> this trade uses TAKE.
-      - Lost (either mode), or no prior trade logged yet for this symbol
-        -> this trade uses the symbol's normal default
-        (config.META_LABEL_DEFAULT_ACTION_BY_SYMBOL).
-
-    Returns (action, confidence, bypassed) in the same shape
-    predict_take_trade() already returns for the Bayesian-bandit path —
-    confidence is a 1.0 policy marker (this isn't a probability), and
-    bypassed=True only when there's no prior trade to react to yet (pure
-    pass-through to default, same meaning as the bandit's own bypassed
-    flag below the min-sample floor).
-    """
-    try:
-        last = strategy_stats.stats.get_last_trade_action(symbol)
-    except Exception as exc:
-        logger.warning(f"JANJA RULE: get_last_trade_action({symbol}) failed: {exc}")
-        last = None
-
-    if last is None:
-        return default_action, 1.0, True
-
-    last_action, last_won = last
-    if not last_won:
-        action = default_action
-    elif last_action == "TAKE":
-        action = "INVERT"
-    else:  # last_action == "INVERT" and it won
-        action = "TAKE"
-
-    logger.info(
-        "JANJA RULE: %s last_action=%s last_won=%s default=%s -> action=%s",
-        symbol, last_action, last_won, default_action, action,
-    )
-    return action, 1.0, False
-
-
 # ── MODULE-LEVEL SINGLETONS ────────────────────────────────────────────
 _model = MetaLabelingModel()
 _prediction_log = PredictionLog()
@@ -859,9 +815,15 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     probability. No enriched features, no external data — purely this
     symbol's own win/loss history.
 
-    JANJA RULE (Aug 2026): for symbols in config.JANJA_SYMBOLS, the
-    Bayesian bandit above is skipped entirely in favor of a sequential
-    TAKE/INVERT alternator — see _janja_action()'s docstring.
+    NOTE (user-directed, Aug 2026): bot_engine.py's execution path no
+    longer uses this function's TAKE/INVERT output to decide trade
+    direction — see config.INVERT_ALL_SIGNALS / bot_engine.py's
+    "UNIVERSAL SIGNAL INVERSION" step, which unconditionally inverts
+    every symbol's direction regardless of what this bandit would have
+    picked. This function and its underlying win/loss bookkeeping are
+    left in place and still callable (e.g. for the dashboard / smoke
+    test / future use) but are no longer part of the live trade-decision
+    path.
     """
     strategy = str(features["strategy"])
     symbol = str(features["symbol"])
@@ -881,45 +843,40 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
 
     action, confidence, bypassed = default_action, 1.0, True
 
-    if symbol in getattr(config, "JANJA_SYMBOLS", []):
-        # JANJA RULE takes priority over the Bayesian bandit for these
-        # symbols — see config.JANJA_SYMBOLS / _janja_action() above.
-        action, confidence, bypassed = _janja_action(symbol, default_action)
-    else:
-        try:
-            tis = strategy_stats.stats.get_take_invert_stats(symbol)
-            wins_take, losses_take = tis["wins_take"], tis["losses_take"]
-            wins_invert, losses_invert = tis["wins_invert"], tis["losses_invert"]
-            n_override = (wins_invert + losses_invert) if override_action == "INVERT" \
-                else (wins_take + losses_take)
-            min_samples = getattr(config, "BAYESIAN_MIN_SAMPLES_FOR_OVERRIDE", 8)
+    try:
+        tis = strategy_stats.stats.get_take_invert_stats(symbol)
+        wins_take, losses_take = tis["wins_take"], tis["losses_take"]
+        wins_invert, losses_invert = tis["wins_invert"], tis["losses_invert"]
+        n_override = (wins_invert + losses_invert) if override_action == "INVERT" \
+            else (wins_take + losses_take)
+        min_samples = getattr(config, "BAYESIAN_MIN_SAMPLES_FOR_OVERRIDE", 8)
 
-            if n_override >= min_samples:
-                if override_action == "INVERT":
-                    prob_override_better = _prob_a_beats_b(wins_invert, losses_invert, wins_take, losses_take)
-                else:
-                    prob_override_better = _prob_a_beats_b(wins_take, losses_take, wins_invert, losses_invert)
+        if n_override >= min_samples:
+            if override_action == "INVERT":
+                prob_override_better = _prob_a_beats_b(wins_invert, losses_invert, wins_take, losses_take)
+            else:
+                prob_override_better = _prob_a_beats_b(wins_take, losses_take, wins_invert, losses_invert)
 
-                override_min_conf = getattr(config, "BAYESIAN_OVERRIDE_CONFIDENCE", 0.80)
-                bypassed = False
-                if prob_override_better >= override_min_conf:
-                    action, confidence = override_action, prob_override_better
-                else:
-                    action = default_action
-                    confidence = _beta_posterior_mean(wins_take, losses_take) if default_action == "TAKE" \
-                        else _beta_posterior_mean(wins_invert, losses_invert)
+            override_min_conf = getattr(config, "BAYESIAN_OVERRIDE_CONFIDENCE", 0.80)
+            bypassed = False
+            if prob_override_better >= override_min_conf:
+                action, confidence = override_action, prob_override_better
+            else:
+                action = default_action
+                confidence = _beta_posterior_mean(wins_take, losses_take) if default_action == "TAKE" \
+                    else _beta_posterior_mean(wins_invert, losses_invert)
 
-                logger.info(
-                    "BAYESIAN BANDIT: %s default=%s override=%s p(override_better)=%.3f "
-                    "(take:%dW/%dL invert:%dW/%dL) -> action=%s",
-                    symbol, default_action, override_action, prob_override_better,
-                    wins_take, losses_take, wins_invert, losses_invert, action,
-                )
-            # else: override mode doesn't have enough of its own trades yet —
-            # stay on default, confidence stays the 1.0 pass-through marker.
-        except Exception as exc:
-            logger.warning(f"Bayesian TAKE/INVERT bandit failed for {symbol}: {exc}")
-            action, confidence, bypassed = default_action, 1.0, True
+            logger.info(
+                "BAYESIAN BANDIT: %s default=%s override=%s p(override_better)=%.3f "
+                "(take:%dW/%dL invert:%dW/%dL) -> action=%s",
+                symbol, default_action, override_action, prob_override_better,
+                wins_take, losses_take, wins_invert, losses_invert, action,
+            )
+        # else: override mode doesn't have enough of its own trades yet —
+        # stay on default, confidence stays the 1.0 pass-through marker.
+    except Exception as exc:
+        logger.warning(f"Bayesian TAKE/INVERT bandit failed for {symbol}: {exc}")
+        action, confidence, bypassed = default_action, 1.0, True
 
     _prediction_log.insert(
         strategy=strategy, symbol=symbol, entry_score=entry_score,
