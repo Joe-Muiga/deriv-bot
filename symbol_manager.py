@@ -31,7 +31,8 @@ _BEAR_BULL_POST_RESET_MINS = getattr(config, 'BEAR_BULL_TREND_SHIFT_MINS', 20)
 class SymbolManager:
     def __init__(self):
         self._suspension_until = {}    # symbol -> unix expiry timestamp
-        self._last_traded = {}         # symbol -> unix timestamp of last placement
+        self._last_traded = {}         # symbol -> unix timestamp of last SUCCESSFUL placement
+        self._last_attempt = {}        # symbol -> unix timestamp of last ATTEMPT (success or fail)
         self._session_losses = {}      # symbol -> loss count this UTC session
         self._symbol_wins = {}         # symbol -> win count this session
         self._symbol_trades = {}       # symbol -> total trade count this session
@@ -67,6 +68,32 @@ class SymbolManager:
             logger.info(f"BLOCKED: {symbol} already has an active contract")
             return False
 
+        # RETRY COOLDOWN (fix, Aug 2026 — "signals generated many times at
+        # the same time which end up suspended & not executed"): a signal
+        # condition that persists across several 1s scan cycles (the same
+        # completed bar, an indicator still past threshold, etc.) was being
+        # re-attempted on literally every cycle with zero spacing, because
+        # _last_traded only updates on a CONFIRMED SUCCESSFUL placement —
+        # a failed buy left nothing to gap-check against, so the very next
+        # 1s cycle re-fired the identical signal immediately. A handful of
+        # genuinely-failing attempts back-to-back like that burns through
+        # bot_engine's BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD (default 5) in
+        # a few seconds and the symbol gets suspended — not because it
+        # actually failed 5 independent times, but because one persistent
+        # signal was recounted 5 times in under 10s. Spacing every attempt
+        # (success or failure) by SIGNAL_RETRY_COOLDOWN_SECS gives a
+        # transient issue (rate limit, momentary API hiccup) real time to
+        # clear between tries, and means the circuit breaker only actually
+        # trips for a genuinely persistent problem.
+        retry_cooldown = getattr(config, "SIGNAL_RETRY_COOLDOWN_SECS", 20)
+        since_attempt = time.time() - self._last_attempt.get(symbol, 0)
+        if since_attempt < retry_cooldown:
+            logger.debug(
+                f"BLOCKED: {symbol} retry-cooldown not met "
+                f"({since_attempt:.0f}s elapsed, {retry_cooldown:.0f}s required)"
+            )
+            return False
+
         gap_required = config.SYMBOL_MIN_GAP_MINS * 60
         elapsed = time.time() - self._last_traded.get(symbol, 0)
         if elapsed < gap_required:
@@ -78,8 +105,18 @@ class SymbolManager:
 
         return True
 
+    def record_attempt(self, symbol: str) -> None:
+        """
+        Called once per execution attempt on this symbol, regardless of
+        whether the buy ultimately succeeds or fails — see the retry-
+        cooldown check in can_trade_now() for why this needs to be
+        distinct from record_trade_placed() (success-only).
+        """
+        self._last_attempt[symbol] = time.time()
+
     def record_trade_placed(self, symbol: str) -> None:
         self._last_traded[symbol] = time.time()
+        self._last_attempt[symbol] = time.time()
         self._active_symbols.add(symbol)
         logger.info(f"TRADE PLACED: {symbol} | Active: {self._active_symbols}")
 
@@ -245,8 +282,10 @@ class SymbolManager:
         tradeable = []
         suspended_list = []
         session_blocked = []
+        cooldown_list = []
 
         now = time.time()
+        retry_cooldown = getattr(config, "SIGNAL_RETRY_COOLDOWN_SECS", 20)
         for symbol in source:
             if symbol in self._active_symbols:
                 continue
@@ -260,6 +299,16 @@ class SymbolManager:
                 session_blocked.append(symbol)
                 continue
 
+            # Same retry-cooldown as can_trade_now() — skip re-scanning a
+            # symbol whose last attempt (success or failure) is still
+            # inside the cooldown window, rather than re-evaluating and
+            # re-logging an identical signal every single cycle only to
+            # have can_trade_now() reject it downstream anyway.
+            since_attempt = now - self._last_attempt.get(symbol, 0)
+            if since_attempt < retry_cooldown:
+                cooldown_list.append(symbol)
+                continue
+
             gap_required = getattr(config, 'SYMBOL_MIN_GAP_MINS', 1) * 60
             elapsed = now - self._last_traded.get(symbol, 0)
             if elapsed < gap_required:
@@ -270,7 +319,8 @@ class SymbolManager:
         logger.info(
             f"Queue: {len(tradeable)} tradeable | "
             f"Suspended: {suspended_list} | "
-            f"Session-blocked: {session_blocked}"
+            f"Session-blocked: {session_blocked} | "
+            f"Retry-cooldown: {cooldown_list}"
         )
         return tradeable
 
