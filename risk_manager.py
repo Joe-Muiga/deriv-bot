@@ -96,6 +96,7 @@ from typing import List, Optional
 
 import config
 import strategy_stats
+import exit_engine
 
 logger = logging.getLogger(__name__)
 
@@ -393,6 +394,96 @@ class RiskManager:
         lo = getattr(config, "DYNAMIC_STOP_LOSS_PCT_MIN", 15.0)
         hi = getattr(config, "DYNAMIC_STOP_LOSS_PCT_MAX", 90.0)
         return float(max(lo, min(hi, raw_pct)))
+
+    def compute_calibrated_stop_loss_pct(
+        self,
+        symbol: str,
+        base_stop_loss_pct: float,
+        atr_pct: float = 0.0,
+        multiplier: int = 100,
+    ) -> float:
+        """
+        User-directed fix (Aug 2026): "the stoploss is placed where the
+        popular signals would have placed the take profit... make it be
+        placed at a low level but not too low since i anticipate the
+        market to move to that direction then reverse and hit my take
+        profit."
+
+        Replaces the blind base_stop_loss_pct * TAKE_PROFIT_RATIO swap
+        width (deriv_client.buy_multiplier(), config.TP_SL_SWAP_ENABLED)
+        with a width sized from where price has actually tended to go.
+        base_stop_loss_pct is the SMALL side of the swap — unchanged,
+        still what STOP_LOSS_MAP / compute_dynamic_stop_loss_pct produced,
+        and still what ends up as take_profit_amount after the swap. This
+        method returns the pct to use for the WIDE, swapped-in stop-loss
+        side instead of a flat multiple of that.
+
+        Priority order for the candidate distance:
+          1. MAE-percentile (data-driven) — the config.MAE_STOP_PERCENTILE
+             -th percentile of how far past WINNING trades on this symbol
+             dipped against the position (their Maximum Adverse Excursion,
+             tracked live per-contract in exit_engine.py) before reversing
+             to hit target. This is the actual "not too low" anchor: it
+             sits just past where the anticipated move-then-reverse
+             pattern has empirically tended to turn, not an arbitrary
+             number. Needs >= config.MAE_STOP_MIN_SAMPLES winning trades
+             logged for this symbol (exit_engine.get_mae_percentile()
+             returns None below that and this path is skipped).
+          2. ATR fallback (compute_dynamic_stop_loss_pct) — real-
+             volatility-anchored, used while MAE history is still thin.
+          3. Static fallback — base_stop_loss_pct * TAKE_PROFIT_RATIO, the
+             original blind swap width, only if neither of the above is
+             available (e.g. first trades right after a fresh redeploy).
+
+        Whichever source wins, the result is then:
+          - floored at max(DYNAMIC_STOP_LOSS_PCT_MIN, base_stop_loss_pct)
+            — never tighter than the noise floor or the base level itself,
+            preserving room for the anticipated adverse move.
+          - capped at base_stop_loss_pct * MAX_LOSS_TO_WIN_RATIO — bounds
+            the worst-case single loss to a fixed, small multiple of the
+            quick-win target however the candidate was derived. This is
+            the direct fix for the $54.6-loss-vs-$23-win asymmetry (a
+            ratio of ~2.37, close to the old unbounded 2.5x
+            TAKE_PROFIT_RATIO swap) — MAX_LOSS_TO_WIN_RATIO defaults to
+            1.5, well under half that.
+
+        Every call is logged with its source and inputs, same convention
+        as compute_kelly_fraction() below.
+        """
+        safety_mult = getattr(config, "MAE_STOP_SAFETY_MULT", 1.15)
+        mae_pct_frac: Optional[float] = None
+        try:
+            mae_pct_frac = exit_engine.get_mae_percentile(
+                symbol, getattr(config, "MAE_STOP_PERCENTILE", 85.0))
+        except Exception as exc:
+            logger.debug(f"CALIBRATED STOP | {symbol} | MAE lookup failed: {exc}")
+
+        if mae_pct_frac is not None:
+            candidate = mae_pct_frac * 100.0 * safety_mult
+            source = "mae_percentile"
+        elif atr_pct > 0:
+            candidate = self.compute_dynamic_stop_loss_pct(atr_pct, multiplier)
+            source = "atr_fallback"
+        else:
+            candidate = base_stop_loss_pct * getattr(config, "TAKE_PROFIT_RATIO", 2.5)
+            source = "static_fallback"
+
+        floor = max(
+            getattr(config, "DYNAMIC_STOP_LOSS_PCT_MIN", 15.0),
+            base_stop_loss_pct,
+        )
+        ceiling = base_stop_loss_pct * getattr(config, "MAX_LOSS_TO_WIN_RATIO", 1.5)
+        # floor could theoretically exceed ceiling if MAX_LOSS_TO_WIN_RATIO
+        # is misconfigured below 1.0 — guard so we never return something
+        # tighter than the floor demands.
+        final_pct = max(floor, min(max(ceiling, floor), candidate))
+
+        logger.info(
+            f"CALIBRATED STOP | {symbol} | source={source} "
+            f"candidate={candidate:.2f}% floor={floor:.2f}% "
+            f"ceiling={ceiling:.2f}% -> final={final_pct:.2f}%"
+        )
+        return final_pct
 
     # ── Kelly overlay ────────────────────────────────────────────────────────
 
