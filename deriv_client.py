@@ -1140,6 +1140,7 @@ class DerivClient:
             multiplier:    int    = None,
             stop_loss_pct: float  = None,
             take_profit_ratio: float = None,
+            calibrated_stop_loss_pct: float = None,
             strategy:      str    = "default",
             cb_threshold:  int    = 3,
             cb_cooldown:   float  = 60.0,
@@ -1172,7 +1173,15 @@ class DerivClient:
         ...and then, per config.TP_SL_SWAP_ENABLED (user-directed, Aug
         2026), SWAPPED before being sent: the limit_order's take_profit
         is set to the computed stop_loss_amount, and its stop_loss is
-        set to the computed take_profit_amount.
+        set to whichever of the following is available (MAE-calibrated
+        stop fix, Aug 2026): calibrated_stop_loss_pct if the caller
+        passed one (risk_manager.compute_calibrated_stop_loss_pct() —
+        sized from real Maximum Adverse Excursion history / ATR, capped
+        at config.MAX_LOSS_TO_WIN_RATIO of the take-profit side rather
+        than an unbounded take_profit_ratio multiple), else the original
+        computed_take_profit_amount (stop_loss_amount * take_profit_ratio)
+        as a last-resort fallback — same behavior as before this fix if
+        the caller doesn't pass calibrated_stop_loss_pct at all.
 
         strategy identifies the signal/strategy that produced this trade,
         used as the second half of the circuit-breaker key (symbol,
@@ -1211,26 +1220,37 @@ class DerivClient:
             contract_type = "MULTUP" if direction == "LONG" else "MULTDOWN"
 
             # TP/SL SWAP (user-directed, Aug 2026 — see
-            # config.TP_SL_SWAP_ENABLED). Computed exactly as before —
-            # stake x stop_loss_pct for the stop distance, then x
-            # take_profit_ratio for the take-profit distance — and then
-            # the two amounts are swapped before being sent: the take
-            # profit is placed where the stop-loss would otherwise have
-            # gone, and the stop-loss is placed where the take-profit
-            # would otherwise have gone.
+            # config.TP_SL_SWAP_ENABLED). The quick-win side is computed
+            # exactly as before — stake x stop_loss_pct — and always ends
+            # up as the take-profit amount after the swap. The wide,
+            # swapped-in stop-loss side used to always be that same
+            # amount x take_profit_ratio (an unbounded 2.5x by default —
+            # the direct cause of the $54.6-loss-vs-$23-win asymmetry).
+            # MAE-CALIBRATED STOP FIX (Aug 2026): when the caller passes
+            # calibrated_stop_loss_pct (risk_manager.compute_calibrated_
+            # stop_loss_pct() — sized from real Maximum Adverse Excursion
+            # history or ATR, hard-capped at config.MAX_LOSS_TO_WIN_RATIO
+            # of the take-profit side), that value is used for the stop
+            # distance instead of the flat take_profit_ratio multiple.
+            # Falls back to the old behavior unchanged if the caller
+            # doesn't pass one.
             _computed_stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
-            _computed_take_profit_amount = round(_computed_stop_loss_amount * take_profit_ratio, 2)
+            if calibrated_stop_loss_pct is not None:
+                _computed_wide_amount = round(stake * (calibrated_stop_loss_pct / 100.0), 2)
+            else:
+                _computed_wide_amount = round(_computed_stop_loss_amount * take_profit_ratio, 2)
             if getattr(config, "TP_SL_SWAP_ENABLED", True):
-                stop_loss_amount   = _computed_take_profit_amount
+                stop_loss_amount   = _computed_wide_amount
                 take_profit_amount = _computed_stop_loss_amount
             else:
                 stop_loss_amount   = _computed_stop_loss_amount
-                take_profit_amount = _computed_take_profit_amount
+                take_profit_amount = _computed_wide_amount
 
             logger.info(
                 f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f} "
                 f"multiplier={multiplier}x SL=${stop_loss_amount:.2f} "
                 f"TP=${take_profit_amount:.2f}"
+                + (" [calibrated]" if calibrated_stop_loss_pct is not None else " [legacy-ratio]")
             )
 
             proposal_req = {
