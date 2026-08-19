@@ -396,6 +396,56 @@ DYNAMIC_STOP_LOSS_PCT_MIN   = 15.0   # floor — never set a stop tighter than t
 DYNAMIC_STOP_LOSS_PCT_MAX   = 90.0   # ceiling — leave headroom under Deriv's
                                       # own 100%-of-stake max-loss cap
 
+# ── MAE-CALIBRATED STOP WIDTH (user-directed, Aug 2026) ───────────────
+# Replaces TAKE_PROFIT_RATIO as the blind multiplier that decides how
+# wide the swapped-in stop-loss is (see TP_SL_SWAP_ENABLED below —
+# stop_loss_pct * TAKE_PROFIT_RATIO used to become the actual stop-loss
+# distance unconditionally, e.g. 2.5x the quick-win target no matter
+# what the market actually does). Root cause of the win/loss $ skew:
+# best trade $23 vs worst trade $54.6 on live results is close to that
+# same 2.5x ratio — the stop was sized by arithmetic, not by where price
+# actually tends to be when a winning trade's anticipated reversal
+# happens.
+#
+# risk_manager.compute_calibrated_stop_loss_pct() now sizes the
+# swapped-in stop from the MAE_STOP_PERCENTILE-th percentile of how far
+# past WINNING trades on that symbol dipped against the position (their
+# Maximum Adverse Excursion, tracked live per-contract in exit_engine.py)
+# before reversing to hit target — i.e. just past where the anticipated
+# move-then-reverse pattern actually tends to turn, not an arbitrary
+# multiple. Falls back to the existing ATR-based compute_dynamic_stop_
+# loss_pct() while MAE_STOP_MIN_SAMPLES hasn't been reached yet for a
+# symbol, and to the old TAKE_PROFIT_RATIO multiple only if neither is
+# available (cold start, first trades after a fresh redeploy).
+# Whichever source produced the candidate, it is then always floored at
+# the base stop_loss_pct itself (never tighter than the level
+# STOP_LOSS_MAP/compute_dynamic_stop_loss_pct already calibrated per
+# symbol — keeps the room needed for price to move against the position
+# before reversing) and capped at base_stop_loss_pct * MAX_LOSS_TO_WIN_
+# RATIO — this last part is the actual fix: it bounds the worst-case
+# single loss to a fixed multiple of the quick-win target regardless of
+# which source produced the candidate, so a loss can no longer cost
+# several times what a win pays.
+MAE_STOP_PERCENTILE   = 85.0   # use the 85th percentile of past winners'
+                                # adverse excursion — covers the large
+                                # majority of the anticipated-reversal
+                                # pattern without sizing off a single
+                                # outlier trade
+MAE_STOP_SAFETY_MULT  = 1.15   # small margin on top of the raw
+                                # percentile so the stop doesn't sit
+                                # exactly on the historical edge
+MAE_STOP_MIN_SAMPLES  = 20     # minimum logged winning trades for a
+                                # symbol before its MAE percentile is
+                                # trusted; below this, fall back to the
+                                # ATR-based / static estimate instead
+MAX_LOSS_TO_WIN_RATIO = 1.5    # hard ceiling — the swapped-in stop can
+                                # never be sized wider than this multiple
+                                # of the quick-win (take-profit) amount,
+                                # however it was derived. Was an
+                                # unbounded 2.5x via TAKE_PROFIT_RATIO;
+                                # this is the direct fix for the $54.6-
+                                # loss-vs-$23-win asymmetry
+
 # ── VOL REGIME DETECTION (for VOL_BREAKOUT / VOL_REV_MULT, signal_engine.py) ──
 # ENHANCEMENT (win-rate pass, Aug 2026): dashboard trade history showed
 # VOL_BREAKOUT losing on the large majority of its trades while carrying
@@ -769,6 +819,20 @@ TICK_RESUBSCRIBE_RETRY_SECS = 30
 BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD    = 5
 BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS = 15
 
+# Fix, Aug 2026 — "signals generated many times at the same time which end
+# up suspended & not executed". A signal condition that persists across
+# several SCAN_CYCLE_SLEEP (1s) cycles was being re-attempted on every
+# single cycle with zero spacing, because the pre-existing SYMBOL_MIN_GAP_
+# MINS gap only updates on a CONFIRMED SUCCESSFUL placement — a failed buy
+# left nothing to gap-check against, so the identical signal re-fired
+# ~1s later, burning through BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD (5) in
+# under 10s and getting the symbol suspended for a problem that was really
+# one persistent signal counted five times, not five independent
+# failures. symbol_manager.can_trade_now()/get_queue() now require this
+# many seconds between ANY two attempts on the same symbol (success or
+# failure) before a new one is allowed through.
+SIGNAL_RETRY_COOLDOWN_SECS = 20
+
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
 INIT_BATCH_SIZE        = 8
@@ -795,14 +859,26 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
 
-# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
-# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
-# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
-# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
-# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
-# _next_scheduled_fire().
+# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS as a ROLLING
+# window measured from when trading actually resumes after the previous
+# redeploy — NOT anchored to fixed clock boundaries. Cycle, forever:
+#   1. Trade normally for REDEPLOY_INTERVAL_HOURS.
+#   2. Timer fires -> is_redeploy_pending() goes True -> bot_engine's
+#      _main_loop stops taking NEW entries (existing open contracts are
+#      untouched and keep being actively managed).
+#   3. _settle_loop actively drains every open contract (confirmed closes
+#      only, never a guess — up to DRAIN_MAX_SECS).
+#   4. Once flat, trigger_redeploy() fires the Render deploy hook -> the
+#      whole process restarts fresh (or, if RENDER_DEPLOY_HOOK_URL isn't
+#      set, restart_scheduler just clears the pending flag in place and
+#      loop 1-4 repeats inside the same process instead).
+#   5. New process/cycle starts the same REDEPLOY_INTERVAL_HOURS timer
+#      again. Continuous, autonomous, no manual step anywhere in the loop.
+# REDEPLOY_TIMEZONE is kept only for log/status readability (converting
+# the next-due timestamp to a local time in log lines) — it no longer
+# anchors *when* the timer fires, only how that moment is displayed.
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 6
+REDEPLOY_INTERVAL_HOURS = 3
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
