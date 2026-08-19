@@ -121,6 +121,14 @@ class _ContractState:
     static_tp_amount: float
     armed: bool = False
     peak_profit: float = float("-inf")
+    # Maximum Adverse Excursion tracking (MAE-calibrated stop fix, Aug
+    # 2026) — the worst (most negative) profit seen while this contract
+    # was open, mirroring peak_profit's MFE tracking on the other side.
+    # Logged per symbol at close (record_closed(), winning trades only)
+    # so risk_manager.compute_calibrated_stop_loss_pct() can size the
+    # swapped-in stop-loss from where past winners actually dipped to
+    # before reversing, instead of an arbitrary TAKE_PROFIT_RATIO multiple.
+    trough_profit: float = float("inf")
     last_proposed_floor: Optional[float] = None
     history: List[_Snapshot] = field(default_factory=list)
 
@@ -130,6 +138,58 @@ class _ContractState:
 # --------------------------------------------------------------------------
 
 _contract_states: Dict[str, _ContractState] = {}
+
+# MAE-calibrated stop fix (Aug 2026) — rolling, per-symbol history of how
+# far past WINNING trades dipped against the position (as a fraction of
+# stake) before reversing to hit target. Populated in record_closed();
+# read by risk_manager.compute_calibrated_stop_loss_pct() via
+# get_mae_percentile(). In-memory only, same lifetime as _contract_states
+# — reset for free on every redeploy, rebuilds from live trades after.
+_mae_history: Dict[str, List[float]] = {}
+MAE_HISTORY_MAXLEN = 200
+
+
+def _percentile(data: List[float], pct: float) -> float:
+    """
+    Linear-interpolation percentile (matches numpy's default 'linear'
+    method) without adding a numpy dependency to this module. `data`
+    need not be sorted going in.
+    """
+    if not data:
+        return 0.0
+    ordered = sorted(data)
+    if len(ordered) == 1:
+        return ordered[0]
+    k = (len(ordered) - 1) * (pct / 100.0)
+    f = int(k)
+    c = min(f + 1, len(ordered) - 1)
+    if f == c:
+        return ordered[f]
+    return ordered[f] + (ordered[c] - ordered[f]) * (k - f)
+
+
+def _record_mae(symbol: str, mae_fraction: float) -> None:
+    """mae_fraction is (abs of the worst negative profit seen) / stake —
+    always >= 0. Called only for WINNING trades (see record_closed)."""
+    hist = _mae_history.setdefault(symbol, [])
+    hist.append(max(0.0, mae_fraction))
+    if len(hist) > MAE_HISTORY_MAXLEN:
+        del hist[: len(hist) - MAE_HISTORY_MAXLEN]
+
+
+def get_mae_percentile(symbol: str, pct: float = 85.0) -> Optional[float]:
+    """
+    Returns the pct-th percentile of this symbol's logged winning-trade
+    MAE fractions (of stake), or None if fewer than
+    config.MAE_STOP_MIN_SAMPLES samples have been logged yet — callers
+    must treat None as "not enough data, use a fallback".
+    """
+    hist = _mae_history.get(symbol)
+    min_samples = getattr(config, "MAE_STOP_MIN_SAMPLES", 20)
+    if not hist or len(hist) < min_samples:
+        return None
+    return _percentile(hist, pct)
+
 
 _model: Any = None
 _model_lock = asyncio.Lock()
@@ -191,6 +251,8 @@ def record_snapshot(
 
         if current_profit > state.peak_profit:
             state.peak_profit = current_profit
+        if current_profit < state.trough_profit:
+            state.trough_profit = current_profit
 
         _append_jsonl(
             SNAPSHOT_LOG_PATH,
@@ -417,6 +479,21 @@ def record_closed(contract_id: str, final_profit: float) -> None:
         if state is None or not state.history:
             logger.warning("EXIT ENGINE: record_closed called with no history for %s", contract_id)
             return
+
+        # MAE-calibrated stop fix (Aug 2026) — only WINNING trades teach
+        # us anything about "how far does price move against the position
+        # before the anticipated reversal happens" (a losing trade's
+        # trough is just wherever the static stop finally caught it, not
+        # a real reversal point). trough_profit starts at +inf and is
+        # only ever lowered by an actual negative snapshot, so a trade
+        # that was never underwater at all correctly contributes MAE=0.
+        if final_profit > 0 and state.stake:
+            worst = min(state.trough_profit, 0.0)  # ignore the +inf sentinel if never underwater
+            mae_fraction = abs(worst) / state.stake
+            try:
+                _record_mae(state.symbol, mae_fraction)
+            except Exception as exc:
+                logger.warning("EXIT ENGINE: _record_mae failed for %s: %s", contract_id, exc)
 
         decay_fraction = config.EXIT_DECAY_CLOSE_FRACTION
         eventual_peak = max(state.peak_profit, final_profit)
