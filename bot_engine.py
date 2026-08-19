@@ -997,6 +997,14 @@ class BotEngine:
         if not self.symbols.can_trade_now(symbol):
             return False
 
+        # RETRY COOLDOWN (fix, Aug 2026): mark this as an attempt the
+        # instant it clears the gate above, before the buy call — success
+        # or failure both count, so a persistently-firing signal can't
+        # re-enter _execute() again next cycle and burn through the buy-
+        # failure circuit breaker in a handful of seconds. See
+        # symbol_manager.can_trade_now()'s retry-cooldown check.
+        self.symbols.record_attempt(symbol)
+
         strategy = getattr(sig, "strategy", "unknown")
 
         # Implementation Brief v4 §5.1 — leverage-aware meta-labeling
@@ -1154,19 +1162,46 @@ class BotEngine:
                 self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
                 if ml_atr_pct > 0 else None
             )
+            resolved_multiplier = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER)
+            # MAE-calibrated stop fix (Aug 2026): dyn_sl_pct above (or the
+            # STOP_LOSS_MAP default when ATR isn't available yet) is the
+            # SMALL/base side and is unaffected — it still ends up as the
+            # take-profit amount after TP_SL_SWAP_ENABLED. This is the
+            # WIDE, swapped-in stop-loss side; see risk_manager.compute_
+            # calibrated_stop_loss_pct()'s docstring for the full priority
+            # order (MAE percentile -> ATR fallback -> legacy ratio).
+            base_sl_pct = dyn_sl_pct if dyn_sl_pct is not None else config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
+            calibrated_sl_pct = self.risk.compute_calibrated_stop_loss_pct(
+                symbol             = symbol,
+                base_stop_loss_pct = base_sl_pct,
+                atr_pct            = ml_atr_pct if ml_atr_pct > 0 else 0.0,
+                multiplier         = resolved_multiplier,
+            )
             buy_resp = await self.client.buy_multiplier(
                 symbol        = symbol,
                 direction     = direction,
                 stake         = stake,
-                multiplier    = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+                multiplier    = resolved_multiplier,
                 stop_loss_pct = dyn_sl_pct,
+                calibrated_stop_loss_pct = calibrated_sl_pct,
                 strategy      = strategy,
             )
         elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
+            # Same MAE-calibrated stop as the VOL_MULTIPLIER_SYMBOLS branch
+            # above, resolved against the static STOP_LOSS_MAP base since
+            # these symbols (Boom/Crash etc.) don't compute live ATR here.
+            base_sl_pct = config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
+            calibrated_sl_pct = self.risk.compute_calibrated_stop_loss_pct(
+                symbol             = symbol,
+                base_stop_loss_pct = base_sl_pct,
+                atr_pct            = 0.0,
+                multiplier         = config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+            )
             buy_resp = await self.client.buy_multiplier(
                 symbol   = symbol,
                 direction= direction,
                 stake    = stake,
+                calibrated_stop_loss_pct = calibrated_sl_pct,
                 strategy = strategy,
             )
         else:
@@ -1358,6 +1393,25 @@ class BotEngine:
             self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
         except Exception:
             pass
+
+        # BUG FIX (Aug 2026, found while wiring the MAE-calibrated stop):
+        # exit_engine.record_closed() was previously only called from two
+        # rare edge-case paths (the adaptive-exit already-closed branch
+        # and the Multiplier max-hold branch) — every ordinary close
+        # (natural WS push via _on_contract_result, or the general orphan
+        # sweep) never called it at all. That starved BOTH the ML exit
+        # layer's training set (_total_closed_logged needs to reach
+        # META_LABEL_MIN_TRADES=200 — at the old call-site coverage that
+        # could take a very long time even with heavy trading volume) and
+        # the new MAE-percentile stop calibration (get_mae_percentile()
+        # in exit_engine.py) of almost all of their real data. Safe to
+        # call unconditionally here — record_closed() pops the contract's
+        # state and no-ops with a log line if it's already been popped by
+        # one of the other two call sites, so nothing double-counts.
+        try:
+            exit_engine.record_closed(cid, pnl)
+        except Exception as exc:
+            logger.warning(f"exit_engine.record_closed({cid}) failed: {exc}")
 
         strategy    = info.get("strategy", "unknown")
         entry_score = float(getattr(info.get("sig"), "score", 0.0))
