@@ -387,64 +387,38 @@ VOLATILITY_SYMBOLS = ALL_TRADE_SYMBOLS  # alias for compatibility with bot_engin
 # corresponds to a stable number of ATRs of real price movement no
 # matter which multiplier a symbol is forced into. STOP_LOSS_MAP /
 # DEFAULT_STOP_LOSS_PCT stay untouched and keep governing Boom/Crash
-# exactly as before — this only applies to VOL_MULTIPLIER_SYMBOLS (see
-# RiskManager.compute_dynamic_stop_loss_pct() in risk_manager.py and its
-# call site in bot_engine.py's _execute()).
+# exactly as before — this now applies to every symbol in
+# config.MULTIPLIER_SYMBOLS (widened from VOL_MULTIPLIER_SYMBOLS only,
+# Aug 2026, so Boom/Crash gets the same minimized stop as everything
+# else — see RiskManager.compute_dynamic_stop_loss_pct() in
+# risk_manager.py and its call site in bot_engine.py's _execute()).
 DYNAMIC_STOP_LOSS_ENABLED   = True
-STOP_ATR_MULT               = 2.0    # stop distance target, in ATRs of price
-DYNAMIC_STOP_LOSS_PCT_MIN   = 15.0   # floor — never set a stop tighter than this
+
+# Safety margin applied outside the Kalman-filter noise floor (see
+# risk_manager.compute_dynamic_stop_loss_pct()) — the smallest multiple
+# of the filter's own residual noise band a stop can sit at before it's
+# just measuring noise rather than a real move against the position.
+# 1.2 means "20% wider than the noise band itself", the tightest margin
+# considered still statistically defensible; the noise band itself
+# (1.0x, no margin) is used as the hard floor beneath which the
+# computed distance is never allowed to go.
+STOP_KALMAN_SAFETY_MULT     = 1.2
+STOP_KALMAN_LOOKBACK        = 20     # bars of residuals used for the noise read
+# ── DYNAMIC STOP-LOSS FLOOR (user-directed, Aug 2026) — MINIMIZED ─────────
+# Was 2.0 (target stop distance = 2x ATR) / 15.0 (never tighter than 15%
+# of stake). The user reported the live stop-loss was landing bigger
+# than the take-profit and asked for it to be as tight as it can
+# mathematically be. STOP_ATR_MULT is left as a sanity ceiling only —
+# risk_manager.compute_dynamic_stop_loss_pct() now takes the SMALLER of
+# this ATR-based distance and a Kalman-filter noise-floor-based distance
+# (see STOP_KALMAN_SAFETY_MULT below), and DYNAMIC_STOP_LOSS_PCT_MIN is
+# now just a hard backstop for when neither read is available — the
+# Kalman floor is what actually determines "the lowest it can possibly
+# be" on a live trade, not this constant.
+STOP_ATR_MULT               = 2.0    # stop distance ceiling, in ATRs of price
+DYNAMIC_STOP_LOSS_PCT_MIN   = 3.0    # hard backstop only — see note above
 DYNAMIC_STOP_LOSS_PCT_MAX   = 90.0   # ceiling — leave headroom under Deriv's
                                       # own 100%-of-stake max-loss cap
-
-# ── MAE-CALIBRATED STOP WIDTH (user-directed, Aug 2026) ───────────────
-# Replaces TAKE_PROFIT_RATIO as the blind multiplier that decides how
-# wide the swapped-in stop-loss is (see TP_SL_SWAP_ENABLED below —
-# stop_loss_pct * TAKE_PROFIT_RATIO used to become the actual stop-loss
-# distance unconditionally, e.g. 2.5x the quick-win target no matter
-# what the market actually does). Root cause of the win/loss $ skew:
-# best trade $23 vs worst trade $54.6 on live results is close to that
-# same 2.5x ratio — the stop was sized by arithmetic, not by where price
-# actually tends to be when a winning trade's anticipated reversal
-# happens.
-#
-# risk_manager.compute_calibrated_stop_loss_pct() now sizes the
-# swapped-in stop from the MAE_STOP_PERCENTILE-th percentile of how far
-# past WINNING trades on that symbol dipped against the position (their
-# Maximum Adverse Excursion, tracked live per-contract in exit_engine.py)
-# before reversing to hit target — i.e. just past where the anticipated
-# move-then-reverse pattern actually tends to turn, not an arbitrary
-# multiple. Falls back to the existing ATR-based compute_dynamic_stop_
-# loss_pct() while MAE_STOP_MIN_SAMPLES hasn't been reached yet for a
-# symbol, and to the old TAKE_PROFIT_RATIO multiple only if neither is
-# available (cold start, first trades after a fresh redeploy).
-# Whichever source produced the candidate, it is then always floored at
-# the base stop_loss_pct itself (never tighter than the level
-# STOP_LOSS_MAP/compute_dynamic_stop_loss_pct already calibrated per
-# symbol — keeps the room needed for price to move against the position
-# before reversing) and capped at base_stop_loss_pct * MAX_LOSS_TO_WIN_
-# RATIO — this last part is the actual fix: it bounds the worst-case
-# single loss to a fixed multiple of the quick-win target regardless of
-# which source produced the candidate, so a loss can no longer cost
-# several times what a win pays.
-MAE_STOP_PERCENTILE   = 85.0   # use the 85th percentile of past winners'
-                                # adverse excursion — covers the large
-                                # majority of the anticipated-reversal
-                                # pattern without sizing off a single
-                                # outlier trade
-MAE_STOP_SAFETY_MULT  = 1.15   # small margin on top of the raw
-                                # percentile so the stop doesn't sit
-                                # exactly on the historical edge
-MAE_STOP_MIN_SAMPLES  = 20     # minimum logged winning trades for a
-                                # symbol before its MAE percentile is
-                                # trusted; below this, fall back to the
-                                # ATR-based / static estimate instead
-MAX_LOSS_TO_WIN_RATIO = 1.5    # hard ceiling — the swapped-in stop can
-                                # never be sized wider than this multiple
-                                # of the quick-win (take-profit) amount,
-                                # however it was derived. Was an
-                                # unbounded 2.5x via TAKE_PROFIT_RATIO;
-                                # this is the direct fix for the $54.6-
-                                # loss-vs-$23-win asymmetry
 
 # ── VOL REGIME DETECTION (for VOL_BREAKOUT / VOL_REV_MULT, signal_engine.py) ──
 # ENHANCEMENT (win-rate pass, Aug 2026): dashboard trade history showed
@@ -525,7 +499,7 @@ TAKE_PROFIT_RATIO = 2.5
 # Bayesian TAKE/INVERT
 # bandit's role in choosing trade direction. This is unconditional and
 # applies to every symbol, every strategy, every trade: whatever direction
-# the strategy layer (see POPULAR INDICATOR CONFLUENCE below) computes as
+# the strategy layer (see POPULAR INDICATOR STRATEGY below) computes as
 # its price prediction is flipped — a computed BUY is placed as a SELL,
 # a computed SELL is placed as a BUY — immediately before the order is
 # sent. No per-symbol table, no win-rate gating, no opt-out list. See
@@ -542,7 +516,22 @@ INVERT_ALL_SIGNALS = True
 # amounts are swapped after being computed exactly as before (stake ×
 # stop_loss_pct, then × TAKE_PROFIT_RATIO). Not applicable to Rise/Fall
 # (CALL/PUT) contracts, which have no limit_order concept.
+#
+# NOTE (user-directed, Aug 2026): the swap itself is UNCHANGED — the
+# user asked only to shrink the stop-loss's underlying magnitude (see
+# STOP_KALMAN_SAFETY_MULT above / risk_manager.compute_dynamic_stop_loss_pct()),
+# not to change the swap or the take-profit ratio. Because the swap
+# takes whatever stop_loss_pct it's given, minimizing that input
+# minimizes both legs proportionally without altering this ordering.
 TP_SL_SWAP_ENABLED = True
+
+# Per-(indicator, symbol) suspension window (spec point 8, Aug 2026): when
+# strategy_stats.is_underperforming(strategy, symbol) first flips True for a
+# given (indicator, symbol) pair, pair_suspension.maybe_suspend() starts a
+# flat, non-renewing clock this many minutes long. Only that pair sits out;
+# every other indicator keeps trading that symbol, and this indicator keeps
+# trading every other symbol. See pair_suspension.py.
+PAIR_SUSPEND_MINUTES = 60
 
 # ── POPULAR INDICATOR CONFLUENCE STRATEGY (user-directed, Aug 2026) ──────
 # Replaces the strategy used to trade every symbol in MULTIPLIER_SYMBOLS
@@ -607,6 +596,13 @@ POPULAR_SUPERTREND_MULT   = 3.0
 # mean-reverting/anti-persistent) used to dynamically re-weight the
 # trend-following indicators against the mean-reversion/oscillator ones
 # rather than weighting every indicator equally regardless of regime.
+# NOTE: the live signal_engine.py evaluator was subsequently simplified
+# to a single-most-popular-indicator pick rather than this confluence
+# vote (per a later, separate request) and no longer reads
+# POPULAR_CONFLUENCE_MIN_SCORE / POPULAR_HURST_LOOKBACK /
+# POPULAR_HURST_MIN_BARS — left in place here untouched, unused, exactly
+# as they already are in the live file, since only the stop-loss-related
+# settings below were touched this round.
 POPULAR_KALMAN_PROCESS_VAR  = 1e-5
 POPULAR_KALMAN_MEASURE_VAR  = 1e-2
 POPULAR_HURST_LOOKBACK      = 100
@@ -819,20 +815,6 @@ TICK_RESUBSCRIBE_RETRY_SECS = 30
 BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD    = 5
 BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS = 15
 
-# Fix, Aug 2026 — "signals generated many times at the same time which end
-# up suspended & not executed". A signal condition that persists across
-# several SCAN_CYCLE_SLEEP (1s) cycles was being re-attempted on every
-# single cycle with zero spacing, because the pre-existing SYMBOL_MIN_GAP_
-# MINS gap only updates on a CONFIRMED SUCCESSFUL placement — a failed buy
-# left nothing to gap-check against, so the identical signal re-fired
-# ~1s later, burning through BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD (5) in
-# under 10s and getting the symbol suspended for a problem that was really
-# one persistent signal counted five times, not five independent
-# failures. symbol_manager.can_trade_now()/get_queue() now require this
-# many seconds between ANY two attempts on the same symbol (success or
-# failure) before a new one is allowed through.
-SIGNAL_RETRY_COOLDOWN_SECS = 20
-
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
 INIT_BATCH_SIZE        = 8
@@ -859,24 +841,12 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
 
-# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS as a ROLLING
-# window measured from when trading actually resumes after the previous
-# redeploy — NOT anchored to fixed clock boundaries. Cycle, forever:
-#   1. Trade normally for REDEPLOY_INTERVAL_HOURS.
-#   2. Timer fires -> is_redeploy_pending() goes True -> bot_engine's
-#      _main_loop stops taking NEW entries (existing open contracts are
-#      untouched and keep being actively managed).
-#   3. _settle_loop actively drains every open contract (confirmed closes
-#      only, never a guess — up to DRAIN_MAX_SECS).
-#   4. Once flat, trigger_redeploy() fires the Render deploy hook -> the
-#      whole process restarts fresh (or, if RENDER_DEPLOY_HOOK_URL isn't
-#      set, restart_scheduler just clears the pending flag in place and
-#      loop 1-4 repeats inside the same process instead).
-#   5. New process/cycle starts the same REDEPLOY_INTERVAL_HOURS timer
-#      again. Continuous, autonomous, no manual step anywhere in the loop.
-# REDEPLOY_TIMEZONE is kept only for log/status readability (converting
-# the next-due timestamp to a local time in log lines) — it no longer
-# anchors *when* the timer fires, only how that moment is displayed.
+# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
+# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
+# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
+# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
+# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
+# _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
 REDEPLOY_INTERVAL_HOURS = 3
 
