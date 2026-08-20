@@ -685,6 +685,44 @@ class DerivClient:
             logger.error(f"FORCE CHECK ERROR {contract_id}: {e}")
             return {}
 
+    async def get_portfolio(self) -> list:
+        """
+        Query Deriv's own server-side state for every currently-open
+        contract on this account ({"portfolio": 1}) — no dependency on any
+        local file, database, or in-memory dict.
+
+        Spec point 10 (Aug 2026): Render's filesystem is ephemeral across
+        deploys on this plan, and the bot's own in-memory open-contract
+        tracking is wiped on every process restart too. Since the bot
+        force-redeploys itself every REDEPLOY_INTERVAL_HOURS (spec point
+        11), that's a real, frequent blackout window for the dashboard
+        unless "what's open" is re-derived from Deriv's server on startup
+        instead of assumed to have survived locally. Call this once, right
+        after connecting, and use the result to rebuild both bot_engine.py's
+        own open-contract tracking and keep_alive.py's dashboard state
+        (see bot_engine.py's startup path / keep_alive.update_open_contracts()).
+
+        Returns the list of contract dicts under "contracts" in Deriv's
+        response (each with contract_id, symbol, contract_type, buy_price,
+        purchase_time, etc. — the same shape as proposal_open_contract
+        entries), or [] on any failure. Never raises.
+        """
+        try:
+            resp = await self._send({"portfolio": 1})
+            if not resp:
+                logger.warning("GET PORTFOLIO: no response")
+                return []
+            if resp.get("error"):
+                err = resp["error"]
+                logger.error(f"GET PORTFOLIO FAILED: {err.get('code')}: {err.get('message')}")
+                return []
+            contracts = resp.get("portfolio", {}).get("contracts", [])
+            logger.info(f"GET PORTFOLIO: {len(contracts)} open contract(s) on Deriv's own state")
+            return contracts
+        except Exception as e:
+            logger.error(f"GET PORTFOLIO ERROR: {e}")
+            return []
+
     # ─── Request helper ───────────────────────────────────────────────────────
 
     async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
@@ -1140,10 +1178,12 @@ class DerivClient:
             multiplier:    int    = None,
             stop_loss_pct: float  = None,
             take_profit_ratio: float = None,
-            calibrated_stop_loss_pct: float = None,
             strategy:      str    = "default",
             cb_threshold:  int    = 3,
             cb_cooldown:   float  = 60.0,
+            stop_loss_price:   float = None,
+            take_profit_price: float = None,
+            entry_price:       float = None,
             **kwargs) -> dict:
         """
         Buy a Multipliers (MULTUP/MULTDOWN) contract via the required
@@ -1173,15 +1213,28 @@ class DerivClient:
         ...and then, per config.TP_SL_SWAP_ENABLED (user-directed, Aug
         2026), SWAPPED before being sent: the limit_order's take_profit
         is set to the computed stop_loss_amount, and its stop_loss is
-        set to whichever of the following is available (MAE-calibrated
-        stop fix, Aug 2026): calibrated_stop_loss_pct if the caller
-        passed one (risk_manager.compute_calibrated_stop_loss_pct() —
-        sized from real Maximum Adverse Excursion history / ATR, capped
-        at config.MAX_LOSS_TO_WIN_RATIO of the take-profit side rather
-        than an unbounded take_profit_ratio multiple), else the original
-        computed_take_profit_amount (stop_loss_amount * take_profit_ratio)
-        as a last-resort fallback — same behavior as before this fix if
-        the caller doesn't pass calibrated_stop_loss_pct at all.
+        set to the computed take_profit_amount.
+
+        Popular-indicator pipeline (spec point 6, Aug 2026): when
+        stop_loss_price/take_profit_price/entry_price are all supplied,
+        this whole stake-percentage computation (and the
+        TP_SL_SWAP_ENABLED amount-swap above) is bypassed entirely — the
+        caller has already inverted direction AND swapped the two PRICE
+        levels upstream (bot_engine.py's universal inversion step), so
+        swapping the dollar AMOUNTS again here would double-swap and
+        cancel out. Instead the two PRICE levels are converted straight to
+        dollar SL/TP using the standard linear P&L relationship for
+        Deriv's leveraged Multiplier contracts (P&L ~= stake x multiplier
+        x %price-move):
+            dist_to_stop   = abs(entry_price - stop_loss_price)
+            dist_to_target = abs(entry_price - take_profit_price)
+            stop_loss_amount   = stake * multiplier * (dist_to_stop   / entry_price)
+            take_profit_amount = stake * multiplier * (dist_to_target / entry_price)
+        entry_price should be the same price the caller's indicator
+        actually measured its distance against (e.g.
+        signal_engine.SignalResult.native_entry_price) — not a freshly
+        re-fetched quote, or the distance sent here won't match what was
+        computed upstream.
 
         strategy identifies the signal/strategy that produced this trade,
         used as the second half of the circuit-breaker key (symbol,
@@ -1219,38 +1272,44 @@ class DerivClient:
             stake = self._cap_stake(stake, symbol)
             contract_type = "MULTUP" if direction == "LONG" else "MULTDOWN"
 
-            # TP/SL SWAP (user-directed, Aug 2026 — see
-            # config.TP_SL_SWAP_ENABLED). The quick-win side is computed
-            # exactly as before — stake x stop_loss_pct — and always ends
-            # up as the take-profit amount after the swap. The wide,
-            # swapped-in stop-loss side used to always be that same
-            # amount x take_profit_ratio (an unbounded 2.5x by default —
-            # the direct cause of the $54.6-loss-vs-$23-win asymmetry).
-            # MAE-CALIBRATED STOP FIX (Aug 2026): when the caller passes
-            # calibrated_stop_loss_pct (risk_manager.compute_calibrated_
-            # stop_loss_pct() — sized from real Maximum Adverse Excursion
-            # history or ATR, hard-capped at config.MAX_LOSS_TO_WIN_RATIO
-            # of the take-profit side), that value is used for the stop
-            # distance instead of the flat take_profit_ratio multiple.
-            # Falls back to the old behavior unchanged if the caller
-            # doesn't pass one.
-            _computed_stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
-            if calibrated_stop_loss_pct is not None:
-                _computed_wide_amount = round(stake * (calibrated_stop_loss_pct / 100.0), 2)
+            if stop_loss_price is not None and take_profit_price is not None and entry_price:
+                # Popular-indicator pipeline (spec point 6) — native PRICE
+                # levels supplied, already inverted+swapped upstream.
+                # Convert straight to dollar SL/TP; do NOT re-apply
+                # TP_SL_SWAP_ENABLED here, that would double-swap.
+                dist_to_stop   = abs(entry_price - stop_loss_price)
+                dist_to_target = abs(entry_price - take_profit_price)
+                stop_loss_amount   = round(stake * multiplier * (dist_to_stop   / entry_price), 2)
+                take_profit_amount = round(stake * multiplier * (dist_to_target / entry_price), 2)
+                logger.info(
+                    f"NATIVE SL/TP: {symbol} entry={entry_price:.5f} "
+                    f"stop_price={stop_loss_price:.5f} target_price={take_profit_price:.5f} "
+                    f"-> SL=${stop_loss_amount:.2f} TP=${take_profit_amount:.2f}"
+                )
             else:
-                _computed_wide_amount = round(_computed_stop_loss_amount * take_profit_ratio, 2)
-            if getattr(config, "TP_SL_SWAP_ENABLED", True):
-                stop_loss_amount   = _computed_wide_amount
-                take_profit_amount = _computed_stop_loss_amount
-            else:
-                stop_loss_amount   = _computed_stop_loss_amount
-                take_profit_amount = _computed_wide_amount
+                # Legacy stake-percentage path — still used by any call
+                # site that doesn't supply native price levels.
+                # TP/SL SWAP (user-directed, Aug 2026 — see
+                # config.TP_SL_SWAP_ENABLED). Computed exactly as before —
+                # stake x stop_loss_pct for the stop distance, then x
+                # take_profit_ratio for the take-profit distance — and then
+                # the two amounts are swapped before being sent: the take
+                # profit is placed where the stop-loss would otherwise have
+                # gone, and the stop-loss is placed where the take-profit
+                # would otherwise have gone.
+                _computed_stop_loss_amount   = round(stake * (stop_loss_pct / 100.0), 2)
+                _computed_take_profit_amount = round(_computed_stop_loss_amount * take_profit_ratio, 2)
+                if getattr(config, "TP_SL_SWAP_ENABLED", True):
+                    stop_loss_amount   = _computed_take_profit_amount
+                    take_profit_amount = _computed_stop_loss_amount
+                else:
+                    stop_loss_amount   = _computed_stop_loss_amount
+                    take_profit_amount = _computed_take_profit_amount
 
             logger.info(
                 f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f} "
                 f"multiplier={multiplier}x SL=${stop_loss_amount:.2f} "
                 f"TP=${take_profit_amount:.2f}"
-                + (" [calibrated]" if calibrated_stop_loss_pct is not None else " [legacy-ratio]")
             )
 
             proposal_req = {
