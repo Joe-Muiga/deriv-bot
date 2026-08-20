@@ -31,6 +31,7 @@ import numpy as np
 import config
 import indicators as ind
 import strategy_stats
+import pair_suspension
 from candlestick_builder import Candle
 from symbol_manager import SymbolManager
 
@@ -70,6 +71,20 @@ class SignalResult:
     contract_kind: str            = "RISE_FALL"   # "RISE_FALL" | "DIGIT"
     digit:         Optional[int]  = None            # 0-9, DIGIT contracts only
     match_type:    Optional[str]  = None            # "MATCH" | "DIFFER"
+    # Popular-indicator pipeline: native SL/TP price levels computed by
+    # whichever indicator produced this result, using that indicator's own
+    # standard technical-analysis convention (not a stake percentage).
+    # These are PRE-inversion, PRE-swap — they describe the stop/target for
+    # the direction actually signalled above. bot_engine.py's universal
+    # inversion step swaps stop<->target at the same time it flips direction.
+    native_stop_price:   Optional[float] = None   # indicator's own SL price level
+    native_target_price: Optional[float] = None   # indicator's own TP price level
+    # The price the signal (and native_stop_price/native_target_price) was
+    # actually computed against — threaded through to deriv_client.py's
+    # dollar-conversion so it measures distance off the SAME price the
+    # indicator used, rather than re-fetching a fresh quote that may have
+    # since moved (see deriv_client.buy_multiplier()'s entry_price param).
+    native_entry_price:  Optional[float] = None
 
 
 NONE_RESULT = SignalResult("NONE", 0, 0.0, "NONE", "No signal")
@@ -818,6 +833,109 @@ def _cross_dir(now_a: float, now_b: float, prev_a: float, prev_b: float) -> Opti
     return 1.0 if now_above else -1.0
 
 
+def _swing_stop(direction: str, H: np.ndarray, L: np.ndarray, period: int) -> float:
+    """Nearest swing low/high over the last `period` bars — min(L[-N:]) for
+    a long stop, max(H[-N:]) for a short stop. Shared by every oscillator
+    (RSI, MACD, Stochastic, ADX/DMI, CCI, Williams %R) whose own convention
+    doesn't have a single native price level of its own."""
+    n = max(2, min(period, len(H)))
+    return float(np.min(L[-n:])) if direction == "LONG" else float(np.max(H[-n:]))
+
+
+def _native_stop_target(
+    picked_label: str, direction: str, entry: float,
+    C: np.ndarray, H: np.ndarray, L: np.ndarray, *,
+    ema_slow: np.ndarray, bb_mid: np.ndarray, bb_upper: np.ndarray, bb_lower: np.ndarray,
+    sar_vals: np.ndarray, senkou_a: np.ndarray, senkou_b: np.ndarray,
+    kijun: np.ndarray, st_line: np.ndarray,
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Native stop-loss / take-profit PRICE levels for whichever indicator was
+    picked, using that indicator's own standard TA convention (spec point
+    3) — never a stake percentage. `direction` is the un-inverted reading
+    (LONG/SHORT) exactly as evaluate_popular_indicator() computed it; the
+    swap to bot-execution SL/TP happens later in bot_engine.py, alongside
+    the direction inversion (spec points 4/5).
+
+    Returns (stop, target) as raw prices, or (None, None) if the picked
+    label somehow isn't recognized (should not happen — every label in
+    POPULAR_INDICATOR_ORDER is handled below).
+    """
+    sign = 1.0 if direction == "LONG" else -1.0
+
+    if picked_label == "EMA_CROSS":
+        stop = float(ema_slow[-1])
+        target = entry + (entry - stop)   # equal-distance projection off the crossover gap
+        return stop, target
+
+    if picked_label == "RSI":
+        stop = _swing_stop(direction, H, L, config.POPULAR_RSI_PERIOD)
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    if picked_label == "MACD_CROSS":
+        stop = _swing_stop(direction, H, L, config.POPULAR_MACD_SLOW)
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    if picked_label == "BOLLINGER":
+        # Small buffer beyond the touched band — the band value itself is
+        # the native stop; the middle band (SMA basis) is the textbook
+        # mean-reversion target.
+        stop = float(bb_lower[-1]) if direction == "LONG" else float(bb_upper[-1])
+        target = float(bb_mid[-1])
+        return stop, target
+
+    if picked_label == "STOCHASTIC":
+        stop = _swing_stop(direction, H, L, config.POPULAR_STOCH_K_PERIOD)
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    if picked_label == "ADX_DMI":
+        # Wider target — ADX confirming trend strength justifies riding
+        # further than the standard 2R used by the oscillators above.
+        stop = _swing_stop(direction, H, L, config.POPULAR_ADX_PERIOD)
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    if picked_label == "PARABOLIC_SAR":
+        # The current SAR dot value itself *is* its native stop.
+        stop = float(sar_vals[-1])
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    if picked_label == "ICHIMOKU_CLOUD":
+        top = max(float(senkou_a[-1]), float(senkou_b[-1]))
+        bottom = min(float(senkou_a[-1]), float(senkou_b[-1]))
+        thickness = top - bottom
+        stop = bottom if direction == "LONG" else top   # near edge of the cloud
+        target = entry + sign * 2.0 * thickness
+        return stop, target
+
+    if picked_label == "ICHIMOKU_TK_CROSS":
+        stop = float(kijun[-1])   # standard Ichimoku stop reference
+        target = entry + sign * 2.0 * abs(entry - stop)   # conventional 2:1 Kijun projection
+        return stop, target
+
+    if picked_label == "CCI":
+        stop = _swing_stop(direction, H, L, config.POPULAR_CCI_PERIOD)
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    if picked_label == "WILLIAMS_R":
+        stop = _swing_stop(direction, H, L, config.POPULAR_WILLIAMS_R_PERIOD)
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    if picked_label == "SUPERTREND":
+        # The current Supertrend line value itself is its native trailing stop.
+        stop = float(st_line[-1])
+        target = entry + sign * 2.0 * abs(entry - stop)
+        return stop, target
+
+    return None, None
+
+
 def evaluate_popular_indicator(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     # BUGFIX (Aug 2026): this previously required 60 bars (to fully
     # mature Ichimoku's default 52-period Senkou Span B), but
@@ -967,51 +1085,82 @@ def evaluate_popular_indicator(ltf_bars: List[Candle], symbol: str) -> SignalRes
         1.0 if st_dir_arr[-1] > 0 else -1.0)
     detail["SUPERTREND"] = f"{'up' if st_dir_arr[-1] > 0 else 'down'}"
 
-    # 13) Kalman filter adaptive trend velocity ("cutting edge"
-    #     addition) — deliberately last in priority; a fallback read so
-    #     a symbol still gets a signal on the rare bar where every
-    #     classic indicator above abstains.
-    kalman_level, kalman_vel = ind.kalman_trend(
-        C, config.POPULAR_KALMAN_PROCESS_VAR, config.POPULAR_KALMAN_MEASURE_VAR)
-    last_vel = float(kalman_vel[-1])
-    reads["KALMAN_TREND"] = None if last_vel == 0.0 else (1.0 if last_vel > 0.0 else -1.0)
-    detail["KALMAN_TREND"] = f"vel={last_vel:.6f}"
+    # NOTE: a Kalman-filter adaptive trend/velocity fallback used to sit
+    # here as indicator #13. Removed per spec (user-directed, Aug 2026):
+    # the ranked list is limited to genuinely popularly-used indicators,
+    # and a Kalman filter isn't one of them — not even as a last-resort
+    # fallback. ind.kalman_trend() itself is left in indicators.py, unused
+    # by this function.
 
     # Most-popular-first priority order — see the strategy comment above.
     POPULAR_INDICATOR_ORDER = [
         "EMA_CROSS", "RSI", "MACD_CROSS", "BOLLINGER", "STOCHASTIC",
         "ADX_DMI", "PARABOLIC_SAR", "ICHIMOKU_CLOUD", "ICHIMOKU_TK_CROSS",
-        "CCI", "WILLIAMS_R", "SUPERTREND", "KALMAN_TREND",
+        "CCI", "WILLIAMS_R", "SUPERTREND",
     ]
 
-    signalling = [(label, reads[label]) for label in POPULAR_INDICATOR_ORDER if reads.get(label) is not None]
+    # Filter out both "not currently signalling" AND any (indicator, symbol)
+    # pair that's sitting out its 1-hour underperformance suspension
+    # (spec point 8) — done HERE, at pick time, not as an after-the-fact
+    # reject of the whole result. That's what lets the symbol fall through
+    # to the next-ranked indicator that IS signalling instead of getting no
+    # trade at all on this pass. See pair_suspension.py.
+    signalling = [
+        (label, reads[label]) for label in POPULAR_INDICATOR_ORDER
+        if reads.get(label) is not None and not pair_suspension.is_suspended(label, symbol)
+    ]
 
     if not signalling:
         logger.debug(f"REJECTED: {symbol} POPULAR_INDICATOR strength=0 score=0.000 — nothing signalling")
         return NONE_RESULT
 
-    picked_label, picked_dir = signalling[0]   # most popular among those currently signalling
+    picked_label, picked_dir = signalling[0]   # most popular among those currently signalling, eligible
     rank_index = POPULAR_INDICATOR_ORDER.index(picked_label)
     direction = "LONG" if picked_dir > 0 else "SHORT"
+
+    # Check whether this pair should START its 1-hour suspension clock now
+    # (it just traded, or is about to). This only decides whether to START
+    # the timer — pair_suspension.is_suspended() above is what actually
+    # gates future picks, and maybe_suspend() is idempotent so this can't
+    # push an existing suspension's expiry back out.
+    try:
+        if strategy_stats.stats.is_underperforming(picked_label, symbol):
+            pair_suspension.maybe_suspend(picked_label, symbol)
+    except Exception as exc:
+        logger.warning(f"is_underperforming({picked_label},{symbol}) check failed: {exc}")
 
     # Strength/score communicate how popular the picked indicator is,
     # not a blended-confidence figure — there is nothing to blend.
     score = 1.0 - (rank_index / len(POPULAR_INDICATOR_ORDER))
     strength = 3 if rank_index < len(POPULAR_INDICATOR_ORDER) // 2 else 2
 
+    # Native stop-loss / take-profit PRICE levels (spec point 3) — computed
+    # only for the picked indicator, using its own standard TA convention.
+    # These are pre-inversion, pre-swap: the stop/target for `direction`
+    # exactly as read above. bot_engine.py's universal inversion step swaps
+    # stop<->target at the same time it flips direction (spec points 4/5).
+    native_stop, native_target = _native_stop_target(
+        picked_label, direction, last_close, C, H, L,
+        ema_slow=ema_slow, bb_mid=bb_mid, bb_upper=bb_upper, bb_lower=bb_lower,
+        sar_vals=sar_vals, senkou_a=senkou_a, senkou_b=senkou_b,
+        kijun=kijun, st_line=st_line,
+    )
+
     also_signalling = ", ".join(f"{lbl}={'L' if d > 0 else 'S'}" for lbl, d in signalling[1:])
     reason = (
         f"picked={picked_label}[{detail.get(picked_label, '')}] rank={rank_index + 1}/"
-        f"{len(POPULAR_INDICATOR_ORDER)}"
+        f"{len(POPULAR_INDICATOR_ORDER)} stop={native_stop} target={native_target}"
         + (f" also_signalling[{also_signalling}]" if also_signalling else " (only one signalling)")
     )
     logger.info(
-        f"SIGNAL: {symbol} {direction} POPULAR_INDICATOR strength={strength} "
-        f"score={score:.3f} picked={picked_label}"
+        f"SIGNAL: {symbol} {direction} {picked_label} strength={strength} "
+        f"score={score:.3f} native_stop={native_stop} native_target={native_target}"
     )
     return SignalResult(
         direction=direction, strength=strength, score=score,
-        strategy="POPULAR_INDICATOR", reason=reason,
+        strategy=picked_label, reason=reason,
+        native_stop_price=native_stop, native_target_price=native_target,
+        native_entry_price=last_close,
     )
 
 
@@ -1608,23 +1757,20 @@ class SignalEngine:
             return NONE_RESULT
 
         if result.strength >= 2:
-            # FIX (profitability audit): strategy_stats.is_underperforming()
-            # existed but was never called anywhere in the codebase — a
-            # (strategy, symbol) pair could keep losing indefinitely with
-            # no automatic throttle. This is the single choke point every
-            # strategy result passes through, so gate here.
-            try:
-                if strategy_stats.stats.is_underperforming(result.strategy, symbol):
-                    logger.info(
-                        f"REJECTED: {symbol} {result.strategy} strength={result.strength} "
-                        f"score={result.score:.3f} — pair flagged underperforming "
-                        f"(win rate below STRATEGY_WIN_RATE_FLOOR over last "
-                        f"STRATEGY_WIN_RATE_MIN_TRADES trades)"
-                    )
-                    return NONE_RESULT
-            except Exception as exc:
-                logger.warning(f"is_underperforming({result.strategy},{symbol}) check failed: {exc}")
-
+            # NOTE: the old is_underperforming() gate that used to live here
+            # (rejecting the WHOLE result post-hoc) has been removed for the
+            # popular-indicator pipeline (spec point 8). It's been moved
+            # earlier and re-scoped: evaluate_popular_indicator() now checks
+            # per-(indicator, symbol) suspension (pair_suspension.py) at
+            # PICK time, so a suspended pair is skipped in favor of the
+            # next-ranked signalling indicator instead of killing the whole
+            # symbol's trade for this pass. Leaving both gates in place
+            # would double-gate and could still reject a result
+            # evaluate_popular_indicator() already worked around. Other,
+            # non-popular-indicator evaluators routed through this same
+            # evaluate() are not spec-covered here and no longer get an
+            # underperformance gate either — see Section 1 of the request
+            # if a separate gate for those paths is wanted later.
             logger.info(
                 f"SIGNAL: {symbol} {result.direction} {result.strategy} "
                 f"strength={result.strength} score={result.score:.3f}"
