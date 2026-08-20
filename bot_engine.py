@@ -468,6 +468,26 @@ class BotEngine:
         self._session_start_balance = self.client.balance
         self._current_utc_day       = _dt.datetime.utcnow().day
 
+        # ── Redeploy-proof open-contract recovery (spec point 10, Aug 2026) ──
+        # Render's filesystem is ephemeral across deploys on this plan (no
+        # persistent disk attached) and this process's own in-memory
+        # _open_contracts dict is wiped on every restart exactly the same
+        # way — so after a redeploy (including the force-redeploy every
+        # REDEPLOY_INTERVAL_HOURS, spec point 11) both bot_engine's own
+        # tracking AND the dashboard's open_contracts start empty even
+        # though real contracts may still be open on Deriv's own servers.
+        # Re-derive "what's open" from Deriv's own server-side state via
+        # get_portfolio() — the only source that doesn't depend on
+        # anything surviving locally — and use it to rebuild both this
+        # object's tracking and keep_alive's dashboard state before the
+        # first scan cycle, so there's zero blackout window right after a
+        # redeploy instead of waiting to rediscover open trades piecemeal
+        # as settlement pushes trickle in.
+        try:
+            await self._recover_open_contracts_from_portfolio()
+        except Exception as exc:
+            logger.warning(f"Open-contract recovery from portfolio failed: {exc}")
+
         await self._init_all_symbols()
 
         try:
@@ -498,6 +518,94 @@ class BotEngine:
             ws_task.cancel()
 
     # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
+
+    async def _recover_open_contracts_from_portfolio(self):
+        """
+        Spec point 10: rebuild both this object's _open_contracts tracking
+        and keep_alive's dashboard state directly from Deriv's own
+        server-side portfolio ({"portfolio": 1}), rather than trusting
+        anything that might have survived the last redeploy locally.
+        Called once, at the very start of run(), before the first scan
+        cycle.
+
+        Best-effort mapping: proposal/buy responses this bot places itself
+        carry richer bookkeeping (strategy, native SL/TP, enriched
+        features, etc.) than a portfolio snapshot does, so recovered
+        entries are necessarily thinner — enough for the dashboard to show
+        the contract live and for _monitor_exit()/_settle_loop() to still
+        notice it close, not a full reconstruction of every field
+        placement-time registration captures.
+        """
+        try:
+            contracts = await self.client.get_portfolio()
+        except Exception as exc:
+            logger.warning(f"get_portfolio() failed during recovery: {exc}")
+            return
+
+        if not contracts:
+            logger.info("PORTFOLIO RECOVERY: no open contracts on Deriv — clean start")
+            return
+
+        recovered = 0
+        for c in contracts:
+            try:
+                cid = str(c.get("contract_id", ""))
+                if not cid or cid in self._open_contracts:
+                    continue
+                symbol = c.get("symbol") or c.get("underlying_symbol") or "—"
+                contract_type = (c.get("contract_type") or "").upper()
+                direction = "LONG" if contract_type in ("MULTUP", "CALL") else (
+                    "SHORT" if contract_type in ("MULTDOWN", "PUT") else "—")
+                buy_price = float(c.get("buy_price", c.get("purchase_price", 0.0)) or 0.0)
+                opened_at = float(c.get("purchase_time", time.time()) or time.time())
+
+                self._open_contracts[cid] = {
+                    "symbol":      symbol,
+                    "direction":   direction,
+                    "stake":       buy_price,
+                    "entry_price": None,
+                    "opened_at":   opened_at,
+                    "rec":         None,
+                    "sig":         None,
+                    "strategy":    c.get("shortcode", "RECOVERED"),
+                    "stop_loss":   None,
+                    "take_profit": None,
+                    "multiplier":  c.get("multiplier"),
+                    "atr_pct":     0.0,
+                    "regime":      "NONE",
+                    "enriched_features": {},
+                    "inverted":    None,
+                    "recovered_from_portfolio": True,
+                }
+                self._contract_open_times[cid] = opened_at
+
+                try:
+                    await self.client.subscribe_contract(
+                        cid,
+                        lambda msg, _cid=cid: asyncio.create_task(
+                            self._on_contract_result(_cid, msg)),
+                        symbol=symbol,
+                    )
+                except Exception as exc:
+                    logger.warning(f"subscribe_contract({cid}) during recovery failed: {exc}")
+
+                recovered += 1
+            except Exception as exc:
+                logger.warning(f"Skipping unparsable portfolio contract {c}: {exc}")
+
+        logger.warning(
+            f"PORTFOLIO RECOVERY: rebuilt {recovered} open contract(s) from "
+            f"Deriv's own server-side state after redeploy/restart"
+        )
+
+        # Push immediately — don't wait for the periodic _dashboard_loop
+        # tick — so the dashboard has zero blackout window right after a
+        # redeploy.
+        try:
+            self._push_dashboard()
+        except Exception:
+            pass
+        set_active_trades(len(self._open_contracts))
 
     async def _init_all_symbols(self):
         trade_symbols = list(getattr(config, "TRADE_SYMBOLS",
@@ -997,31 +1105,28 @@ class BotEngine:
         if not self.symbols.can_trade_now(symbol):
             return False
 
-        # RETRY COOLDOWN (fix, Aug 2026): mark this as an attempt the
-        # instant it clears the gate above, before the buy call — success
-        # or failure both count, so a persistently-firing signal can't
-        # re-enter _execute() again next cycle and burn through the buy-
-        # failure circuit breaker in a handful of seconds. See
-        # symbol_manager.can_trade_now()'s retry-cooldown check.
-        self.symbols.record_attempt(symbol)
-
         strategy = getattr(sig, "strategy", "unknown")
 
         # Implementation Brief v4 §5.1 — leverage-aware meta-labeling
-        # features. multiplier/atr_pct/regime are only meaningful for
-        # config.VOL_MULTIPLIER_SYMBOLS; everything else (old Rise/Fall
-        # rows, Boom/Crash, Jump, Bear/Bull, etc.) passes the neutral
+        # features. multiplier/atr_pct/regime are only fully meaningful
+        # for config.VOL_MULTIPLIER_SYMBOLS (regime in particular — Boom/
+        # Crash don't run VOL_BREAKOUT/VOL_REV_MULT so ml_regime stays
+        # "NONE" for them); everything else that isn't a Multiplier
+        # symbol at all (Jump, Bear/Bull, etc.) passes the neutral
         # defaults below so the model can distinguish old-regime rows
-        # from new ones rather than crashing on missing fields. regime is
-        # derived from the strategy name directly (VOL_BREAKOUT->TREND,
-        # VOL_REV_MULT->RANGE) rather than recomputing _vol_regime() here,
-        # since signal_engine.py already made that call when it produced
-        # `sig`. Also reused below by the VOL_MULTIPLIER_SYMBOLS buy
-        # branch so the ATR isn't computed twice.
-        ml_multiplier = 0.0
-        ml_atr_pct    = 0.0
-        ml_regime     = "NONE"
-        if symbol in getattr(config, "VOL_MULTIPLIER_SYMBOLS", []):
+        # from new ones rather than crashing on missing fields.
+        # ml_atr_pct / ml_kalman_noise_pct are now computed for every
+        # symbol in config.MULTIPLIER_SYMBOLS (widened from
+        # VOL_MULTIPLIER_SYMBOLS only, Aug 2026 — user-directed: Boom/
+        # Crash gets the same minimized stop-loss as everything else, see
+        # the buy branch below / risk_manager.compute_dynamic_stop_loss_pct()).
+        # Also reused below by that buy branch so neither is computed
+        # twice.
+        ml_multiplier       = 0.0
+        ml_atr_pct          = 0.0
+        ml_kalman_noise_pct = 0.0
+        ml_regime           = "NONE"
+        if symbol in getattr(config, "MULTIPLIER_SYMBOLS", []):
             builder = self._ltf.get(symbol)
             bars = builder.completed_bars if builder else []
             if len(bars) >= 15:
@@ -1031,6 +1136,31 @@ class BotEngine:
                 _atr_val = ind.atr(_H, _L, _C, config.ATR_PERIOD)
                 _last_atr = float(_atr_val[~np.isnan(_atr_val)][-1]) if len(_atr_val) else 0.0
                 ml_atr_pct = _last_atr / float(_C[-1]) if _C[-1] else 0.0
+
+                # MINIMIZED STOP-LOSS (user-directed, Aug 2026): the
+                # Kalman filter's own residuals against recent price
+                # (actual price minus the filter's smoothed level
+                # estimate) are the mathematically principled read of
+                # how much this symbol is currently just noise, as
+                # opposed to a real move — reused here from the same
+                # ind.kalman_trend() the Popular Indicator strategy
+                # already calls, so it isn't computed twice. Passed to
+                # risk_manager.compute_dynamic_stop_loss_pct() below,
+                # which uses it to set the tightest defensible stop.
+                try:
+                    lookback = getattr(config, "STOP_KALMAN_LOOKBACK", 20)
+                    _kalman_level, _ = ind.kalman_trend(
+                        _C,
+                        getattr(config, "POPULAR_KALMAN_PROCESS_VAR", 1e-5),
+                        getattr(config, "POPULAR_KALMAN_MEASURE_VAR", 1e-2),
+                    )
+                    _residuals = (_C - _kalman_level)[-lookback:]
+                    _noise_std = float(np.std(_residuals)) if len(_residuals) else 0.0
+                    ml_kalman_noise_pct = _noise_std / float(_C[-1]) if _C[-1] else 0.0
+                except Exception as exc:
+                    logger.debug(f"kalman noise-floor calc failed for {symbol}: {exc}")
+                    ml_kalman_noise_pct = 0.0
+
             ml_multiplier = float(config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER))
             if strategy == "VOL_BREAKOUT":
                 ml_regime = "TREND"
@@ -1087,6 +1217,17 @@ class BotEngine:
                 f"SIGNAL INVERTED: {symbol} | {strategy} | {original_direction} -> "
                 f"{sig.direction} (universal inversion, config.INVERT_ALL_SIGNALS)"
             )
+            # Popular-indicator pipeline, spec point 5: the SL/TP PRICE
+            # levels swap along with direction, in this same place and at
+            # the same time as the flip above — not as a second, separate
+            # pass elsewhere, which would risk swapping against a
+            # stale/re-fetched signal. The indicator's own stop-loss level
+            # becomes the bot's take-profit; its take-profit level becomes
+            # the bot's stop-loss.
+            if sig.native_stop_price is not None and sig.native_target_price is not None:
+                sig.native_stop_price, sig.native_target_price = (
+                    sig.native_target_price, sig.native_stop_price
+                )
 
         # FIX (profitability audit): this call previously passed no
         # arguments, so RiskManager.calculate_stake()'s Kelly overlay
@@ -1144,66 +1285,72 @@ class BotEngine:
         # config.MULTIPLIER_SYMBOLS is the single source of truth for this
         # split (see config.py's "STRATEGY ROUTING" section); everything
         # else keeps using buy_contract() exactly as before.
-        # Implementation Brief v4 §4 / Fix H — the Vol/1Hz/Step Multiplier
-        # family needs a stop_loss_pct computed from live ATR instead of
-        # the static STOP_LOSS_MAP default, since that map was calibrated
-        # for Boom/Crash's ~x100 multiplier and copying it unchanged onto
-        # e.g. R_10's x400 floor gets positions stopped out by tick noise,
-        # not by the market being wrong (see config.py's VOL_MULTIPLIER
-        # section / risk_manager.compute_dynamic_stop_loss_pct()). Checked
-        # before the general MULTIPLIER_SYMBOLS branch since these 11
-        # symbols are now also members of that list.
-        elif (symbol in getattr(config, "VOL_MULTIPLIER_SYMBOLS", [])
+        # Implementation Brief v4 §4 / Fix H, widened to all of
+        # MULTIPLIER_SYMBOLS (user-directed, Aug 2026) — every Multiplier
+        # symbol now gets a stop_loss_pct computed live from ATR/Kalman
+        # instead of the static STOP_LOSS_MAP default, since that map was
+        # calibrated per symbol by hand and the live read is both tighter
+        # and self-adjusting to current volatility (see config.py's
+        # STOP_KALMAN_SAFETY_MULT section / risk_manager
+        # .compute_dynamic_stop_loss_pct()). This now covers Boom/Crash
+        # too, so the plain buy_multiplier() fallback branch below is
+        # only reached if DYNAMIC_STOP_LOSS_ENABLED itself is off.
+        elif (symbol in getattr(config, "MULTIPLIER_SYMBOLS", [])
                 and getattr(config, "DYNAMIC_STOP_LOSS_ENABLED", False)):
-            # ml_atr_pct / ml_multiplier were already computed above for the
-            # meta-labeling feature dict — reused here so the ATR isn't
-            # calculated twice per trade.
-            dyn_sl_pct = (
-                self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
-                if ml_atr_pct > 0 else None
-            )
-            resolved_multiplier = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER)
-            # MAE-calibrated stop fix (Aug 2026): dyn_sl_pct above (or the
-            # STOP_LOSS_MAP default when ATR isn't available yet) is the
-            # SMALL/base side and is unaffected — it still ends up as the
-            # take-profit amount after TP_SL_SWAP_ENABLED. This is the
-            # WIDE, swapped-in stop-loss side; see risk_manager.compute_
-            # calibrated_stop_loss_pct()'s docstring for the full priority
-            # order (MAE percentile -> ATR fallback -> legacy ratio).
-            base_sl_pct = dyn_sl_pct if dyn_sl_pct is not None else config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
-            calibrated_sl_pct = self.risk.compute_calibrated_stop_loss_pct(
-                symbol             = symbol,
-                base_stop_loss_pct = base_sl_pct,
-                atr_pct            = ml_atr_pct if ml_atr_pct > 0 else 0.0,
-                multiplier         = resolved_multiplier,
-            )
-            buy_resp = await self.client.buy_multiplier(
-                symbol        = symbol,
-                direction     = direction,
-                stake         = stake,
-                multiplier    = resolved_multiplier,
-                stop_loss_pct = dyn_sl_pct,
-                calibrated_stop_loss_pct = calibrated_sl_pct,
-                strategy      = strategy,
-            )
+            # ml_atr_pct / ml_kalman_noise_pct / ml_multiplier were
+            # already computed above for the meta-labeling feature dict
+            # — reused here so neither is calculated twice per trade.
+            # Popular-indicator pipeline (spec points 3/6): when the signal
+            # carries native SL/TP PRICE levels (already inverted+swapped
+            # above), those take over entirely — a price-distance stop is
+            # exactly what point 3 requires instead of any percentage-of-
+            # stake method, so dyn_sl_pct/compute_dynamic_stop_loss_pct()
+            # is bypassed on this path (Section 1). Fall back to the old
+            # dynamic-ATR percentage path only when native prices aren't
+            # available (e.g. this signal didn't come from the popular-
+            # indicator evaluator, or its price computation failed).
+            if sig.native_stop_price is not None and sig.native_target_price is not None:
+                buy_resp = await self.client.buy_multiplier(
+                    symbol             = symbol,
+                    direction          = direction,
+                    stake              = stake,
+                    multiplier         = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+                    strategy           = strategy,
+                    stop_loss_price    = sig.native_stop_price,
+                    take_profit_price  = sig.native_target_price,
+                    entry_price        = sig.native_entry_price,
+                )
+            else:
+                dyn_sl_pct = (
+                    self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
+                    if ml_atr_pct > 0 else None
+                )
+                buy_resp = await self.client.buy_multiplier(
+                    symbol        = symbol,
+                    direction     = direction,
+                    stake         = stake,
+                    multiplier    = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+                    stop_loss_pct = dyn_sl_pct,
+                    strategy      = strategy,
+                )
         elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
-            # Same MAE-calibrated stop as the VOL_MULTIPLIER_SYMBOLS branch
-            # above, resolved against the static STOP_LOSS_MAP base since
-            # these symbols (Boom/Crash etc.) don't compute live ATR here.
-            base_sl_pct = config.STOP_LOSS_MAP.get(symbol, config.DEFAULT_STOP_LOSS_PCT)
-            calibrated_sl_pct = self.risk.compute_calibrated_stop_loss_pct(
-                symbol             = symbol,
-                base_stop_loss_pct = base_sl_pct,
-                atr_pct            = 0.0,
-                multiplier         = config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
-            )
-            buy_resp = await self.client.buy_multiplier(
-                symbol   = symbol,
-                direction= direction,
-                stake    = stake,
-                calibrated_stop_loss_pct = calibrated_sl_pct,
-                strategy = strategy,
-            )
+            if sig.native_stop_price is not None and sig.native_target_price is not None:
+                buy_resp = await self.client.buy_multiplier(
+                    symbol             = symbol,
+                    direction          = direction,
+                    stake              = stake,
+                    strategy           = strategy,
+                    stop_loss_price    = sig.native_stop_price,
+                    take_profit_price  = sig.native_target_price,
+                    entry_price        = sig.native_entry_price,
+                )
+            else:
+                buy_resp = await self.client.buy_multiplier(
+                    symbol   = symbol,
+                    direction= direction,
+                    stake    = stake,
+                    strategy = strategy,
+                )
         else:
             buy_resp = await self.client.buy_contract(
                 symbol      = symbol,
@@ -1317,17 +1464,25 @@ class BotEngine:
         #    existing fixed-expiry handling untouched). Purely additive: does
         #    not change how the contract above was registered.
         #
-        # ALT METHOD REMOVED (win-rate pass, Aug 2026, per explicit user
-        # request: "strictly either take or invert, no ALT"). R_75 and
-        # 1HZ50V flow through the same general exit engine as every other
-        # Multiplier symbol below. Direction for every Multiplier symbol
-        # is now decided by the Popular Indicator Confluence strategy
-        # (signal_engine.evaluate_popular_confluence()) plus the
-        # unconditional universal inversion applied above — see
-        # config.INVERT_ALL_SIGNALS.
+        # BYPASSED for popular-indicator-pipeline trades (Section 1 of the
+        # Aug 2026 request): this engine's contract_update() calls revise
+        # SL/TP post-entry, but the spec fixes SL/TP at entry from the
+        # picked indicator's own native price levels (already swapped) and
+        # says nothing about moving them afterward — letting a trailing
+        # exit adjust them post-entry would silently override that. Gate
+        # on native_stop_price/native_target_price being present (i.e. this
+        # signal actually came from evaluate_popular_indicator()) rather
+        # than symbol membership, so any future non-popular-indicator
+        # Multiplier strategy still gets the adaptive exit engine exactly
+        # as before.
+        has_native_levels = (
+            getattr(sig, "native_stop_price", None) is not None
+            and getattr(sig, "native_target_price", None) is not None
+        )
         if (symbol in getattr(config, "MULTIPLIER_SYMBOLS", set())
                 and getattr(config, "EXIT_ENGINE_ENABLED", False)
-                and symbol in getattr(config, "EXIT_ENGINE_SYMBOLS", set())):
+                and symbol in getattr(config, "EXIT_ENGINE_SYMBOLS", set())
+                and not has_native_levels):
             asyncio.create_task(self._monitor_exit(cid))
 
         self.symbols.record_trade_placed(symbol)
@@ -1393,25 +1548,6 @@ class BotEngine:
             self.risk.register_close(rec, exit_price=sell_price, pnl=pnl)
         except Exception:
             pass
-
-        # BUG FIX (Aug 2026, found while wiring the MAE-calibrated stop):
-        # exit_engine.record_closed() was previously only called from two
-        # rare edge-case paths (the adaptive-exit already-closed branch
-        # and the Multiplier max-hold branch) — every ordinary close
-        # (natural WS push via _on_contract_result, or the general orphan
-        # sweep) never called it at all. That starved BOTH the ML exit
-        # layer's training set (_total_closed_logged needs to reach
-        # META_LABEL_MIN_TRADES=200 — at the old call-site coverage that
-        # could take a very long time even with heavy trading volume) and
-        # the new MAE-percentile stop calibration (get_mae_percentile()
-        # in exit_engine.py) of almost all of their real data. Safe to
-        # call unconditionally here — record_closed() pops the contract's
-        # state and no-ops with a log line if it's already been popped by
-        # one of the other two call sites, so nothing double-counts.
-        try:
-            exit_engine.record_closed(cid, pnl)
-        except Exception as exc:
-            logger.warning(f"exit_engine.record_closed({cid}) failed: {exc}")
 
         strategy    = info.get("strategy", "unknown")
         entry_score = float(getattr(info.get("sig"), "score", 0.0))
