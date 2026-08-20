@@ -1187,47 +1187,22 @@ class BotEngine:
         except Exception as exc:
             logger.debug(f"compute_enriched_features({symbol}) failed: {exc}")
 
-        # UNIVERSAL SIGNAL INVERSION (user-directed, Aug 2026) — replaces
-        # the old sequential TAKE/INVERT alternator and the meta_labeling
-        # Bayesian TAKE/INVERT
-        # bandit's role in choosing trade direction (see
-        # config.INVERT_ALL_SIGNALS). Unconditional: every symbol, every
-        # strategy, every trade. Whatever direction the strategy layer
-        # computed as its price prediction is flipped immediately before
-        # the order goes out — a computed LONG is placed as SHORT and a
-        # computed SHORT is placed as LONG. meta_labeling.predict_take_trade()
-        # is no longer called from this path (its TAKE/INVERT decision
-        # would only ever be overridden by the rule below anyway); the
-        # module and its win/loss bookkeeping are left intact for
-        # logging/dashboard use — see meta_labeling.py's
-        # predict_take_trade() docstring.
+        # SIGNAL INVERSION — DISABLED (user-directed, Aug 2026). Previously
+        # this block unconditionally flipped every computed LONG/SHORT
+        # direction (and swapped native_stop_price/native_target_price
+        # along with it) immediately before the order was sent — see
+        # config.INVERT_ALL_SIGNALS. That is now off: signals execute
+        # exactly as the strategy layer (see POPULAR INDICATOR STRATEGY)
+        # computed them, no flip, no SL/TP price swap. The `inverted`
+        # flag is kept (always False) purely because it still flows into
+        # ml_features below and meta_labeling._PairEVModel._fit() reads
+        # it back out to decide whether to flip a trade's training label —
+        # leaving it in place means that logic is a no-op rather than
+        # needing a second change there.
         inverted = False
-        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL" or sig.direction not in ("LONG", "SHORT"):
-            # No LONG/SHORT to flip (e.g. JUMP_BUILDUP's DIGIT
-            # Matches/Differs contracts) — nothing to invert, trade
-            # through exactly as computed.
-            logger.debug(
-                f"INVERT SKIPPED: {symbol} | {strategy} | inversion isn't "
-                f"applicable to contract_kind={getattr(sig, 'contract_kind', 'RISE_FALL')}")
-        else:
-            original_direction = sig.direction
-            sig.direction = "SHORT" if sig.direction == "LONG" else "LONG"
-            inverted = True
-            logger.info(
-                f"SIGNAL INVERTED: {symbol} | {strategy} | {original_direction} -> "
-                f"{sig.direction} (universal inversion, config.INVERT_ALL_SIGNALS)"
-            )
-            # Popular-indicator pipeline, spec point 5: the SL/TP PRICE
-            # levels swap along with direction, in this same place and at
-            # the same time as the flip above — not as a second, separate
-            # pass elsewhere, which would risk swapping against a
-            # stale/re-fetched signal. The indicator's own stop-loss level
-            # becomes the bot's take-profit; its take-profit level becomes
-            # the bot's stop-loss.
-            if sig.native_stop_price is not None and sig.native_target_price is not None:
-                sig.native_stop_price, sig.native_target_price = (
-                    sig.native_target_price, sig.native_stop_price
-                )
+        logger.debug(
+            f"INVERT DISABLED: {symbol} | {strategy} | signal executes as "
+            f"computed ({sig.direction}), config.INVERT_ALL_SIGNALS=False")
 
         # FIX (profitability audit): this call previously passed no
         # arguments, so RiskManager.calculate_stake()'s Kelly overlay
