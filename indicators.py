@@ -439,7 +439,19 @@ def digit_score(
     """
     Scoring system for digit over/under strategy, using the latest values
     of each input series. Returns (score, direction) where
-    direction = "OVER" | "UNDER" | "NONE". Minimum score 6 required.
+    direction = "OVER" | "UNDER" | "NONE".
+
+    FIX (Task 3 — full textbook confirmation, no partial firing, Aug 2026):
+    previously fired on over_score/under_score >= 6 out of a possible 8
+    (RSI extreme=3, BB touch=3, ROC momentum=2) — reachable with only 2 of
+    the 3 documented conditions true (RSI extreme + BB touch = 6, with no
+    ROC confirmation at all). That's a confidence-threshold standing in
+    for a missing condition, exactly the pattern this task asks to close.
+    Now requires ALL THREE conditions (RSI extreme AND price at/through
+    the matching Bollinger Band AND ROC momentum agreeing) before firing
+    either direction — the score is still returned (now always 8 when it
+    fires, since all three components are mandatory) purely for the
+    caller's existing score/strength scaling, not as a substitute gate.
     """
     try:
         C = _to(closes)
@@ -457,25 +469,19 @@ def digit_score(
         bbl_v = _safe_last(BL, close_v)
         roc_v = _safe_last(ROC, 0.0)
 
-        over_score = 0
-        under_score = 0
+        over_rsi   = rsi_v < 22
+        over_bb    = close_v <= bbl_v
+        over_roc   = roc_v < -0.02
+        over_score = (3 if over_rsi else 0) + (3 if over_bb else 0) + (2 if over_roc else 0)
 
-        if rsi_v > 78:
-            under_score += 3
-        if rsi_v < 22:
-            over_score += 3
-        if close_v >= bbu_v:
-            under_score += 3
-        if close_v <= bbl_v:
-            over_score += 3
-        if roc_v < -0.02:
-            over_score += 2
-        if roc_v > 0.02:
-            under_score += 2
+        under_rsi   = rsi_v > 78
+        under_bb    = close_v >= bbu_v
+        under_roc   = roc_v > 0.02
+        under_score = (3 if under_rsi else 0) + (3 if under_bb else 0) + (2 if under_roc else 0)
 
-        if over_score >= 6 and over_score > under_score:
+        if over_rsi and over_bb and over_roc:
             return over_score, "OVER"
-        if under_score >= 6 and under_score > over_score:
+        if under_rsi and under_bb and under_roc:
             return under_score, "UNDER"
         return max(over_score, under_score), "NONE"
     except Exception:
