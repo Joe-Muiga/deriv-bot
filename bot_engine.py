@@ -53,6 +53,7 @@ import restart_scheduler
 import symbols as sym_module
 import strategy_stats
 import meta_labeling
+import pair_suspension
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
@@ -65,7 +66,7 @@ import indicators as ind
 from keep_alive import (update_status, set_active_trades,
                         record_trade,
                         record_signal, record_failure,
-                        update_open_contracts, _status)
+                        update_open_contracts, update_suspended_symbols, _status)
 from symbols import get_symbol_class
 
 logger = logging.getLogger(__name__)
@@ -866,6 +867,58 @@ class BotEngine:
         except Exception:
             pass
 
+        # Task 5/6 fix — dashboard suspension data source.
+        #
+        # Root cause (confirmed): the old suspended_symbols=[...] block
+        # below read directly from self.symbols._suspension_until, which is
+        # SymbolManager's WHOLE-SYMBOL suspension state. Per
+        # symbol_manager.py's own record_result() comments, self.symbols
+        # .suspend() is called from exactly one place now — the buy-failure
+        # circuit breaker in _execute() — confirmed by grepping every call
+        # site in this codebase (bot_engine.py:~1387 is the only one).
+        # Performance-based throttling for the popular-indicator pipeline
+        # is scoped to individual (indicator, symbol) pairs via
+        # pair_suspension.py instead, and that data was never wired to the
+        # dashboard anywhere — pair_suspension.snapshot() existed but was
+        # never called. Net effect: "Suspended Symbols" on the dashboard
+        # showed only rare API-failure suspensions, while the pair
+        # suspensions operators actually care about day to day (and which
+        # explain "wins showing while suspended" — the symbol itself was
+        # never blocked, only that one underperforming indicator on it)
+        # were completely invisible.
+        #
+        # Fix: two clearly-separated data sources, matching the task's
+        # recommendation —
+        #   1. pair_suspension.snapshot() -> update_suspended_symbols() ->
+        #      _state["suspended_symbols"] (repurposing the previously-
+        #      orphaned update_suspended_symbols() as the one function that
+        #      owns this key, instead of update_status() also being able to
+        #      write it — that dual-writer setup was the second half of the
+        #      bug: two functions could both set _state["suspended_symbols"],
+        #      only one of which was actually ever called, and it had the
+        #      wrong data).
+        #   2. Whole-symbol circuit-breaker suspensions kept, but relabeled
+        #      to their own field (circuit_breaker_symbols) in the
+        #      update_status() call below instead of being conflated with
+        #      per-pair suspensions under the same key.
+        try:
+            pair_susp_list = [
+                {"pair": pair, "seconds_remaining": round(secs, 0)}
+                for pair, secs in pair_suspension.snapshot().items()
+            ]
+            update_suspended_symbols(pair_susp_list)
+        except Exception as exc:
+            logger.warning(f"pair_suspension dashboard push failed: {exc}")
+
+        circuit_breaker_symbols = [
+            {
+                "symbol":          s,
+                "suspended_until": self.symbols._suspension_until.get(s, 0),
+            }
+            for s in getattr(self.symbols, "_suspension_until", {})
+            if self.symbols.is_suspended(s)
+        ]
+
         update_status(
             running               = True,
             balance               = self.client.balance,
@@ -884,14 +937,16 @@ class BotEngine:
             recent_trades         = _status.get("recent_trades", []),
             best_symbols          = self.symbols.best_symbols(50),
             balance_history       = _status.get("balance_history", []),
-            suspended_symbols     = [
-                {
-                    "symbol":          s,
-                    "suspended_until": self.symbols._suspension_until.get(s, 0),
-                }
-                for s in getattr(self.symbols, "_suspension_until", {})
-                if self.symbols.is_suspended(s)
-            ],
+            # Task 5 fix: this used to be suspended_symbols=[...] sourced
+            # from self.symbols._suspension_until (whole-symbol, circuit-
+            # breaker-only suspension) and update_status() writing straight
+            # into _state["suspended_symbols"] — the wrong data, written by
+            # a second path that raced/overwrote whatever
+            # update_suspended_symbols() (above) had just set from the
+            # correct pair_suspension.snapshot() source. Now kept as its
+            # own clearly-labeled field instead of overloading the
+            # suspended_symbols key a second time.
+            circuit_breaker_symbols = circuit_breaker_symbols,
             gross_profit          = summary.get("gross_profit",  0),
             gross_loss            = summary.get("gross_loss",    0),
             profit_factor         = summary.get("profit_factor", 0),
@@ -1187,22 +1242,116 @@ class BotEngine:
         except Exception as exc:
             logger.debug(f"compute_enriched_features({symbol}) failed: {exc}")
 
-        # SIGNAL INVERSION — DISABLED (user-directed, Aug 2026). Previously
-        # this block unconditionally flipped every computed LONG/SHORT
-        # direction (and swapped native_stop_price/native_target_price
-        # along with it) immediately before the order was sent — see
-        # config.INVERT_ALL_SIGNALS. That is now off: signals execute
-        # exactly as the strategy layer (see POPULAR INDICATOR STRATEGY)
-        # computed them, no flip, no SL/TP price swap. The `inverted`
-        # flag is kept (always False) purely because it still flows into
-        # ml_features below and meta_labeling._PairEVModel._fit() reads
-        # it back out to decide whether to flip a trade's training label —
-        # leaving it in place means that logic is a no-op rather than
-        # needing a second change there.
+        # UNIVERSAL SIGNAL INVERSION (user-directed, Aug 2026) — replaces
+        # the old sequential TAKE/INVERT alternator and the meta_labeling
+        # Bayesian TAKE/INVERT
+        # bandit's role in choosing trade direction (see
+        # config.INVERT_ALL_SIGNALS). Unconditional: every symbol, every
+        # strategy, every trade. Whatever direction the strategy layer
+        # computed as its price prediction is flipped immediately before
+        # the order goes out — a computed LONG is placed as SHORT and a
+        # computed SHORT is placed as LONG. meta_labeling.predict_take_trade()
+        # is no longer called from this path (its TAKE/INVERT decision
+        # would only ever be overridden by the rule below anyway); the
+        # module and its win/loss bookkeeping are left intact for
+        # logging/dashboard use — see meta_labeling.py's
+        # predict_take_trade() docstring.
         inverted = False
-        logger.debug(
-            f"INVERT DISABLED: {symbol} | {strategy} | signal executes as "
-            f"computed ({sig.direction}), config.INVERT_ALL_SIGNALS=False")
+        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL" or sig.direction not in ("LONG", "SHORT"):
+            # No LONG/SHORT to flip (e.g. JUMP_BUILDUP's DIGIT
+            # Matches/Differs contracts) — nothing to invert, trade
+            # through exactly as computed.
+            logger.debug(
+                f"INVERT SKIPPED: {symbol} | {strategy} | inversion isn't "
+                f"applicable to contract_kind={getattr(sig, 'contract_kind', 'RISE_FALL')}")
+        else:
+            original_direction = sig.direction
+            sig.direction = "SHORT" if sig.direction == "LONG" else "LONG"
+            inverted = True
+            logger.info(
+                f"SIGNAL INVERTED: {symbol} | {strategy} | {original_direction} -> "
+                f"{sig.direction} (universal inversion, config.INVERT_ALL_SIGNALS)"
+            )
+            # Popular-indicator pipeline, spec point 5: the SL/TP PRICE
+            # levels swap along with direction, in this same place and at
+            # the same time as the flip above — not as a second, separate
+            # pass elsewhere, which would risk swapping against a
+            # stale/re-fetched signal. The indicator's own stop-loss level
+            # becomes the bot's take-profit; its take-profit level becomes
+            # the bot's stop-loss.
+            if sig.native_stop_price is not None and sig.native_target_price is not None:
+                sig.native_stop_price, sig.native_target_price = (
+                    sig.native_target_price, sig.native_stop_price
+                )
+
+                # Task 4 (Aug 2026) — stop-tightening after the donkey-
+                # strategy swap. Immediately after the swap above (still in
+                # price-distance terms, before deriv_client.py converts to
+                # dollar SL/TP), pull the STOP-LOSS in to 20% of its
+                # post-swap distance from entry (an 80% tightening toward
+                # entry). Take-profit is left exactly as computed by the
+                # swap above — untouched.
+                #
+                # sig.native_stop_price, post-swap, already holds whichever
+                # price is about to be sent downstream as the executed
+                # stop-loss (deriv_client.buy_multiplier()'s
+                # stop_loss_price= kwarg reads this field directly,
+                # regardless of what it held before the swap) — so tighten
+                # that field in place, not "whichever variable used to be
+                # the stop before this block ran".
+                #
+                # Only reachable when inversion actually happened (this
+                # whole line is inside that `else` branch) AND both native
+                # price levels were present (the enclosing `if` here) — for
+                # every other path (contract_kind != RISE_FALL, no
+                # LONG/SHORT direction, or no native price levels at all)
+                # there is no post-swap stop to tighten, so this step is
+                # simply skipped there, matching current behavior for those
+                # paths per the task's own instruction.
+                entry = sig.native_entry_price
+                if entry is None or not math.isfinite(entry) or entry == 0:
+                    # Judgment call (per task instructions: handle
+                    # gracefully, don't crash the pipeline): skip the
+                    # tightening for this trade rather than guess at an
+                    # entry price, and log why so a strategy path reaching
+                    # here without one is visible.
+                    logger.warning(
+                        f"STOP TIGHTEN SKIPPED: {symbol} | {strategy} — no "
+                        f"valid native_entry_price at inversion time "
+                        f"(entry={entry!r}); leaving the post-swap stop "
+                        f"untightened for this trade."
+                    )
+                elif sig.native_stop_price is None or not math.isfinite(sig.native_stop_price):
+                    logger.warning(
+                        f"STOP TIGHTEN SKIPPED: {symbol} | {strategy} — "
+                        f"post-swap native_stop_price is invalid "
+                        f"({sig.native_stop_price!r}); leaving untightened."
+                    )
+                else:
+                    old_stop       = sig.native_stop_price
+                    original_dist  = abs(entry - old_stop)
+                    tightened_dist = 0.2 * original_dist
+                    # Derived generically off abs(entry - old_stop) rather
+                    # than hardcoding a per-direction formula: for a LONG
+                    # (post-swap direction — sig.direction was already
+                    # flipped above), the stop sits below entry, so pulling
+                    # it "in" means moving it UP toward entry; for a SHORT
+                    # the stop sits above entry, so pulling it in means
+                    # moving it DOWN toward entry.
+                    if sig.direction == "LONG":
+                        new_stop = entry - tightened_dist
+                    else:  # "SHORT"
+                        new_stop = entry + tightened_dist
+
+                    logger.info(
+                        f"STOP TIGHTENED: {symbol} | {strategy} | {sig.direction} | "
+                        f"post-swap stop distance ${original_dist:.5f} -> "
+                        f"${tightened_dist:.5f} (20% of original, 80% "
+                        f"tightening toward entry={entry:.5f}) | "
+                        f"stop {old_stop:.5f} -> {new_stop:.5f} | "
+                        f"target unchanged at {sig.native_target_price}"
+                    )
+                    sig.native_stop_price = new_stop
 
         # FIX (profitability audit): this call previously passed no
         # arguments, so RiskManager.calculate_stake()'s Kelly overlay
@@ -1213,6 +1362,34 @@ class BotEngine:
         # pairs with no measured edge and scale toward the Kelly-optimal
         # fraction for pairs that do have one.
         stake     = await self.risk.calculate_stake(strategy=strategy, symbol=symbol)
+
+        # Task 1 root-cause fix — RiskManager.calculate_stake() legitimately
+        # returns 0.0 as a "don't trade this pair right now" sentinel in
+        # three confirmed cases: the Kelly overlay vetoing a pair with no
+        # measured edge (fraction<=0), the exposure ceiling already being
+        # full (room<=0), or the post-clamp stake landing below MIN_STAKE.
+        # All three are real, working risk decisions — not bugs — but
+        # nothing downstream used to check for them before building SL/TP
+        # off this stake and calling buy_contract()/buy_multiplier(), which
+        # is the confirmed root cause of the $0 stake / $0 SL/TP symptom
+        # (both dollar formulas have stake as a direct factor). Aborting
+        # here, at the earliest point after the value is known, stops a
+        # legitimate "skip this trade" decision from ever being turned into
+        # a malformed order. deriv_client.py's buy_*() methods also
+        # independently validate stake/SL-TP immediately before every API
+        # call as a second-layer safety net — this is the root-cause-level
+        # fix, not a substitute for that net.
+        if not math.isfinite(stake) or stake <= 0:
+            logger.warning(
+                f"TRADE ABORTED: {symbol} | {strategy} — RiskManager "
+                f"returned a non-tradeable stake (${stake!r}); expected "
+                f"when the Kelly overlay vetoes this pair, the exposure "
+                f"ceiling is full, or the clamped stake fell below "
+                f"MIN_STAKE (see risk_manager.calculate_stake() logs above "
+                f"for which). Skipping this trade attempt rather than "
+                f"sending a $0 order."
+            )
+            return False
         # NOTE: for DIGIT signals (JUMP_BUILDUP) this is "MATCH"/"DIFFER",
         # not "LONG"/"SHORT" — passed through below to record_signal(),
         # risk.register_open(), and journal.open_trade() purely as a label.
