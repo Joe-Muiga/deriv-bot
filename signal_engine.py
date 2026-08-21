@@ -472,24 +472,27 @@ def evaluate_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult
     else:
         short_all = False
 
-    if long_score >= 6 and long_score >= short_score:
+    # FIX (Task 3 — full textbook confirmation, no partial firing, Aug
+    # 2026): previously fired on long_score/short_score >= 6 out of 8
+    # (RSI extreme=3, price-at-band=3, ROC momentum=2) — reachable with
+    # only 2 of the 3 documented conditions (RSI + band touch = 6, no ROC
+    # confirmation required at all). That's a confidence-threshold
+    # substituting for a missing condition. Textbook mean-reversion here
+    # is RSI extreme AND price at/through the band AND ROC confirming
+    # momentum — now gated on all_met (all three), not the score.
+    if long_all and long_score >= short_score:
         raw = long_score
         direction = "LONG"
-        all_met = long_all
-    elif short_score >= 6:
+    elif short_all:
         raw = short_score
         direction = "SHORT"
-        all_met = short_all
     else:
         best = max(long_score, short_score)
         logger.debug(f"REJECTED: {symbol} MEAN_REV strength=0 score={best/8.0:.3f} — below threshold")
         return SignalResult("NONE", 0, best / 8.0, "MEAN_REV", "Below entry threshold")
 
     score = raw / 8.0
-    strength = 3 if all_met else (2 if score >= 6 / 8.0 else 1)
-    if strength <= 1:
-        logger.info(f"REJECTED: {symbol} MEAN_REV strength=1 score={score:.3f} — below threshold")
-        return SignalResult("NONE", 0, score, "MEAN_REV", "Below entry threshold")
+    strength = 3
 
     logger.info(
         f"SIGNAL: {symbol} {direction} MEAN_REV strength={strength} score={score:.3f}"
@@ -717,14 +720,16 @@ def evaluate_vol_reversion_mult(ltf_bars: List[Candle], symbol: str) -> SignalRe
     else:
         short_all = False
 
-    if long_score >= 6 and long_score >= short_score:
+    # FIX (Task 3 — full textbook confirmation, no partial firing, Aug
+    # 2026): same pattern/fix as evaluate_mean_reversion() above — gated
+    # on all_met (RSI extreme AND band touch AND ROC momentum, all three)
+    # rather than a >=6/8 score that a 2-of-3 combination could satisfy.
+    if long_all and long_score >= short_score:
         raw = long_score
         direction = "LONG"
-        all_met = long_all
-    elif short_score >= 6:
+    elif short_all:
         raw = short_score
         direction = "SHORT"
-        all_met = short_all
     else:
         best = max(long_score, short_score)
         logger.debug(f"REJECTED: {symbol} VOL_REV_MULT strength=0 score={best/8.0:.3f} — below threshold")
@@ -745,10 +750,7 @@ def evaluate_vol_reversion_mult(ltf_bars: List[Candle], symbol: str) -> SignalRe
             )
 
     score = raw / 8.0
-    strength = 3 if all_met else (2 if score >= 6 / 8.0 else 1)
-    if strength <= 1:
-        logger.info(f"REJECTED: {symbol} VOL_REV_MULT strength=1 score={score:.3f} — below threshold")
-        return SignalResult("NONE", 0, score, "VOL_REV_MULT", "Below entry threshold")
+    strength = 3
 
     logger.info(
         f"SIGNAL: {symbol} {direction} VOL_REV_MULT strength={strength} score={score:.3f}"
@@ -1334,7 +1336,23 @@ def evaluate_boom_crash(ltf_bars: List[Candle], symbol: str) -> SignalResult:
     else:
         return NONE_RESULT
 
-    strength = 3 if rsi_confirmed else 2
+    # FIX (Task 3 — full textbook confirmation, no partial firing, Aug
+    # 2026): rsi_confirmed previously only affected strength (3 vs 2) and
+    # never gated whether the signal fired at all — a post-spike fade with
+    # NO RSI confirmation still fired at strength=2. The textbook
+    # post-spike fade requires RSI to actually be in the overbought/
+    # oversold zone that supports fading back toward the mean; that's a
+    # real condition, not just a strength modifier. Now hard-gated: no
+    # RSI confirmation, no signal.
+    if not rsi_confirmed:
+        logger.info(
+            f"REJECTED: {symbol} BOOM_CRASH strength=0 score=0.000 — "
+            f"{spike_type} spike detected but RSI={last_rsi:.1f} does not "
+            f"confirm the fade direction"
+        )
+        return NONE_RESULT
+
+    strength = 3
     score = min(spike_size / (last_atr * 5.0), 1.0)
 
     logger.info(
@@ -1660,27 +1678,60 @@ def evaluate_trend_shift(
         return NONE_RESULT
 
     # Confirmation check — does current EMA alignment support the KNOWN
-    # fixed bias right now? This only scores conviction; it never changes
-    # `direction`, which stays whatever bias_map says regardless.
+    # fixed bias right now?
     if direction == "LONG":
         aligned = ema_fast > ema_slow > ema_trend
     else:
         aligned = ema_fast < ema_slow < ema_trend
 
-    separation_atr = abs(ema_fast - ema_slow) / last_atr
-    raw_score = min(separation_atr / 3.0, 1.0)  # 3x ATR separation -> full score; tune with live data
+    # FIX (Task 3 — full textbook confirmation, no partial firing, Aug
+    # 2026): `aligned` and `rsi_contradicts` are real, documented
+    # conditions (EMA order confirming the bias; RSI not sitting in the
+    # zone that contradicts it) — previously they only dampened `score`
+    # (0.5x / 0.6x) rather than gating whether the signal could fire at
+    # all, meaning a fully-misaligned EMA read AND a contradicting RSI
+    # could still combine with a high enough separation_atr to clear
+    # MIN_TREND_SHIFT_SCORE and fire anyway. That's a confidence threshold
+    # substituting for missing conditions — the exact pattern this task
+    # asks to close. Direction itself still never changes (fixed daily-
+    # reset bias by design, per this function's docstring) — only whether
+    # a signal is allowed to fire at all is now hard-gated on both.
+    #
+    # Judgment call: the pre-fix comments frame `aligned`/`rsi_contradicts`
+    # as pure conviction-scoring by deliberate product design, not a
+    # textbook EMA-crossover entry condition. Task 3's instructions are
+    # explicit that every place a documented condition is allowed to
+    # substitute-via-score rather than gate should be tightened, so both
+    # are promoted to hard requirements here; noted in the changelog
+    # rather than silently reinterpreting the strategy.
     if not aligned:
-        # The daily trend is supposed to hold all cycle by product design,
-        # so a misaligned EMA read is more likely short-term noise than a
-        # genuine reversal — dampen the score rather than reject outright.
-        raw_score *= 0.5
+        logger.info(
+            f"REJECTED: {symbol} TREND_SHIFT strength=0 score=0.000 — "
+            f"EMA alignment does not currently support fixed bias={direction} "
+            f"(ema_fast={ema_fast:.5f} ema_slow={ema_slow:.5f} ema_trend={ema_trend:.5f})"
+        )
+        return SignalResult(
+            "NONE", 0, 0.0, "TREND_SHIFT",
+            f"EMA not aligned with fixed bias={direction}",
+        )
 
     rsi_overbought = getattr(config, "RSI_OVERBOUGHT", 70)
     rsi_oversold = getattr(config, "RSI_OVERSOLD", 30)
     rsi_contradicts = (direction == "LONG" and last_rsi >= rsi_overbought) or (
         direction == "SHORT" and last_rsi <= rsi_oversold
     )
-    score = raw_score * 0.6 if rsi_contradicts else raw_score
+    if rsi_contradicts:
+        logger.info(
+            f"REJECTED: {symbol} TREND_SHIFT strength=0 score=0.000 — "
+            f"RSI={last_rsi:.1f} contradicts fixed bias={direction}"
+        )
+        return SignalResult(
+            "NONE", 0, 0.0, "TREND_SHIFT",
+            f"RSI={last_rsi:.1f} contradicts fixed bias={direction}",
+        )
+
+    separation_atr = abs(ema_fast - ema_slow) / last_atr
+    score = min(separation_atr / 3.0, 1.0)  # 3x ATR separation -> full score; tune with live data
     score = max(0.0, min(1.0, score))
 
     min_score = getattr(config, "MIN_TREND_SHIFT_SCORE", 0.65)
