@@ -136,6 +136,7 @@ v9 → v10 audit changes (full compliance pass):
 import asyncio
 import json
 import logging
+import math
 import time
 from typing import Callable, Dict, Optional, List, Any
 
@@ -368,6 +369,11 @@ class DerivClient:
                     try:
                         await self._subscribe_balance()
                         await self._resubscribe_contracts()
+                        # Task 2 fix — see _resubscribe_ticks() docstring:
+                        # ticks were never re-subscribed after a reconnect
+                        # before this, which silently orphaned live tick
+                        # streams for every previously-subscribed symbol.
+                        await self._resubscribe_ticks()
                         await dispatch_task
                     finally:
                         dispatch_task.cancel()
@@ -524,6 +530,11 @@ class DerivClient:
         """
         while True:
             await asyncio.sleep(_CONTRACT_POLL_INTERVAL)
+            # Task 2 observability requirement — cheap, always logged
+            # (regardless of whether there's anything to poll) so tracking-
+            # set sizes are visible on a predictable cadence rather than
+            # only when something is already open.
+            logger.debug(f"SUBSCRIPTION STATE: {self.subscription_state_sizes()}")
             if not self._polling_contracts:
                 continue
             logger.info(
@@ -566,6 +577,21 @@ class DerivClient:
         sync with what deriv_client is actually still watching.
         """
         return set(self._polling_contracts.keys()) | set(self._subscribed_contracts)
+
+    def subscription_state_sizes(self) -> dict:
+        """
+        Task 2 observability requirement: current size of every tracking
+        set this module maintains, so a divergence between them (the class
+        of bug this task exists to fix) is visible in logs/dashboard going
+        forward instead of only surfacing as an opaque "AlreadySubscribed"
+        or silent-tick-loss symptom discovered after the fact.
+        """
+        return {
+            "polling_contracts":    len(self._polling_contracts),
+            "subscribed_contracts": len(self._subscribed_contracts),
+            "tick_subscriptions":   len(self._subscription_map),
+            "tick_callbacks":       len(self._tick_callbacks),
+        }
 
     # ─── Last-resort truth source (Fix C.3) ───────────────────────────────
 
@@ -648,14 +674,85 @@ class DerivClient:
             logger.error(f"SUBSCRIBE FAILED: {cid} — {e}")
 
     async def _resubscribe_contracts(self):
-        """Re-subscribe every tracked contract_id after a (re)connect."""
-        if not self._subscribed_contracts:
-            return
-        pending = list(self._subscribed_contracts)
+        """
+        Re-subscribe every currently-open contract's proposal_open_contract
+        WS channel after a (re)connect.
+
+        FIX (Task 2 — tracking divergence): previously rebuilt from
+        self._subscribed_contracts, which is NOT the authoritative "what's
+        actually open" set — self._polling_contracts is. subscribe_contract()
+        registers a contract in _polling_contracts synchronously, then fires
+        the WS subscribe via asyncio.create_task(self._subscribe_ws_contract(cid))
+        — fire-and-forget, non-blocking. If a reconnect interrupts the
+        connection before that task lands (i.e. before cid is added to
+        _subscribed_contracts), the old code would silently drop that
+        contract from resubscription forever: it was never in
+        _subscribed_contracts to begin with, so it wouldn't be in `pending`
+        either. The contract would then only ever be resolved by the 30s
+        polling fallback, with no live WS push — exactly the kind of
+        one-tracker-diverges-from-the-other bug this task asked to find.
+
+        Rebuilding from self._polling_contracts (the single source of truth
+        for "which contracts we still consider open") instead means every
+        genuinely open contract gets its WS subscription (re)requested on
+        every reconnect, regardless of how far the previous subscribe
+        attempt got.
+        """
         self._subscribed_contracts.clear()
+        pending = list(self._polling_contracts.keys())
+        if not pending:
+            return
         logger.info(f"RESUBSCRIBING: {len(pending)} contracts after reconnect")
         for cid in pending:
             await self._subscribe_ws_contract(cid)
+
+    async def _resubscribe_ticks(self):
+        """
+        Re-issue every live tick subscription after a (re)connect.
+
+        FIX (Task 2 — tracking divergence / silent tick loss): the previous
+        connect() flow never re-subscribed ticks at all after a reconnect.
+        subscribe_ticks()'s own no-double-subscribe guard is
+        `if symbol in self._subscription_map: return existing`  — but
+        self._subscription_map is never cleared on disconnect, so after a
+        reconnect it still holds sub_ids from the now-dead connection.
+        Every subscription the server held is gone the instant that
+        connection drops (a fresh WS connection has no memory of the old
+        one's subscriptions) — but subscribe_ticks() would keep matching
+        the stale map entry and skip re-sending the request, leaving that
+        symbol with local state that says "subscribed" while the server
+        has nothing live for it. This is exactly the "bot's internal state
+        doesn't think it's already subscribed... or vice versa" symptom
+        from Task 2, and it explains ticks silently stopping for a symbol
+        with nothing else visibly wrong (no error, no _tick_degraded flag —
+        that only gets set on an explicit subscribe failure, not a reconnect
+        that quietly orphans an existing one).
+
+        Clears _subscription_map first so subscribe_ticks() always re-sends
+        on the new connection, then rebuilds from self._tick_callbacks (the
+        single source of truth for "which symbols the bot currently wants
+        live ticks for") rather than the stale sub_id map.
+        """
+        symbols = list(self._tick_callbacks.keys())
+        self._subscription_map.clear()
+        if not symbols:
+            return
+        logger.info(f"RESUBSCRIBING TICKS: {len(symbols)} symbol(s) after reconnect")
+        for symbol in symbols:
+            callback = self._tick_callbacks.get(symbol)
+            if callback is None:
+                continue
+            try:
+                resp   = await self._send({"ticks": symbol, "subscribe": 1})
+                sub_id = resp.get("tick", {}).get("id", symbol)
+                self._subscription_map[symbol] = sub_id
+                logger.info(f"Tick subscription restored: {symbol} (sub_id={sub_id})")
+            except Exception as exc:
+                logger.warning(
+                    f"TICK RESUBSCRIBE FAILED: {symbol} after reconnect — {exc} "
+                    f"(will retry via the normal degraded-retry path if bot_engine "
+                    f"notices no ticks are arriving)"
+                )
 
     # ─── Force check a specific contract ─────────────────────────────────────
 
@@ -969,17 +1066,107 @@ class DerivClient:
     def _cap_stake(self, stake: float, symbol: str) -> float:
         """
         Mirrors the FIX 3 stake-cap rule documented above for buy_contract()
-        (if stake > balance * 0.5, cap at max(balance * 0.02, 0.35)).
+        (if stake > balance * 0.5, cap at max(balance * 0.02, MIN_STAKE)).
 
         Used only by the new proposal-based buy methods below —
         buy_contract() itself is left untouched per task instructions.
+
+        FIX (Task 1 — $0 stake root cause): the cap floor used to be the
+        module's own hardcoded 0.35, completely independent of
+        config.MIN_STAKE (100 in this deployment). RiskManager.calculate_
+        stake() already clamps every stake it returns to >= MIN_STAKE
+        before handing it to bot_engine._execute() — but if that stake then
+        exceeded balance*0.5, this method would cap it right back down to
+        as low as $0.35, silently undercutting the floor RiskManager had
+        just enforced one layer up. The floor is now config.MIN_STAKE
+        itself, so no later capping step in the pipeline can push the
+        final "amount" sent to the API back below the floor the risk
+        system decided on.
+
+        balance <= 0 (not yet fetched, or a genuine 0 mid-session) is left
+        uncapped here (can't safely compute balance*0.5/balance*0.02
+        against an unknown/zero balance) — the hard stake>0/finite
+        validation immediately before each buy_* call's proposal request
+        is what actually guards against a bad value reaching the API in
+        that case, not this method.
         """
-        balance = self._balance
+        balance = self._balance or 0.0
         if balance > 0 and stake > balance * 0.5:
-            capped = max(balance * 0.02, 0.35)
+            floor  = getattr(config, "MIN_STAKE", 0.35)
+            capped = max(balance * 0.02, floor)
             logger.info(f"STAKE CAPPED: ${stake:.4f} → ${capped:.4f} ({symbol})")
             return capped
         return stake
+
+    # ─── Task 1 — hard numeric validation guard ────────────────────────────
+    # Centralized here (rather than duplicated at every bot_engine.py call
+    # site) so every buy_* path — present and future — gets the same
+    # guarantee: stake and any SL/TP dollar amount sent to the API is never
+    # 0, negative, or non-finite. This is a safety net on top of the actual
+    # root-cause fixes above (RiskManager's legitimate $0.00 "don't trade
+    # this pair" sentinel now being checked by bot_engine._execute() before
+    # it ever reaches a buy_* call, and _cap_stake() now respecting
+    # MIN_STAKE as its floor) — not a replacement for them. Never raises;
+    # returns a reason string on failure, or None if the value is valid.
+
+    @staticmethod
+    def _invalid_reason(label: str, value: Optional[float]) -> Optional[str]:
+        if value is None:
+            return f"{label} is None"
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return f"{label}={value!r} is not numeric"
+        if not math.isfinite(v):
+            return f"{label}={v} is not finite"
+        if v <= 0:
+            return f"{label}={v:.6f} is <= 0"
+        return None
+
+    def _validate_stake(self, stake: float, symbol: str, context: str) -> bool:
+        """
+        True if `stake` is safe to send as the API's "amount" field.
+        Logs a clear, specific reason and returns False otherwise —
+        callers must abort that specific trade attempt on False rather
+        than sending the malformed order.
+        """
+        reason = self._invalid_reason("stake", stake)
+        if reason:
+            logger.error(
+                f"BUY ABORTED: {symbol} ({context}) — invalid stake, "
+                f"refusing to send a malformed order: {reason}"
+            )
+            return False
+        return True
+
+    def _validate_limit_order(
+        self, stop_loss_amount: float, take_profit_amount: float,
+        symbol: str, context: str,
+    ) -> bool:
+        """
+        True if both SL and TP dollar amounts are safe to send in a
+        Multiplier proposal's limit_order. Logs which one is bad and why
+        (dist-to-stop/target computed as 0, stake was 0 so the product
+        collapsed to 0, entry_price was bad, etc. — the log line names the
+        value, not the upstream cause, since by this point that's all this
+        layer can see) and returns False otherwise.
+        """
+        ok = True
+        reason = self._invalid_reason("stop_loss_amount", stop_loss_amount)
+        if reason:
+            logger.error(
+                f"BUY ABORTED: {symbol} ({context}) — invalid stop_loss_amount, "
+                f"refusing to send a malformed limit_order: {reason}"
+            )
+            ok = False
+        reason = self._invalid_reason("take_profit_amount", take_profit_amount)
+        if reason:
+            logger.error(
+                f"BUY ABORTED: {symbol} ({context}) — invalid take_profit_amount, "
+                f"refusing to send a malformed limit_order: {reason}"
+            )
+            ok = False
+        return ok
 
     @staticmethod
     def _digit_contract_type(match_type: str) -> Optional[str]:
@@ -1060,6 +1247,12 @@ class DerivClient:
                 f"SKIPPED: {symbol}/{strategy} — circuit breaker cooldown "
                 f"active ({remaining:.0f}s remaining)"
             )
+            return None
+
+        # Task 1 hard guard — checked before the semaphore/rate-limit wait
+        # so an invalid stake never even occupies a buy slot.
+        if not self._validate_stake(stake, symbol, "buy_contract/Rise-Fall"):
+            self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
             return None
 
         async with self._buy_semaphore:
@@ -1263,6 +1456,18 @@ class DerivClient:
         if take_profit_ratio is None:
             take_profit_ratio = config.TAKE_PROFIT_RATIO
 
+        # Task 1 hard guard — stake checked before the semaphore/rate-limit
+        # wait so an invalid stake never even occupies a buy slot. This is
+        # the guard that actually catches RiskManager's legitimate $0.00
+        # "no edge / exposure ceiling full / below MIN_STAKE" sentinel if
+        # bot_engine._execute()'s own earlier check (the root-cause fix)
+        # were ever bypassed or a future call site skipped it — belt and
+        # suspenders, per the task's explicit "safety net on top of, not
+        # instead of" requirement.
+        if not self._validate_stake(stake, symbol, "buy_multiplier"):
+            self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+            return None
+
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
             if elapsed < 3.0:
@@ -1270,13 +1475,32 @@ class DerivClient:
             self._last_buy_time = time.time()
 
             stake = self._cap_stake(stake, symbol)
+            # Re-validate after capping — _cap_stake() can only raise a
+            # stake that's too large down toward MIN_STAKE, never toward
+            # 0, but this keeps the guarantee airtight regardless of any
+            # future change to that method's floor logic.
+            if not self._validate_stake(stake, symbol, "buy_multiplier (post-cap)"):
+                self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                return None
+
             contract_type = "MULTUP" if direction == "LONG" else "MULTDOWN"
 
             if stop_loss_price is not None and take_profit_price is not None and entry_price:
                 # Popular-indicator pipeline (spec point 6) — native PRICE
-                # levels supplied, already inverted+swapped upstream.
-                # Convert straight to dollar SL/TP; do NOT re-apply
-                # TP_SL_SWAP_ENABLED here, that would double-swap.
+                # levels supplied, already inverted+swapped (and, per Task 4,
+                # stop-tightened) upstream. Convert straight to dollar
+                # SL/TP; do NOT re-apply TP_SL_SWAP_ENABLED here, that would
+                # double-swap.
+                #
+                # Task 1: entry_price/stop_loss_price/take_profit_price
+                # being merely truthy doesn't guarantee dist_to_stop or
+                # dist_to_target is actually > 0 — a strategy path that
+                # failed to compute a real price level but didn't None-out
+                # the field could hand this a stop/target equal to entry,
+                # which would silently divide out to a $0 SL/TP below. The
+                # _validate_limit_order() call after this block is what
+                # catches that; nothing here needs to change for it, but
+                # flagging why the check below isn't redundant.
                 dist_to_stop   = abs(entry_price - stop_loss_price)
                 dist_to_target = abs(entry_price - take_profit_price)
                 stop_loss_amount   = round(stake * multiplier * (dist_to_stop   / entry_price), 2)
@@ -1287,6 +1511,20 @@ class DerivClient:
                     f"-> SL=${stop_loss_amount:.2f} TP=${take_profit_amount:.2f}"
                 )
             else:
+                if stop_loss_price is not None and take_profit_price is not None and not entry_price:
+                    # Task 1 — this is the "strategy path reached here
+                    # without a native entry price" case: falls through to
+                    # the legacy percentage path below rather than dividing
+                    # by a zero/None entry_price, but that fallback was
+                    # previously silent. Logged now so a missing
+                    # native_entry_price is visible instead of looking like
+                    # this trade simply never had native levels at all.
+                    logger.warning(
+                        f"NATIVE SL/TP SKIPPED: {symbol} — stop_loss_price/"
+                        f"take_profit_price supplied but entry_price="
+                        f"{entry_price!r} is missing/zero; falling back to "
+                        f"the stake-percentage SL/TP method instead"
+                    )
                 # Legacy stake-percentage path — still used by any call
                 # site that doesn't supply native price levels.
                 # TP/SL SWAP (user-directed, Aug 2026 — see
@@ -1305,6 +1543,18 @@ class DerivClient:
                 else:
                     stop_loss_amount   = _computed_stop_loss_amount
                     take_profit_amount = _computed_take_profit_amount
+
+            # Task 1 hard guard — the actual point that closes the "$0
+            # stake -> $0 SL/TP" hole: both formulas above have stake as a
+            # factor, so anything that let a $0/negative/non-finite value
+            # through this far (a zero dist_to_stop from a bad native
+            # price level, a zero stop_loss_pct, stake having slipped
+            # through despite the earlier checks, etc.) is caught here,
+            # immediately before the request is built, rather than being
+            # sent to the API.
+            if not self._validate_limit_order(stop_loss_amount, take_profit_amount, symbol, "buy_multiplier"):
+                self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                return None
 
             logger.info(
                 f"BUY ATTEMPT: {symbol} {contract_type} stake=${stake:.4f} "
@@ -1486,6 +1736,10 @@ class DerivClient:
         contract for polling via subscribe_contract() — mirrors
         buy_contract()'s existing division of responsibility.
         """
+        # Task 1 hard guard — checked before the semaphore/rate-limit wait.
+        if not self._validate_stake(stake, symbol, "buy_accumulator"):
+            return None
+
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
             if elapsed < 3.0:
@@ -1500,6 +1754,8 @@ class DerivClient:
                 return None
 
             stake = self._cap_stake(stake, symbol)
+            if not self._validate_stake(stake, symbol, "buy_accumulator (post-cap)"):
+                return None
             logger.info(
                 f"BUY ATTEMPT: {symbol} ACCU stake=${stake:.4f} "
                 f"growth_rate={growth_rate}%"
@@ -1785,6 +2041,10 @@ class DerivClient:
         """
         contract_type = self._digit_contract_type(match_type)
 
+        # Task 1 hard guard — checked before the semaphore/rate-limit wait.
+        if not self._validate_stake(stake, symbol, "buy_digit_contract"):
+            return None
+
         async with self._buy_semaphore:
             elapsed = time.time() - self._last_buy_time
             if elapsed < 3.0:
@@ -1802,6 +2062,8 @@ class DerivClient:
                 return None
 
             stake = self._cap_stake(stake, symbol)
+            if not self._validate_stake(stake, symbol, "buy_digit_contract (post-cap)"):
+                return None
             logger.info(
                 f"BUY ATTEMPT: {symbol} {contract_type} digit={digit} "
                 f"stake=${stake:.4f}"
