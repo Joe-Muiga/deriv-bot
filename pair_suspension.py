@@ -46,25 +46,29 @@ _suspended_until: Dict[Tuple[str, str], float] = {}
 
 
 def is_suspended(strategy: str, symbol: str) -> bool:
-    """DISABLED (user-directed, Aug 2026): performance-based pair suspension
-    is off. Always returns False so no (indicator, symbol) pair ever sits
-    out — signal_engine.py's picking loop treats every pair as eligible
-    regardless of strategy_stats.is_underperforming(). The buy-failure
-    circuit breaker in symbol_manager.py/deriv_client.py is untouched by
-    this and still protects against hammering the API on repeated buy
-    failures."""
-    return False
+    """True if this exact (indicator, symbol) pair is currently sitting out
+    its suspension window. Does not affect any other pair."""
+    until = _suspended_until.get((strategy, symbol), 0.0)
+    return time.time() < until
 
 
 def maybe_suspend(strategy: str, symbol: str) -> None:
-    """DISABLED (user-directed, Aug 2026): no-op. Previously started a flat
-    config.PAIR_SUSPEND_MINUTES clock the first time
-    strategy_stats.is_underperforming() flipped True for this (indicator,
-    symbol) pair; now does nothing, so no pair is ever suspended.
-    _suspended_until is left unused/empty rather than removed, so
-    seconds_remaining()/snapshot()/clear() below stay valid no-ops for any
-    dashboard/debug code that still calls them."""
-    return
+    """
+    Call this once, right after strategy_stats.is_underperforming() returns
+    True for this (indicator, symbol) pair. Idempotent: if the pair is
+    already suspended, this does nothing — that's what makes the window a
+    flat PAIR_SUSPEND_MINUTES rather than one that keeps getting pushed back
+    out for as long as the rolling win rate stays bad.
+    """
+    if is_suspended(strategy, symbol):
+        return
+    minutes = getattr(config, "PAIR_SUSPEND_MINUTES", 60)
+    _suspended_until[(strategy, symbol)] = time.time() + minutes * 60
+    logger.info(
+        f"PAIR SUSPENDED: {strategy}/{symbol} for {minutes}min "
+        f"(underperforming) — other indicators on {symbol} and {strategy} "
+        f"on other symbols are unaffected"
+    )
 
 
 def seconds_remaining(strategy: str, symbol: str) -> float:
