@@ -815,14 +815,15 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     probability. No enriched features, no external data — purely this
     symbol's own win/loss history.
 
-    NOTE (user-directed, Aug 2026): bot_engine.py's execution path does
-    not use this function's TAKE/INVERT output to decide trade
-    direction — signals execute exactly as the strategy layer computes
-    them (see bot_engine.py's "SIGNAL INVERSION — DISABLED" step;
-    config.INVERT_ALL_SIGNALS = False). This function and its underlying
-    win/loss bookkeeping are left in place and still callable (e.g. for
-    the dashboard / smoke test / future use) but are not part of the
-    live trade-decision path.
+    NOTE (user-directed, Aug 2026): bot_engine.py's execution path no
+    longer uses this function's TAKE/INVERT output to decide trade
+    direction — see config.INVERT_ALL_SIGNALS / bot_engine.py's
+    "UNIVERSAL SIGNAL INVERSION" step, which unconditionally inverts
+    every symbol's direction regardless of what this bandit would have
+    picked. This function and its underlying win/loss bookkeeping are
+    left in place and still callable (e.g. for the dashboard / smoke
+    test / future use) but are no longer part of the live trade-decision
+    path.
     """
     strategy = str(features["strategy"])
     symbol = str(features["symbol"])
