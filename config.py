@@ -494,16 +494,18 @@ MEAN_REV_REQUIRE_TURN = True
 # contract_update, without changing this ratio itself.
 TAKE_PROFIT_RATIO = 2.5
 
-# ── UNIVERSAL SIGNAL INVERSION (user-directed, Aug 2026 — now DISABLED) ──
-# Previously flipped every computed direction (a computed BUY placed as a
-# SELL, a computed SELL placed as a BUY) immediately before the order was
-# sent, unconditionally, for every symbol/strategy/trade. Turned off:
-# signals now execute exactly as the strategy layer (see POPULAR
-# INDICATOR STRATEGY below) computes them. This flag is documentation
-# only — bot_engine.py's execution path (search "SIGNAL INVERSION —
-# DISABLED") no longer branches on it — but it's set to False here so it
-# doesn't mislead anyone reading config.py in isolation.
-INVERT_ALL_SIGNALS = False
+# ── UNIVERSAL SIGNAL INVERSION (user-directed, Aug 2026) ─────────────────
+# Replaces the old sequential TAKE/INVERT alternator and the meta_labeling
+# Bayesian TAKE/INVERT
+# bandit's role in choosing trade direction. This is unconditional and
+# applies to every symbol, every strategy, every trade: whatever direction
+# the strategy layer (see POPULAR INDICATOR STRATEGY below) computes as
+# its price prediction is flipped — a computed BUY is placed as a SELL,
+# a computed SELL is placed as a BUY — immediately before the order is
+# sent. No per-symbol table, no win-rate gating, no opt-out list. See
+# bot_engine.py's execution path for the single choke point that applies
+# this (search "UNIVERSAL SIGNAL INVERSION").
+INVERT_ALL_SIGNALS = True
 
 # ── TP/SL SWAP FOR MULTIPLIER CONTRACTS (user-directed, Aug 2026) ────────
 # Applies only where Multiplier contracts carry an explicit stop_loss /
@@ -523,12 +525,12 @@ INVERT_ALL_SIGNALS = False
 # minimizes both legs proportionally without altering this ordering.
 TP_SL_SWAP_ENABLED = True
 
-# Per-(indicator, symbol) suspension window — DISABLED (user-directed,
-# Aug 2026). pair_suspension.is_suspended() now always returns False and
-# maybe_suspend() is a no-op, so no (indicator, symbol) pair is ever
-# suspended regardless of this value. PAIR_SUSPEND_MINUTES is left here
-# only as documentation of the old window length in case this is
-# re-enabled later. See pair_suspension.py.
+# Per-(indicator, symbol) suspension window (spec point 8, Aug 2026): when
+# strategy_stats.is_underperforming(strategy, symbol) first flips True for a
+# given (indicator, symbol) pair, pair_suspension.maybe_suspend() starts a
+# flat, non-renewing clock this many minutes long. Only that pair sits out;
+# every other indicator keeps trading that symbol, and this indicator keeps
+# trading every other symbol. See pair_suspension.py.
 PAIR_SUSPEND_MINUTES = 60
 
 # ── POPULAR INDICATOR CONFLUENCE STRATEGY (user-directed, Aug 2026) ──────
@@ -839,13 +841,14 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
 
-# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, as a rolling
-# interval measured from the last actual redeploy/resumption (NOT anchored
-# to any fixed wall-clock time — see restart_scheduler.py's run_scheduler()
-# docstring). REDEPLOY_TIMEZONE is unused by the current rolling scheduler;
-# left in place only in case a future fixed-clock schedule needs it again.
+# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
+# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
+# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
+# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
+# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
+# _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 1
+REDEPLOY_INTERVAL_HOURS = 3
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
