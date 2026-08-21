@@ -98,6 +98,18 @@ _state: dict = {
     "signal_log":            [],   # last 20 emitted signals
     "failure_log":           [],   # last 50 failed placements
     "session_start_balance": 0.0,  # set once on first trade or bot start
+    # Task 5/6 fix (Aug 2026): "suspended_symbols" now holds per-
+    # (indicator, symbol) pair suspensions, sourced correctly from
+    # pair_suspension.snapshot() via update_suspended_symbols() below —
+    # see that function's docstring for the full root-cause explanation.
+    # Whole-symbol buy-failure circuit-breaker suspensions (the only
+    # remaining caller of SymbolManager.suspend()) get their own,
+    # separately-labeled key so the two are never conflated again.
+    "circuit_breaker_symbols": [],
+    # Task 7 dashboard visibility — set by restart_scheduler.py.
+    "redeploy_hook_missing":         False,
+    "redeploy_watchdog_overdue":     False,
+    "redeploy_watchdog_overdue_mins": 0.0,
 }
 
 _status = _state   # alias for bot_engine imports
@@ -318,6 +330,17 @@ def update_open_contracts(contracts: list) -> None:
 
 
 def update_suspended_symbols(suspended: list) -> None:
+    """
+    Task 5 fix: this was previously an orphaned function — nothing called
+    it, and _push_dashboard() in bot_engine.py wrote _state["suspended_
+    symbols"] itself via update_status(), sourced from SymbolManager's
+    whole-symbol suspension state (the wrong data — see bot_engine.py's
+    _push_dashboard() for the full root-cause explanation). Repurposed as
+    the ONE function that owns this key: bot_engine.py's _push_dashboard()
+    now calls this with data built from pair_suspension.snapshot() (a list
+    of {"pair": "<strategy>/<symbol>", "seconds_remaining": <float>}
+    dicts) — the correct, per-(indicator, symbol) suspension source.
+    """
     _state["suspended_symbols"] = list(suspended)
 
 
@@ -727,23 +750,52 @@ def _render_dashboard() -> str:
             open_rows = ("<tr><td colspan='4' style='text-align:center;color:#484f58'>"
                          "No open contracts</td></tr>")
 
-        # ── Suspended symbols ─────────────────────────────────────────────────
+        # ── Suspended (indicator, symbol) pairs — Task 5/6 fix ──────────────────
+        # Sourced from pair_suspension.snapshot() via bot_engine._push_dashboard()
+        # -> update_suspended_symbols() -> _state["suspended_symbols"]. Each entry
+        # is {"pair": "<strategy>/<symbol>", "seconds_remaining": <float>} — NOT
+        # the old whole-symbol {"symbol", "suspended_until"} shape (that data now
+        # lives separately under "circuit_breaker_symbols", rendered below).
         susp_rows = ""
         for x in sorted(
             [z for z in s.get("suspended_symbols", [])
-             if float(z.get("suspended_until", 0)) > now_ts],
-            key=lambda z: float(z.get("suspended_until", 0)),
+             if float(z.get("seconds_remaining", 0)) > 0],
+            key=lambda z: float(z.get("seconds_remaining", 0)),
         ):
-            mins_left = max(0, int((float(x["suspended_until"]) - now_ts) / 60))
+            secs_left = float(x.get("seconds_remaining", 0))
+            mins_left = max(0, int(secs_left / 60))
+            secs_disp = f"{mins_left} min" if mins_left > 0 else f"{int(secs_left)}s"
             susp_rows += (
                 f"<tr>"
-                f"<td><b>{x.get('symbol', '—')}</b></td>"
-                f"<td><span class='susp-badge'>⏸ {mins_left} min remaining</span></td>"
+                f"<td><b>{x.get('pair', '—')}</b></td>"
+                f"<td><span class='susp-badge'>⏸ {secs_disp} remaining</span></td>"
                 f"</tr>"
             )
         if not susp_rows:
             susp_rows = ("<tr><td colspan='2' style='text-align:center;color:#484f58'>"
                          "None suspended</td></tr>")
+
+        # ── Circuit-breaker suspended symbols (whole-symbol, buy-failure) ───────
+        # This is what "Suspended Symbols" used to show before the Task 5 fix —
+        # kept, but now its own clearly-labeled section rather than being
+        # conflated with per-pair performance suspensions above. Only
+        # SymbolManager's buy-failure circuit breaker writes to this state.
+        cb_rows = ""
+        for x in sorted(
+            [z for z in s.get("circuit_breaker_symbols", [])
+             if float(z.get("suspended_until", 0)) > now_ts],
+            key=lambda z: float(z.get("suspended_until", 0)),
+        ):
+            mins_left = max(0, int((float(x["suspended_until"]) - now_ts) / 60))
+            cb_rows += (
+                f"<tr>"
+                f"<td><b>{x.get('symbol', '—')}</b></td>"
+                f"<td><span class='susp-badge'>⏸ {mins_left} min remaining</span></td>"
+                f"</tr>"
+            )
+        if not cb_rows:
+            cb_rows = ("<tr><td colspan='2' style='text-align:center;color:#484f58'>"
+                       "None suspended</td></tr>")
 
         # ── Symbol leaderboard (all symbols, full stats) ──────────────────────
         sym_rows = ""
@@ -1023,11 +1075,18 @@ def _render_dashboard() -> str:
   <tbody>{open_rows}</tbody>
 </table>
 
-<!-- ── 8. Suspended Symbols ── -->
-<div class="section-title">Suspended Symbols</div>
+<!-- ── 8. Suspended Indicator/Symbol Pairs (Task 5/6 fix) ── -->
+<div class="section-title">Suspended Indicator/Symbol Pairs</div>
+<table>
+  <thead><tr><th>Strategy/Symbol</th><th>Status</th></tr></thead>
+  <tbody>{susp_rows}</tbody>
+</table>
+
+<!-- ── 8b. Circuit-Breaker Suspended Symbols ── -->
+<div class="section-title">Circuit-Breaker Suspended Symbols</div>
 <table>
   <thead><tr><th>Symbol</th><th>Status</th></tr></thead>
-  <tbody>{susp_rows}</tbody>
+  <tbody>{cb_rows}</tbody>
 </table>
 
 <!-- ── 9. Symbol Leaderboard ── -->
@@ -1238,7 +1297,11 @@ def stats_route():
         "last_signal":        s.get("last_signal", "—"),
         "tradeable_count":    int(s.get("tradeable_count", 0)),
         "active_trades":      int(s.get("active_trades", 0)),
-        "suspended_symbols":  s.get("suspended_symbols", []),
+        "suspended_symbols":  s.get("suspended_symbols", []),  # Task 5 fix: now per-(indicator,symbol) pair data — see update_suspended_symbols() docstring
+        "circuit_breaker_symbols": s.get("circuit_breaker_symbols", []),  # whole-symbol buy-failure suspensions, Task 5/6
+        "redeploy_hook_missing":          bool(s.get("redeploy_hook_missing", False)),
+        "redeploy_watchdog_overdue":      bool(s.get("redeploy_watchdog_overdue", False)),
+        "redeploy_watchdog_overdue_mins": round(float(s.get("redeploy_watchdog_overdue_mins", 0.0)), 1),
         "hourly_pnl":         s.get("hourly_pnl", {}),
         "daily_pnl_history":  s.get("daily_pnl_history", []),
         "all_trades_count":   len(s.get("all_trades", [])),
