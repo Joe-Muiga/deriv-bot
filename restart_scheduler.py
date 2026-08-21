@@ -42,8 +42,22 @@ logger = logging.getLogger(__name__)
 
 # ── Module-level scheduler state ────────────────────────────────────────────
 _pending: bool = False
-_last_triggered_at: float = 0.0
+_last_triggered_at: float = 0.0          # last time trigger_redeploy() ran at all
+_last_confirmed_redeploy_at: float = 0.0  # last time it actually succeeded (Task 7)
 _last_scheduled_at: float = 0.0
+_process_start_time: float = time.time()
+_last_watchdog_warning_at: float = 0.0
+_hook_missing_warned_at: float = 0.0
+
+# Task 7 fix — soft/optional dashboard visibility. restart_scheduler.py
+# doesn't otherwise depend on keep_alive.py; imported lazily and guarded
+# so a missing/broken keep_alive never breaks the scheduler itself.
+def _push_dashboard_flag(**kwargs) -> None:
+    try:
+        import keep_alive
+        keep_alive.update_status(**kwargs)
+    except Exception:
+        pass
 
 
 def is_redeploy_pending() -> bool:
@@ -120,27 +134,62 @@ def trigger_redeploy() -> None:
     Fires the Render deploy hook (if configured) and clears the pending
     flag. Called by bot_engine.py ONLY after every open contract has been
     actively, confirmably closed.
+
+    FIX (Task 7 — root cause of the 5h37m-without-redeploy incident,
+    confirmed by code inspection): when RENDER_DEPLOY_HOOK_URL isn't set
+    in the deployed environment, this used to clear `_pending` and quietly
+    return — no actual redeploy happens, but the rolling timer in
+    run_scheduler() sees `_pending` go False and starts a fresh
+    REDEPLOY_INTERVAL_HOURS window right then, as if a real redeploy had
+    just occurred. The process just keeps running and keeps trading,
+    indefinitely, with the scheduler's own logs looking completely normal
+    ("next redeploy at ..." every cycle) — this fully explains the
+    symptom: at the 3h mark the drain likely finished quickly, this
+    silent no-op fired, trading resumed immediately, and the next ~2h37m
+    of trading happened before the process was presumably restarted by
+    some external/manual trigger rather than this mechanism.
+
+    Now: a missing hook URL is logged at CRITICAL with an unmissable
+    banner (not a routine warning line) and pushed to the dashboard, and
+    `_last_confirmed_redeploy_at` — the baseline the new watchdog below
+    uses — is deliberately NOT updated on this path, only on an actual
+    successful hook fire. `_last_triggered_at` (this function having run
+    at all, success or not) is kept separately for existing behavior/logs.
     """
-    global _pending, _last_triggered_at
+    global _pending, _last_triggered_at, _hook_missing_warned_at
 
     hook_url = getattr(config, "RENDER_DEPLOY_HOOK_URL", "")
     _last_triggered_at = time.time()
 
     if not hook_url:
-        logger.warning(
-            "trigger_redeploy() called but RENDER_DEPLOY_HOOK_URL is not "
-            "set — clearing pending flag without actually redeploying"
+        _hook_missing_warned_at = time.time()
+        logger.critical(
+            "\n" + "=" * 78 + "\n"
+            "REDEPLOY HOOK NOT CONFIGURED\n"
+            "RENDER_DEPLOY_HOOK_URL is not set. trigger_redeploy() is clearing "
+            "the pending flag and starting a brand-new "
+            f"{getattr(config, 'REDEPLOY_INTERVAL_HOURS', 3)}h window WITHOUT an "
+            "actual redeploy happening. The rolling-restart mechanism is "
+            "effectively disabled until RENDER_DEPLOY_HOOK_URL is configured in "
+            "the deployment environment.\n" + "=" * 78
         )
+        _push_dashboard_flag(redeploy_hook_missing=True)
         _pending = False
         return
 
     async def _fire():
+        global _last_confirmed_redeploy_at
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(hook_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
                     body = await resp.text()
                     if resp.status in (200, 201, 202):
                         logger.info(f"REDEPLOY HOOK FIRED: HTTP {resp.status}")
+                        _last_confirmed_redeploy_at = time.time()
+                        _push_dashboard_flag(
+                            redeploy_hook_missing=False,
+                            redeploy_watchdog_overdue=False,
+                        )
                     else:
                         logger.error(
                             f"REDEPLOY HOOK FAILED: HTTP {resp.status} — {body[:500]}"
@@ -157,10 +206,70 @@ def trigger_redeploy() -> None:
             import requests
             resp = requests.post(hook_url, timeout=20)
             logger.info(f"REDEPLOY HOOK FIRED (sync): HTTP {resp.status_code}")
+            if resp.status_code in (200, 201, 202):
+                global _last_confirmed_redeploy_at
+                _last_confirmed_redeploy_at = time.time()
+                _push_dashboard_flag(
+                    redeploy_hook_missing=False,
+                    redeploy_watchdog_overdue=False,
+                )
         except Exception as exc:
             logger.error(f"REDEPLOY HOOK ERROR (sync fallback): {exc}")
 
     _pending = False
+
+
+async def _watchdog_loop():
+    """
+    Task 7 self-check requirement: an independent watchdog that fires a
+    loud, high-visibility warning if wall-clock time since the last
+    CONFIRMED redeploy (or process start, before the first one) exceeds
+    REDEPLOY_INTERVAL_HOURS by more than a grace margin — regardless of
+    what run_scheduler()'s own `_pending` state currently says, and
+    regardless of the specific cause (missing hook URL, a stuck drain in
+    bot_engine._settle_loop(), a wedged run_scheduler() task, etc). This
+    is what makes "the rolling redeploy mechanism has stopped actually
+    redeploying" visible in logs/dashboard going forward, rather than
+    only discovered after the fact by noticing the process has been up
+    far longer than intended.
+    """
+    global _last_watchdog_warning_at
+
+    check_interval_secs = 60
+    grace_secs = getattr(config, "REDEPLOY_WATCHDOG_GRACE_MINS", 20) * 60
+    warn_repeat_secs = getattr(config, "REDEPLOY_WATCHDOG_REPEAT_MINS", 15) * 60
+
+    while True:
+        try:
+            await asyncio.sleep(check_interval_secs)
+            interval_hours = getattr(config, "REDEPLOY_INTERVAL_HOURS", 3)
+            interval_secs = interval_hours * 3600
+            baseline = _last_confirmed_redeploy_at or _process_start_time
+            uptime_secs = time.time() - baseline
+            overdue_by = uptime_secs - interval_secs
+
+            if overdue_by > grace_secs:
+                now = time.time()
+                if now - _last_watchdog_warning_at >= warn_repeat_secs:
+                    _last_watchdog_warning_at = now
+                    logger.critical(
+                        "\n" + "=" * 78 + "\n"
+                        f"REDEPLOY WATCHDOG: no CONFIRMED redeploy in "
+                        f"{uptime_secs / 3600:.2f}h — {overdue_by / 60:.0f}min "
+                        f"past the {interval_hours}h interval + grace margin. "
+                        f"The rolling-redeploy mechanism may be stalled — check "
+                        f"RENDER_DEPLOY_HOOK_URL is set and reachable, and that "
+                        f"bot_engine's _settle_loop()/drain logic isn't stuck.\n"
+                        + "=" * 78
+                    )
+                    _push_dashboard_flag(
+                        redeploy_watchdog_overdue=True,
+                        redeploy_watchdog_overdue_mins=round(overdue_by / 60, 1),
+                    )
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:
+            logger.error(f"restart_scheduler._watchdog_loop: {exc}")
 
 
 def start_restart_scheduler():
@@ -178,7 +287,8 @@ def start_restart_scheduler():
     try:
         loop = asyncio.get_running_loop()
         loop.create_task(run_scheduler())
-        logger.info("restart_scheduler: started on the running event loop")
+        loop.create_task(_watchdog_loop())
+        logger.info("restart_scheduler: started on the running event loop (scheduler + watchdog)")
         return
     except RuntimeError:
         pass
@@ -189,10 +299,10 @@ def start_restart_scheduler():
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         try:
-            loop.run_until_complete(run_scheduler())
+            loop.run_until_complete(asyncio.gather(run_scheduler(), _watchdog_loop()))
         except Exception as exc:
             logger.error(f"restart_scheduler thread crashed: {exc}")
 
     t = threading.Thread(target=_thread_target, name="restart-scheduler", daemon=True)
     t.start()
-    logger.info("restart_scheduler: started on a dedicated background thread")
+    logger.info("restart_scheduler: started on a dedicated background thread (scheduler + watchdog)")
