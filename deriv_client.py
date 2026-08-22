@@ -137,6 +137,7 @@ import asyncio
 import json
 import logging
 import math
+import re
 import time
 from typing import Callable, Dict, Optional, List, Any
 
@@ -1377,6 +1378,7 @@ class DerivClient:
             stop_loss_price:   float = None,
             take_profit_price: float = None,
             entry_price:       float = None,
+            native_stop_ceiling_price: float = None,
             **kwargs) -> dict:
         """
         Buy a Multipliers (MULTUP/MULTDOWN) contract via the required
@@ -1428,6 +1430,19 @@ class DerivClient:
         signal_engine.SignalResult.native_entry_price) — not a freshly
         re-fetched quote, or the distance sent here won't match what was
         computed upstream.
+
+        Task 2 (Aug 2026) — retry-widen on Deriv's stop-loss-minimum
+        rejection: native_stop_ceiling_price, when supplied, is the
+        post-swap, PRE-tightening native stop PRICE level (i.e. what
+        native_stop_price would still be if bot_engine.py's Task 4
+        stop-tightening step hadn't pulled it in toward entry). It is
+        converted to a dollar ceiling the same way stop_loss_price is
+        converted to stop_loss_amount below, and used as the hard upper
+        bound on how far a stop-loss-minimum retry is allowed to widen —
+        see the retry block after the first proposal attempt. When not
+        supplied (e.g. tightening never ran for this trade, or the caller
+        used the legacy stake-percentage path), no ceiling is enforced on
+        a retry.
 
         strategy identifies the signal/strategy that produced this trade,
         used as the second half of the circuit-breaker key (symbol,
@@ -1510,6 +1525,16 @@ class DerivClient:
                     f"stop_price={stop_loss_price:.5f} target_price={take_profit_price:.5f} "
                     f"-> SL=${stop_loss_amount:.2f} TP=${take_profit_amount:.2f}"
                 )
+                # Task 2 — dollar ceiling for a stop-loss-minimum retry
+                # (see docstring): converts the pre-tightening native stop
+                # PRICE into the same dollar terms as stop_loss_amount
+                # above, using the identical formula, so a retry can never
+                # widen the stop past what the strategy's own untightened
+                # risk definition would have produced.
+                sl_retry_ceiling_amount = None
+                if native_stop_ceiling_price is not None:
+                    ceiling_dist = abs(entry_price - native_stop_ceiling_price)
+                    sl_retry_ceiling_amount = round(stake * multiplier * (ceiling_dist / entry_price), 2)
             else:
                 if stop_loss_price is not None and take_profit_price is not None and not entry_price:
                     # Task 1 — this is the "strategy path reached here
@@ -1543,6 +1568,11 @@ class DerivClient:
                 else:
                     stop_loss_amount   = _computed_stop_loss_amount
                     take_profit_amount = _computed_take_profit_amount
+                # Task 2 — the untightened-ceiling concept only applies to
+                # the native-price path above (Task 4's tightening only
+                # ever runs on native PRICE levels); the legacy
+                # stake-percentage path has no such ceiling to enforce.
+                sl_retry_ceiling_amount = None
 
             # Task 1 hard guard — the actual point that closes the "$0
             # stake -> $0 SL/TP" hole: both formulas above have stake as a
@@ -1584,12 +1614,113 @@ class DerivClient:
                     return None
                 if prop_resp.get("error"):
                     err = prop_resp["error"]
-                    logger.error(
-                        f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
-                        f"| details={err.get('details')} | full_req={proposal_req}"
+
+                    # Task 2 (Aug 2026) — retry-widen on Deriv's own dynamic
+                    # stop-loss-minimum rejection instead of aborting the
+                    # trade outright. Confirmed against the real error shape
+                    # in this bot's production logs (Render, Aug 2026):
+                    #   error["details"] == {"field": "stop_loss"}
+                    #   error["message"] == "Enter an amount equal to or
+                    #       higher than <N>." (e.g. "... higher than 1.47.")
+                    # This floor is not a fixed per-symbol constant — Deriv
+                    # computes it dynamically off live spread/volatility at
+                    # proposal time — so a fixed config value can't avoid
+                    # it; retry once with a corrected amount instead.
+                    details = err.get("details") or {}
+                    message = err.get("message") or ""
+                    is_stop_loss_min_rejection = (
+                        details.get("field") == "stop_loss"
+                        and re.search(r"higher than", message, re.IGNORECASE) is not None
                     )
-                    self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
-                    return None
+
+                    if not is_stop_loss_min_rejection:
+                        logger.error(
+                            f"FAILED: {symbol} — {err.get('code')}: {err.get('message')} "
+                            f"| details={err.get('details')} | full_req={proposal_req}"
+                        )
+                        self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                        return None
+
+                    # Robust to the message's wording varying slightly —
+                    # pull the first (only) number out of it rather than
+                    # assuming a fixed decimal format.
+                    match = re.search(r"[-+]?\d*\.?\d+", message)
+                    if not match:
+                        logger.error(
+                            f"FAILED: {symbol} — stop_loss-minimum rejection but "
+                            f"couldn't parse a numeric minimum out of the message "
+                            f"— {err.get('code')}: {message} | details={details} "
+                            f"| full_req={proposal_req} (aborting rather than "
+                            f"guessing a corrected amount)"
+                        )
+                        self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                        return None
+
+                    required_min = float(match.group())
+                    # Small safety buffer (5%) so a small live price move
+                    # between this failed attempt and the retry doesn't
+                    # bounce it again.
+                    corrected_amount = round(required_min * 1.05, 2)
+
+                    capped_at_ceiling = False
+                    if sl_retry_ceiling_amount is not None and corrected_amount > sl_retry_ceiling_amount:
+                        capped_at_ceiling = True
+                        if sl_retry_ceiling_amount < required_min:
+                            # Even the fully untightened stop distance is
+                            # still below what Deriv requires for this
+                            # attempt — this symbol/multiplier/stake
+                            # combination cannot satisfy Deriv's floor
+                            # within the strategy's own native risk
+                            # definition. Do not force an oversized stop
+                            # through; abort the trade instead.
+                            logger.warning(
+                                f"STOP-LOSS RETRY SKIPPED: {symbol} — even at full "
+                                f"untightened distance, computed SL "
+                                f"${sl_retry_ceiling_amount:.2f} is below Deriv's "
+                                f"required minimum ${required_min:.2f} for this "
+                                f"attempt — skipping trade, this symbol/multiplier/"
+                                f"stake combination cannot satisfy Deriv's floor "
+                                f"within the strategy's own native risk definition."
+                            )
+                            self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                            return None
+                        corrected_amount = sl_retry_ceiling_amount
+
+                    logger.info(
+                        f"STOP-LOSS RETRY: {symbol} — originally intended "
+                        f"(tightened) SL=${stop_loss_amount:.2f}, Deriv's stated "
+                        f"minimum=${required_min:.2f}, corrected SL="
+                        f"${corrected_amount:.2f}"
+                        + (
+                            " (capped at the strategy's untightened ceiling)"
+                            if capped_at_ceiling
+                            else " (minimum + 5% safety buffer)"
+                        )
+                    )
+
+                    proposal_req["limit_order"]["stop_loss"] = corrected_amount
+                    retry_resp = await self._send(proposal_req)
+                    if not retry_resp:
+                        logger.error(
+                            f"FAILED: {symbol} — no response (multiplier proposal, "
+                            f"stop-loss retry)"
+                        )
+                        self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                        return None
+                    if retry_resp.get("error"):
+                        # Retry exactly once — if it also fails, for any
+                        # reason, abort and log normally rather than
+                        # looping.
+                        rerr = retry_resp["error"]
+                        logger.error(
+                            f"FAILED: {symbol} — stop-loss retry also rejected — "
+                            f"{rerr.get('code')}: {rerr.get('message')} | "
+                            f"details={rerr.get('details')} | full_req={proposal_req}"
+                        )
+                        self._cb_record_failure(symbol, strategy, cb_threshold, cb_cooldown)
+                        return None
+
+                    prop_resp = retry_resp
 
                 proposal = prop_resp.get("proposal", {})
                 logger.info(f"PROPOSAL RESPONSE: {proposal}")
