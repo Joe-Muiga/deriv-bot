@@ -1284,13 +1284,37 @@ class BotEngine:
                     sig.native_target_price, sig.native_stop_price
                 )
 
-                # Task 4 (Aug 2026) — stop-tightening after the donkey-
-                # strategy swap. Immediately after the swap above (still in
+                # Task 2 (Aug 2026, stop-loss rejection fix pass) — record
+                # the post-swap, PRE-tightening stop price as a ceiling
+                # before Task 4 below potentially tightens it in place.
+                # deriv_client.buy_multiplier() uses this (converted to a
+                # dollar amount there, off the same entry_price/stake/
+                # multiplier used for the tightened stop) as the hard upper
+                # bound on how far its stop-loss-minimum retry logic is
+                # allowed to widen a rejected stop — never past what the
+                # strategy's own untightened/native risk definition would
+                # have produced. Set unconditionally here (before the
+                # skip-condition checks below) so every path that reaches
+                # deriv_client with a native stop price also carries a
+                # matching ceiling, even the ones where tightening itself
+                # ends up skipped (in which case ceiling == the untouched
+                # stop already in place, i.e. no widening headroom at all).
+                sig.native_stop_ceiling_price = sig.native_stop_price
+
+                # Task 4 (Aug 2026), REVISED (Aug 2026, stop-loss rejection
+                # fix pass) — stop-tightening after the donkey-strategy
+                # swap. Immediately after the swap above (still in
                 # price-distance terms, before deriv_client.py converts to
-                # dollar SL/TP), pull the STOP-LOSS in to 20% of its
-                # post-swap distance from entry (an 80% tightening toward
-                # entry). Take-profit is left exactly as computed by the
-                # swap above — untouched.
+                # dollar SL/TP), pull the STOP-LOSS in to 40% of its
+                # post-swap distance from entry (a 60% tightening toward
+                # entry). Originally 20%/80% — loosened to 40%/60% because
+                # production logs confirmed the tighter figure made the
+                # overwhelming majority of buy attempts fail Deriv's own
+                # dynamic per-attempt stop-loss minimum before a contract
+                # was ever bought (see deriv_client.buy_multiplier()'s
+                # Task 2 retry-widen logic, which handles the rejections
+                # this alone doesn't eliminate). Take-profit is left
+                # exactly as computed by the swap above — untouched.
                 #
                 # sig.native_stop_price, post-swap, already holds whichever
                 # price is about to be sent downstream as the executed
@@ -1330,7 +1354,7 @@ class BotEngine:
                 else:
                     old_stop       = sig.native_stop_price
                     original_dist  = abs(entry - old_stop)
-                    tightened_dist = 0.2 * original_dist
+                    tightened_dist = 0.4 * original_dist
                     # Derived generically off abs(entry - old_stop) rather
                     # than hardcoding a per-direction formula: for a LONG
                     # (post-swap direction — sig.direction was already
@@ -1346,7 +1370,7 @@ class BotEngine:
                     logger.info(
                         f"STOP TIGHTENED: {symbol} | {strategy} | {sig.direction} | "
                         f"post-swap stop distance ${original_dist:.5f} -> "
-                        f"${tightened_dist:.5f} (20% of original, 80% "
+                        f"${tightened_dist:.5f} (40% of original, 60% "
                         f"tightening toward entry={entry:.5f}) | "
                         f"stop {old_stop:.5f} -> {new_stop:.5f} | "
                         f"target unchanged at {sig.native_target_price}"
@@ -1471,6 +1495,7 @@ class BotEngine:
                     stop_loss_price    = sig.native_stop_price,
                     take_profit_price  = sig.native_target_price,
                     entry_price        = sig.native_entry_price,
+                    native_stop_ceiling_price = getattr(sig, "native_stop_ceiling_price", None),
                 )
             else:
                 dyn_sl_pct = (
@@ -1495,6 +1520,7 @@ class BotEngine:
                     stop_loss_price    = sig.native_stop_price,
                     take_profit_price  = sig.native_target_price,
                     entry_price        = sig.native_entry_price,
+                    native_stop_ceiling_price = getattr(sig, "native_stop_ceiling_price", None),
                 )
             else:
                 buy_resp = await self.client.buy_multiplier(
