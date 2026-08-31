@@ -818,12 +818,13 @@ def predict_take_trade(features: Dict[str, object]) -> Tuple[str, float]:
     NOTE (user-directed, Aug 2026): bot_engine.py's execution path no
     longer uses this function's TAKE/INVERT output to decide trade
     direction — see config.INVERT_ALL_SIGNALS / bot_engine.py's
-    "UNIVERSAL SIGNAL INVERSION" step, which unconditionally inverts
-    every symbol's direction regardless of what this bandit would have
-    picked. This function and its underlying win/loss bookkeeping are
-    left in place and still callable (e.g. for the dashboard / smoke
-    test / future use) but are no longer part of the live trade-decision
-    path.
+    "SIGNAL DIRECTION" step, which (only when INVERT_ALL_SIGNALS is
+    explicitly turned on) inverts every symbol's direction regardless of
+    what this bandit would have picked; by default INVERT_ALL_SIGNALS is
+    off and signals trade through as computed. This function and its
+    underlying win/loss bookkeeping are left in place and still callable
+    (e.g. for the dashboard / smoke test / future use) but are no longer
+    part of the live trade-decision path.
     """
     strategy = str(features["strategy"])
     symbol = str(features["symbol"])
