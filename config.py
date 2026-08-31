@@ -494,36 +494,32 @@ MEAN_REV_REQUIRE_TURN = True
 # contract_update, without changing this ratio itself.
 TAKE_PROFIT_RATIO = 2.5
 
-# ── UNIVERSAL SIGNAL INVERSION (user-directed, Aug 2026) ─────────────────
-# Replaces the old sequential TAKE/INVERT alternator and the meta_labeling
-# Bayesian TAKE/INVERT
-# bandit's role in choosing trade direction. This is unconditional and
-# applies to every symbol, every strategy, every trade: whatever direction
-# the strategy layer (see POPULAR INDICATOR STRATEGY below) computes as
-# its price prediction is flipped — a computed BUY is placed as a SELL,
-# a computed SELL is placed as a BUY — immediately before the order is
-# sent. No per-symbol table, no win-rate gating, no opt-out list. See
-# bot_engine.py's execution path for the single choke point that applies
-# this (search "UNIVERSAL SIGNAL INVERSION").
-INVERT_ALL_SIGNALS = True
+# ── SIGNAL DIRECTION INVERSION (user-directed, Aug 2026 reversal) ────────
+# Formerly "UNIVERSAL SIGNAL INVERSION": when this was True, every trade
+# was placed in the OPPOSITE direction to what the strategy/indicator
+# layer computed (a computed BUY was placed as a SELL, and vice versa),
+# unconditionally, for every symbol and every strategy. The user has
+# since asked for the bot to trade exactly as its indicators say, so this
+# now defaults to False: signals are placed in the direction they were
+# computed in, with no flip. See bot_engine.py's execution path (search
+# "SIGNAL DIRECTION") for the single choke point that applies this. Set
+# back to True to restore the old inverted behaviour.
+INVERT_ALL_SIGNALS = False
 
-# ── TP/SL SWAP FOR MULTIPLIER CONTRACTS (user-directed, Aug 2026) ────────
+# ── TP/SL SWAP FOR MULTIPLIER CONTRACTS (user-directed, Aug 2026 reversal) ─
 # Applies only where Multiplier contracts carry an explicit stop_loss /
-# take_profit limit_order (deriv_client.buy_multiplier()). The distance
-# that would normally have been used for the stop-loss is placed as the
-# take-profit instead, and the distance that would normally have been
-# the take-profit is placed as the stop-loss instead — i.e. the two
-# amounts are swapped after being computed exactly as before (stake ×
-# stop_loss_pct, then × TAKE_PROFIT_RATIO). Not applicable to Rise/Fall
-# (CALL/PUT) contracts, which have no limit_order concept.
-#
-# NOTE (user-directed, Aug 2026): the swap itself is UNCHANGED — the
-# user asked only to shrink the stop-loss's underlying magnitude (see
-# STOP_KALMAN_SAFETY_MULT above / risk_manager.compute_dynamic_stop_loss_pct()),
-# not to change the swap or the take-profit ratio. Because the swap
-# takes whatever stop_loss_pct it's given, minimizing that input
-# minimizes both legs proportionally without altering this ordering.
-TP_SL_SWAP_ENABLED = True
+# take_profit limit_order (deriv_client.buy_multiplier()), on the legacy
+# stake-percentage path (i.e. when native indicator price levels aren't
+# supplied). When this was True, the distance normally used for the
+# stop-loss was placed as the take-profit instead, and vice versa — the
+# two computed amounts (stake × stop_loss_pct, then × TAKE_PROFIT_RATIO)
+# were swapped before being sent. The user has since asked for the bot to
+# trade with its own computed stop-loss and take-profit, so this now
+# defaults to False: the stop-loss goes where the stop-loss belongs, and
+# the take-profit goes where the take-profit belongs. Not applicable to
+# Rise/Fall (CALL/PUT) contracts, which have no limit_order concept. Set
+# back to True to restore the old swapped behaviour.
+TP_SL_SWAP_ENABLED = False
 
 # Per-(indicator, symbol) suspension window (spec point 8, Aug 2026): when
 # strategy_stats.is_underperforming(strategy, symbol) first flips True for a
