@@ -85,6 +85,13 @@ class SignalResult:
     # indicator used, rather than re-fetching a fresh quote that may have
     # since moved (see deriv_client.buy_multiplier()'s entry_price param).
     native_entry_price:  Optional[float] = None
+    # Set by bot_engine._apply_scaled_native_levels() when
+    # config.SCALED_SL_TP_INVERT_DIRECTION flips this signal's direction —
+    # never set here. Lets _execute()'s bookkeeping ("inverted" in
+    # _open_contracts, read back by _apply_settlement()'s meta-labeling
+    # training-label logic and strategy_stats.get_take_invert_stats())
+    # know a flip happened without needing sight of the pre-transform sig.
+    execution_inverted:  bool = False
 
 
 NONE_RESULT = SignalResult("NONE", 0, 0.0, "NONE", "No signal")
