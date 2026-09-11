@@ -1178,10 +1178,13 @@ class BotEngine:
             # 9. Execute top signals — unless delayed entry applies, in which
             #    case they're armed and watched instead of bought immediately
             #    (see _arm_pending_entry / config.DELAYED_ENTRY_ENABLED).
+            #    Scaled native SL/TP (config.SCALED_SL_TP_ENABLED) is applied
+            #    first either way — it only touches stop/target levels, entry
+            #    timing is untouched by it.
             if top:
                 to_execute: List[ScanResult] = []
                 for r in top:
-                    s = r.sig
+                    s = self._apply_scaled_native_levels(r.sig)
                     delayed_eligible = (
                         getattr(config, "DELAYED_ENTRY_ENABLED", False)
                         and s.direction in ("LONG", "SHORT")
@@ -1193,7 +1196,7 @@ class BotEngine:
                     if delayed_eligible:
                         self._arm_pending_entry(r.symbol, s)
                     else:
-                        to_execute.append(r)
+                        to_execute.append(replace(r, sig=s))
 
                 if to_execute:
                     await asyncio.gather(
@@ -1363,6 +1366,78 @@ class BotEngine:
         )
         await self._execute(symbol, swapped_sig)
 
+    # ── Scaled native SL/TP (immediate entry) ────────────────────────────────────
+    # See config.py's "SCALED NATIVE SL/TP" block for the spec. Distinct from the
+    # delayed-entry machinery above: entry is immediate, exactly as the indicator
+    # signaled — only the stop-loss and take-profit levels are recomputed.
+
+    def _apply_scaled_native_levels(self, sig: SignalResult) -> SignalResult:
+        """
+        config.SCALED_SL_TP_INVERT_DIRECTION True (current default): the
+        signal's direction is flipped (LONG<->SHORT) and the new stop/target
+        are placed on the sides that now match that flipped direction —
+        entry itself is never moved, this just mirrors both levels through
+        it. With entry=100, native_stop=90, native_target=130 (a LONG) and
+        SL_MULT=0.60/TP_MULT=1.33, the executed trade is a SHORT with
+        stop=118 (60% of the original entry-to-target distance, now above
+        entry) and target=86.7 (133% of the original entry-to-stop
+        distance, now below entry):
+            new_stop   = entry + SL_MULT * (native_target - entry)
+            new_target = entry - TP_MULT * (entry - native_stop)
+
+        False: direction is left alone and the same two distances are
+        scaled onto their ORIGINAL sides instead of mirrored:
+            new_target = entry + TP_MULT * (entry - native_stop)
+            new_stop   = entry - SL_MULT * (native_target - entry)
+
+        Either way both formulas are direction-agnostic — (native_target -
+        entry) and (entry - native_stop) already carry the right sign for
+        LONG vs SHORT, same trick used in _arm_pending_entry's
+        trigger_price — and entry itself (sig.native_entry_price) is never
+        modified by this function either way.
+        """
+        if not getattr(config, "SCALED_SL_TP_ENABLED", False):
+            return sig
+        if sig.direction not in ("LONG", "SHORT"):
+            return sig
+        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL":
+            return sig
+        if sig.native_entry_price is None or sig.native_stop_price is None \
+                or sig.native_target_price is None:
+            return sig
+
+        entry   = float(sig.native_entry_price)
+        stop    = float(sig.native_stop_price)
+        target  = float(sig.native_target_price)
+        tp_mult = getattr(config, "SCALED_TP_STOP_MULT", 1.50)
+        sl_mult = getattr(config, "SCALED_SL_TARGET_MULT", 0.35)
+        invert  = getattr(config, "SCALED_SL_TP_INVERT_DIRECTION", True)
+
+        if invert:
+            new_direction = "SHORT" if sig.direction == "LONG" else "LONG"
+            new_target    = entry - tp_mult * (entry - stop)
+            new_stop      = entry + sl_mult * (target - entry)
+        else:
+            new_direction = sig.direction
+            new_target    = entry + tp_mult * (entry - stop)
+            new_stop      = entry - sl_mult * (target - entry)
+
+        scaled = replace(
+            sig,
+            direction=new_direction,
+            native_stop_price=new_stop,
+            native_target_price=new_target,
+            execution_inverted=invert,
+        )
+        logger.info(
+            f"SCALED NATIVE SL/TP: {sig.direction}"
+            f"{' -> ' + new_direction if invert else ''} | entry={entry:.5f} "
+            f"(unchanged) | native_stop={stop:.5f}, native_target={target:.5f} "
+            f"-> new_stop={new_stop:.5f} ({sl_mult*100:.0f}% of entry-to-target), "
+            f"new_target={new_target:.5f} ({tp_mult*100:.0f}% of entry-to-stop)"
+        )
+        return scaled
+
     # ── Execution ──────────────────────────────────────────────────────────────
 
     async def _execute(self, symbol: str, sig: SignalResult) -> bool:
@@ -1452,45 +1527,48 @@ class BotEngine:
         except Exception as exc:
             logger.debug(f"compute_enriched_features({symbol}) failed: {exc}")
 
-        # SIGNAL DIRECTION: TAKE-AS-COMPUTED (user-directed, Sep 2026) —
-        # replaces the prior "UNIVERSAL SIGNAL INVERSION" step
-        # (config.INVERT_ALL_SIGNALS, now False). The bot executes exactly
-        # what the indicator layer (signal_engine.evaluate_popular_indicator()
-        # / _native_stop_target()) computed: a computed LONG is placed as
-        # LONG, a computed SHORT is placed as SHORT, the indicator's own
-        # stop-loss price level is sent as the stop-loss, and its own
-        # take-profit price level is sent as the take-profit — no flip, no
-        # swap, no post-hoc tightening of either level. sig.direction,
-        # sig.native_stop_price, and sig.native_target_price are left
-        # exactly as signal_engine.py computed them (see that file's
-        # "un-inverted textbook reading" comment on evaluate_popular_indicator()
-        # and the per-indicator TA conventions in _native_stop_target()).
-        # NOTE: this still holds for `sig` as _execute() receives it here.
-        # A signal that goes through the DELAYED ENTRY path (see
-        # config.DELAYED_ENTRY_ENABLED / _execute_pending_entry() above)
-        # arrives with native_stop_price/native_target_price already
-        # swapped and native_entry_price already replaced with the live
-        # trigger-time price — that swap happens once, before _execute()
-        # is ever called, not inside it. direction itself is still never
-        # flipped either way.
-        # `inverted` is kept as a field (always False now) purely so
-        # downstream bookkeeping that already keys off it — _apply_settlement()'s
-        # meta-labeling training-label logic and
-        # strategy_stats.get_take_invert_stats() — keeps working unchanged
-        # on old AND new trades without special-casing; see the comments at
-        # those call sites for why the field has to keep existing.
-        inverted = False
+        # SIGNAL DIRECTION (user-directed, Sep 2026 through Sep 11 2026) —
+        # by the time _execute() sees `sig`, any transform has already
+        # happened upstream, once, before this function is ever called:
+        #   - config.DELAYED_ENTRY_ENABLED (currently False): would have
+        #     replaced native_stop_price/native_target_price/native_entry_price
+        #     via _execute_pending_entry(), direction untouched.
+        #   - config.SCALED_SL_TP_ENABLED (currently True, see
+        #     _apply_scaled_native_levels()): rescales native_stop_price/
+        #     native_target_price off the original entry-to-stop /
+        #     entry-to-target distances, and — when
+        #     config.SCALED_SL_TP_INVERT_DIRECTION is also True (currently
+        #     is) — flips direction (LONG<->SHORT) and mirrors those two
+        #     scaled levels to the sides matching the flipped direction.
+        # Either way _execute() itself never inspects or changes
+        # sig.direction / native_stop_price / native_target_price — it just
+        # sends whatever it was handed. `inverted` below reflects whether
+        # THIS particular trade's direction was flipped from what the
+        # indicator originally computed, read off
+        # sig.execution_inverted (set only by _apply_scaled_native_levels,
+        # defaults False for every other path) — this is what
+        # _apply_settlement()'s meta-labeling training-label logic and
+        # strategy_stats.get_take_invert_stats() key off; see the comments
+        # at those call sites for why the field has to keep existing.
+        inverted = bool(getattr(sig, "execution_inverted", False))
         if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL" or sig.direction not in ("LONG", "SHORT"):
             logger.debug(
                 f"DIRECTION PASSTHROUGH: {symbol} | {strategy} | inversion "
                 f"machinery isn't applicable to contract_kind="
                 f"{getattr(sig, 'contract_kind', 'RISE_FALL')} anyway "
                 f"(DIGIT-style contracts have no LONG/SHORT to flip)")
+        elif inverted:
+            logger.info(
+                f"SIGNAL SCALED + INVERTED: {symbol} | {strategy} | "
+                f"executing {sig.direction} (flipped from the indicator's "
+                f"original call) | stop={sig.native_stop_price} "
+                f"target={sig.native_target_price}"
+            )
         else:
             logger.info(
                 f"SIGNAL TAKEN AS-IS: {symbol} | {strategy} | {sig.direction} "
-                f"(no inversion, config.INVERT_ALL_SIGNALS=False) | "
-                f"stop={sig.native_stop_price} target={sig.native_target_price}"
+                f"(no inversion) | stop={sig.native_stop_price} "
+                f"target={sig.native_target_price}"
             )
 
         # FIX (profitability audit): this call previously passed no
@@ -2030,92 +2108,4 @@ class BotEngine:
                         await asyncio.sleep(5)
 
                     if not self._open_contracts:
-                        restart_scheduler.trigger_redeploy()
-                        logger.info("Redeploy triggered — standing by")
-                        self._cycle_count = 0
-                    # else: redeploy stays pending. We deliberately do NOT
-                    # clear _open_contracts / _contract_open_times here —
-                    # the next settle tick will re-enter this branch and
-                    # keep trying to drain for real.
-
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                logger.error(f"_settle_loop: {exc}")
-
-    # ── Orphan handling ─────────────────────────────────────────────────────────
-
-    async def _handle_orphans(self):
-        now = time.time()
-        multiplier_symbols = getattr(config, "MULTIPLIER_SYMBOLS", set())
-
-        for cid, info in list(self._open_contracts.items()):
-            opened_at = info.get("opened_at", now)
-            age       = now - opened_at
-            symbol    = info.get("symbol", "UNKNOWN")
-
-            # Multiplier contracts (no fixed expiry) get their own explicit,
-            # active-close-only path (Fix E) — never the Rise/Fall
-            # age-based logic below.
-            if symbol in multiplier_symbols:
-                await self._handle_multiplier_orphan(cid, info, age)
-                continue
-
-            # Already in the reconcile-pending state from a previous tick —
-            # keep polling on its own cadence rather than re-deriving age.
-            if cid in self._reconciling:
-                await self._reconcile_pending_contract(cid, info)
-                continue
-
-            if age >= CONTRACT_FORCE_CLOSE_SECS:
-                await self._begin_reconciliation(cid, info)
-            elif age >= CONTRACT_MAX_AGE_SECS:
-                try:
-                    await self.client.force_check_contract(cid)
-                except Exception as exc:
-                    logger.warning(f"force_check_contract({cid}): {exc}")
-
-    # ── Reconciliation entry point (Fix C) ──────────────────────────────────
-    #
-    # Replaces the old "just declare a loss" ORPHAN_TIMEOUT branch. A
-    # Rise/Fall contract past CONTRACT_FORCE_CLOSE_SECS gets exactly one
-    # more authoritative check; if it's genuinely settled, it's recorded
-    # for real through the shared _apply_settlement() helper (same logic
-    # _on_contract_result() uses). If not, it moves into reconcile_pending
-    # and is retried — it is NEVER marked win/loss on a guess.
-
-    async def _begin_reconciliation(self, cid: str, info: dict) -> None:
-        symbol = info.get("symbol", "UNKNOWN")
-        try:
-            poc = await self.client.force_check_contract(cid)
-        except Exception as exc:
-            logger.warning(f"force_check_contract({cid}) at reconcile-start: {exc}")
-            poc = {}
-
-        if poc.get("is_sold") or poc.get("is_expired"):
-            self._open_contracts.pop(cid, None)
-            self._contract_open_times.pop(cid, None)
-            self._reconciling.pop(cid, None)
-            try:
-                self.client.stop_tracking(cid)
-            except Exception:
-                pass
-            await self._apply_settlement(cid, info, poc, close_reason="normal")
-            return
-
-        now = time.time()
-        self._reconciling[cid] = {"reconcile_started_at": now, "last_poll": now}
-        logger.warning(
-            f"RECONCILE PENDING: {cid} ({symbol}) still open after "
-            f"{CONTRACT_FORCE_CLOSE_SECS}s — polling every "
-            f"{RECONCILE_POLL_INTERVAL_SECS}s until a real result arrives; "
-            f"dashboard keeps it visibly open/pending, never a guessed result"
-        )
-        try:
-            self._push_dashboard()
-        except Exception:
-            pass
-
-    async def _reconcile_pending_contract(self, cid: str, info: dict) -> None:
-        state = self._reconciling.get(cid)
-    
+                        restart_scheduler.trigger_r
