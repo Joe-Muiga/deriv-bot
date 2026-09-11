@@ -826,6 +826,23 @@ class BotEngine:
         describe the same set of contracts. Once Fix C removes the
         fabrication path this should never happen — treat any occurrence
         as a bug to investigate, not something to silently absorb.
+
+        Self-heal (Sep 2026): this used to only log the warning and leave
+        the gap open forever. Root cause traced to _execute()'s
+        `await self.client.subscribe_contract(...)` call being wrapped in
+        a bare try/except that just warns on failure — if that one call
+        drops (a transient WS hiccup, a race during reconnect, etc.), the
+        contract is permanently invisible to deriv_client's tracking for
+        the rest of the process's life: no live close push, and it's also
+        skipped by deriv_client's own 30s polling fallback (which only
+        walks _polling_contracts). It still gets an eventual authoritative
+        check via _handle_orphans()'s age-based force_check_contract() /
+        sell_contract() calls (those key off _open_contracts directly, not
+        the tracking sets, so they're unaffected by this gap) — but until
+        then it sits fully blind, and it blocks the redeploy drain loop
+        from ever seeing _open_contracts go empty. Re-issuing
+        subscribe_contract() here closes that gap as soon as it's
+        detected instead of waiting on the age-based path.
         """
         try:
             tracked_by_client = self.client.get_tracked_contract_ids()
@@ -844,8 +861,36 @@ class BotEngine:
             logger.warning(
                 f"TRACKING DIVERGENCE: {len(missing_from_client)} contract(s) "
                 f"open in bot_engine but not tracked by deriv_client: "
-                f"{missing_from_client}"
+                f"{missing_from_client} — re-registering now"
             )
+            for cid in missing_from_client:
+                asyncio.create_task(self._reregister_tracking(cid))
+
+    async def _reregister_tracking(self, cid: str) -> None:
+        """
+        Self-heal half of _check_tracking_divergence() above: re-run the
+        exact same subscribe_contract() call _execute() makes right after
+        a buy, for a contract that's fallen out of deriv_client's tracking.
+        subscribe_contract() unconditionally rewrites _polling_contracts[cid]
+        and its own _subscribe_ws_contract() no-ops safely if a subscription
+        already exists — safe to call redundantly, never double-subscribes.
+        """
+        info = self._open_contracts.get(cid)
+        if info is None:
+            return  # closed/settled between the divergence check and now
+        symbol = info.get("symbol", "")
+        try:
+            await self.client.subscribe_contract(
+                cid,
+                lambda msg, _cid=cid: asyncio.create_task(
+                    self._on_contract_result(_cid, msg)),
+                symbol=symbol,
+            )
+            logger.info(f"TRACKING DIVERGENCE HEALED: {cid} re-registered")
+        except Exception as exc:
+            logger.warning(
+                f"TRACKING DIVERGENCE RE-REGISTER FAILED: {cid} — {exc} "
+                f"(will retry on the next dashboard cycle)")
 
     def _push_dashboard(self):
         risk_s  = self.risk.summary()
@@ -2073,68 +2118,4 @@ class BotEngine:
 
     async def _reconcile_pending_contract(self, cid: str, info: dict) -> None:
         state = self._reconciling.get(cid)
-        if not state:
-            return
-
-        now = time.time()
-        if now - state.get("last_poll", 0) < RECONCILE_POLL_INTERVAL_SECS:
-            return
-        state["last_poll"] = now
-
-        symbol = info.get("symbol", "UNKNOWN")
-        try:
-            poc = await self.client.force_check_contract(cid)
-        except Exception as exc:
-            logger.warning(f"force_check_contract({cid}) during reconcile: {exc}")
-            poc = {}
-
-        elapsed = now - state["reconcile_started_at"]
-
-        if poc.get("is_sold") or poc.get("is_expired"):
-            self._open_contracts.pop(cid, None)
-            self._contract_open_times.pop(cid, None)
-            self._reconciling.pop(cid, None)
-            try:
-                self.client.stop_tracking(cid)
-            except Exception:
-                pass
-            await self._apply_settlement(cid, info, poc, close_reason="reconcile_delayed")
-            return
-
-        if elapsed >= RECONCILE_MAX_SECS:
-            # Last-resort truth source (Fix C.3) — a different real query,
-            # never a guess. If it doesn't find anything either, keep
-            # retrying in the background; the contract stays visibly
-            # open/pending forever if it has to, but never gets a
-            # fabricated win/loss.
-            try:
-                pt = await self.client.profit_table_lookup(cid)
-            except Exception as exc:
-                logger.error(f"profit_table_lookup({cid}) failed: {exc}")
-                pt = {}
-
-            if pt.get("is_sold"):
-                self._open_contracts.pop(cid, None)
-                self._contract_open_times.pop(cid, None)
-                self._reconciling.pop(cid, None)
-                try:
-                    self.client.stop_tracking(cid)
-                except Exception:
-                    pass
-                await self._apply_settlement(cid, info, pt, close_reason="reconcile_delayed")
-                return
-
-            logger.error(
-                f"RECONCILE STILL PENDING: {cid} ({symbol}) unresolved "
-                f"after {elapsed:.0f}s (ceiling {RECONCILE_MAX_SECS}s) — "
-                f"escalating loudly; still NOT recording a guessed result, "
-                f"will keep retrying in the background"
-            )
-
-    # ── Multiplier contracts — explicit, active closing only (Fix E) ───────
-
-    async def _handle_multiplier_orphan(self, cid: str, info: dict, age: float) -> None:
-        if age < MULTIPLIER_MAX_HOLD_SECS:
-            return
-
     
