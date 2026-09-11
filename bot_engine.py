@@ -1256,9 +1256,9 @@ class BotEngine:
         entry  = float(sig.native_entry_price)
         stop   = float(sig.native_stop_price)
         target = float(sig.native_target_price)
-        pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.33)
+        pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.75)
         # Works for both directions: target is on the profit side of entry,
-        # so entry + pct*(target-entry) lands 33% of the way there whichever
+        # so entry + pct*(target-entry) lands 75% of the way there whichever
         # sign (target-entry) has.
         trigger = entry + pct * (target - entry)
 
