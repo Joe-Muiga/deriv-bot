@@ -558,6 +558,42 @@ DELAYED_ENTRY_ENABLED      = False
 DELAYED_ENTRY_TRIGGER_PCT  = 0.75
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
+# ── SCALED NATIVE SL/TP (user-directed, Sep 11 2026) ──────────────────────
+# Entry is immediate, exactly as the indicator signals — no delay, unlike
+# DELAYED_ENTRY above; native_entry_price itself is never moved. Only the
+# stop-loss and take-profit levels change, and — when
+# SCALED_SL_TP_INVERT_DIRECTION is also True — direction flips too.
+#
+# SCALED_SL_TP_INVERT_DIRECTION = True (current default): direction flips
+# (LONG<->SHORT) and the two scaled distances land mirrored, on the sides
+# that match the FLIPPED direction:
+#   new_stop   = native_entry_price + SCALED_SL_TARGET_MULT *
+#                (native_target_price - native_entry_price)
+#   new_target = native_entry_price - SCALED_TP_STOP_MULT *
+#                (native_entry_price - native_stop_price)
+# Worked example: indicator says LONG, entry=100, native_stop=90,
+# native_target=130. Executed as SHORT instead, with stop=118 (35% of the
+# original entry-to-target distance, now above entry) and target=86.7
+# (150% of the original entry-to-stop distance, now below entry).
+#
+# SCALED_SL_TP_INVERT_DIRECTION = False: direction is left alone and the
+# same two distances scale onto their ORIGINAL sides instead of mirrored:
+#   new_target = native_entry_price + SCALED_TP_STOP_MULT *
+#                (native_entry_price - native_stop_price)
+#   new_stop   = native_entry_price - SCALED_SL_TARGET_MULT *
+#                (native_target_price - native_entry_price)
+#
+# Either way, both formulas are direction-agnostic (native_target_price -
+# native_entry_price) and (native_entry_price - native_stop_price) already
+# carry the right sign for LONG vs SHORT. See bot_engine.py's
+# _apply_scaled_native_levels() for the implementation, and _execute()'s
+# `inverted` bookkeeping (keyed off SignalResult.execution_inverted) for
+# how a flip gets recorded for meta-labeling / strategy_stats.
+SCALED_SL_TP_ENABLED          = True
+SCALED_SL_TP_INVERT_DIRECTION = True
+SCALED_TP_STOP_MULT           = 1.50   # was 1.33
+SCALED_SL_TARGET_MULT         = 0.35   # was 0.60
+
 # Per-(indicator, symbol) suspension window (spec point 8, Aug 2026): when
 # strategy_stats.is_underperforming(strategy, symbol) first flips True for a
 # given (indicator, symbol) pair, pair_suspension.maybe_suspend() starts a
