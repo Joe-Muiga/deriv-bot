@@ -543,7 +543,18 @@ TP_SL_SWAP_ENABLED = False
 # RISE_FALL — DIGIT signals (Jump buildup) are untouched. See
 # bot_engine.py's _arm_pending_entry / _check_pending_entry /
 # _execute_pending_entry for the implementation.
-DELAYED_ENTRY_ENABLED      = True
+#
+# DISABLED (user-directed, Sep 11 2026): reverted to plain native
+# execution — the indicator's own direction is bought immediately, its
+# own native_stop_price is the stop-loss, its own native_target_price is
+# the take-profit, no delay, no swap. That's exactly what happens when
+# this flag is False: _arm_pending_entry() is never called, every signal
+# falls straight through to the immediate _execute() path (the
+# TAKE-AS-COMPUTED block above), which already sends native_stop_price /
+# native_target_price / native_entry_price completely unmodified. The
+# delayed-entry + swap machinery below is left in place, just switched
+# off, in case it's wanted again later.
+DELAYED_ENTRY_ENABLED      = False
 DELAYED_ENTRY_TRIGGER_PCT  = 0.75
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
