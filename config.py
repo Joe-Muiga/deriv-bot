@@ -519,6 +519,34 @@ INVERT_ALL_SIGNALS = False
 # unchanged — only the swap is removed.
 TP_SL_SWAP_ENABLED = False
 
+# ── DELAYED ENTRY + NATIVE SL/TP SWAP (user-directed, Sep 2026) ──────────
+# Layered on top of TAKE-AS-COMPUTED above — direction is still never
+# flipped. What changes is WHEN and AT WHAT LEVELS the bot enters:
+#   1. Indicators are read to strict textbook definitions (unchanged).
+#   2. A firing signal is NOT bought immediately. It's armed as a pending
+#      entry (bot_engine.py's self._pending_entries) and watched tick by
+#      tick against its own native_entry_price / native_stop_price /
+#      native_target_price (see signal_engine.SignalResult).
+#   3. Only once live price has moved DELAYED_ENTRY_TRIGGER_PCT of the
+#      distance from native_entry_price toward native_target_price does
+#      the bot actually enter — at the live price at that moment, not the
+#      original signal-time price.
+#   4. At that instant the indicator's own native_stop_price becomes the
+#      trade's take-profit, and native_target_price becomes the trade's
+#      stop-loss (the two are swapped; direction is not inverted).
+#   5. If price instead reverses back to the original native_stop_price
+#      before the trigger fires, the setup is scrapped (no trade).
+#   6. If neither happens within DELAYED_ENTRY_TIMEOUT_SECS, the pending
+#      entry expires unfilled.
+# Only applies to signals that carry native price levels (the live
+# popular-indicator path) with direction LONG/SHORT and contract_kind
+# RISE_FALL — DIGIT signals (Jump buildup) are untouched. See
+# bot_engine.py's _arm_pending_entry / _check_pending_entry /
+# _execute_pending_entry for the implementation.
+DELAYED_ENTRY_ENABLED      = True
+DELAYED_ENTRY_TRIGGER_PCT  = 0.75
+DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
+
 # Per-(indicator, symbol) suspension window (spec point 8, Aug 2026): when
 # strategy_stats.is_underperforming(strategy, symbol) first flips True for a
 # given (indicator, symbol) pair, pair_suspension.maybe_suspend() starts a
