@@ -107,7 +107,9 @@ class PendingEntry:
     A signal that fired but hasn't been bought yet — armed and watched
     tick-by-tick (see bot_engine._check_pending_entry, called from
     _on_tick) until it either triggers, gets scrapped, or expires.
-    See config.py's "DELAYED ENTRY + NATIVE SL/TP SWAP" block.
+    See config.py's "DELAYED ENTRY" block. What actually gets executed on
+    trigger is decided separately by the "SCALED NATIVE SL/TP" transform,
+    applied against this entry's original (unmodified) native levels.
     """
     symbol:           str
     sig:              SignalResult
@@ -1178,13 +1180,17 @@ class BotEngine:
             # 9. Execute top signals — unless delayed entry applies, in which
             #    case they're armed and watched instead of bought immediately
             #    (see _arm_pending_entry / config.DELAYED_ENTRY_ENABLED).
-            #    Scaled native SL/TP (config.SCALED_SL_TP_ENABLED) is applied
-            #    first either way — it only touches stop/target levels, entry
-            #    timing is untouched by it.
+            #    Delayed-entry signals are armed on their RAW native levels —
+            #    scaled+inverted SL/TP (config.SCALED_SL_TP_ENABLED) is only
+            #    applied once the entry actually triggers, inside
+            #    _execute_pending_entry(), against those original levels —
+            #    not here. Signals that skip delayed entry (no native levels,
+            #    DIGIT contracts, etc.) still get it applied immediately below,
+            #    though it's a no-op for anything without native levels anyway.
             if top:
                 to_execute: List[ScanResult] = []
                 for r in top:
-                    s = self._apply_scaled_native_levels(r.sig)
+                    s = r.sig
                     delayed_eligible = (
                         getattr(config, "DELAYED_ENTRY_ENABLED", False)
                         and s.direction in ("LONG", "SHORT")
@@ -1196,7 +1202,7 @@ class BotEngine:
                     if delayed_eligible:
                         self._arm_pending_entry(r.symbol, s)
                     else:
-                        to_execute.append(replace(r, sig=s))
+                        to_execute.append(replace(r, sig=self._apply_scaled_native_levels(s)))
 
                 if to_execute:
                     await asyncio.gather(
@@ -1248,8 +1254,11 @@ class BotEngine:
             logger.error(f"SCAN ERROR {symbol}: {type(exc).__name__}: {exc}", exc_info=True)
             return None
 
-    # ── Delayed entry / native SL-TP swap ────────────────────────────────────────
-    # See config.py's "DELAYED ENTRY + NATIVE SL/TP SWAP" block for the spec.
+    # ── Delayed entry / scaled+inverted execution on trigger ────────────────────
+    # See config.py's "DELAYED ENTRY" and "SCALED NATIVE SL/TP" blocks for the
+    # spec. Monitoring here is always against the RAW, untouched native levels
+    # the indicator computed — the scaled+inverted transform is only applied
+    # once triggered, in _execute_pending_entry(), not at arm time.
 
     def _arm_pending_entry(self, symbol: str, sig: SignalResult) -> None:
         """Register a firing signal as pending instead of buying it now."""
@@ -1259,9 +1268,9 @@ class BotEngine:
         entry  = float(sig.native_entry_price)
         stop   = float(sig.native_stop_price)
         target = float(sig.native_target_price)
-        pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.75)
+        pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.25)
         # Works for both directions: target is on the profit side of entry,
-        # so entry + pct*(target-entry) lands 75% of the way there whichever
+        # so entry + pct*(target-entry) lands pct% of the way there whichever
         # sign (target-entry) has.
         trigger = entry + pct * (target - entry)
 
@@ -1272,11 +1281,12 @@ class BotEngine:
             strategy=getattr(sig, "strategy", "unknown"),
         )
         logger.info(
-            f"PENDING ENTRY ARMED: {symbol} | {sig.direction} | "
-            f"entry_ref={entry:.5f} trigger={trigger:.5f} "
+            f"PENDING ENTRY ARMED: {symbol} | {sig.direction} (as the "
+            f"indicator called it) | entry_ref={entry:.5f} trigger={trigger:.5f} "
             f"({pct*100:.0f}% toward native_target={target:.5f}) | "
-            f"native_stop={stop:.5f} -> will become new TP on trigger | "
-            f"native_target={target:.5f} -> will become new SL on trigger"
+            f"native_stop={stop:.5f} | on trigger: executed via the scaled+"
+            f"inverted transform (see _apply_scaled_native_levels), not a "
+            f"straight swap"
         )
 
     def _check_pending_entry(self, symbol: str, price: float) -> None:
@@ -1353,17 +1363,17 @@ class BotEngine:
                     f"concurrent cap ({family_count}/{max_per_family})")
                 return
 
-        # Swap: original native_target_price -> new stop-loss,
-        #       original native_stop_price   -> new take-profit.
-        # Entry reference is the live price at trigger, not the stale
-        # signal-time price — deriv_client.buy_multiplier() measures the
-        # SL/TP dollar distance off this.
-        swapped_sig = replace(
-            pe.sig,
-            native_stop_price=pe.target_ref_price,
-            native_target_price=pe.stop_ref_price,
-            native_entry_price=live_price,
-        )
+        # The trigger only confirms the ORIGINAL setup ran 25% of the way
+        # toward its own target — what actually gets traded is decided by
+        # the same scaled+inverted transform immediate entries use
+        # (config.SCALED_SL_TP_ENABLED / SCALED_SL_TP_INVERT_DIRECTION),
+        # applied here against pe.sig's untouched original native levels.
+        # native_entry_price is then overridden to the live trigger price
+        # since deriv_client.buy_multiplier() measures its SL/TP dollar
+        # distance off whatever entry_price it's given, and the real fill
+        # reference is this live price, not the stale signal-time one.
+        transformed = self._apply_scaled_native_levels(pe.sig)
+        swapped_sig = replace(transformed, native_entry_price=live_price)
         await self._execute(symbol, swapped_sig)
 
     # ── Scaled native SL/TP (immediate entry) ────────────────────────────────────
@@ -2089,487 +2099,4 @@ class BotEngine:
                         if drain_elapsed >= drain_max_secs:
                             stuck = [
                                 f"{cid} (age={int(time.time() - info.get('opened_at', time.time()))}s)"
-                                for cid, info in self._open_contracts.items()
-                            ]
-                            logger.warning(
-                                f"DRAIN_MAX_SECS ({drain_max_secs}s) exceeded "
-                                f"with {len(self._open_contracts)} contract(s) "
-                                f"still not confirmed-closed: {', '.join(stuck)} "
-                                f"— DELAYING the redeploy rather than wiping "
-                                f"their bookkeeping (Requirement 1). Will keep "
-                                f"actively trying to close them and re-check "
-                                f"on the next settle tick."
-                            )
-                            break
-
-                        logger.info(
-                            f"Draining — {len(self._open_contracts)} "
-                            f"contract(s) open, actively confirming closes")
-                        await asyncio.sleep(5)
-
-                    if not self._open_contracts:
-                        restart_scheduler.trigger_redeploy()
-                        logger.info("Redeploy triggered — standing by")
-                        self._cycle_count = 0
-                    # else: redeploy stays pending. We deliberately do NOT
-                    # clear _open_contracts / _contract_open_times here —
-                    # the next settle tick will re-enter this branch and
-                    # keep trying to drain for real.
-
-            except asyncio.CancelledError:
-                return
-            except Exception as exc:
-                logger.error(f"_settle_loop: {exc}")
-
-    # ── Orphan handling ─────────────────────────────────────────────────────────
-
-    async def _handle_orphans(self):
-        now = time.time()
-        multiplier_symbols = getattr(config, "MULTIPLIER_SYMBOLS", set())
-
-        for cid, info in list(self._open_contracts.items()):
-            opened_at = info.get("opened_at", now)
-            age       = now - opened_at
-            symbol    = info.get("symbol", "UNKNOWN")
-
-            # Multiplier contracts (no fixed expiry) get their own explicit,
-            # active-close-only path (Fix E) — never the Rise/Fall
-            # age-based logic below.
-            if symbol in multiplier_symbols:
-                await self._handle_multiplier_orphan(cid, info, age)
-                continue
-
-            # Already in the reconcile-pending state from a previous tick —
-            # keep polling on its own cadence rather than re-deriving age.
-            if cid in self._reconciling:
-                await self._reconcile_pending_contract(cid, info)
-                continue
-
-            if age >= CONTRACT_FORCE_CLOSE_SECS:
-                await self._begin_reconciliation(cid, info)
-            elif age >= CONTRACT_MAX_AGE_SECS:
-                try:
-                    await self.client.force_check_contract(cid)
-                except Exception as exc:
-                    logger.warning(f"force_check_contract({cid}): {exc}")
-
-    # ── Reconciliation entry point (Fix C) ──────────────────────────────────
-    #
-    # Replaces the old "just declare a loss" ORPHAN_TIMEOUT branch. A
-    # Rise/Fall contract past CONTRACT_FORCE_CLOSE_SECS gets exactly one
-    # more authoritative check; if it's genuinely settled, it's recorded
-    # for real through the shared _apply_settlement() helper (same logic
-    # _on_contract_result() uses). If not, it moves into reconcile_pending
-    # and is retried — it is NEVER marked win/loss on a guess.
-
-    async def _begin_reconciliation(self, cid: str, info: dict) -> None:
-        symbol = info.get("symbol", "UNKNOWN")
-        try:
-            poc = await self.client.force_check_contract(cid)
-        except Exception as exc:
-            logger.warning(f"force_check_contract({cid}) at reconcile-start: {exc}")
-            poc = {}
-
-        if poc.get("is_sold") or poc.get("is_expired"):
-            self._open_contracts.pop(cid, None)
-            self._contract_open_times.pop(cid, None)
-            self._reconciling.pop(cid, None)
-            try:
-                self.client.stop_tracking(cid)
-            except Exception:
-                pass
-            await self._apply_settlement(cid, info, poc, close_reason="normal")
-            return
-
-        now = time.time()
-        self._reconciling[cid] = {"reconcile_started_at": now, "last_poll": now}
-        logger.warning(
-            f"RECONCILE PENDING: {cid} ({symbol}) still open after "
-            f"{CONTRACT_FORCE_CLOSE_SECS}s — polling every "
-            f"{RECONCILE_POLL_INTERVAL_SECS}s until a real result arrives; "
-            f"dashboard keeps it visibly open/pending, never a guessed result"
-        )
-        try:
-            self._push_dashboard()
-        except Exception:
-            pass
-
-    async def _reconcile_pending_contract(self, cid: str, info: dict) -> None:
-        state = self._reconciling.get(cid)
-        if not state:
-            return
-
-        now = time.time()
-        if now - state.get("last_poll", 0) < RECONCILE_POLL_INTERVAL_SECS:
-            return
-        state["last_poll"] = now
-
-        symbol = info.get("symbol", "UNKNOWN")
-        try:
-            poc = await self.client.force_check_contract(cid)
-        except Exception as exc:
-            logger.warning(f"force_check_contract({cid}) during reconcile: {exc}")
-            poc = {}
-
-        elapsed = now - state["reconcile_started_at"]
-
-        if poc.get("is_sold") or poc.get("is_expired"):
-            self._open_contracts.pop(cid, None)
-            self._contract_open_times.pop(cid, None)
-            self._reconciling.pop(cid, None)
-            try:
-                self.client.stop_tracking(cid)
-            except Exception:
-                pass
-            await self._apply_settlement(cid, info, poc, close_reason="reconcile_delayed")
-            return
-
-        if elapsed >= RECONCILE_MAX_SECS:
-            # Last-resort truth source (Fix C.3) — a different real query,
-            # never a guess. If it doesn't find anything either, keep
-            # retrying in the background; the contract stays visibly
-            # open/pending forever if it has to, but never gets a
-            # fabricated win/loss.
-            try:
-                pt = await self.client.profit_table_lookup(cid)
-            except Exception as exc:
-                logger.error(f"profit_table_lookup({cid}) failed: {exc}")
-                pt = {}
-
-            if pt.get("is_sold"):
-                self._open_contracts.pop(cid, None)
-                self._contract_open_times.pop(cid, None)
-                self._reconciling.pop(cid, None)
-                try:
-                    self.client.stop_tracking(cid)
-                except Exception:
-                    pass
-                await self._apply_settlement(cid, info, pt, close_reason="reconcile_delayed")
-                return
-
-            logger.error(
-                f"RECONCILE STILL PENDING: {cid} ({symbol}) unresolved "
-                f"after {elapsed:.0f}s (ceiling {RECONCILE_MAX_SECS}s) — "
-                f"escalating loudly; still NOT recording a guessed result, "
-                f"will keep retrying in the background"
-            )
-
-    # ── Multiplier contracts — explicit, active closing only (Fix E) ───────
-
-    async def _handle_multiplier_orphan(self, cid: str, info: dict, age: float) -> None:
-        if age < MULTIPLIER_MAX_HOLD_SECS:
-            return
-
-        symbol = info.get("symbol", "UNKNOWN")
-        logger.info(
-            f"MULTIPLIER MAX-HOLD: {cid} ({symbol}) held {age:.0f}s >= "
-            f"{MULTIPLIER_MAX_HOLD_SECS}s — actively selling to realize the "
-            f"real current price (never a guess, per Fix E / Requirement 1)"
-        )
-        try:
-            sell_resp = await self.client.sell_contract(cid, price=0)
-        except Exception as exc:
-            logger.error(f"sell_contract({cid}) failed during max-hold close: {exc}")
-            sell_resp = None
-
-        if not sell_resp:
-            # Sell failed — the classic cause (matches the logs you're
-            # seeing: "ContractNotFound: This contract was not found among
-            # your open positions") is that Deriv already considers this
-            # contract closed — e.g. it hit its own limit_order stop-out,
-            # or the proposal_open_contract close push never reached us
-            # (a subscription dropped/missed across a reconnect) — while
-            # our local bookkeeping never got the memo. Retrying a sell on
-            # a contract that no longer exists is a guaranteed infinite
-            # loop: it fails the same way forever, age keeps climbing, and
-            # the position sits "open" in our books indefinitely (this is
-            # what produced the 15-16h "stuck" positions). Before giving up
-            # for this cycle, run one authoritative check — same
-            # force_check_contract → profit_table_lookup fallback Fix C
-            # already uses for Rise/Fall — and settle for real if Deriv
-            # confirms it's actually closed.
-            try:
-                poc = await self.client.force_check_contract(cid)
-            except Exception as exc:
-                logger.warning(f"force_check_contract({cid}) after failed sell: {exc}")
-                poc = {}
-
-            if not (poc.get("is_sold") or poc.get("is_expired")):
-                try:
-                    poc = await self.client.profit_table_lookup(cid)
-                except Exception as exc:
-                    logger.warning(f"profit_table_lookup({cid}) after failed sell: {exc}")
-                    poc = {}
-
-            if poc.get("is_sold") or poc.get("is_expired"):
-                logger.info(
-                    f"MULTIPLIER ALREADY CLOSED: {cid} ({symbol}) — sell "
-                    f"failed because Deriv already considers it closed; "
-                    f"settling from the authoritative check instead of "
-                    f"retrying a sell forever."
-                )
-                self._open_contracts.pop(cid, None)
-                self._contract_open_times.pop(cid, None)
-                self._reconciling.pop(cid, None)
-                try:
-                    self.client.stop_tracking(cid)
-                except Exception:
-                    pass
-                await self._apply_settlement(cid, info, poc, close_reason="orphan_already_closed")
-                return
-
-            # Genuinely still open and the sell call itself failed for some
-            # other (presumably transient) reason — this contract must
-            # NEVER be removed from _open_contracts without a confirmed
-            # close. Leave it open and tracked; retry next
-            # _handle_orphans tick.
-            logger.warning(
-                f"MULTIPLIER SELL FAILED: {cid} ({symbol}) — still open, "
-                f"will retry active close next cycle (no bookkeeping wiped)"
-            )
-            return
-
-        # One authoritative follow-up check to get profit/sell_price in the
-        # same shape _apply_settlement() expects.
-        try:
-            poc = await self.client.force_check_contract(cid)
-        except Exception:
-            poc = {}
-
-        if not (poc.get("is_sold") or poc.get("is_expired")):
-            # Fall back to the sell response itself — sold_for is a real,
-            # confirmed value even if the follow-up check hasn't caught up.
-            sold_for = float(sell_resp.get("sold_for", 0))
-            stake    = float(info.get("stake", 0.0))
-            poc = {
-                "is_sold":    1,
-                "sell_price": sold_for,
-                "profit":     sold_for - stake,
-                "payout":     sold_for,
-            }
-
-        self._open_contracts.pop(cid, None)
-        self._contract_open_times.pop(cid, None)
-        self._reconciling.pop(cid, None)
-        try:
-            self.client.stop_tracking(cid)
-        except Exception:
-            pass
-        await self._apply_settlement(cid, info, poc, close_reason="time_based_close")
-
-    # ── Adaptive Exit Engine — per-contract monitoring loop ─────────────────
-    #
-    # Runs at config.EXIT_POLL_INTERVAL_SECS (default 15s) — tighter than the
-    # general _handle_orphans sweep (30s) — because exit timing matters more
-    # for open-ended Multiplier risk than the general health-check sweep
-    # does. This is purely additive: _handle_multiplier_orphan's 30-minute
-    # MULTIPLIER_MAX_HOLD_SECS force-close remains the untouched outer safety
-    # bound and still fires if this task ever stops running (e.g. a restart
-    # wipes the task but not yet the open-contract record).
-    #
-    # Never calls _apply_settlement for a natural close (is_sold/is_expired
-    # discovered on a poll) — that's owned by _on_contract_result (WS push)
-    # or the orphan sweep. Only calls it for a close *this method* actively
-    # triggers via sell_contract (CLOSE_NOW), reusing the same shared
-    # settlement path everything else uses.
-
-    async def _monitor_exit(self, cid: str) -> None:
-        poll_interval = getattr(config, "EXIT_POLL_INTERVAL_SECS", 15)
-
-        while cid in self._open_contracts:
-            try:
-                await asyncio.sleep(poll_interval)
-
-                # Re-check after the sleep — the contract may have settled
-                # via the WS push path or the orphan sweep while we waited.
-                info = self._open_contracts.get(cid)
-                if info is None:
-                    return
-
-                try:
-                    poc = await self.client.force_check_contract(cid)
-                except Exception as exc:
-                    logger.warning(f"_monitor_exit force_check_contract({cid}): {exc}")
-                    continue
-
-                if poc.get("is_sold") or poc.get("is_expired"):
-                    # Natural close — the existing settlement path handles
-                    # recording it. Not our job; just stop monitoring.
-                    return
-
-                symbol      = info.get("symbol", "UNKNOWN")
-                opened_at   = info.get("opened_at", time.time())
-                elapsed     = time.time() - opened_at
-                live_profit = float(poc.get("profit", 0.0))
-
-                # BUG FIX (found while implementing the ALT method below,
-                # unrelated to any of this session's other changes): these
-                # calls never matched exit_engine.record_snapshot()'s /
-                # decide_exit()'s actual parameter names (elapsed_secs,
-                # stake, current_profit, static_sl_amount, static_tp_amount,
-                # multiplier — not symbol/profit/elapsed/poc). Every call
-                # has been raising TypeError and getting silently swallowed
-                # by the except block below since this was written — the
-                # entire rule-based trailing layer and its ML layer have
-                # been inert this whole time, independent of the
-                # EXIT_ARM_PROFIT_FRACTION / EXIT_TRAIL_LOCK_FRACTION /
-                # EXIT_DECAY_CLOSE_FRACTION retuning done earlier this
-                # session, which was correct but had nothing to act on.
-                # static_sl/tp_amount come from the contract's own live
-                # limit_order (ground truth from Deriv, not a
-                # recomputation that could drift from what was actually
-                # set) — poc.get("limit_order") is documented Deriv API
-                # behavior for contracts with a limit_order attached.
-                stake = float(info.get("stake", 0.0))
-                multiplier = int(info.get("multiplier")
-                                  or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER))
-                limit_order = poc.get("limit_order") or {}
-                static_sl_amount = float(limit_order.get("stop_loss") or 0.0)
-                static_tp_amount = float(limit_order.get("take_profit") or 0.0)
-
-                try:
-                    exit_engine.record_snapshot(
-                        cid,
-                        symbol            = symbol,
-                        elapsed_secs      = elapsed,
-                        stake             = stake,
-                        current_profit    = live_profit,
-                        static_sl_amount  = static_sl_amount,
-                        static_tp_amount  = static_tp_amount,
-                        multiplier        = multiplier,
-                    )
-                    decision = exit_engine.decide_exit(
-                        cid,
-                        symbol            = symbol,
-                        elapsed_secs      = elapsed,
-                        stake             = stake,
-                        current_profit    = live_profit,
-                        static_sl_amount  = static_sl_amount,
-                        static_tp_amount  = static_tp_amount,
-                        multiplier        = multiplier,
-                    )
-                except Exception as exc:
-                    logger.warning(f"exit_engine decision failed for {cid}: {exc}")
-                    continue
-
-                action = getattr(decision, "action", None)
-
-                if action == "TRAIL_UPDATE":
-                    try:
-                        await self.client.contract_update(
-                            cid, stop_loss=decision.new_stop_loss)
-                        logger.info(
-                            f"ADAPTIVE EXIT TRAIL: {cid} ({symbol}) "
-                            f"stop_loss -> {decision.new_stop_loss}")
-                    except Exception as exc:
-                        logger.warning(f"contract_update({cid}) trail failed: {exc}")
-                    continue
-
-                if action == "CLOSE_NOW":
-                    logger.info(
-                        f"ADAPTIVE EXIT CLOSE: {cid} ({symbol}) elapsed="
-                        f"{elapsed:.0f}s profit={live_profit:.4f} — actively "
-                        f"selling to realize the real current price")
-                    try:
-                        sell_resp = await self.client.sell_contract(cid, price=0)
-                    except Exception as exc:
-                        logger.error(f"sell_contract({cid}) failed during adaptive exit: {exc}")
-                        sell_resp = None
-
-                    if not sell_resp:
-                        # Same failure mode as _handle_multiplier_orphan's
-                        # max-hold close (ContractNotFound because Deriv
-                        # already considers this closed — its own
-                        # limit_order stop-out fired, or a WS close push
-                        # was dropped across a reconnect). Run the same
-                        # authoritative check before assuming it's still
-                        # open, or this retries a dead sell forever exactly
-                        # like the max-hold path did.
-                        try:
-                            check_poc = await self.client.force_check_contract(cid)
-                        except Exception as exc:
-                            logger.warning(f"force_check_contract({cid}) after failed adaptive-exit sell: {exc}")
-                            check_poc = {}
-
-                        if not (check_poc.get("is_sold") or check_poc.get("is_expired")):
-                            try:
-                                check_poc = await self.client.profit_table_lookup(cid)
-                            except Exception as exc:
-                                logger.warning(f"profit_table_lookup({cid}) after failed adaptive-exit sell: {exc}")
-                                check_poc = {}
-
-                        if check_poc.get("is_sold") or check_poc.get("is_expired"):
-                            logger.info(
-                                f"ADAPTIVE EXIT ALREADY CLOSED: {cid} ({symbol}) "
-                                f"— sell failed because Deriv already considers "
-                                f"it closed; settling from the authoritative "
-                                f"check instead of retrying a sell forever."
-                            )
-                            self._open_contracts.pop(cid, None)
-                            self._contract_open_times.pop(cid, None)
-                            self._reconciling.pop(cid, None)
-                            try:
-                                self.client.stop_tracking(cid)
-                            except Exception:
-                                pass
-                            await self._apply_settlement(
-                                cid, info, check_poc, close_reason="adaptive_exit_already_closed")
-                            try:
-                                exit_engine.record_closed(cid, float(check_poc.get("profit", 0.0)))
-                            except Exception as exc:
-                                logger.warning(f"exit_engine.record_closed({cid}) failed: {exc}")
-                            return
-
-                        # No confirmed close — never drop bookkeeping without
-                        # one (same invariant _handle_multiplier_orphan
-                        # follows). Leave it open/tracked; retry next tick.
-                        logger.warning(
-                            f"ADAPTIVE EXIT SELL FAILED: {cid} ({symbol}) — "
-                            f"still open, will retry next tick")
-                        continue
-
-                    # One authoritative follow-up check, same pattern as
-                    # _handle_multiplier_orphan's max-hold close.
-                    try:
-                        close_poc = await self.client.force_check_contract(cid)
-                    except Exception:
-                        close_poc = {}
-
-                    if not (close_poc.get("is_sold") or close_poc.get("is_expired")):
-                        sold_for = float(sell_resp.get("sold_for", 0))
-                        stake    = float(info.get("stake", 0.0))
-                        close_poc = {
-                            "is_sold":    1,
-                            "sell_price": sold_for,
-                            "profit":     sold_for - stake,
-                            "payout":     sold_for,
-                        }
-
-                    final_profit = float(close_poc.get("profit", 0.0))
-
-                    self._open_contracts.pop(cid, None)
-                    self._contract_open_times.pop(cid, None)
-                    self._reconciling.pop(cid, None)
-                    try:
-                        self.client.stop_tracking(cid)
-                    except Exception:
-                        pass
-
-                    await self._apply_settlement(
-                        cid, info, close_poc, close_reason="adaptive_exit")
-
-                    try:
-                        exit_engine.record_closed(cid, final_profit)
-                    except Exception as exc:
-                        logger.warning(f"exit_engine.record_closed({cid}) failed: {exc}")
-
-                    return
-
-                # action == "HOLD" (or anything unrecognized) — do nothing,
-                # keep looping.
-
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error(f"_monitor_exit({cid}) tick failed: {exc}")
-                continue
+                                for cid, info 
