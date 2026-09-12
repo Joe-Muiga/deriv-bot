@@ -1322,10 +1322,11 @@ class BotEngine:
             f"PENDING ENTRY ARMED: {symbol} | indicator called {sig.direction} | "
             f"entry_ref={entry:.5f} | CONFIRM @ {trigger_confirm:.5f} "
             f"({pct*100:.0f}% toward native_target={target:.5f}) -> same "
-            f"direction, stop={entry:.5f}, target={target:.5f} | "
-            f"REJECT @ {trigger_reject:.5f} ({pct*100:.0f}% toward "
-            f"native_stop={stop:.5f}) -> opposite direction, stop={entry:.5f}, "
-            f"target={stop:.5f}"
+            f"direction, target={target:.5f} | REJECT @ {trigger_reject:.5f} "
+            f"({pct*100:.0f}% toward native_stop={stop:.5f}) -> opposite "
+            f"direction, target={stop:.5f} | stop on either branch: "
+            f"STOP_LOSS_MIDPOINT_PCT of the way from entry_ref to wherever "
+            f"it actually fills"
         )
 
     def _check_pending_entry(self, symbol: str, price: float) -> None:
@@ -1372,12 +1373,15 @@ class BotEngine:
         # simultaneous same-symbol positions were getting opened.
         # _execute_pending_entry()'s finally block releases this.
         self._executing_symbols.add(symbol)
+        sl_mid_pct   = getattr(config, "STOP_LOSS_MIDPOINT_PCT", 0.5)
+        planned_stop = pe.entry_ref_price + sl_mid_pct * (price - pe.entry_ref_price)
         if branch == "confirm":
             logger.info(
                 f"PENDING ENTRY CONFIRMED: {symbol} | {pe.direction} | "
                 f"price={price:.5f} crossed confirm={pe.trigger_confirm_price:.5f} "
-                f"— entering {pe.direction}, stop={pe.entry_ref_price:.5f}, "
-                f"target={pe.target_ref_price:.5f}"
+                f"— entering {pe.direction} at {price:.5f}, stop={planned_stop:.5f} "
+                f"({sl_mid_pct*100:.0f}% between entry_ref={pe.entry_ref_price:.5f} "
+                f"and fill), target={pe.target_ref_price:.5f}"
             )
         else:
             flipped = "SHORT" if is_long else "LONG"
@@ -1385,8 +1389,9 @@ class BotEngine:
                 f"PENDING ENTRY REJECTED: {symbol} | indicator called "
                 f"{pe.direction} | price={price:.5f} crossed "
                 f"reject={pe.trigger_reject_price:.5f} — entering {flipped} "
-                f"instead, stop={pe.entry_ref_price:.5f}, "
-                f"target={pe.stop_ref_price:.5f}"
+                f"instead at {price:.5f}, stop={planned_stop:.5f} "
+                f"({sl_mid_pct*100:.0f}% between entry_ref={pe.entry_ref_price:.5f} "
+                f"and fill), target={pe.stop_ref_price:.5f}"
             )
         asyncio.create_task(self._execute_pending_entry(symbol, pe, price, branch))
 
@@ -1433,8 +1438,11 @@ class BotEngine:
                         f"concurrent cap ({family_count}/{max_per_family})")
                     return
 
-            # Stop-loss is ALWAYS the original native_entry_price, on both
-            # branches. What differs is direction and take-profit:
+            # Stop-loss sits at STOP_LOSS_MIDPOINT_PCT of the way between the
+            # ORIGINAL native_entry_price and the ACTUAL execution price
+            # (live_price, wherever the confirm/reject trigger fired) — not
+            # pinned exactly to native_entry_price anymore. What differs by
+            # branch is direction and take-profit:
             #   confirm -> same direction, target = original native_target
             #   reject  -> opposite direction, target = original native_stop
             #              (repurposed as this flipped trade's target)
@@ -1442,8 +1450,8 @@ class BotEngine:
             # deriv_client.buy_multiplier() measures its SL/TP dollar
             # distance off whatever entry_price it's given, and the real
             # fill reference is this live price, not the stale signal-time
-            # one — the stop/target PRICES themselves stay the original
-            # absolute levels computed at arm time, unmodified.
+            # one — the take-profit PRICE itself stays the original absolute
+            # level computed at arm time, unmodified.
             if branch == "confirm":
                 new_direction = pe.direction
                 new_target    = pe.target_ref_price
@@ -1451,10 +1459,13 @@ class BotEngine:
                 new_direction = "SHORT" if pe.direction == "LONG" else "LONG"
                 new_target    = pe.stop_ref_price
 
+            sl_mid_pct = getattr(config, "STOP_LOSS_MIDPOINT_PCT", 0.5)
+            new_stop = pe.entry_ref_price + sl_mid_pct * (live_price - pe.entry_ref_price)
+
             swapped_sig = replace(
                 pe.sig,
                 direction=new_direction,
-                native_stop_price=pe.entry_ref_price,
+                native_stop_price=new_stop,
                 native_target_price=new_target,
                 native_entry_price=live_price,
                 execution_inverted=(branch == "reject"),
