@@ -917,7 +917,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 0.45
+REDEPLOY_INTERVAL_HOURS = 0.21
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
