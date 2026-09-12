@@ -519,23 +519,31 @@ INVERT_ALL_SIGNALS = False
 # unchanged — only the swap is removed.
 TP_SL_SWAP_ENABLED = False
 
-# ── DELAYED ENTRY + NATIVE SL/TP SWAP (user-directed, Sep 2026) ──────────
-# Layered on top of TAKE-AS-COMPUTED above — direction is still never
-# flipped. What changes is WHEN and AT WHAT LEVELS the bot enters:
+# ── DELAYED ENTRY (user-directed, Sep 2026, re-enabled + retimed Sep 12) ──
+# What changes is WHEN the bot enters — WHAT gets executed on entry is
+# decided separately by SCALED NATIVE SL/TP below, not here:
 #   1. Indicators are read to strict textbook definitions (unchanged).
 #   2. A firing signal is NOT bought immediately. It's armed as a pending
 #      entry (bot_engine.py's self._pending_entries) and watched tick by
-#      tick against its own native_entry_price / native_stop_price /
-#      native_target_price (see signal_engine.SignalResult).
+#      tick against its OWN RAW, UNMODIFIED native_entry_price /
+#      native_stop_price / native_target_price (see
+#      signal_engine.SignalResult) — the scaled+inverted transform below
+#      is not applied yet at this point.
 #   3. Only once live price has moved DELAYED_ENTRY_TRIGGER_PCT of the
 #      distance from native_entry_price toward native_target_price does
 #      the bot actually enter — at the live price at that moment, not the
 #      original signal-time price.
-#   4. At that instant the indicator's own native_stop_price becomes the
-#      trade's take-profit, and native_target_price becomes the trade's
-#      stop-loss (the two are swapped; direction is not inverted).
+#   4. At that instant, SCALED_SL_TP_ENABLED's transform (see below) is
+#      applied against the ORIGINAL native levels from step 2 to decide
+#      the executed direction and stop/target, then native_entry_price on
+#      the result is overridden to the live trigger price (deriv_client.
+#      buy_multiplier() needs its entry_price to match the actual fill
+#      reference). With the current defaults that means: direction flips
+#      from what the indicator called, stop/target are the 35%/150%
+#      mirrored levels computed off the original entry/stop/target.
 #   5. If price instead reverses back to the original native_stop_price
-#      before the trigger fires, the setup is scrapped (no trade).
+#      before the trigger fires, the setup is scrapped (no trade) — this
+#      check, like the trigger itself, is against the ORIGINAL levels.
 #   6. If neither happens within DELAYED_ENTRY_TIMEOUT_SECS, the pending
 #      entry expires unfilled.
 # Only applies to signals that carry native price levels (the live
@@ -543,26 +551,18 @@ TP_SL_SWAP_ENABLED = False
 # RISE_FALL — DIGIT signals (Jump buildup) are untouched. See
 # bot_engine.py's _arm_pending_entry / _check_pending_entry /
 # _execute_pending_entry for the implementation.
-#
-# DISABLED (user-directed, Sep 11 2026): reverted to plain native
-# execution — the indicator's own direction is bought immediately, its
-# own native_stop_price is the stop-loss, its own native_target_price is
-# the take-profit, no delay, no swap. That's exactly what happens when
-# this flag is False: _arm_pending_entry() is never called, every signal
-# falls straight through to the immediate _execute() path (the
-# TAKE-AS-COMPUTED block above), which already sends native_stop_price /
-# native_target_price / native_entry_price completely unmodified. The
-# delayed-entry + swap machinery below is left in place, just switched
-# off, in case it's wanted again later.
-DELAYED_ENTRY_ENABLED      = False
-DELAYED_ENTRY_TRIGGER_PCT  = 0.75
+DELAYED_ENTRY_ENABLED      = True
+DELAYED_ENTRY_TRIGGER_PCT  = 0.25   # was 0.75, before that 0.33
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
 # ── SCALED NATIVE SL/TP (user-directed, Sep 11 2026) ──────────────────────
-# Entry is immediate, exactly as the indicator signals — no delay, unlike
-# DELAYED_ENTRY above; native_entry_price itself is never moved. Only the
-# stop-loss and take-profit levels change, and — when
-# SCALED_SL_TP_INVERT_DIRECTION is also True — direction flips too.
+# Decides WHAT gets executed — direction and stop/target — once an entry
+# happens. For a signal that goes through DELAYED_ENTRY above, this runs
+# at trigger time against that signal's ORIGINAL native levels (entry
+# itself then gets overridden to the live trigger price — see
+# _execute_pending_entry). For a signal that skips delayed entry (no
+# native levels, DIGIT contracts, or DELAYED_ENTRY_ENABLED=False), this
+# runs immediately instead, entry unmodified.
 #
 # SCALED_SL_TP_INVERT_DIRECTION = True (current default): direction flips
 # (LONG<->SHORT) and the two scaled distances land mirrored, on the sides
@@ -917,7 +917,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 1
+REDEPLOY_INTERVAL_HOURS = 0.5
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
