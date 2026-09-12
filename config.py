@@ -552,7 +552,7 @@ TP_SL_SWAP_ENABLED = False
 # bot_engine.py's _arm_pending_entry / _check_pending_entry /
 # _execute_pending_entry for the implementation.
 DELAYED_ENTRY_ENABLED      = True
-DELAYED_ENTRY_TRIGGER_PCT  = 0.25   # was 0.75, before that 0.33
+DELAYED_ENTRY_TRIGGER_PCT  = 0.15   # was 0.25, before that 0.75, before that 0.33
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
 # ── SCALED NATIVE SL/TP (user-directed, Sep 11 2026) ──────────────────────
@@ -917,7 +917,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 0.26
+REDEPLOY_INTERVAL_HOURS = 0.45
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
