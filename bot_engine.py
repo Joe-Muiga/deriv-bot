@@ -274,6 +274,16 @@ class BotEngine:
         #    {symbol: PendingEntry}. See config.py for the full mechanism.
         self._pending_entries:        Dict[str, PendingEntry] = {}
 
+        # Closes the race where a symbol sits in neither _pending_entries
+        # nor symbol_manager's _active_symbols — from the instant a pending
+        # entry triggers (or an immediate signal is selected for execution)
+        # until _execute() actually finishes registering it as open. See
+        # _check_pending_entry's trigger branch and _execute_pending_entry's
+        # finally block for where this gets set/released on the delayed
+        # path, and the main cycle loop / _execute_and_release for the
+        # immediate path.
+        self._executing_symbols:      Set[str] = set()
+
         self._initialised_symbols:    Set[str]           = set()
         self._initializing:           Set[str]           = set()
 
@@ -1096,7 +1106,11 @@ class BotEngine:
                     r.symbol, getattr(r.sig, "strategy", "unknown"), r.sig.direction)
 
             # 5. Filter out symbols that can't trade right now
-            signals = [r for r in signals if self.symbols.can_trade_now(r.symbol)]
+            signals = [
+                r for r in signals
+                if self.symbols.can_trade_now(r.symbol)
+                and r.symbol not in self._executing_symbols
+            ]
 
             # 5b. Ensemble voting gate — require >=N independent strategies
             #     agreeing on direction within the window before a signal
@@ -1202,11 +1216,17 @@ class BotEngine:
                     if delayed_eligible:
                         self._arm_pending_entry(r.symbol, s)
                     else:
+                        # Reserve synchronously, same reasoning as the
+                        # delayed-entry trigger path: _active_symbols only
+                        # gets set once _execute() finishes, so without this
+                        # a slow buy call leaves the symbol "available" for
+                        # the next cycle to select and execute again.
+                        self._executing_symbols.add(r.symbol)
                         to_execute.append(replace(r, sig=self._apply_scaled_native_levels(s)))
 
                 if to_execute:
                     await asyncio.gather(
-                        *[self._execute(r.symbol, r.sig) for r in to_execute],
+                        *[self._execute_and_release(r.symbol, r.sig) for r in to_execute],
                         return_exceptions=True,
                     )
 
@@ -1264,6 +1284,10 @@ class BotEngine:
         """Register a firing signal as pending instead of buying it now."""
         if symbol in self._pending_entries:
             return  # already watching a setup for this symbol — don't reset it
+        if symbol in self._executing_symbols:
+            return  # a trigger for this symbol is already executing — don't
+                     # arm a second one on top of it (defense in depth; the
+                     # signals-level filter above should already exclude it)
 
         entry  = float(sig.native_entry_price)
         stop   = float(sig.native_stop_price)
@@ -1322,6 +1346,17 @@ class BotEngine:
                     (not is_long and price <= pe.trigger_price)
         if triggered:
             del self._pending_entries[symbol]
+            # Reserve the symbol THE INSTANT it's decided, synchronously —
+            # before asyncio.create_task() even schedules the coroutine.
+            # Without this, the symbol sits in neither _pending_entries nor
+            # symbol_manager's _active_symbols (that only gets set once
+            # _execute() actually completes a buy) for the gap between here
+            # and whenever the scheduled task actually runs. Any tick or
+            # scan cycle landing in that gap sees an "available" symbol and
+            # re-arms/re-executes it — this is exactly how multiple
+            # simultaneous same-symbol positions were getting opened.
+            # _execute_pending_entry()'s finally block releases this.
+            self._executing_symbols.add(symbol)
             logger.info(
                 f"PENDING ENTRY TRIGGERED: {symbol} | {pe.direction} | "
                 f"price={price:.5f} crossed trigger={pe.trigger_price:.5f} — "
@@ -1335,46 +1370,56 @@ class BotEngine:
         Fires the actual buy once a pending entry has triggered. Re-checks
         every guard the normal cycle loop would have applied (can_trade_now,
         concurrent slots, family cap) since this can fire between cycles.
+
+        The whole body runs under a finally that releases this symbol's
+        _executing_symbols reservation (taken synchronously in
+        _check_pending_entry right when the trigger fired) — on every exit
+        path, not just the successful one, so a dropped attempt (no slot,
+        family cap, can_trade_now False) doesn't leave the symbol
+        permanently un-armable.
         """
-        if not self.symbols.can_trade_now(symbol):
-            logger.info(
-                f"PENDING ENTRY DROPPED: {symbol} — can_trade_now() False at trigger time")
-            return
-
-        concurrent_limit = self.risk.current_concurrent_limit
-        open_count       = len(self._open_contracts)
-        if open_count >= concurrent_limit:
-            logger.info(
-                f"PENDING ENTRY DROPPED: {symbol} — no concurrent slot free "
-                f"at trigger time ({open_count}/{concurrent_limit})")
-            return
-
-        family_map     = getattr(config, "SYMBOL_FAMILY_MAP", {})
-        max_per_family = getattr(config, "MAX_CONCURRENT_PER_FAMILY", 2)
-        fam = family_map.get(symbol)
-        if fam:
-            family_count = sum(
-                1 for c in self._open_contracts.values()
-                if family_map.get(c.get("symbol")) == fam
-            )
-            if family_count >= max_per_family:
+        try:
+            if not self.symbols.can_trade_now(symbol):
                 logger.info(
-                    f"PENDING ENTRY DROPPED: {symbol} — family {fam} at "
-                    f"concurrent cap ({family_count}/{max_per_family})")
+                    f"PENDING ENTRY DROPPED: {symbol} — can_trade_now() False at trigger time")
                 return
 
-        # The trigger only confirms the ORIGINAL setup ran 25% of the way
-        # toward its own target — what actually gets traded is decided by
-        # the same scaled+inverted transform immediate entries use
-        # (config.SCALED_SL_TP_ENABLED / SCALED_SL_TP_INVERT_DIRECTION),
-        # applied here against pe.sig's untouched original native levels.
-        # native_entry_price is then overridden to the live trigger price
-        # since deriv_client.buy_multiplier() measures its SL/TP dollar
-        # distance off whatever entry_price it's given, and the real fill
-        # reference is this live price, not the stale signal-time one.
-        transformed = self._apply_scaled_native_levels(pe.sig)
-        swapped_sig = replace(transformed, native_entry_price=live_price)
-        await self._execute(symbol, swapped_sig)
+            concurrent_limit = self.risk.current_concurrent_limit
+            open_count       = len(self._open_contracts)
+            if open_count >= concurrent_limit:
+                logger.info(
+                    f"PENDING ENTRY DROPPED: {symbol} — no concurrent slot free "
+                    f"at trigger time ({open_count}/{concurrent_limit})")
+                return
+
+            family_map     = getattr(config, "SYMBOL_FAMILY_MAP", {})
+            max_per_family = getattr(config, "MAX_CONCURRENT_PER_FAMILY", 2)
+            fam = family_map.get(symbol)
+            if fam:
+                family_count = sum(
+                    1 for c in self._open_contracts.values()
+                    if family_map.get(c.get("symbol")) == fam
+                )
+                if family_count >= max_per_family:
+                    logger.info(
+                        f"PENDING ENTRY DROPPED: {symbol} — family {fam} at "
+                        f"concurrent cap ({family_count}/{max_per_family})")
+                    return
+
+            # The trigger only confirms the ORIGINAL setup ran 25% of the way
+            # toward its own target — what actually gets traded is decided by
+            # the same scaled+inverted transform immediate entries use
+            # (config.SCALED_SL_TP_ENABLED / SCALED_SL_TP_INVERT_DIRECTION),
+            # applied here against pe.sig's untouched original native levels.
+            # native_entry_price is then overridden to the live trigger price
+            # since deriv_client.buy_multiplier() measures its SL/TP dollar
+            # distance off whatever entry_price it's given, and the real fill
+            # reference is this live price, not the stale signal-time one.
+            transformed = self._apply_scaled_native_levels(pe.sig)
+            swapped_sig = replace(transformed, native_entry_price=live_price)
+            await self._execute(symbol, swapped_sig)
+        finally:
+            self._executing_symbols.discard(symbol)
 
     # ── Scaled native SL/TP (immediate entry) ────────────────────────────────────
     # See config.py's "SCALED NATIVE SL/TP" block for the spec. Distinct from the
@@ -1449,6 +1494,19 @@ class BotEngine:
         return scaled
 
     # ── Execution ──────────────────────────────────────────────────────────────
+
+    async def _execute_and_release(self, symbol: str, sig: SignalResult) -> bool:
+        """
+        Thin wrapper for the immediate (non-delayed-entry) path: releases
+        this symbol's _executing_symbols reservation (taken synchronously
+        when it was selected into to_execute, above) once the buy attempt
+        is fully resolved — mirrors what _execute_pending_entry's finally
+        block does for the delayed-entry path.
+        """
+        try:
+            return await self._execute(symbol, sig)
+        finally:
+            self._executing_symbols.discard(symbol)
 
     async def _execute(self, symbol: str, sig: SignalResult) -> bool:
         # Hard gate — re-verify right before placing the order
