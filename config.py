@@ -552,7 +552,7 @@ TP_SL_SWAP_ENABLED = False
 # bot_engine.py's _arm_pending_entry / _check_pending_entry /
 # _execute_pending_entry for the implementation.
 DELAYED_ENTRY_ENABLED      = True
-DELAYED_ENTRY_TRIGGER_PCT  = 0.20   # was 0.25, before that 0.75, before that 0.33
+DELAYED_ENTRY_TRIGGER_PCT  = 0.15   # was 0.25, before that 0.75, before that 0.33
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
 # ── SCALED NATIVE SL/TP (user-directed, Sep 11 2026) ──────────────────────
@@ -591,8 +591,8 @@ DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerl
 # how a flip gets recorded for meta-labeling / strategy_stats.
 SCALED_SL_TP_ENABLED          = True
 SCALED_SL_TP_INVERT_DIRECTION = True
-SCALED_TP_STOP_MULT           = 1.84   # was 1.33
-SCALED_SL_TARGET_MULT         = 0.51   # was 0.60
+SCALED_TP_STOP_MULT           = 1.80   # was 1.33
+SCALED_SL_TARGET_MULT         = 0.55   # was 0.60
 
 # Per-(indicator, symbol) suspension window (spec point 8, Aug 2026): when
 # strategy_stats.is_underperforming(strategy, symbol) first flips True for a
@@ -678,9 +678,25 @@ POPULAR_HURST_LOOKBACK      = 100
 POPULAR_HURST_MIN_BARS      = 40
 
 # ── STAKE SETTINGS ───────────────────────────────────────────
+# MANUAL STAKE MODE (user-directed, Sep 12 2026): the person wants direct
+# control of stake size from here, full stop — everything else that used
+# to have a say (BASE_STAKE_PCT/balance-scaling, the PLS win/loss-streak
+# multiplier, the Kelly overlay, the stability dampener, the portfolio
+# exposure ceiling) is bypassed entirely. risk_manager.calculate_stake()
+# checks this flag first and — when True — returns MANUAL_STAKE_AMOUNT
+# immediately, no other stake logic runs at all. Set False to restore all
+# of the dynamic sizing below exactly as it was.
+MANUAL_STAKE_MODE   = True
+MANUAL_STAKE_AMOUNT = 100.0
+# Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
+# MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
+# at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
+# no longer expressed as a % of balance.
+
 BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
+                                # INACTIVE while MANUAL_STAKE_MODE = True.
 MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
                                 # IMPORTANT — read before assuming this is a
                                 # harmless safety floor: base_stake =
@@ -703,7 +719,20 @@ MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
                                 # file is read. If flat $100 stakes weren't
                                 # the intent, lower this back down and let
                                 # BASE_STAKE_PCT/Kelly drive sizing instead.
+                                # SUPERSEDED Sep 12 2026 by MANUAL_STAKE_MODE
+                                # above — this value (and the dynamics this
+                                # comment describes) only matter again if
+                                # that flag is turned back off. This is also
+                                # the exact bug that led to MANUAL_STAKE_MODE:
+                                # the stability dampener (drawdown/loss-streak,
+                                # further below) ran AFTER this $100 floor
+                                # clamp, so any dampening at all pushed the
+                                # stake below $100, and calculate_stake()
+                                # zeroed it outright rather than shrinking it
+                                # — a hard stop after as few as 2 consecutive
+                                # losses, not a graceful size-down.
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
+                                # INACTIVE while MANUAL_STAKE_MODE = True.
 DAILY_LOSS_LIMIT_PCT = 0.06    # FIX: was 0.15 (15%) — too loose to act as a
                                 # real circuit breaker. 6% is a more typical
                                 # prudent daily stop for leveraged multiplier
@@ -773,7 +802,7 @@ PLS_WIN_EXTRA_SLOTS = [0,   0,   0,   0,   0   ]
 # highly-correlated symbols (e.g. R_10 and 1HZ10V both track the same
 # volatility parameter). Lowered to reduce simultaneous drawdown risk;
 # raise gradually only once live win-rate/profit-factor justify it.
-MAX_CONCURRENT_TRADES = 6
+MAX_CONCURRENT_TRADES = 10
 
 # Correlated-symbol grouping — synthetic indices sharing the same underlying
 # volatility parameter (just different tick generation) move together far
@@ -917,7 +946,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 0.21
+REDEPLOY_INTERVAL_HOURS = 0.17
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
