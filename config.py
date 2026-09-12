@@ -564,6 +564,16 @@ DELAYED_ENTRY_TRIGGER_PCT  = 0.50   # was 0.25, before that 0.15, 0.75, 0.33 —
                                       # triggers; tune here to change both at once.
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
+# Stop-loss placement (user-directed, Sep 12 2026): on whichever branch
+# fires (confirm or reject), the stop is no longer pinned exactly to
+# native_entry_price — it sits STOP_LOSS_MIDPOINT_PCT of the way between
+# native_entry_price and the ACTUAL fill price (wherever the trigger
+# executed). 0.5 = the midpoint. 0.0 would put it back at native_entry_price
+# exactly; 1.0 would put it at the fill price itself (no room at all).
+# See bot_engine.py's _execute_pending_entry / _check_pending_entry's
+# planned_stop logging for the implementation.
+STOP_LOSS_MIDPOINT_PCT = 0.5
+
 # ── SCALED NATIVE SL/TP (user-directed, Sep 11 2026) ──────────────────────
 # NOTE: no longer used by the delayed-entry path above (Sep 12 2026) — that
 # path now builds its own stop/target directly from the two-trigger design.
@@ -959,7 +969,10 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 0.22833333
+REDEPLOY_INTERVAL_HOURS = 13.7 / 60   # 13.7 minutes, expressed as hours since
+                                        # that's the unit restart_scheduler.py
+                                        # expects (interval_secs = hours*3600).
+                                        # Was 1h, before that 3h.
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
