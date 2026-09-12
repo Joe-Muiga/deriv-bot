@@ -535,6 +535,8 @@ class RiskManager:
         next trade on this (strategy, symbol) pair, PLS + Kelly overlay
         combined, using the current cached balance.
         """
+        if getattr(config, "MANUAL_STAKE_MODE", False):
+            return float(getattr(config, "MANUAL_STAKE_AMOUNT", self.min_stake))
         pls_stake = self._compute_stake(self._current_balance)
         return self._apply_kelly_overlay(
             pls_stake, self._current_balance, strategy, symbol
@@ -559,6 +561,15 @@ class RiskManager:
         Log format:
           STAKE: $X (pls=$Y base=$Z ×M streak=+N [strategy=... symbol=...])
         """
+        if getattr(config, "MANUAL_STAKE_MODE", False):
+            manual_stake = float(getattr(config, "MANUAL_STAKE_AMOUNT", self.min_stake))
+            logger.info(
+                f"STAKE: ${manual_stake:.2f} — MANUAL_STAKE_MODE active, "
+                f"BASE_STAKE_PCT/Kelly/dampener/exposure-ceiling all bypassed"
+                + (f" strategy={strategy} symbol={symbol}" if strategy and symbol else "")
+            )
+            return manual_stake
+
         balance = await self._fetch_live_balance()
 
         base      = max(self._current_balance * self.base_stake_pct, self.min_stake)
