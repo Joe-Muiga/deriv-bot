@@ -106,20 +106,35 @@ class PendingEntry:
     """
     A signal that fired but hasn't been bought yet — armed and watched
     tick-by-tick (see bot_engine._check_pending_entry, called from
-    _on_tick) until it either triggers, gets scrapped, or expires.
-    See config.py's "DELAYED ENTRY" block. What actually gets executed on
-    trigger is decided separately by the "SCALED NATIVE SL/TP" transform,
-    applied against this entry's original (unmodified) native levels.
+    _on_tick) until one of two triggers fires, or it expires unfilled.
+    See config.py's "DELAYED ENTRY" block (Sep 12 2026 two-trigger design).
+
+    Two prices are armed at once, both measured from the ORIGINAL native
+    entry, and whichever the market reaches first decides everything:
+      - CONFIRM (trigger_confirm_price): price moves DELAYED_ENTRY_TRIGGER_PCT
+        of the entry-to-target distance in the indicator's own direction.
+        Fires in the SAME direction the indicator called, stop-loss set to
+        the original native_entry_price, take-profit left at the original
+        native_target_price.
+      - REJECT (trigger_reject_price): price instead moves
+        DELAYED_ENTRY_TRIGGER_PCT of the entry-to-stop distance against the
+        indicator's call. Fires in the OPPOSITE direction, stop-loss still
+        set to the original native_entry_price, take-profit set to the
+        original native_stop_price (repurposed as a target for the flipped
+        trade).
+    There is no separate "scrap" outcome — reaching the reject side is a
+    valid trade, not a failure. Only the timeout still results in no trade.
     """
-    symbol:           str
-    sig:              SignalResult
-    direction:        str     # "LONG" | "SHORT" — locked at arm time
-    entry_ref_price:  float   # native_entry_price when armed
-    stop_ref_price:   float   # native_stop_price when armed (original SL)
-    target_ref_price: float   # native_target_price when armed (original TP)
-    trigger_price:    float   # entry_ref + DELAYED_ENTRY_TRIGGER_PCT * (target_ref - entry_ref)
-    created_at:       float
-    strategy:         str
+    symbol:                str
+    sig:                   SignalResult
+    direction:              str     # original indicator direction, locked at arm time
+    entry_ref_price:        float   # native_entry_price when armed
+    stop_ref_price:         float   # native_stop_price when armed (original SL)
+    target_ref_price:       float   # native_target_price when armed (original TP)
+    trigger_confirm_price:  float   # entry_ref + PCT * (target_ref - entry_ref)
+    trigger_reject_price:   float   # entry_ref + PCT * (stop_ref - entry_ref)
+    created_at:             float
+    strategy:               str
 
 
 # ─── Thompson sampling bandit ───────────────────────────────────────────────
@@ -1274,11 +1289,9 @@ class BotEngine:
             logger.error(f"SCAN ERROR {symbol}: {type(exc).__name__}: {exc}", exc_info=True)
             return None
 
-    # ── Delayed entry / scaled+inverted execution on trigger ────────────────────
-    # See config.py's "DELAYED ENTRY" and "SCALED NATIVE SL/TP" blocks for the
-    # spec. Monitoring here is always against the RAW, untouched native levels
-    # the indicator computed — the scaled+inverted transform is only applied
-    # once triggered, in _execute_pending_entry(), not at arm time.
+    # ── Delayed entry — two-trigger design (Sep 12 2026) ─────────────────────────
+    # See config.py's "DELAYED ENTRY" block for the spec. Monitoring here is
+    # always against the RAW, untouched native levels the indicator computed.
 
     def _arm_pending_entry(self, symbol: str, sig: SignalResult) -> None:
         """Register a firing signal as pending instead of buying it now."""
@@ -1293,24 +1306,26 @@ class BotEngine:
         stop   = float(sig.native_stop_price)
         target = float(sig.native_target_price)
         pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.25)
-        # Works for both directions: target is on the profit side of entry,
-        # so entry + pct*(target-entry) lands pct% of the way there whichever
-        # sign (target-entry) has.
-        trigger = entry + pct * (target - entry)
+        # Both direction-agnostic: (target-entry) and (stop-entry) already
+        # carry the right sign for LONG vs SHORT, so these two formulas work
+        # unmodified either way.
+        trigger_confirm = entry + pct * (target - entry)
+        trigger_reject  = entry + pct * (stop - entry)
 
         self._pending_entries[symbol] = PendingEntry(
             symbol=symbol, sig=sig, direction=sig.direction,
             entry_ref_price=entry, stop_ref_price=stop, target_ref_price=target,
-            trigger_price=trigger, created_at=time.time(),
-            strategy=getattr(sig, "strategy", "unknown"),
+            trigger_confirm_price=trigger_confirm, trigger_reject_price=trigger_reject,
+            created_at=time.time(), strategy=getattr(sig, "strategy", "unknown"),
         )
         logger.info(
-            f"PENDING ENTRY ARMED: {symbol} | {sig.direction} (as the "
-            f"indicator called it) | entry_ref={entry:.5f} trigger={trigger:.5f} "
-            f"({pct*100:.0f}% toward native_target={target:.5f}) | "
-            f"native_stop={stop:.5f} | on trigger: executed via the scaled+"
-            f"inverted transform (see _apply_scaled_native_levels), not a "
-            f"straight swap"
+            f"PENDING ENTRY ARMED: {symbol} | indicator called {sig.direction} | "
+            f"entry_ref={entry:.5f} | CONFIRM @ {trigger_confirm:.5f} "
+            f"({pct*100:.0f}% toward native_target={target:.5f}) -> same "
+            f"direction, stop={entry:.5f}, target={target:.5f} | "
+            f"REJECT @ {trigger_reject:.5f} ({pct*100:.0f}% toward "
+            f"native_stop={stop:.5f}) -> opposite direction, stop={entry:.5f}, "
+            f"target={stop:.5f}"
         )
 
     def _check_pending_entry(self, symbol: str, price: float) -> None:
@@ -1322,52 +1337,64 @@ class BotEngine:
         timeout = getattr(config, "DELAYED_ENTRY_TIMEOUT_SECS", 600)
         if time.time() - pe.created_at > timeout:
             logger.info(
-                f"PENDING ENTRY EXPIRED: {symbol} | {pe.direction} | "
-                f"never reached trigger={pe.trigger_price:.5f} within {timeout}s"
+                f"PENDING ENTRY EXPIRED: {symbol} | {pe.direction} | reached "
+                f"neither confirm={pe.trigger_confirm_price:.5f} nor "
+                f"reject={pe.trigger_reject_price:.5f} within {timeout}s"
             )
             del self._pending_entries[symbol]
             return
 
         is_long = pe.direction == "LONG"
 
-        # Setup failed — price reversed to the native stop before the
-        # trigger mark was ever reached. Scrap it, no trade.
-        if (is_long and price <= pe.stop_ref_price) or \
-           (not is_long and price >= pe.stop_ref_price):
-            logger.info(
-                f"PENDING ENTRY SCRAPPED: {symbol} | {pe.direction} | "
-                f"price={price:.5f} hit native_stop={pe.stop_ref_price:.5f} "
-                f"before reaching trigger={pe.trigger_price:.5f} — setup failed"
-            )
-            del self._pending_entries[symbol]
+        # CONFIRM: price moved toward the indicator's own target. Trade in
+        # the SAME direction the indicator called.
+        confirm_hit = (is_long and price >= pe.trigger_confirm_price) or \
+                      (not is_long and price <= pe.trigger_confirm_price)
+        # REJECT: price instead moved toward the indicator's own stop.
+        # Trade in the OPPOSITE direction — this is a second valid trigger,
+        # not a failure; there is no more "scrap" outcome.
+        reject_hit = (is_long and price <= pe.trigger_reject_price) or \
+                     (not is_long and price >= pe.trigger_reject_price)
+
+        if not (confirm_hit or reject_hit):
             return
 
-        triggered = (is_long and price >= pe.trigger_price) or \
-                    (not is_long and price <= pe.trigger_price)
-        if triggered:
-            del self._pending_entries[symbol]
-            # Reserve the symbol THE INSTANT it's decided, synchronously —
-            # before asyncio.create_task() even schedules the coroutine.
-            # Without this, the symbol sits in neither _pending_entries nor
-            # symbol_manager's _active_symbols (that only gets set once
-            # _execute() actually completes a buy) for the gap between here
-            # and whenever the scheduled task actually runs. Any tick or
-            # scan cycle landing in that gap sees an "available" symbol and
-            # re-arms/re-executes it — this is exactly how multiple
-            # simultaneous same-symbol positions were getting opened.
-            # _execute_pending_entry()'s finally block releases this.
-            self._executing_symbols.add(symbol)
+        branch = "confirm" if confirm_hit else "reject"
+        del self._pending_entries[symbol]
+        # Reserve the symbol THE INSTANT it's decided, synchronously —
+        # before asyncio.create_task() even schedules the coroutine.
+        # Without this, the symbol sits in neither _pending_entries nor
+        # symbol_manager's _active_symbols (that only gets set once
+        # _execute() actually completes a buy) for the gap between here
+        # and whenever the scheduled task actually runs. Any tick or
+        # scan cycle landing in that gap sees an "available" symbol and
+        # re-arms/re-executes it — this is exactly how multiple
+        # simultaneous same-symbol positions were getting opened.
+        # _execute_pending_entry()'s finally block releases this.
+        self._executing_symbols.add(symbol)
+        if branch == "confirm":
             logger.info(
-                f"PENDING ENTRY TRIGGERED: {symbol} | {pe.direction} | "
-                f"price={price:.5f} crossed trigger={pe.trigger_price:.5f} — "
-                f"entering now with swapped SL/TP"
+                f"PENDING ENTRY CONFIRMED: {symbol} | {pe.direction} | "
+                f"price={price:.5f} crossed confirm={pe.trigger_confirm_price:.5f} "
+                f"— entering {pe.direction}, stop={pe.entry_ref_price:.5f}, "
+                f"target={pe.target_ref_price:.5f}"
             )
-            asyncio.create_task(self._execute_pending_entry(symbol, pe, price))
+        else:
+            flipped = "SHORT" if is_long else "LONG"
+            logger.info(
+                f"PENDING ENTRY REJECTED: {symbol} | indicator called "
+                f"{pe.direction} | price={price:.5f} crossed "
+                f"reject={pe.trigger_reject_price:.5f} — entering {flipped} "
+                f"instead, stop={pe.entry_ref_price:.5f}, "
+                f"target={pe.stop_ref_price:.5f}"
+            )
+        asyncio.create_task(self._execute_pending_entry(symbol, pe, price, branch))
 
     async def _execute_pending_entry(
-            self, symbol: str, pe: PendingEntry, live_price: float) -> None:
+            self, symbol: str, pe: PendingEntry, live_price: float, branch: str) -> None:
         """
-        Fires the actual buy once a pending entry has triggered. Re-checks
+        Fires the actual buy once a pending entry has triggered — either the
+        "confirm" or "reject" branch (see PendingEntry's docstring). Re-checks
         every guard the normal cycle loop would have applied (can_trade_now,
         concurrent slots, family cap) since this can fire between cycles.
 
@@ -1406,17 +1433,32 @@ class BotEngine:
                         f"concurrent cap ({family_count}/{max_per_family})")
                     return
 
-            # The trigger only confirms the ORIGINAL setup ran 25% of the way
-            # toward its own target — what actually gets traded is decided by
-            # the same scaled+inverted transform immediate entries use
-            # (config.SCALED_SL_TP_ENABLED / SCALED_SL_TP_INVERT_DIRECTION),
-            # applied here against pe.sig's untouched original native levels.
-            # native_entry_price is then overridden to the live trigger price
-            # since deriv_client.buy_multiplier() measures its SL/TP dollar
-            # distance off whatever entry_price it's given, and the real fill
-            # reference is this live price, not the stale signal-time one.
-            transformed = self._apply_scaled_native_levels(pe.sig)
-            swapped_sig = replace(transformed, native_entry_price=live_price)
+            # Stop-loss is ALWAYS the original native_entry_price, on both
+            # branches. What differs is direction and take-profit:
+            #   confirm -> same direction, target = original native_target
+            #   reject  -> opposite direction, target = original native_stop
+            #              (repurposed as this flipped trade's target)
+            # entry_price is overridden to the live trigger price since
+            # deriv_client.buy_multiplier() measures its SL/TP dollar
+            # distance off whatever entry_price it's given, and the real
+            # fill reference is this live price, not the stale signal-time
+            # one — the stop/target PRICES themselves stay the original
+            # absolute levels computed at arm time, unmodified.
+            if branch == "confirm":
+                new_direction = pe.direction
+                new_target    = pe.target_ref_price
+            else:
+                new_direction = "SHORT" if pe.direction == "LONG" else "LONG"
+                new_target    = pe.stop_ref_price
+
+            swapped_sig = replace(
+                pe.sig,
+                direction=new_direction,
+                native_stop_price=pe.entry_ref_price,
+                native_target_price=new_target,
+                native_entry_price=live_price,
+                execution_inverted=(branch == "reject"),
+            )
             await self._execute(symbol, swapped_sig)
         finally:
             self._executing_symbols.discard(symbol)
@@ -1447,8 +1489,8 @@ class BotEngine:
 
         Either way both formulas are direction-agnostic — (native_target -
         entry) and (entry - native_stop) already carry the right sign for
-        LONG vs SHORT, same trick used in _arm_pending_entry's
-        trigger_price — and entry itself (sig.native_entry_price) is never
+        LONG vs SHORT, same trick used in _arm_pending_entry's trigger
+        prices — and entry itself (sig.native_entry_price) is never
         modified by this function either way.
         """
         if not getattr(config, "SCALED_SL_TP_ENABLED", False):
