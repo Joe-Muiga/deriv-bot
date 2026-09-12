@@ -591,8 +591,8 @@ DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerl
 # how a flip gets recorded for meta-labeling / strategy_stats.
 SCALED_SL_TP_ENABLED          = True
 SCALED_SL_TP_INVERT_DIRECTION = True
-SCALED_TP_STOP_MULT           = 1.70   # was 1.33
-SCALED_SL_TARGET_MULT         = 0.72   # was 0.60
+SCALED_TP_STOP_MULT           = 1.84   # was 1.33
+SCALED_SL_TARGET_MULT         = 0.51   # was 0.60
 
 # Per-(indicator, symbol) suspension window (spec point 8, Aug 2026): when
 # strategy_stats.is_underperforming(strategy, symbol) first flips True for a
