@@ -110,20 +110,21 @@ class PendingEntry:
     See config.py's "DELAYED ENTRY" block (Sep 12 2026 two-trigger design).
 
     Two prices are armed at once, both measured from the ORIGINAL native
-    entry, and whichever the market reaches first decides everything:
+    entry, and whichever the market reaches first decides everything —
+    both branches now bet on price fading back to the original
+    native_entry_price rather than continuing (Sep 12 2026 redesign):
       - CONFIRM (trigger_confirm_price): price moves DELAYED_ENTRY_TRIGGER_PCT
         of the entry-to-target distance in the indicator's own direction.
-        Fires in the SAME direction the indicator called, stop-loss set to
-        the original native_entry_price, take-profit left at the original
-        native_target_price.
+        Trades the OPPOSITE direction from what the indicator called (a
+        fade back toward entry from the target side), stop-loss = the
+        original native_target_price, take-profit = native_entry_price.
       - REJECT (trigger_reject_price): price instead moves
         DELAYED_ENTRY_TRIGGER_PCT of the entry-to-stop distance against the
-        indicator's call. Fires in the OPPOSITE direction, stop-loss still
-        set to the original native_entry_price, take-profit set to the
-        original native_stop_price (repurposed as a target for the flipped
-        trade).
-    There is no separate "scrap" outcome — reaching the reject side is a
-    valid trade, not a failure. Only the timeout still results in no trade.
+        indicator's call. Trades the SAME direction the indicator called (a
+        fade back toward entry from the stop side), stop-loss = the
+        original native_stop_price, take-profit = native_entry_price.
+    There is no separate "scrap" outcome — reaching either side is a valid
+    trade. Only the timeout still results in no trade.
     """
     symbol:                str
     sig:                   SignalResult
@@ -1318,15 +1319,15 @@ class BotEngine:
             trigger_confirm_price=trigger_confirm, trigger_reject_price=trigger_reject,
             created_at=time.time(), strategy=getattr(sig, "strategy", "unknown"),
         )
+        fade_confirm_dir = "SHORT" if sig.direction == "LONG" else "LONG"
         logger.info(
             f"PENDING ENTRY ARMED: {symbol} | indicator called {sig.direction} | "
             f"entry_ref={entry:.5f} | CONFIRM @ {trigger_confirm:.5f} "
-            f"({pct*100:.0f}% toward native_target={target:.5f}) -> same "
-            f"direction, target={target:.5f} | REJECT @ {trigger_reject:.5f} "
-            f"({pct*100:.0f}% toward native_stop={stop:.5f}) -> opposite "
-            f"direction, target={stop:.5f} | stop on either branch: "
-            f"STOP_LOSS_MIDPOINT_PCT of the way from entry_ref to wherever "
-            f"it actually fills"
+            f"({pct*100:.0f}% toward native_target={target:.5f}) -> fade back: "
+            f"{fade_confirm_dir}, stop={target:.5f}, target={entry:.5f} | "
+            f"REJECT @ {trigger_reject:.5f} ({pct*100:.0f}% toward "
+            f"native_stop={stop:.5f}) -> fade back: {sig.direction}, "
+            f"stop={stop:.5f}, target={entry:.5f}"
         )
 
     def _check_pending_entry(self, symbol: str, price: float) -> None:
@@ -1373,25 +1374,24 @@ class BotEngine:
         # simultaneous same-symbol positions were getting opened.
         # _execute_pending_entry()'s finally block releases this.
         self._executing_symbols.add(symbol)
-        sl_mid_pct   = getattr(config, "STOP_LOSS_MIDPOINT_PCT", 0.5)
-        planned_stop = pe.entry_ref_price + sl_mid_pct * (price - pe.entry_ref_price)
         if branch == "confirm":
+            fade_dir = "SHORT" if is_long else "LONG"
             logger.info(
-                f"PENDING ENTRY CONFIRMED: {symbol} | {pe.direction} | "
-                f"price={price:.5f} crossed confirm={pe.trigger_confirm_price:.5f} "
-                f"— entering {pe.direction} at {price:.5f}, stop={planned_stop:.5f} "
-                f"({sl_mid_pct*100:.0f}% between entry_ref={pe.entry_ref_price:.5f} "
-                f"and fill), target={pe.target_ref_price:.5f}"
+                f"PENDING ENTRY CONFIRMED: {symbol} | indicator called "
+                f"{pe.direction} | price={price:.5f} crossed "
+                f"confirm={pe.trigger_confirm_price:.5f} — fading back to "
+                f"entry: entering {fade_dir} at {price:.5f}, "
+                f"stop={pe.target_ref_price:.5f} (native_target), "
+                f"target={pe.entry_ref_price:.5f} (native_entry)"
             )
         else:
-            flipped = "SHORT" if is_long else "LONG"
             logger.info(
                 f"PENDING ENTRY REJECTED: {symbol} | indicator called "
                 f"{pe.direction} | price={price:.5f} crossed "
-                f"reject={pe.trigger_reject_price:.5f} — entering {flipped} "
-                f"instead at {price:.5f}, stop={planned_stop:.5f} "
-                f"({sl_mid_pct*100:.0f}% between entry_ref={pe.entry_ref_price:.5f} "
-                f"and fill), target={pe.stop_ref_price:.5f}"
+                f"reject={pe.trigger_reject_price:.5f} — fading back to "
+                f"entry: entering {pe.direction} at {price:.5f}, "
+                f"stop={pe.stop_ref_price:.5f} (native_stop), "
+                f"target={pe.entry_ref_price:.5f} (native_entry)"
             )
         asyncio.create_task(self._execute_pending_entry(symbol, pe, price, branch))
 
@@ -1438,29 +1438,32 @@ class BotEngine:
                         f"concurrent cap ({family_count}/{max_per_family})")
                     return
 
-            # Stop-loss sits at STOP_LOSS_MIDPOINT_PCT of the way between the
-            # ORIGINAL native_entry_price and the ACTUAL execution price
-            # (live_price, wherever the confirm/reject trigger fired) — not
-            # pinned exactly to native_entry_price anymore. What differs by
-            # branch is direction and take-profit:
-            #   confirm -> same direction, target = original native_target
-            #   reject  -> opposite direction, target = original native_stop
-            #              (repurposed as this flipped trade's target)
+            # FADE-BACK-TO-ENTRY design (Sep 12 2026): trigger timing is
+            # unchanged (confirm/reject still fire off the same 75% marks),
+            # but what gets traded now bets on price reverting to the
+            # ORIGINAL native_entry_price rather than continuing:
+            #   - take-profit is ALWAYS native_entry_price, on either branch.
+            #   - stop-loss is the level price was originally heading toward
+            #     for that branch — native_target_price on confirm,
+            #     native_stop_price on reject — used as the exact original
+            #     price, not a midpoint (STOP_LOSS_MIDPOINT_PCT no longer
+            #     applies to this design).
+            #   - since the target moves to the OPPOSITE side of price from
+            #     where it was, direction has to flip to match: confirm
+            #     (price extended toward the old target) trades OPPOSITE the
+            #     indicator's call; reject (price extended toward the old
+            #     stop) trades the SAME direction the indicator called.
             # entry_price is overridden to the live trigger price since
             # deriv_client.buy_multiplier() measures its SL/TP dollar
-            # distance off whatever entry_price it's given, and the real
-            # fill reference is this live price, not the stale signal-time
-            # one — the take-profit PRICE itself stays the original absolute
-            # level computed at arm time, unmodified.
+            # distance off whatever entry_price it's given.
             if branch == "confirm":
-                new_direction = pe.direction
-                new_target    = pe.target_ref_price
-            else:
                 new_direction = "SHORT" if pe.direction == "LONG" else "LONG"
-                new_target    = pe.stop_ref_price
+                new_stop      = pe.target_ref_price
+            else:
+                new_direction = pe.direction
+                new_stop      = pe.stop_ref_price
 
-            sl_mid_pct = getattr(config, "STOP_LOSS_MIDPOINT_PCT", 0.5)
-            new_stop = pe.entry_ref_price + sl_mid_pct * (live_price - pe.entry_ref_price)
+            new_target = pe.entry_ref_price
 
             swapped_sig = replace(
                 pe.sig,
@@ -1468,7 +1471,7 @@ class BotEngine:
                 native_stop_price=new_stop,
                 native_target_price=new_target,
                 native_entry_price=live_price,
-                execution_inverted=(branch == "reject"),
+                execution_inverted=(branch == "confirm"),
             )
             await self._execute(symbol, swapped_sig)
         finally:
