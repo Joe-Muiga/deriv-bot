@@ -519,39 +519,47 @@ INVERT_ALL_SIGNALS = False
 # unchanged — only the swap is removed.
 TP_SL_SWAP_ENABLED = False
 
-# ── DELAYED ENTRY — two-trigger design (user-directed, Sep 12 2026) ──────
-# Replaces the previous single-trigger + scaled-transform design entirely.
+# ── DELAYED ENTRY — two-trigger, fade-back-to-entry design (user-directed,
+#    Sep 12 2026, latest twist same day) ──────────────────────────────────
 # A firing signal is NOT bought immediately. It's armed
 # (bot_engine.py's self._pending_entries) with TWO trigger prices watched
 # tick by tick against its own RAW, UNMODIFIED native_entry_price /
 # native_stop_price / native_target_price — whichever the market reaches
-# first decides everything:
+# first decides everything. Trigger TIMING is unchanged from the original
+# two-trigger design; what changed is that BOTH branches now bet on price
+# reverting to the original native_entry_price rather than continuing:
 #
 #   CONFIRM: price moves DELAYED_ENTRY_TRIGGER_PCT of the entry-to-target
-#   distance IN the indicator's own direction.
-#     -> trade the SAME direction the indicator called
-#     -> stop-loss = the original native_entry_price
-#     -> take-profit = the original native_target_price, unchanged
+#   distance IN the indicator's own direction (i.e. the move looked real).
+#     -> trade the OPPOSITE direction from what the indicator called —
+#        fading back toward entry from the target side
+#     -> stop-loss = the original native_target_price (where price was
+#        heading before the fade bet)
+#     -> take-profit = native_entry_price
 #
 #   REJECT: price instead moves DELAYED_ENTRY_TRIGGER_PCT of the
 #   entry-to-stop distance AGAINST the indicator's call.
-#     -> trade the OPPOSITE direction instead
-#     -> stop-loss = the original native_entry_price (same as CONFIRM)
-#     -> take-profit = the original native_stop_price, repurposed as this
-#        flipped trade's target
+#     -> trade the SAME direction the indicator originally called —
+#        fading back toward entry from the stop side
+#     -> stop-loss = the original native_stop_price
+#     -> take-profit = native_entry_price
 #
 # Worked example: indicator says LONG, entry=100, native_stop=90,
-# native_target=130, DELAYED_ENTRY_TRIGGER_PCT=0.25. Confirm trigger =
-# 107.5 (25% toward 130) -> if hit, buy at 107.5, stop=100, target=130.
-# Reject trigger = 97.5 (25% toward 90) -> if hit first instead, sell at
-# 97.5, stop=100, target=90. Mirrored the same way for an original SHORT.
+# native_target=130, DELAYED_ENTRY_TRIGGER_PCT=0.75. Confirm trigger =
+# 122.5 (75% toward 130) -> if hit, SELL at 122.5 (opposite of the
+# indicator's LONG), stop=130, target=100. Reject trigger = 92.5 (75%
+# toward 90) -> if hit first instead, BUY at 92.5 (same as the indicator's
+# original LONG), stop=90, target=100. Mirrored the same way for an
+# original SHORT.
 #
 # The entry price itself is always the live price at whichever trigger
 # fires — the stop and target are always the ORIGINAL absolute levels
-# from arm time, never recomputed off the live price. There is no more
-# "scrap" outcome — reaching the reject side is a valid trade, not a
-# failure. Only DELAYED_ENTRY_TIMEOUT_SECS still results in no trade at
-# all, if the market never reaches either trigger.
+# from arm time (native_target_price / native_stop_price / native_entry_price),
+# never recomputed off the live price — STOP_LOSS_MIDPOINT_PCT below no
+# longer applies to this design, it's dormant. There is no "scrap"
+# outcome — reaching either side is a valid trade. Only
+# DELAYED_ENTRY_TIMEOUT_SECS still results in no trade at all, if the
+# market never reaches either trigger.
 #
 # Only applies to signals that carry native price levels (the live
 # popular-indicator path) with direction LONG/SHORT and contract_kind
@@ -564,6 +572,10 @@ DELAYED_ENTRY_TRIGGER_PCT  = 0.75   # was 0.50, before that 0.25, 0.15, 0.75, 0.
                                       # triggers; tune here to change both at once.
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
+# DORMANT as of the Sep 12 2026 fade-back-to-entry redesign above — that
+# design uses native_target_price/native_stop_price directly as the exact
+# stop-loss, not a midpoint. Left here in case a future design wants it
+# back; not read by any current code path.
 # Stop-loss placement (user-directed, Sep 12 2026): on whichever branch
 # fires (confirm or reject), the stop is no longer pinned exactly to
 # native_entry_price — it sits STOP_LOSS_MIDPOINT_PCT of the way between
