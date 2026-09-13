@@ -608,8 +608,8 @@ DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerl
 # meta-labeling / strategy_stats.
 FIXED_ENTRY_LEVELS_ENABLED   = True
 FIXED_ENTRY_INVERT_DIRECTION = True
-FIXED_ENTRY_TP_PCT           = 0.50   # was 0.59
-FIXED_ENTRY_SL_PCT           = 0.25   # was 0.29 — ratio held at exactly 2:1
+FIXED_ENTRY_TP_PCT           = 2.00   # was 0.59
+FIXED_ENTRY_SL_PCT           = 1.00   # was 0.29 — ratio held at exactly 2:1
 
 # DORMANT as of the Sep 12 2026 fixed-percentage redesign above — that
 # design uses native_target_price/native_stop_price directly as the exact
