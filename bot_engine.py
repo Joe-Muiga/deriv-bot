@@ -1484,18 +1484,24 @@ class BotEngine:
 
     def _apply_fixed_pct_native_levels(self, sig: SignalResult) -> SignalResult:
         """
-        Entry is immediate, exactly as the indicator signals — direction is
-        never flipped, native_entry_price is never modified. Only stop-loss
-        and take-profit get replaced, both measured off the SAME
-        entry-to-target distance:
+        Entry is immediate, exactly as the indicator signals —
+        native_entry_price is never modified either way. Both stop-loss and
+        take-profit are measured off the SAME entry-to-target distance;
+        whether direction flips and which side each level lands on depends
+        on config.FIXED_ENTRY_INVERT_DIRECTION:
+
+        True (current default): direction flips (LONG<->SHORT) and both
+        levels mirror to the sides that match the FLIPPED direction:
+            take_profit = entry - FIXED_ENTRY_TP_PCT * (target - entry)
+            stop_loss   = entry + FIXED_ENTRY_SL_PCT * (target - entry)
+
+        False: direction is left alone and the same two distances land on
+        their ORIGINAL (non-mirrored) sides instead:
             take_profit = entry + FIXED_ENTRY_TP_PCT * (target - entry)
             stop_loss   = entry - FIXED_ENTRY_SL_PCT * (target - entry)
-        take_profit lands on the target side of entry (same side the
-        original native_target_price was on); stop_loss lands on the
-        OPPOSITE side (the native stop-loss's side) — note the minus sign —
-        using that same entry-to-target distance as its magnitude, not the
-        original entry-to-stop distance. Both formulas are direction-agnostic:
-        (target - entry) already carries the right sign for LONG vs SHORT.
+
+        Either way both formulas are direction-agnostic: (target - entry)
+        already carries the right sign for LONG vs SHORT.
         """
         if not getattr(config, "FIXED_ENTRY_LEVELS_ENABLED", False):
             return sig
@@ -1506,27 +1512,36 @@ class BotEngine:
         if sig.native_entry_price is None or sig.native_target_price is None:
             return sig
 
-        entry   = float(sig.native_entry_price)
-        target  = float(sig.native_target_price)
-        tp_pct  = getattr(config, "FIXED_ENTRY_TP_PCT", 0.59)
-        sl_pct  = getattr(config, "FIXED_ENTRY_SL_PCT", 0.29)
+        entry    = float(sig.native_entry_price)
+        target   = float(sig.native_target_price)
+        tp_pct   = getattr(config, "FIXED_ENTRY_TP_PCT", 0.50)
+        sl_pct   = getattr(config, "FIXED_ENTRY_SL_PCT", 0.25)
+        invert   = getattr(config, "FIXED_ENTRY_INVERT_DIRECTION", True)
         distance = target - entry
 
-        new_target = entry + tp_pct * distance
-        new_stop   = entry - sl_pct * distance
+        if invert:
+            new_direction = "SHORT" if sig.direction == "LONG" else "LONG"
+            new_target    = entry - tp_pct * distance
+            new_stop      = entry + sl_pct * distance
+        else:
+            new_direction = sig.direction
+            new_target    = entry + tp_pct * distance
+            new_stop      = entry - sl_pct * distance
 
         fixed = replace(
             sig,
+            direction=new_direction,
             native_stop_price=new_stop,
             native_target_price=new_target,
-            execution_inverted=False,
+            execution_inverted=invert,
         )
         logger.info(
-            f"FIXED-PCT NATIVE LEVELS: {sig.direction} | entry={entry:.5f} "
-            f"(unchanged) | native_target={target:.5f} -> take_profit="
-            f"{new_target:.5f} ({tp_pct*100:.0f}% of entry-to-target, target "
-            f"side) | stop_loss={new_stop:.5f} ({sl_pct*100:.0f}% of "
-            f"entry-to-target, opposite side) | ratio={tp_pct/sl_pct:.2f}:1"
+            f"FIXED-PCT NATIVE LEVELS: {sig.direction}"
+            f"{' -> ' + new_direction if invert else ''} | entry={entry:.5f} "
+            f"(unchanged) | take_profit={new_target:.5f} ({tp_pct*100:.0f}% "
+            f"of entry-to-target) | stop_loss={new_stop:.5f} "
+            f"({sl_pct*100:.0f}% of entry-to-target) | "
+            f"ratio={tp_pct/sl_pct:.2f}:1"
         )
         return fixed
 
