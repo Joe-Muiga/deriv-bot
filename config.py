@@ -575,28 +575,41 @@ DELAYED_ENTRY_TRIGGER_PCT  = 0.75   # was 0.50, before that 0.25, 0.15, 0.75, 0.
                                       # triggers; tune here to change both at once.
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
-# ── FIXED-PERCENTAGE-OF-TARGET NATIVE LEVELS (user-directed, Sep 12 2026) ──
-# Entry is immediate, exactly as the indicator signals — no delay, no
-# direction flip, native_entry_price used unmodified. Only the stop-loss
-# and take-profit get replaced, both measured off the SAME entry-to-target
-# distance (native_target_price - native_entry_price):
+# ── FIXED-PERCENTAGE-OF-TARGET NATIVE LEVELS (user-directed, Sep 12 2026,
+#    inversion twist same day) ────────────────────────────────────────────
+# Entry is immediate, exactly as the indicator signals — no delay,
+# native_entry_price used unmodified. Direction and levels behave
+# differently depending on FIXED_ENTRY_INVERT_DIRECTION:
+#
+# FIXED_ENTRY_INVERT_DIRECTION = True (current default): direction flips
+# (LONG<->SHORT: indicator's buy executes as sell, sell as buy) and the
+# take-profit/stop-loss mirror to the sides that match the FLIPPED
+# direction — both still measured off the SAME entry-to-target distance:
+#   take_profit = native_entry_price - FIXED_ENTRY_TP_PCT * (native_target_price - native_entry_price)
+#   stop_loss   = native_entry_price + FIXED_ENTRY_SL_PCT * (native_target_price - native_entry_price)
+# Worked example: indicator says LONG (buy), entry=100, native_target=130.
+# Executed as SHORT (sell) instead, take_profit=85 (50% of the
+# entry-to-target distance, now BELOW entry — the flipped trade's profit
+# side), stop_loss=107.5 (25% of that distance, now ABOVE entry — the
+# flipped trade's loss side). Ratio 0.50/0.25 = exactly 2:1.
+#
+# FIXED_ENTRY_INVERT_DIRECTION = False: direction is left alone and the
+# same two distances land on their ORIGINAL (non-mirrored) sides instead:
 #   take_profit = native_entry_price + FIXED_ENTRY_TP_PCT * (native_target_price - native_entry_price)
 #     -> on the TARGET side of entry, same side as the original native target.
 #   stop_loss   = native_entry_price - FIXED_ENTRY_SL_PCT * (native_target_price - native_entry_price)
-#     -> on the OPPOSITE side of entry (the native stop-loss's side) —
-#        note the minus sign: same distance magnitude as if measured from
-#        the target side, but placed on the loss side, not the profit side.
-# Both formulas are direction-agnostic — (native_target_price -
-# native_entry_price) already carries the right sign for LONG vs SHORT.
-# FIXED_ENTRY_SL_PCT was nudged down from the 31% first requested (59/31 ~=
-# 1.9:1) to keep the reward:risk ratio safely above 2:1 (59/29 ~= 2.03:1)
-# per explicit instruction. Worked example: indicator LONG, entry=100,
-# target=130 (stop=90 unused by this formula) -> take_profit = 100 +
-# 0.59*30 = 117.7, stop_loss = 100 - 0.29*30 = 91.3. See bot_engine.py's
-# _apply_fixed_pct_native_levels() for the implementation.
-FIXED_ENTRY_LEVELS_ENABLED = True
-FIXED_ENTRY_TP_PCT         = 0.25
-FIXED_ENTRY_SL_PCT         = 0.50   # was 0.31 — nudged down to clear 2:1
+#     -> on the OPPOSITE side of entry (the native stop-loss's side).
+#
+# Either way, both formulas are direction-agnostic — (native_target_price -
+# native_entry_price) already carries the right sign for LONG vs SHORT. See
+# bot_engine.py's _apply_fixed_pct_native_levels() for the implementation,
+# and _execute()'s `inverted` bookkeeping (keyed off
+# SignalResult.execution_inverted) for how a flip gets recorded for
+# meta-labeling / strategy_stats.
+FIXED_ENTRY_LEVELS_ENABLED   = True
+FIXED_ENTRY_INVERT_DIRECTION = True
+FIXED_ENTRY_TP_PCT           = 0.50   # was 0.59
+FIXED_ENTRY_SL_PCT           = 0.25   # was 0.29 — ratio held at exactly 2:1
 
 # DORMANT as of the Sep 12 2026 fixed-percentage redesign above — that
 # design uses native_target_price/native_stop_price directly as the exact
