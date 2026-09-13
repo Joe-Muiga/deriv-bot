@@ -596,7 +596,7 @@ DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerl
 # _apply_fixed_pct_native_levels() for the implementation.
 FIXED_ENTRY_LEVELS_ENABLED = True
 FIXED_ENTRY_TP_PCT         = 0.59
-FIXED_ENTRY_SL_PCT         = 0.29   # was 0.31 — nudged down to clear 2:1
+FIXED_ENTRY_SL_PCT         = 0.14   # was 0.31 — nudged down to clear 2:1
 
 # DORMANT as of the Sep 12 2026 fixed-percentage redesign above — that
 # design uses native_target_price/native_stop_price directly as the exact
