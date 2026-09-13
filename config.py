@@ -566,13 +566,39 @@ TP_SL_SWAP_ENABLED = False
 # RISE_FALL — DIGIT signals (Jump buildup) are untouched. See
 # bot_engine.py's _arm_pending_entry / _check_pending_entry /
 # _execute_pending_entry for the implementation.
-DELAYED_ENTRY_ENABLED      = True
+# DISABLED (user-directed, Sep 12 2026): entry is immediate again — the
+# fixed-percentage-of-target design below replaces this two-trigger
+# machinery entirely. Left in place, dormant, in case it's wanted back.
+DELAYED_ENTRY_ENABLED      = False
 DELAYED_ENTRY_TRIGGER_PCT  = 0.75   # was 0.50, before that 0.25, 0.15, 0.75, 0.33 —
                                       # now shared by BOTH the confirm and reject
                                       # triggers; tune here to change both at once.
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
-# DORMANT as of the Sep 12 2026 fade-back-to-entry redesign above — that
+# ── FIXED-PERCENTAGE-OF-TARGET NATIVE LEVELS (user-directed, Sep 12 2026) ──
+# Entry is immediate, exactly as the indicator signals — no delay, no
+# direction flip, native_entry_price used unmodified. Only the stop-loss
+# and take-profit get replaced, both measured off the SAME entry-to-target
+# distance (native_target_price - native_entry_price):
+#   take_profit = native_entry_price + FIXED_ENTRY_TP_PCT * (native_target_price - native_entry_price)
+#     -> on the TARGET side of entry, same side as the original native target.
+#   stop_loss   = native_entry_price - FIXED_ENTRY_SL_PCT * (native_target_price - native_entry_price)
+#     -> on the OPPOSITE side of entry (the native stop-loss's side) —
+#        note the minus sign: same distance magnitude as if measured from
+#        the target side, but placed on the loss side, not the profit side.
+# Both formulas are direction-agnostic — (native_target_price -
+# native_entry_price) already carries the right sign for LONG vs SHORT.
+# FIXED_ENTRY_SL_PCT was nudged down from the 31% first requested (59/31 ~=
+# 1.9:1) to keep the reward:risk ratio safely above 2:1 (59/29 ~= 2.03:1)
+# per explicit instruction. Worked example: indicator LONG, entry=100,
+# target=130 (stop=90 unused by this formula) -> take_profit = 100 +
+# 0.59*30 = 117.7, stop_loss = 100 - 0.29*30 = 91.3. See bot_engine.py's
+# _apply_fixed_pct_native_levels() for the implementation.
+FIXED_ENTRY_LEVELS_ENABLED = True
+FIXED_ENTRY_TP_PCT         = 0.59
+FIXED_ENTRY_SL_PCT         = 0.29   # was 0.31 — nudged down to clear 2:1
+
+# DORMANT as of the Sep 12 2026 fixed-percentage redesign above — that
 # design uses native_target_price/native_stop_price directly as the exact
 # stop-loss, not a midpoint. Left here in case a future design wants it
 # back; not read by any current code path.
@@ -624,7 +650,11 @@ STOP_LOSS_MIDPOINT_PCT = 0.5
 # _apply_scaled_native_levels() for the implementation, and _execute()'s
 # `inverted` bookkeeping (keyed off SignalResult.execution_inverted) for
 # how a flip gets recorded for meta-labeling / strategy_stats.
-SCALED_SL_TP_ENABLED          = True
+# DISABLED (user-directed, Sep 12 2026): FIXED_ENTRY_LEVELS_ENABLED above
+# takes over entirely for the currently-active immediate-execution path,
+# and it never flips direction ("we are going to trade just how the
+# indicators tell us to, no inversion"). Left in place, dormant.
+SCALED_SL_TP_ENABLED          = False
 SCALED_SL_TP_INVERT_DIRECTION = True
 SCALED_TP_STOP_MULT           = 1.50   # was 1.33
 SCALED_SL_TARGET_MULT         = 0.35   # was 0.60
@@ -981,10 +1011,10 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 13.7 / 60   # 13.7 minutes, expressed as hours since
-                                        # that's the unit restart_scheduler.py
-                                        # expects (interval_secs = hours*3600).
-                                        # Was 1h, before that 3h.
+REDEPLOY_INTERVAL_HOURS = 11 / 60   # 11 minutes, expressed as hours since
+                                      # that's the unit restart_scheduler.py
+                                      # expects (interval_secs = hours*3600).
+                                      # Was 13.7 min, before that 1h, 3h.
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
