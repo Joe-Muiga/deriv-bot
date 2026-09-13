@@ -1238,7 +1238,7 @@ class BotEngine:
                         # a slow buy call leaves the symbol "available" for
                         # the next cycle to select and execute again.
                         self._executing_symbols.add(r.symbol)
-                        to_execute.append(replace(r, sig=self._apply_scaled_native_levels(s)))
+                        to_execute.append(replace(r, sig=self._apply_fixed_pct_native_levels(s)))
 
                 if to_execute:
                     await asyncio.gather(
@@ -1476,6 +1476,59 @@ class BotEngine:
             await self._execute(symbol, swapped_sig)
         finally:
             self._executing_symbols.discard(symbol)
+
+    # ── Fixed-percentage-of-target native levels (immediate entry) ───────────────
+    # See config.py's "FIXED-PERCENTAGE-OF-TARGET NATIVE LEVELS" block for the
+    # spec. Currently the only active transform on the immediate-execution path —
+    # delayed entry and the scaled+inverted transform are both disabled.
+
+    def _apply_fixed_pct_native_levels(self, sig: SignalResult) -> SignalResult:
+        """
+        Entry is immediate, exactly as the indicator signals — direction is
+        never flipped, native_entry_price is never modified. Only stop-loss
+        and take-profit get replaced, both measured off the SAME
+        entry-to-target distance:
+            take_profit = entry + FIXED_ENTRY_TP_PCT * (target - entry)
+            stop_loss   = entry - FIXED_ENTRY_SL_PCT * (target - entry)
+        take_profit lands on the target side of entry (same side the
+        original native_target_price was on); stop_loss lands on the
+        OPPOSITE side (the native stop-loss's side) — note the minus sign —
+        using that same entry-to-target distance as its magnitude, not the
+        original entry-to-stop distance. Both formulas are direction-agnostic:
+        (target - entry) already carries the right sign for LONG vs SHORT.
+        """
+        if not getattr(config, "FIXED_ENTRY_LEVELS_ENABLED", False):
+            return sig
+        if sig.direction not in ("LONG", "SHORT"):
+            return sig
+        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL":
+            return sig
+        if sig.native_entry_price is None or sig.native_target_price is None:
+            return sig
+
+        entry   = float(sig.native_entry_price)
+        target  = float(sig.native_target_price)
+        tp_pct  = getattr(config, "FIXED_ENTRY_TP_PCT", 0.59)
+        sl_pct  = getattr(config, "FIXED_ENTRY_SL_PCT", 0.29)
+        distance = target - entry
+
+        new_target = entry + tp_pct * distance
+        new_stop   = entry - sl_pct * distance
+
+        fixed = replace(
+            sig,
+            native_stop_price=new_stop,
+            native_target_price=new_target,
+            execution_inverted=False,
+        )
+        logger.info(
+            f"FIXED-PCT NATIVE LEVELS: {sig.direction} | entry={entry:.5f} "
+            f"(unchanged) | native_target={target:.5f} -> take_profit="
+            f"{new_target:.5f} ({tp_pct*100:.0f}% of entry-to-target, target "
+            f"side) | stop_loss={new_stop:.5f} ({sl_pct*100:.0f}% of "
+            f"entry-to-target, opposite side) | ratio={tp_pct/sl_pct:.2f}:1"
+        )
+        return fixed
 
     # ── Scaled native SL/TP (immediate entry) ────────────────────────────────────
     # See config.py's "SCALED NATIVE SL/TP" block for the spec. Distinct from the
