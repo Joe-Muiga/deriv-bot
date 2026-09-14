@@ -607,7 +607,7 @@ DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerl
 # SignalResult.execution_inverted) for how a flip gets recorded for
 # meta-labeling / strategy_stats.
 FIXED_ENTRY_LEVELS_ENABLED   = True
-FIXED_ENTRY_INVERT_DIRECTION = True
+FIXED_ENTRY_INVERT_DIRECTION = False 
 FIXED_ENTRY_TP_PCT           = 0.44   # was 0.59
 FIXED_ENTRY_SL_PCT           = 0.22   # was 0.29 — ratio held at exactly 2:1
 
