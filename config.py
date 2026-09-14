@@ -569,8 +569,8 @@ TP_SL_SWAP_ENABLED = False
 # DISABLED (user-directed, Sep 12 2026): entry is immediate again — the
 # fixed-percentage-of-target design below replaces this two-trigger
 # machinery entirely. Left in place, dormant, in case it's wanted back.
-DELAYED_ENTRY_ENABLED      = False
-DELAYED_ENTRY_TRIGGER_PCT  = 0.75   # was 0.50, before that 0.25, 0.15, 0.75, 0.33 —
+DELAYED_ENTRY_ENABLED      = True
+DELAYED_ENTRY_TRIGGER_PCT  = 0.20   # was 0.50, before that 0.25, 0.15, 0.75, 0.33 —
                                       # now shared by BOTH the confirm and reject
                                       # triggers; tune here to change both at once.
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
