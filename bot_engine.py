@@ -106,34 +106,30 @@ class PendingEntry:
     """
     A signal that fired but hasn't been bought yet — armed and watched
     tick-by-tick (see bot_engine._check_pending_entry, called from
-    _on_tick) until one of two triggers fires, or it expires unfilled.
-    See config.py's "DELAYED ENTRY" block (Sep 12 2026 two-trigger design).
+    _on_tick) until price reaches the native stop-loss, or it expires
+    unfilled. See config.py's "DELAYED ENTRY — stop as trigger" block
+    (Sep 12 2026 single-trigger redesign, replacing the earlier two-trigger
+    designs entirely).
 
-    Two prices are armed at once, both measured from the ORIGINAL native
-    entry, and whichever the market reaches first decides everything —
-    both branches now bet on price fading back to the original
-    native_entry_price rather than continuing (Sep 12 2026 redesign):
-      - CONFIRM (trigger_confirm_price): price moves DELAYED_ENTRY_TRIGGER_PCT
-        of the entry-to-target distance in the indicator's own direction.
-        Trades the OPPOSITE direction from what the indicator called (a
-        fade back toward entry from the target side), stop-loss = the
-        original native_target_price, take-profit = native_entry_price.
-      - REJECT (trigger_reject_price): price instead moves
-        DELAYED_ENTRY_TRIGGER_PCT of the entry-to-stop distance against the
-        indicator's call. Trades the SAME direction the indicator called (a
-        fade back toward entry from the stop side), stop-loss = the
-        original native_stop_price, take-profit = native_entry_price.
-    There is no separate "scrap" outcome — reaching either side is a valid
-    trade. Only the timeout still results in no trade.
+    Single trigger: price reaching the indicator's own native_stop_price.
+    That's also where we enter — direction is NEVER flipped, we continue
+    the indicator's original call:
+      - target = live entry price + STOP_TRIGGERED_TARGET_PCT * (the
+        ORIGINAL native_target_price - native_entry_price distance),
+        applied toward where the original target was.
+      - stop, computed AFTER the target: placed on the opposite side of
+        entry from the target, at 1/STOP_TRIGGERED_RISK_REWARD_RATIO of
+        the target distance — so the reward:risk ratio is always exactly
+        STOP_TRIGGERED_RISK_REWARD_RATIO (2:1 by default), by construction.
+    There is no "scrap" outcome. Only the timeout still results in no trade.
     """
     symbol:                str
     sig:                   SignalResult
-    direction:              str     # original indicator direction, locked at arm time
-    entry_ref_price:        float   # native_entry_price when armed
-    stop_ref_price:         float   # native_stop_price when armed (original SL)
-    target_ref_price:       float   # native_target_price when armed (original TP)
-    trigger_confirm_price:  float   # entry_ref + PCT * (target_ref - entry_ref)
-    trigger_reject_price:   float   # entry_ref + PCT * (stop_ref - entry_ref)
+    direction:              str     # original indicator direction, unchanged at execution
+    entry_ref_price:        float   # native_entry_price when armed (used only for the target-distance calc)
+    stop_ref_price:         float   # native_stop_price when armed — this IS the trigger
+    target_ref_price:       float   # native_target_price when armed (used only for the target-distance calc)
+    trigger_price:          float   # == stop_ref_price; kept as its own field for clarity at call sites
     created_at:             float
     strategy:               str
 
@@ -1306,28 +1302,22 @@ class BotEngine:
         entry  = float(sig.native_entry_price)
         stop   = float(sig.native_stop_price)
         target = float(sig.native_target_price)
-        pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.25)
-        # Both direction-agnostic: (target-entry) and (stop-entry) already
-        # carry the right sign for LONG vs SHORT, so these two formulas work
-        # unmodified either way.
-        trigger_confirm = entry + pct * (target - entry)
-        trigger_reject  = entry + pct * (stop - entry)
 
         self._pending_entries[symbol] = PendingEntry(
             symbol=symbol, sig=sig, direction=sig.direction,
             entry_ref_price=entry, stop_ref_price=stop, target_ref_price=target,
-            trigger_confirm_price=trigger_confirm, trigger_reject_price=trigger_reject,
+            trigger_price=stop,
             created_at=time.time(), strategy=getattr(sig, "strategy", "unknown"),
         )
-        fade_confirm_dir = "SHORT" if sig.direction == "LONG" else "LONG"
+        tp_pct = getattr(config, "STOP_TRIGGERED_TARGET_PCT", 0.5)
+        ratio  = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
         logger.info(
-            f"PENDING ENTRY ARMED: {symbol} | indicator called {sig.direction} | "
-            f"entry_ref={entry:.5f} | CONFIRM @ {trigger_confirm:.5f} "
-            f"({pct*100:.0f}% toward native_target={target:.5f}) -> fade back: "
-            f"{fade_confirm_dir}, stop={target:.5f}, target={entry:.5f} | "
-            f"REJECT @ {trigger_reject:.5f} ({pct*100:.0f}% toward "
-            f"native_stop={stop:.5f}) -> fade back: {sig.direction}, "
-            f"stop={stop:.5f}, target={entry:.5f}"
+            f"PENDING ENTRY ARMED: {symbol} | {sig.direction} (unchanged on "
+            f"trigger) | entry_ref={entry:.5f} | TRIGGER = native_stop="
+            f"{stop:.5f} | on trigger: enter {sig.direction} there, target = "
+            f"trigger + {tp_pct*100:.0f}% of the original entry-to-target "
+            f"distance ({target - entry:.5f}), stop computed after at "
+            f"1/{ratio:.1f} of the target distance for an exact {ratio:.1f}:1 ratio"
         )
 
     def _check_pending_entry(self, symbol: str, price: float) -> None:
@@ -1339,29 +1329,23 @@ class BotEngine:
         timeout = getattr(config, "DELAYED_ENTRY_TIMEOUT_SECS", 600)
         if time.time() - pe.created_at > timeout:
             logger.info(
-                f"PENDING ENTRY EXPIRED: {symbol} | {pe.direction} | reached "
-                f"neither confirm={pe.trigger_confirm_price:.5f} nor "
-                f"reject={pe.trigger_reject_price:.5f} within {timeout}s"
+                f"PENDING ENTRY EXPIRED: {symbol} | {pe.direction} | never "
+                f"reached trigger (native_stop)={pe.trigger_price:.5f} "
+                f"within {timeout}s"
             )
             del self._pending_entries[symbol]
             return
 
         is_long = pe.direction == "LONG"
 
-        # CONFIRM: price moved toward the indicator's own target. Trade in
-        # the SAME direction the indicator called.
-        confirm_hit = (is_long and price >= pe.trigger_confirm_price) or \
-                      (not is_long and price <= pe.trigger_confirm_price)
-        # REJECT: price instead moved toward the indicator's own stop.
-        # Trade in the OPPOSITE direction — this is a second valid trigger,
-        # not a failure; there is no more "scrap" outcome.
-        reject_hit = (is_long and price <= pe.trigger_reject_price) or \
-                     (not is_long and price >= pe.trigger_reject_price)
-
-        if not (confirm_hit or reject_hit):
+        # Single trigger: price reaching the indicator's own native stop.
+        # For a LONG, native_stop sits below native_entry, so "reaching" it
+        # means price falling to or below it. For a SHORT it's the mirror.
+        triggered = (is_long and price <= pe.trigger_price) or \
+                    (not is_long and price >= pe.trigger_price)
+        if not triggered:
             return
 
-        branch = "confirm" if confirm_hit else "reject"
         del self._pending_entries[symbol]
         # Reserve the symbol THE INSTANT it's decided, synchronously —
         # before asyncio.create_task() even schedules the coroutine.
@@ -1374,32 +1358,19 @@ class BotEngine:
         # simultaneous same-symbol positions were getting opened.
         # _execute_pending_entry()'s finally block releases this.
         self._executing_symbols.add(symbol)
-        if branch == "confirm":
-            fade_dir = "SHORT" if is_long else "LONG"
-            logger.info(
-                f"PENDING ENTRY CONFIRMED: {symbol} | indicator called "
-                f"{pe.direction} | price={price:.5f} crossed "
-                f"confirm={pe.trigger_confirm_price:.5f} — fading back to "
-                f"entry: entering {fade_dir} at {price:.5f}, "
-                f"stop={pe.target_ref_price:.5f} (native_target), "
-                f"target={pe.entry_ref_price:.5f} (native_entry)"
-            )
-        else:
-            logger.info(
-                f"PENDING ENTRY REJECTED: {symbol} | indicator called "
-                f"{pe.direction} | price={price:.5f} crossed "
-                f"reject={pe.trigger_reject_price:.5f} — fading back to "
-                f"entry: entering {pe.direction} at {price:.5f}, "
-                f"stop={pe.stop_ref_price:.5f} (native_stop), "
-                f"target={pe.entry_ref_price:.5f} (native_entry)"
-            )
-        asyncio.create_task(self._execute_pending_entry(symbol, pe, price, branch))
+        logger.info(
+            f"PENDING ENTRY TRIGGERED: {symbol} | {pe.direction} | "
+            f"price={price:.5f} reached native_stop={pe.trigger_price:.5f} — "
+            f"entering {pe.direction} at {price:.5f}, continuing toward "
+            f"where the original target was"
+        )
+        asyncio.create_task(self._execute_pending_entry(symbol, pe, price))
 
     async def _execute_pending_entry(
-            self, symbol: str, pe: PendingEntry, live_price: float, branch: str) -> None:
+            self, symbol: str, pe: PendingEntry, live_price: float) -> None:
         """
-        Fires the actual buy once a pending entry has triggered — either the
-        "confirm" or "reject" branch (see PendingEntry's docstring). Re-checks
+        Fires the actual buy once price has reached the native stop-loss
+        (the single trigger — see PendingEntry's docstring). Re-checks
         every guard the normal cycle loop would have applied (can_trade_now,
         concurrent slots, family cap) since this can fire between cycles.
 
@@ -1438,40 +1409,36 @@ class BotEngine:
                         f"concurrent cap ({family_count}/{max_per_family})")
                     return
 
-            # FADE-BACK-TO-ENTRY design (Sep 12 2026): trigger timing is
-            # unchanged (confirm/reject still fire off the same 75% marks),
-            # but what gets traded now bets on price reverting to the
-            # ORIGINAL native_entry_price rather than continuing:
-            #   - take-profit is ALWAYS native_entry_price, on either branch.
-            #   - stop-loss is the level price was originally heading toward
-            #     for that branch — native_target_price on confirm,
-            #     native_stop_price on reject — used as the exact original
-            #     price, not a midpoint (STOP_LOSS_MIDPOINT_PCT no longer
-            #     applies to this design).
-            #   - since the target moves to the OPPOSITE side of price from
-            #     where it was, direction has to flip to match: confirm
-            #     (price extended toward the old target) trades OPPOSITE the
-            #     indicator's call; reject (price extended toward the old
-            #     stop) trades the SAME direction the indicator called.
+            # STOP-AS-TRIGGER design (Sep 12 2026): the trigger IS the entry
+            # — price reaching native_stop_price. Direction is NEVER
+            # flipped; we continue the indicator's original call:
+            #   - target = live_price + STOP_TRIGGERED_TARGET_PCT *
+            #     (the ORIGINAL native_target_price - native_entry_price
+            #     distance), applied toward where the original target was.
+            #   - stop, computed AFTER the target: opposite side of entry
+            #     from target, at 1/STOP_TRIGGERED_RISK_REWARD_RATIO of the
+            #     target distance — so the ratio is always exactly
+            #     STOP_TRIGGERED_RISK_REWARD_RATIO (2:1 default), by
+            #     construction, regardless of what the original indicator's
+            #     own entry-to-stop distance was.
             # entry_price is overridden to the live trigger price since
             # deriv_client.buy_multiplier() measures its SL/TP dollar
             # distance off whatever entry_price it's given.
-            if branch == "confirm":
-                new_direction = "SHORT" if pe.direction == "LONG" else "LONG"
-                new_stop      = pe.target_ref_price
-            else:
-                new_direction = pe.direction
-                new_stop      = pe.stop_ref_price
+            tp_pct = getattr(config, "STOP_TRIGGERED_TARGET_PCT", 0.5)
+            ratio  = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
+            original_distance = pe.target_ref_price - pe.entry_ref_price
 
-            new_target = pe.entry_ref_price
+            new_target = live_price + tp_pct * original_distance
+            target_distance = new_target - live_price
+            new_stop = live_price - (target_distance / ratio)
 
             swapped_sig = replace(
                 pe.sig,
-                direction=new_direction,
+                direction=pe.direction,
                 native_stop_price=new_stop,
                 native_target_price=new_target,
                 native_entry_price=live_price,
-                execution_inverted=(branch == "confirm"),
+                execution_inverted=False,
             )
             await self._execute(symbol, swapped_sig)
         finally:
