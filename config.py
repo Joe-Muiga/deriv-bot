@@ -519,62 +519,67 @@ INVERT_ALL_SIGNALS = False
 # unchanged — only the swap is removed.
 TP_SL_SWAP_ENABLED = False
 
-# ── DELAYED ENTRY — two-trigger, fade-back-to-entry design (user-directed,
-#    Sep 12 2026, latest twist same day) ──────────────────────────────────
+# ── DELAYED ENTRY — native stop as the trigger (user-directed, Sep 12 2026,
+#    replacing the two-trigger designs entirely) ──────────────────────────
 # A firing signal is NOT bought immediately. It's armed
-# (bot_engine.py's self._pending_entries) with TWO trigger prices watched
-# tick by tick against its own RAW, UNMODIFIED native_entry_price /
-# native_stop_price / native_target_price — whichever the market reaches
-# first decides everything. Trigger TIMING is unchanged from the original
-# two-trigger design; what changed is that BOTH branches now bet on price
-# reverting to the original native_entry_price rather than continuing:
+# (bot_engine.py's self._pending_entries) and watched tick by tick against
+# its own RAW, UNMODIFIED native_stop_price — a SINGLE trigger. Direction
+# is NEVER flipped; we continue the indicator's original call once
+# triggered:
 #
-#   CONFIRM: price moves DELAYED_ENTRY_TRIGGER_PCT of the entry-to-target
-#   distance IN the indicator's own direction (i.e. the move looked real).
-#     -> trade the OPPOSITE direction from what the indicator called —
-#        fading back toward entry from the target side
-#     -> stop-loss = the original native_target_price (where price was
-#        heading before the fade bet)
-#     -> take-profit = native_entry_price
-#
-#   REJECT: price instead moves DELAYED_ENTRY_TRIGGER_PCT of the
-#   entry-to-stop distance AGAINST the indicator's call.
-#     -> trade the SAME direction the indicator originally called —
-#        fading back toward entry from the stop side
-#     -> stop-loss = the original native_stop_price
-#     -> take-profit = native_entry_price
+#   TRIGGER: price reaches the indicator's own native_stop_price.
+#     -> enter there, in the SAME direction the indicator originally
+#        called (continuing toward where the original target was, not
+#        fading or reversing)
+#     -> target = live entry price + STOP_TRIGGERED_TARGET_PCT * (the
+#        ORIGINAL native_target_price - native_entry_price distance),
+#        applied toward where the original target was
+#     -> stop, computed AFTER the target is known: placed on the OPPOSITE
+#        side of entry from the target, at 1/STOP_TRIGGERED_RISK_REWARD_RATIO
+#        of the target distance — so the reward:risk ratio is always
+#        exactly STOP_TRIGGERED_RISK_REWARD_RATIO (2:1 by default), by
+#        construction, regardless of what the original indicator's own
+#        entry-to-stop distance was.
 #
 # Worked example: indicator says LONG, entry=100, native_stop=90,
-# native_target=130, DELAYED_ENTRY_TRIGGER_PCT=0.75. Confirm trigger =
-# 122.5 (75% toward 130) -> if hit, SELL at 122.5 (opposite of the
-# indicator's LONG), stop=130, target=100. Reject trigger = 92.5 (75%
-# toward 90) -> if hit first instead, BUY at 92.5 (same as the indicator's
-# original LONG), stop=90, target=100. Mirrored the same way for an
-# original SHORT.
+# native_target=130 (original entry-to-target distance = 30). Trigger =
+# 90 (native_stop). If price reaches 90, BUY there (same direction as the
+# indicator's original LONG): target = 90 + 0.5*30 = 105, stop = 90 -
+# (15/2) = 82.5 (distances 15 vs 7.5 -> exactly 2:1). Mirrored the same
+# way for an original SHORT: entry=100, native_stop=110, native_target=70
+# (distance = -30) -> trigger=110, if reached SELL there (same direction
+# as the original SHORT): target = 110 + 0.5*(-30) = 95, stop = 110 -
+# (-15/2) = 117.5 (distances 15 vs 7.5 -> exactly 2:1).
 #
-# The entry price itself is always the live price at whichever trigger
-# fires — the stop and target are always the ORIGINAL absolute levels
-# from arm time (native_target_price / native_stop_price / native_entry_price),
-# never recomputed off the live price — STOP_LOSS_MIDPOINT_PCT below no
-# longer applies to this design, it's dormant. There is no "scrap"
-# outcome — reaching either side is a valid trade. Only
-# DELAYED_ENTRY_TIMEOUT_SECS still results in no trade at all, if the
-# market never reaches either trigger.
+# The entry price itself is always the live price at the trigger — the
+# target is computed off the ORIGINAL entry-to-target distance, and the
+# stop is derived from the target, never independently. STOP_LOSS_MIDPOINT_PCT
+# and the previous fade-back/two-trigger designs are all dormant now.
+# There is no "scrap" outcome. Only DELAYED_ENTRY_TIMEOUT_SECS still
+# results in no trade at all, if the market never reaches the stop.
 #
 # Only applies to signals that carry native price levels (the live
 # popular-indicator path) with direction LONG/SHORT and contract_kind
 # RISE_FALL — DIGIT signals (Jump buildup) are untouched. See
 # bot_engine.py's _arm_pending_entry / _check_pending_entry /
 # _execute_pending_entry for the implementation.
-# DISABLED (user-directed, Sep 12 2026): entry is immediate again — the
-# fixed-percentage-of-target design below replaces this two-trigger
-# machinery entirely. Left in place, dormant, in case it's wanted back.
-DELAYED_ENTRY_ENABLED      = False
-DELAYED_ENTRY_TRIGGER_PCT  = 0.20   # was 0.50, before that 0.25, 0.15, 0.75, 0.33 —
-                                      # now shared by BOTH the confirm and reject
-                                      # triggers; tune here to change both at once.
+DELAYED_ENTRY_ENABLED      = True
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 
+STOP_TRIGGERED_TARGET_PCT       = 0.5   # target = trigger + this * original entry-to-target distance
+STOP_TRIGGERED_RISK_REWARD_RATIO = 2.0  # target_distance / stop_distance, held exactly via construction
+
+# DORMANT (Sep 12 2026): the percentage-based trigger from the earlier
+# two-trigger designs — the trigger is now simply native_stop_price
+# itself, no percentage needed. Left here in case a future design wants
+# a percentage-based trigger again; not read by the current design.
+DELAYED_ENTRY_TRIGGER_PCT  = 0.75   # was 0.50, before that 0.25, 0.15, 0.75, 0.33
+
+# DORMANT (Sep 12 2026): superseded by the "DELAYED ENTRY — native stop as
+# the trigger" design above — with DELAYED_ENTRY_ENABLED=True, every
+# native-level-carrying signal becomes delayed-eligible and never reaches
+# this transform at all. Left in place in case immediate entry is wanted
+# again later (set DELAYED_ENTRY_ENABLED=False to make this live again).
 # ── FIXED-PERCENTAGE-OF-TARGET NATIVE LEVELS (user-directed, Sep 12 2026,
 #    inversion twist same day) ────────────────────────────────────────────
 # Entry is immediate, exactly as the indicator signals — no delay,
@@ -607,9 +612,9 @@ DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerl
 # SignalResult.execution_inverted) for how a flip gets recorded for
 # meta-labeling / strategy_stats.
 FIXED_ENTRY_LEVELS_ENABLED   = True
-FIXED_ENTRY_INVERT_DIRECTION = False 
-FIXED_ENTRY_TP_PCT           = 0.44   # was 0.59
-FIXED_ENTRY_SL_PCT           = 0.22   # was 0.29 — ratio held at exactly 2:1
+FIXED_ENTRY_INVERT_DIRECTION = True
+FIXED_ENTRY_TP_PCT           = 0.50   # was 0.59
+FIXED_ENTRY_SL_PCT           = 0.25   # was 0.29 — ratio held at exactly 2:1
 
 # DORMANT as of the Sep 12 2026 fixed-percentage redesign above — that
 # design uses native_target_price/native_stop_price directly as the exact
@@ -668,7 +673,7 @@ STOP_LOSS_MIDPOINT_PCT = 0.5
 # and it never flips direction ("we are going to trade just how the
 # indicators tell us to, no inversion"). Left in place, dormant.
 SCALED_SL_TP_ENABLED          = False
-SCALED_SL_TP_INVERT_DIRECTION = False
+SCALED_SL_TP_INVERT_DIRECTION = True
 SCALED_TP_STOP_MULT           = 1.50   # was 1.33
 SCALED_SL_TARGET_MULT         = 0.35   # was 0.60
 
