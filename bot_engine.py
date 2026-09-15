@@ -1302,23 +1302,30 @@ class BotEngine:
         entry  = float(sig.native_entry_price)
         stop   = float(sig.native_stop_price)
         target = float(sig.native_target_price)
+        pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.25)
+        # Direction-agnostic: (target-entry) already carries the right sign
+        # for LONG vs SHORT, so this lands PCT% of the way toward the
+        # original target whichever direction that is.
+        trigger = entry + pct * (target - entry)
 
         self._pending_entries[symbol] = PendingEntry(
             symbol=symbol, sig=sig, direction=sig.direction,
             entry_ref_price=entry, stop_ref_price=stop, target_ref_price=target,
-            trigger_price=stop,
+            trigger_price=trigger,
             created_at=time.time(), strategy=getattr(sig, "strategy", "unknown"),
         )
-        tp_pct = getattr(config, "STOP_TRIGGERED_TARGET_PCT", 0.5)
-        ratio  = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
+        flipped = "SHORT" if sig.direction == "LONG" else "LONG"
+        ratio   = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
         logger.info(
-            f"PENDING ENTRY ARMED: {symbol} | {sig.direction} (unchanged on "
-            f"trigger) | entry_ref={entry:.5f} | TRIGGER = native_stop="
-            f"{stop:.5f} | on trigger: enter {sig.direction} there, target = "
-            f"trigger + {tp_pct*100:.0f}% of the original entry-to-target "
-            f"distance ({target - entry:.5f}), stop computed after at "
-            f"1/{ratio:.1f} of the target distance for an exact {ratio:.1f}:1 ratio"
+            f"PENDING ENTRY ARMED: {symbol} | indicator called {sig.direction} | "
+            f"entry_ref={entry:.5f} | TRIGGER @ {trigger:.5f} ({pct*100:.0f}% "
+            f"toward native_target={target:.5f}) | on trigger: enter "
+            f"{flipped} (inverted — see _execute_pending_entry for why this "
+            f"is forced, not optional), take-profit = native_stop="
+            f"{stop:.5f}, stop-loss computed after at 1/{ratio:.1f} of the "
+            f"target distance for an exact {ratio:.1f}:1 ratio"
         )
+
 
     def _check_pending_entry(self, symbol: str, price: float) -> None:
         """Called on every live tick for a symbol with an armed entry."""
@@ -1338,11 +1345,12 @@ class BotEngine:
 
         is_long = pe.direction == "LONG"
 
-        # Single trigger: price reaching the indicator's own native stop.
-        # For a LONG, native_stop sits below native_entry, so "reaching" it
-        # means price falling to or below it. For a SHORT it's the mirror.
-        triggered = (is_long and price <= pe.trigger_price) or \
-                    (not is_long and price >= pe.trigger_price)
+        # Trigger: price has moved DELAYED_ENTRY_TRIGGER_PCT of the way
+        # toward the indicator's own target. For a LONG the trigger sits
+        # above native_entry (toward the target), so "reaching" it means
+        # price rising to or above it. For a SHORT it's the mirror.
+        triggered = (is_long and price >= pe.trigger_price) or \
+                    (not is_long and price <= pe.trigger_price)
         if not triggered:
             return
 
@@ -1358,11 +1366,13 @@ class BotEngine:
         # simultaneous same-symbol positions were getting opened.
         # _execute_pending_entry()'s finally block releases this.
         self._executing_symbols.add(symbol)
+        flipped = "SHORT" if is_long else "LONG"
         logger.info(
-            f"PENDING ENTRY TRIGGERED: {symbol} | {pe.direction} | "
-            f"price={price:.5f} reached native_stop={pe.trigger_price:.5f} — "
-            f"entering {pe.direction} at {price:.5f}, continuing toward "
-            f"where the original target was"
+            f"PENDING ENTRY TRIGGERED: {symbol} | indicator called "
+            f"{pe.direction} | price={price:.5f} crossed trigger="
+            f"{pe.trigger_price:.5f} — entering {flipped} (inverted) at "
+            f"{price:.5f}, targeting the original native_stop="
+            f"{pe.stop_ref_price:.5f}"
         )
         asyncio.create_task(self._execute_pending_entry(symbol, pe, price))
 
@@ -1409,36 +1419,44 @@ class BotEngine:
                         f"concurrent cap ({family_count}/{max_per_family})")
                     return
 
-            # STOP-AS-TRIGGER design (Sep 12 2026): the trigger IS the entry
-            # — price reaching native_stop_price. Direction is NEVER
-            # flipped; we continue the indicator's original call:
-            #   - target = live_price + STOP_TRIGGERED_TARGET_PCT *
-            #     (the ORIGINAL native_target_price - native_entry_price
-            #     distance), applied toward where the original target was.
-            #   - stop, computed AFTER the target: opposite side of entry
-            #     from target, at 1/STOP_TRIGGERED_RISK_REWARD_RATIO of the
-            #     target distance — so the ratio is always exactly
+            # PERCENT-TRIGGER-TO-NATIVE-STOP design (Sep 12 2026): the
+            # trigger is DELAYED_ENTRY_TRIGGER_PCT of the way toward the
+            # ORIGINAL native_target — price moving that far confirms the
+            # indicator's move looked real. What we then trade is the
+            # OPPOSITE of the indicator's call, targeting the ORIGINAL
+            # native_stop_price directly:
+            #   - take-profit = the original native_stop_price, used as-is.
+            #   - direction MUST flip to match: with entry now sitting
+            #     between the original entry and target, the original
+            #     native_stop_price is on the far side, opposite from where
+            #     price just came from — that side is only ever a valid
+            #     take-profit for the trade running in the OPPOSITE
+            #     direction from the indicator's original call. This isn't
+            #     a toggle, it's a geometric consequence of this design —
+            #     confirmed with the user before implementing.
+            #   - stop-loss, computed AFTER the target: opposite side of
+            #     entry from the target, at 1/STOP_TRIGGERED_RISK_REWARD_RATIO
+            #     of the target distance — so the ratio is always exactly
             #     STOP_TRIGGERED_RISK_REWARD_RATIO (2:1 default), by
             #     construction, regardless of what the original indicator's
             #     own entry-to-stop distance was.
             # entry_price is overridden to the live trigger price since
             # deriv_client.buy_multiplier() measures its SL/TP dollar
             # distance off whatever entry_price it's given.
-            tp_pct = getattr(config, "STOP_TRIGGERED_TARGET_PCT", 0.5)
-            ratio  = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
-            original_distance = pe.target_ref_price - pe.entry_ref_price
+            ratio = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
 
-            new_target = live_price + tp_pct * original_distance
+            new_direction = "SHORT" if pe.direction == "LONG" else "LONG"
+            new_target = pe.stop_ref_price
             target_distance = new_target - live_price
             new_stop = live_price - (target_distance / ratio)
 
             swapped_sig = replace(
                 pe.sig,
-                direction=pe.direction,
+                direction=new_direction,
                 native_stop_price=new_stop,
                 native_target_price=new_target,
                 native_entry_price=live_price,
-                execution_inverted=False,
+                execution_inverted=True,
             )
             await self._execute(symbol, swapped_sig)
         finally:
