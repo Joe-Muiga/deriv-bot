@@ -674,7 +674,7 @@ STOP_LOSS_MIDPOINT_PCT = 0.5
 # and it never flips direction ("we are going to trade just how the
 # indicators tell us to, no inversion"). Left in place, dormant.
 SCALED_SL_TP_ENABLED          = False
-SCALED_SL_TP_INVERT_DIRECTION = True
+SCALED_SL_TP_INVERT_DIRECTION = False 
 SCALED_TP_STOP_MULT           = 1.50   # was 1.33
 SCALED_SL_TARGET_MULT         = 0.35   # was 0.60
 
