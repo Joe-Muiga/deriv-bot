@@ -613,7 +613,7 @@ STOP_TRIGGERED_TARGET_PCT = 0.5
 # SignalResult.execution_inverted) for how a flip gets recorded for
 # meta-labeling / strategy_stats.
 FIXED_ENTRY_LEVELS_ENABLED   = True
-FIXED_ENTRY_INVERT_DIRECTION = True
+FIXED_ENTRY_INVERT_DIRECTION = False 
 FIXED_ENTRY_TP_PCT           = 0.50   # was 0.59
 FIXED_ENTRY_SL_PCT           = 0.25   # was 0.29 — ratio held at exactly 2:1
 
