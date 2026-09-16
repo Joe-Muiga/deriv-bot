@@ -852,6 +852,11 @@ class BotEngine:
 
         if symbol in self._pending_entries:
             self._check_pending_entry(symbol, price)
+        # DORMANT (Sep 16 2026): self._stop_trigger_pending never gets
+        # populated anymore (see _apply_flip_and_swap_levels' comment) — the
+        # membership check below is always False, kept only so the dormant
+        # stop-as-trigger design would resume working immediately if it were
+        # ever re-armed by hand.
         if symbol in self._stop_trigger_pending:
             self._check_stop_trigger_entry(symbol, price)
 
@@ -1256,27 +1261,27 @@ class BotEngine:
                         family_open_counts[fam] = count + 1
                     top.append(r)
 
-            # 9. Execute top signals — unless delayed entry (or, for the
-            #    handoff's nine symbols, the parallel stop-as-trigger path)
-            #    applies, in which case they're armed and watched instead
-            #    of bought immediately.
-            #    Handoff (Sep 15 2026): config.STOP_AS_TRIGGER_SYMBOLS is
-            #    checked FIRST and, when eligible, takes the symbol
-            #    exclusively — those nine symbols now ALWAYS go through
-            #    _arm_stop_trigger_entry() and never reach
-            #    _arm_pending_entry() (the old DELAYED_ENTRY_* flip design)
-            #    or the immediate fixed-pct path below, so only the
-            #    handoff's own entry/exit design executes for them. Every
-            #    other symbol is completely unaffected — delayed_eligible
-            #    below is unchanged from before this pass.
-            #    Both pending-order paths are armed on their RAW native
+            # 9. Execute top signals — unless delayed entry applies, in
+            #    which case it's armed and watched instead of bought
+            #    immediately (see _arm_pending_entry / DELAYED_ENTRY_ENABLED).
+            #    Flip entry (handoff correction, Sep 16 2026): for the nine
+            #    config.STOP_AS_TRIGGER_SYMBOLS, there is NO arm-and-wait
+            #    step anymore — _apply_flip_and_swap_levels() transforms the
+            #    signal (direction flipped, entry=native as-is, take-profit
+            #    = old native_stop_price, stop-loss re-derived on the
+            #    opposite side) and it's bought IMMEDIATELY below, same as
+            #    the always-immediate fixed-pct path. This REPLACES the
+            #    Sep 15 stop-as-trigger arm-and-wait design entirely for
+            #    these nine symbols — config.STOP_AS_TRIGGER_ENABLED is now
+            #    False and _arm_stop_trigger_entry() is never called, so
+            #    only this flip-entry design executes for them. Every other
+            #    symbol is completely unaffected — delayed_eligible below is
+            #    unchanged from before this pass.
+            #    Delayed-entry signals are still armed on their RAW native
             #    levels — scaled+inverted SL/TP (config.SCALED_SL_TP_ENABLED)
             #    is only applied once a DELAYED_ENTRY_* entry actually
             #    triggers, inside _execute_pending_entry(), against those
-            #    original levels — not here. Signals that skip both pending
-            #    paths (no native levels, DIGIT contracts, etc.) still get
-            #    the fixed-pct transform applied immediately below, though
-            #    it's a no-op for anything without native levels anyway.
+            #    original levels — not here.
             if top:
                 to_execute: List[ScanResult] = []
                 for r in top:
@@ -1288,18 +1293,25 @@ class BotEngine:
                         and s.native_stop_price is not None
                         and s.native_target_price is not None
                     )
-                    stop_trigger_eligible = (
+                    flip_entry_eligible = (
                         has_native_levels
-                        and getattr(config, "STOP_AS_TRIGGER_ENABLED", False)
+                        and getattr(config, "FLIP_ENTRY_ENABLED", False)
                         and r.symbol in getattr(config, "STOP_AS_TRIGGER_SYMBOLS", [])
                     )
                     delayed_eligible = (
-                        not stop_trigger_eligible
+                        not flip_entry_eligible
                         and has_native_levels
                         and getattr(config, "DELAYED_ENTRY_ENABLED", False)
                     )
-                    if stop_trigger_eligible:
-                        self._arm_stop_trigger_entry(r.symbol, s)
+                    if flip_entry_eligible:
+                        flipped_sig = self._apply_flip_and_swap_levels(s)
+                        if flipped_sig is not None:
+                            self._executing_symbols.add(r.symbol)
+                            to_execute.append(replace(r, sig=flipped_sig))
+                        # else: geometrically invalid (target_distance <= 0)
+                        # — drop the signal for this cycle rather than trade
+                        # a malformed one; should be unreachable given how
+                        # the five evaluators construct their own levels.
                     elif delayed_eligible:
                         self._arm_pending_entry(r.symbol, s)
                     else:
@@ -1538,6 +1550,12 @@ class BotEngine:
             self._executing_symbols.discard(symbol)
 
     # ── Stop-as-trigger entry — parallel design (handoff, Sep 15 2026) ───────────
+    # DORMANT as of Sep 16 2026 — superseded entirely by _apply_flip_and_swap_levels()
+    # below (see config.py's now-dormant "STOP-AS-TRIGGER ENTRY" block and its
+    # live replacement, "FLIP ENTRY"). Nothing calls _arm_stop_trigger_entry()
+    # from the dispatch anymore, so self._stop_trigger_pending never gets
+    # populated and the rest of this section is unreachable in practice — left
+    # in place only as history / in case this design is ever wanted back.
     # See config.py's "STOP-AS-TRIGGER ENTRY" block for the spec and worked
     # example. Scoped exclusively to config.STOP_AS_TRIGGER_SYMBOLS; every
     # other symbol keeps using _arm_pending_entry/_check_pending_entry/
@@ -1713,6 +1731,79 @@ class BotEngine:
             await self._execute(symbol, swapped_sig)
         finally:
             self._executing_symbols.discard(symbol)
+
+    # ── Flip entry — immediate, direction flipped (handoff correction, Sep 16 2026) ──
+    # LIVE. Replaces the stop-as-trigger arm-and-wait design above entirely
+    # for config.STOP_AS_TRIGGER_SYMBOLS — see config.py's "FLIP ENTRY"
+    # block for the full spec and worked example. Called directly from the
+    # main dispatch loop, same call shape as _apply_fixed_pct_native_levels
+    # below: no arming, no pending state, no ticks watched — the transform
+    # happens once and the result is bought immediately, in the same cycle.
+
+    def _apply_flip_and_swap_levels(self, sig: SignalResult) -> Optional[SignalResult]:
+        """
+        Handoff correction (Sep 16 2026) — for config.STOP_AS_TRIGGER_SYMBOLS
+        only. Transforms a firing signal for IMMEDIATE execution:
+
+          1. Direction is FLIPPED (LONG -> SHORT, SHORT -> LONG). Intentional:
+             the evaluator's own native_stop_price always sits on the side of
+             entry OPPOSITE its native_target_price, so using native_stop_price
+             as a take-profit (step 3) only makes geometric sense for the
+             OPPOSITE direction from what the evaluator signalled.
+          2. Entry = native_entry_price, used directly, unchanged.
+          3. Take-profit = the evaluator's original native_stop_price,
+             unchanged (native_target_price is no longer used at all).
+          4. Stop-loss is computed fresh, on the side of entry OPPOSITE the
+             new take-profit, so that take_profit_distance / stop_loss_distance
+             is STRICTLY greater than config.FLIP_ENTRY_MIN_RR_RATIO — same
+             ratio+margin construction the retired stop-as-trigger design used.
+
+        Returns None (caller drops the signal for this cycle) if the
+        resulting take-profit distance isn't strictly positive — should be
+        geometrically unreachable given how the five evaluators construct
+        their own levels, but this never derives a stop-loss from a
+        non-positive distance regardless.
+        """
+        if sig.direction not in ("LONG", "SHORT"):
+            return None
+        if sig.native_entry_price is None or sig.native_stop_price is None:
+            return None
+
+        flipped_direction = "SHORT" if sig.direction == "LONG" else "LONG"
+        entry  = float(sig.native_entry_price)
+        target = float(sig.native_stop_price)   # evaluator's old stop -> new take-profit
+        is_long = flipped_direction == "LONG"
+
+        target_distance = (target - entry) if is_long else (entry - target)
+        if target_distance <= 0:
+            logger.warning(
+                f"FLIP-ENTRY DROPPED: {sig.strategy} {sig.direction} — "
+                f"non-positive take-profit distance after flip to "
+                f"{flipped_direction} (entry={entry:.5f}, take-profit="
+                f"{target:.5f}), refusing to trade"
+            )
+            return None
+
+        ratio  = getattr(config, "FLIP_ENTRY_MIN_RR_RATIO", 2.0)
+        margin = getattr(config, "FLIP_ENTRY_SL_SAFETY_MARGIN", 0.10)
+        max_sl_distance = target_distance / ratio
+        sl_distance     = max_sl_distance * (1.0 - margin)
+        new_stop        = (entry - sl_distance) if is_long else (entry + sl_distance)
+
+        logger.info(
+            f"FLIP-ENTRY: {sig.strategy} {sig.direction} -> {flipped_direction} | "
+            f"entry={entry:.5f} (native, immediate) | take-profit={target:.5f} "
+            f"(was native_stop) | new stop-loss={new_stop:.5f} | ratio="
+            f"{(target_distance / sl_distance):.2f}:1 (> {ratio:.1f} required)"
+        )
+        return replace(
+            sig,
+            direction=flipped_direction,
+            native_entry_price=entry,
+            native_stop_price=new_stop,
+            native_target_price=target,
+            execution_inverted=True,
+        )
 
     # ── Fixed-percentage-of-target native levels (immediate entry) ───────────────
     # See config.py's "FIXED-PERCENTAGE-OF-TARGET NATIVE LEVELS" block for the
