@@ -13,6 +13,17 @@ evaluators above them):
   - evaluate_jump_buildup      : Jump index build-up confidence -> digit contract (MATCH/DIFFER)
   - evaluate_trend_shift       : Bear/Bull fixed per-symbol daily-reset bias (RDBULL=LONG, RDBEAR=SHORT)
 
+Additions (handoff, Sep 15 2026) — six dedicated per-symbol evaluators,
+replacing evaluate_popular_indicator() for exactly nine symbols:
+  - evaluate_pullback_trend     : R_75/1HZ75V EMA-trend pullback + RSI turn-back
+  - evaluate_fast_mean_reversion: R_100/1HZ100V fast BB/RSI scalp snap-back
+  - evaluate_spike_catch_1000   : BOOM1000/CRASH1000 drift-exhaustion spike-catch
+  - evaluate_spike_catch_500    : BOOM500/CRASH500, same logic, faster re-arm
+  - evaluate_step_grid          : stpRNG hard EMA+price+RSI+MACD AND-gate
+Each populates native_entry_price/native_stop_price/native_target_price
+for config.STOP_AS_TRIGGER_SYMBOLS' parallel pending-order path in
+bot_engine.py (see config.py's "STOP-AS-TRIGGER ENTRY" section).
+
 See the "NEW STRATEGY CONFIG" region below for the config keys these read
 (all via getattr with safe defaults, so nothing breaks if unset) and the
 chat reply for a full list of flagged inconsistencies/assumptions.
@@ -1769,6 +1780,445 @@ def evaluate_trend_shift(
 
 
 # ---------------------------------------------------------------------------
+# Strategy 7 — Six dedicated per-symbol evaluators (handoff, Sep 15 2026)
+#
+# Replaces evaluate_popular_indicator() for exactly nine symbols —
+# R_75/1HZ75V, R_100/1HZ100V, BOOM1000/CRASH1000, BOOM500/CRASH500,
+# stpRNG — with one independent, textbook-defined strategy per row. Each
+# function below implements ONE named strategy (not a ranked multi-
+# indicator pick like evaluate_popular_indicator()) and always populates
+# native_entry_price / native_stop_price / native_target_price with real
+# stop/target placement per that strategy's own convention — these three
+# fields are what config.STOP_AS_TRIGGER_SYMBOLS' parallel pending-order
+# path (bot_engine.py's _arm_stop_trigger_entry / _check_stop_trigger_entry
+# / _execute_stop_trigger_entry) arms and watches; see config.py's
+# "STOP-AS-TRIGGER ENTRY" section for that mechanism.
+#
+# evaluate_boom_crash() and evaluate_step() (above) were evaluated as
+# possible starting points per the handoff's own "read first" instruction
+# and found NOT reusable as-is: neither ever sets native_stop_price /
+# native_target_price / native_entry_price (a hard requirement here), and
+# evaluate_boom_crash()'s logic fades a spike AFTER it has already printed
+# (contrarian, post-spike) — the opposite timing from rows 3/4 below,
+# which position BEFORE the spike, during drift-exhaustion/consolidation.
+# evaluate_step()'s EMA10/30 + Donchian-band read is in a similar spirit to
+# row 5 but isn't the specific EMA10/EMA20 + price + RSI + MACD hard
+# AND-gate row 5 calls for. Both are left exactly as they were (unrouted,
+# in place) — only their bar-count-gate / `_arrays()` / logging shape was
+# borrowed as a structural reference, per the handoff's own guidance.
+# ---------------------------------------------------------------------------
+
+def evaluate_pullback_trend(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """
+    Row 1 (R_75, 1HZ75V) — Trend-following with pullback entries.
+
+    EMA fast/slow crossover state sets the trend direction. Entry requires
+    price to have recently pulled back to (or through) the fast EMA — a
+    minor swing low (uptrend) / swing high (downtrend) against the trend —
+    AND RSI to have genuinely turned back in the trend's favor: a real
+    cross back above PULLBACK_RSI_OVERSOLD in an uptrend (not merely
+    sitting above it), mirrored below PULLBACK_RSI_OVERBOUGHT in a
+    downtrend. Stop sits just beyond the pullback swing low/high (not an
+    arbitrary ATR multiple); target is a fixed reward:risk multiple of
+    that same stop distance (config.PULLBACK_TREND_RR_RATIO).
+    """
+    min_bars = getattr(config, "PULLBACK_TREND_MIN_BARS", 40)
+    if len(ltf_bars) < min_bars:
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    if len(C) < 2 or math.isnan(float(C[-1])):
+        return NONE_RESULT
+
+    ema_fast = ind.ema(C, getattr(config, "PULLBACK_EMA_FAST_PERIOD", 20))
+    ema_slow = ind.ema(C, getattr(config, "PULLBACK_EMA_SLOW_PERIOD", 50))
+    rsi_vals = ind.rsi(C, getattr(config, "PULLBACK_RSI_PERIOD", 14))
+    atr_val  = _last(ind.atr(H, L, C, 14)) or 1e-9
+
+    e_fast, e_slow = float(ema_fast[-1]), float(ema_slow[-1])
+    if e_fast > e_slow:
+        trend = "LONG"
+    elif e_fast < e_slow:
+        trend = "SHORT"
+    else:
+        return NONE_RESULT
+
+    lookback = getattr(config, "PULLBACK_SWING_LOOKBACK", 8)
+    touch_atr_mult = getattr(config, "PULLBACK_EMA_TOUCH_ATR_MULT", 1.0)
+    rsi_oversold   = getattr(config, "PULLBACK_RSI_OVERSOLD", 30.0)
+    rsi_overbought = getattr(config, "PULLBACK_RSI_OVERBOUGHT", 70.0)
+    stop_buf_mult  = getattr(config, "PULLBACK_STOP_BUFFER_ATR_MULT", 0.25)
+    rr_ratio       = getattr(config, "PULLBACK_TREND_RR_RATIO", 2.0)
+
+    recent_lows  = L[-lookback:]
+    recent_highs = H[-lookback:]
+    ema_fast_recent = ema_fast[-lookback:]
+    last_close = float(C[-1])
+
+    if trend == "LONG":
+        swing_idx = int(np.argmin(recent_lows))
+        swing_low = float(recent_lows[swing_idx])
+        ema_at_swing = float(ema_fast_recent[swing_idx])
+        pulled_back = abs(swing_low - ema_at_swing) <= touch_atr_mult * atr_val or swing_low <= ema_at_swing
+        rsi_turned_back = bool(rsi_vals[-2] <= rsi_oversold and rsi_vals[-1] > rsi_oversold)
+        if not (pulled_back and rsi_turned_back):
+            logger.debug(f"REJECTED: {symbol} PULLBACK_TREND strength=0 score=0.000 — below threshold")
+            return NONE_RESULT
+        direction = "LONG"
+        native_entry_price = last_close
+        native_stop_price  = swing_low - stop_buf_mult * atr_val
+        risk = native_entry_price - native_stop_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price + rr_ratio * risk
+    else:
+        swing_idx = int(np.argmax(recent_highs))
+        swing_high = float(recent_highs[swing_idx])
+        ema_at_swing = float(ema_fast_recent[swing_idx])
+        pulled_back = abs(swing_high - ema_at_swing) <= touch_atr_mult * atr_val or swing_high >= ema_at_swing
+        rsi_turned_back = bool(rsi_vals[-2] >= rsi_overbought and rsi_vals[-1] < rsi_overbought)
+        if not (pulled_back and rsi_turned_back):
+            logger.debug(f"REJECTED: {symbol} PULLBACK_TREND strength=0 score=0.000 — below threshold")
+            return NONE_RESULT
+        direction = "SHORT"
+        native_entry_price = last_close
+        native_stop_price  = swing_high + stop_buf_mult * atr_val
+        risk = native_stop_price - native_entry_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price - rr_ratio * risk
+
+    separation_atr = abs(e_fast - e_slow) / atr_val
+    score = max(0.0, min(1.0, separation_atr / 3.0))
+    strength = 3 if score >= 0.5 else 2
+
+    logger.info(
+        f"SIGNAL: {symbol} {direction} PULLBACK_TREND strength={strength} score={score:.3f} "
+        f"entry={native_entry_price:.5f} stop={native_stop_price:.5f} target={native_target_price:.5f}"
+    )
+    return SignalResult(
+        direction=direction, strength=strength, score=score,
+        strategy="PULLBACK_TREND",
+        reason=(
+            f"EMA{getattr(config, 'PULLBACK_EMA_FAST_PERIOD', 20)}/"
+            f"{getattr(config, 'PULLBACK_EMA_SLOW_PERIOD', 50)} trend={trend}, "
+            f"pullback confirmed + RSI turn-back"
+        ),
+        native_entry_price=native_entry_price,
+        native_stop_price=native_stop_price,
+        native_target_price=native_target_price,
+    )
+
+
+def evaluate_fast_mean_reversion(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """
+    Row 2 (R_100, 1HZ100V) — Fast mean-reversion scalping.
+
+    Fires on short-timeframe overextension — a Bollinger Band touch/pierce
+    OR a fast RSI extreme — confirmed by the very next tick already
+    snapping back toward the mean (last close vs. prior close), not while
+    price is still accelerating into the extreme. Target is the Bollinger
+    mid-band itself (the mean); stop sits just beyond the extreme just
+    touched — deliberately tight, for a high-frequency scalp.
+    """
+    min_bars = getattr(config, "SCALP_MIN_BARS", 25)
+    if len(ltf_bars) < min_bars:
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    if len(C) < 2 or math.isnan(float(C[-1])):
+        return NONE_RESULT
+
+    bb_period = getattr(config, "SCALP_BB_PERIOD", 14)
+    bb_std    = getattr(config, "SCALP_BB_STD", 1.5)
+    rsi_period = getattr(config, "SCALP_RSI_PERIOD", 7)
+    rsi_oversold   = getattr(config, "SCALP_RSI_OVERSOLD", 20.0)
+    rsi_overbought = getattr(config, "SCALP_RSI_OVERBOUGHT", 80.0)
+    stop_buf_mult  = getattr(config, "SCALP_STOP_BUFFER_ATR_MULT", 0.15)
+
+    bb_upper, bb_mid, bb_lower = ind.bollinger_bands(C, bb_period, bb_std)
+    rsi_vals = ind.rsi(C, rsi_period)
+    atr_val  = _last(ind.atr(H, L, C, 14)) or 1e-9
+
+    last_close, prev_close = float(C[-1]), float(C[-2])
+    last_rsi = float(rsi_vals[-1])
+    up_tick, down_tick = last_close > prev_close, last_close < prev_close
+
+    overextended_long  = last_close <= float(bb_lower[-1]) or last_rsi <= rsi_oversold
+    overextended_short = last_close >= float(bb_upper[-1]) or last_rsi >= rsi_overbought
+
+    long_fire  = overextended_long and up_tick
+    short_fire = overextended_short and down_tick
+
+    if long_fire and not short_fire:
+        direction = "LONG"
+        native_entry_price = last_close
+        recent_low = float(np.min(L[-3:]))
+        native_stop_price = min(recent_low, float(bb_lower[-1])) - stop_buf_mult * atr_val
+        native_target_price = float(bb_mid[-1])
+        if native_target_price <= native_entry_price or native_stop_price >= native_entry_price:
+            return NONE_RESULT
+    elif short_fire and not long_fire:
+        direction = "SHORT"
+        native_entry_price = last_close
+        recent_high = float(np.max(H[-3:]))
+        native_stop_price = max(recent_high, float(bb_upper[-1])) + stop_buf_mult * atr_val
+        native_target_price = float(bb_mid[-1])
+        if native_target_price >= native_entry_price or native_stop_price <= native_entry_price:
+            return NONE_RESULT
+    else:
+        logger.debug(f"REJECTED: {symbol} FAST_MEAN_REV strength=0 score=0.000 — below threshold")
+        return NONE_RESULT
+
+    band_width = float(bb_upper[-1]) - float(bb_lower[-1])
+    pct_b = ((last_close - float(bb_lower[-1])) / band_width) if band_width > 0 else 0.5
+    extremeness = max(pct_b, 1.0 - pct_b) if band_width > 0 else 0.5
+    score = max(0.0, min(1.0, extremeness))
+    strength = 3 if score >= 0.9 else 2
+
+    logger.info(
+        f"SIGNAL: {symbol} {direction} FAST_MEAN_REV strength={strength} score={score:.3f} "
+        f"entry={native_entry_price:.5f} stop={native_stop_price:.5f} target={native_target_price:.5f}"
+    )
+    return SignalResult(
+        direction=direction, strength=strength, score=score,
+        strategy="FAST_MEAN_REV",
+        reason=f"Overextension snap-back toward BB mid-band, RSI={last_rsi:.1f}",
+        native_entry_price=native_entry_price,
+        native_stop_price=native_stop_price,
+        native_target_price=native_target_price,
+    )
+
+
+def _evaluate_spike_catch(
+        ltf_bars: List[Candle], symbol: str, *, strategy_name: str,
+        min_bars: int, cons_lookback: int, cons_avg_lookback: int,
+        cons_ratio: float, drift_lookback: int, min_drift_atr_ratio: float,
+        spike_cooldown_bars: int, stop_buffer_atr_mult: float,
+        rr_ratio: float) -> SignalResult:
+    """
+    Shared logic for rows 3/4 (Boom/Crash spike-catching). BOOM drifts
+    down between its up-spikes; CRASH drifts up between its down-spikes.
+    Positions counter to that small-tick drift (buy Boom, sell Crash)
+    once the drift shows exhaustion/consolidation (ind.find_consolidation)
+    and no spike has fired within spike_cooldown_bars — i.e. waiting for
+    the NEXT spike, not chasing the tail of one that already printed
+    (that's evaluate_boom_crash()'s job, left untouched, unrouted).
+    Row 4 (BOOM500/CRASH500) tunes this tighter/faster than row 3
+    (BOOM1000/CRASH1000) via its own cooldown/stop-buffer arguments.
+    """
+    if len(ltf_bars) < min_bars:
+        return NONE_RESULT
+
+    is_boom  = symbol.startswith("BOOM")
+    is_crash = symbol.startswith("CRASH")
+    if not (is_boom or is_crash):
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    if len(C) < 2 or math.isnan(float(C[-1])):
+        return NONE_RESULT
+    atr_val = _last(ind.atr(H, L, C, 14)) or 1e-9
+
+    # No spike within the cooldown window — waiting for a fresh
+    # drift+consolidation cycle, not entering mid/just-after a spike.
+    for bars_ago in range(0, spike_cooldown_bars):
+        c_s = C[:len(C) - bars_ago] if bars_ago > 0 else C
+        h_s = H[:len(H) - bars_ago] if bars_ago > 0 else H
+        l_s = L[:len(L) - bars_ago] if bars_ago > 0 else L
+        if len(c_s) < 2:
+            continue
+        if ind.detect_spike(c_s, h_s, l_s, period=14, atr_multiplier=3.0) != 0:
+            logger.debug(f"REJECTED: {symbol} {strategy_name} strength=0 score=0.000 — below threshold")
+            return NONE_RESULT
+
+    # Drift direction confirmation: Boom drifts down, Crash drifts up,
+    # between spikes.
+    drift_window = C[-drift_lookback:]
+    if len(drift_window) < 2:
+        return NONE_RESULT
+    x = np.arange(len(drift_window), dtype=float)
+    slope = float(np.polyfit(x, drift_window, 1)[0])
+    slope_atr_ratio = slope / atr_val
+
+    if is_boom:
+        drift_ok = slope_atr_ratio <= -min_drift_atr_ratio
+    else:
+        drift_ok = slope_atr_ratio >= min_drift_atr_ratio
+    if not drift_ok:
+        logger.debug(f"REJECTED: {symbol} {strategy_name} strength=0 score=0.000 — below threshold")
+        return NONE_RESULT
+
+    # Drift exhaustion / consolidation.
+    consolidation = ind.find_consolidation(
+        H, L, C, lookback=cons_lookback, avg_lookback=cons_avg_lookback, ratio=cons_ratio)
+    if consolidation is None:
+        logger.debug(f"REJECTED: {symbol} {strategy_name} strength=0 score=0.000 — below threshold")
+        return NONE_RESULT
+    cons_upper, cons_lower = consolidation
+
+    last_close = float(C[-1])
+    if is_boom:
+        direction = "LONG"
+        native_entry_price = last_close
+        native_stop_price = cons_lower - stop_buffer_atr_mult * atr_val
+        risk = native_entry_price - native_stop_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price + rr_ratio * risk
+    else:
+        direction = "SHORT"
+        native_entry_price = last_close
+        native_stop_price = cons_upper + stop_buffer_atr_mult * atr_val
+        risk = native_stop_price - native_entry_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price - rr_ratio * risk
+
+    score = max(0.0, min(1.0, abs(slope_atr_ratio) / (2 * min_drift_atr_ratio)))
+    strength = 3 if score >= 0.75 else 2
+
+    logger.info(
+        f"SIGNAL: {symbol} {direction} {strategy_name} strength={strength} score={score:.3f} "
+        f"entry={native_entry_price:.5f} stop={native_stop_price:.5f} target={native_target_price:.5f} "
+        f"drift_atr_ratio={slope_atr_ratio:.3f}"
+    )
+    return SignalResult(
+        direction=direction, strength=strength, score=score,
+        strategy=strategy_name,
+        reason=(
+            f"Drift-exhaustion consolidation [{cons_lower:.5f},{cons_upper:.5f}], "
+            f"drift_atr_ratio={slope_atr_ratio:.3f}, positioned for next spike"
+        ),
+        native_entry_price=native_entry_price,
+        native_stop_price=native_stop_price,
+        native_target_price=native_target_price,
+    )
+
+
+def evaluate_spike_catch_1000(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """Row 3 (BOOM1000, CRASH1000) — see _evaluate_spike_catch()."""
+    return _evaluate_spike_catch(
+        ltf_bars, symbol, strategy_name="SPIKE_CATCH_1000",
+        min_bars=getattr(config, "SPIKE_CATCH_1000_MIN_BARS", 30),
+        cons_lookback=getattr(config, "SPIKE_CATCH_1000_CONS_LOOKBACK", 15),
+        cons_avg_lookback=getattr(config, "SPIKE_CATCH_1000_CONS_AVG_LOOKBACK", 50),
+        cons_ratio=getattr(config, "SPIKE_CATCH_1000_CONS_RATIO", 0.4),
+        drift_lookback=getattr(config, "SPIKE_CATCH_1000_DRIFT_LOOKBACK", 20),
+        min_drift_atr_ratio=getattr(config, "SPIKE_CATCH_1000_MIN_DRIFT_ATR_RATIO", 0.10),
+        spike_cooldown_bars=getattr(config, "SPIKE_CATCH_1000_COOLDOWN_BARS", 10),
+        stop_buffer_atr_mult=getattr(config, "SPIKE_CATCH_1000_STOP_BUFFER_ATR_MULT", 0.30),
+        rr_ratio=getattr(config, "SPIKE_CATCH_1000_RR_RATIO", 3.0),
+    )
+
+
+def evaluate_spike_catch_500(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """
+    Row 4 (BOOM500, CRASH500) — see _evaluate_spike_catch(). Tuned for this
+    pair's higher spike frequency: shorter cooldown (faster re-arm) and a
+    tighter stop buffer than row 3's BOOM1000/CRASH1000.
+    """
+    return _evaluate_spike_catch(
+        ltf_bars, symbol, strategy_name="SPIKE_CATCH_500",
+        min_bars=getattr(config, "SPIKE_CATCH_500_MIN_BARS", 30),
+        cons_lookback=getattr(config, "SPIKE_CATCH_500_CONS_LOOKBACK", 12),
+        cons_avg_lookback=getattr(config, "SPIKE_CATCH_500_CONS_AVG_LOOKBACK", 40),
+        cons_ratio=getattr(config, "SPIKE_CATCH_500_CONS_RATIO", 0.4),
+        drift_lookback=getattr(config, "SPIKE_CATCH_500_DRIFT_LOOKBACK", 15),
+        min_drift_atr_ratio=getattr(config, "SPIKE_CATCH_500_MIN_DRIFT_ATR_RATIO", 0.10),
+        spike_cooldown_bars=getattr(config, "SPIKE_CATCH_500_COOLDOWN_BARS", 5),
+        stop_buffer_atr_mult=getattr(config, "SPIKE_CATCH_500_STOP_BUFFER_ATR_MULT", 0.15),
+        rr_ratio=getattr(config, "SPIKE_CATCH_500_RR_RATIO", 3.0),
+    )
+
+
+def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
+    """
+    Row 5 (stpRNG) — Indicator-grid entry, hard AND-gate. ALL four must
+    agree before firing (long: EMA10>EMA20, price>EMA20, RSI>55, MACD
+    line>signal line; short: every condition mirrored) — this is a gate,
+    not a scored/weighted pick, so any single condition failing rejects
+    the whole signal. Stop sits outside the recent range that defined the
+    setup (the greater of a recent swing extreme and EMA20 itself, plus a
+    buffer), not an arbitrary ATR multiple alone; target is a fixed
+    reward:risk multiple of that stop distance.
+    """
+    min_bars = getattr(config, "STEP_GRID_MIN_BARS", 30)
+    if len(ltf_bars) < min_bars:
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    if len(C) < 2 or math.isnan(float(C[-1])):
+        return NONE_RESULT
+
+    ema10 = ind.ema(C, getattr(config, "STEP_GRID_EMA_FAST_PERIOD", 10))
+    ema20 = ind.ema(C, getattr(config, "STEP_GRID_EMA_SLOW_PERIOD", 20))
+    rsi_vals = ind.rsi(C, getattr(config, "STEP_GRID_RSI_PERIOD", 14))
+    macd_line, macd_signal, _ = ind.macd(
+        C, getattr(config, "STEP_GRID_MACD_FAST", 12),
+        getattr(config, "STEP_GRID_MACD_SLOW", 26),
+        getattr(config, "STEP_GRID_MACD_SIGNAL", 9))
+    atr_val = _last(ind.atr(H, L, C, 14)) or 1e-9
+
+    last_close = float(C[-1])
+    e10, e20 = float(ema10[-1]), float(ema20[-1])
+    last_rsi = float(rsi_vals[-1])
+    m_line, m_sig = float(macd_line[-1]), float(macd_signal[-1])
+
+    rsi_long_min  = getattr(config, "STEP_GRID_RSI_LONG_MIN", 55.0)
+    rsi_short_max = getattr(config, "STEP_GRID_RSI_SHORT_MAX", 45.0)
+
+    long_gate = (e10 > e20) and (last_close > e20) and (last_rsi > rsi_long_min) and (m_line > m_sig)
+    short_gate = (e10 < e20) and (last_close < e20) and (last_rsi < rsi_short_max) and (m_line < m_sig)
+
+    if long_gate == short_gate:  # neither fired, or (impossible) both did
+        logger.debug(f"REJECTED: {symbol} STEP_GRID strength=0 score=0.000 — below threshold")
+        return NONE_RESULT
+
+    range_lookback = getattr(config, "STEP_GRID_RANGE_LOOKBACK", 20)
+    stop_buf_mult  = getattr(config, "STEP_GRID_STOP_BUFFER_ATR_MULT", 0.30)
+    rr_ratio       = getattr(config, "STEP_GRID_RR_RATIO", 2.0)
+
+    if long_gate:
+        direction = "LONG"
+        range_low = float(np.min(L[-range_lookback:]))
+        native_entry_price = last_close
+        native_stop_price = min(range_low, e20) - stop_buf_mult * atr_val
+        risk = native_entry_price - native_stop_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price + rr_ratio * risk
+    else:
+        direction = "SHORT"
+        range_high = float(np.max(H[-range_lookback:]))
+        native_entry_price = last_close
+        native_stop_price = max(range_high, e20) + stop_buf_mult * atr_val
+        risk = native_stop_price - native_entry_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price - rr_ratio * risk
+
+    score = 0.75  # hard AND-gate — either every condition agrees (fixed high confidence) or it doesn't fire
+    strength = 3
+
+    logger.info(
+        f"SIGNAL: {symbol} {direction} STEP_GRID strength={strength} score={score:.3f} "
+        f"entry={native_entry_price:.5f} stop={native_stop_price:.5f} target={native_target_price:.5f}"
+    )
+    return SignalResult(
+        direction=direction, strength=strength, score=score,
+        strategy="STEP_GRID",
+        reason=(
+            f"AND-gate: EMA10/20={e10:.5f}/{e20:.5f}, price_vs_EMA20, "
+            f"RSI={last_rsi:.1f}, MACD={m_line:.5f} vs {m_sig:.5f}"
+        ),
+        native_entry_price=native_entry_price,
+        native_stop_price=native_stop_price,
+        native_target_price=native_target_price,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
@@ -1790,7 +2240,26 @@ class SignalEngine:
         # strategies (see evaluate_mean_reversion/evaluate_range_break).
         # Not a confluence/vote — see evaluate_popular_indicator()'s own
         # comment block for the single-most-popular-signal selection.
-        if symbol in getattr(config, "MULTIPLIER_SYMBOLS", []):
+        # Six dedicated per-symbol evaluators (handoff, Sep 15 2026) —
+        # checked BEFORE the general MULTIPLIER_SYMBOLS branch so these
+        # nine symbols never reach evaluate_popular_indicator() anymore.
+        # Deliberately NOT removed from config.MULTIPLIER_SYMBOLS /
+        # VOL_MULTIPLIER_SYMBOLS / BOOM_CRASH — those lists still drive
+        # execution routing (buy_multiplier()), MULTIPLIER_MAP,
+        # STOP_LOSS_MAP, and EXIT_ENGINE_SYMBOLS elsewhere, all of which
+        # should keep treating these nine exactly as before; only which
+        # evaluator computes the signal changes here.
+        if symbol in getattr(config, "PULLBACK_TREND_SYMBOLS", []):
+            result = evaluate_pullback_trend(ltf_bars, symbol)
+        elif symbol in getattr(config, "FAST_MEAN_REV_SYMBOLS", []):
+            result = evaluate_fast_mean_reversion(ltf_bars, symbol)
+        elif symbol in getattr(config, "SPIKE_CATCH_1000_SYMBOLS", []):
+            result = evaluate_spike_catch_1000(ltf_bars, symbol)
+        elif symbol in getattr(config, "SPIKE_CATCH_500_SYMBOLS", []):
+            result = evaluate_spike_catch_500(ltf_bars, symbol)
+        elif symbol in getattr(config, "STEP_GRID_SYMBOLS", []):
+            result = evaluate_step_grid(ltf_bars, symbol)
+        elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", []):
             result = evaluate_popular_indicator(ltf_bars, symbol)
         elif symbol in config.DIGIT_SYMBOLS:
             result = evaluate_digit(ltf_bars, symbol, ticks=ticks)
