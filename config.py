@@ -669,22 +669,22 @@ DELAYED_ENTRY_TRIGGER_PCT  = 0.25   # REACTIVATED — was dormant at 0.75; befor
 
 STOP_TRIGGERED_RISK_REWARD_RATIO = 2.0  # target_distance / stop_distance, held exactly via construction
 
-# ── STOP-AS-TRIGGER ENTRY (handoff, Sep 15 2026) ──────────────────────────
-# A NEW, PARALLEL pending-order path — scoped only to
-# config.STOP_AS_TRIGGER_SYMBOLS (the nine symbols carved out above to
-# evaluate_pullback_trend / evaluate_fast_mean_reversion /
-# evaluate_spike_catch_1000 / evaluate_spike_catch_500 /
-# evaluate_step_grid) — built alongside, not in place of, the
-# DELAYED_ENTRY_* design above. This is the "stop as the trigger, no
-# direction flip" mechanic that bot_engine.py's PendingEntry docstring and
-# this file's dormant STOP_TRIGGERED_TARGET_PCT (below) already describe,
-# but that the live DELAYED_ENTRY_* design (percent-trigger toward
-# target, forced flip) does not actually implement — genuinely built here
-# for the first time, in bot_engine.py's StopTriggerPendingEntry /
+# ── STOP-AS-TRIGGER ENTRY (handoff, Sep 15 2026) — DORMANT (Sep 16 2026) ──
+# SUPERSEDED the next day by FLIP ENTRY below — this was a mistake in the
+# original handoff and is kept here, unrouted, only as history/in case it's
+# ever wanted back. bot_engine.py's StopTriggerPendingEntry /
 # _arm_stop_trigger_entry / _check_stop_trigger_entry /
-# _execute_stop_trigger_entry.
+# _execute_stop_trigger_entry are likewise left in place but never called
+# from the dispatch anymore — STOP_AS_TRIGGER_ENABLED=False makes that
+# explicit even though nothing arms into that path regardless.
 #
-# Mechanism:
+# (Originally) scoped only to config.STOP_AS_TRIGGER_SYMBOLS (the nine
+# symbols carved out above to evaluate_pullback_trend /
+# evaluate_fast_mean_reversion / evaluate_spike_catch_1000 /
+# evaluate_spike_catch_500 / evaluate_step_grid) — built alongside, not in
+# place of, the DELAYED_ENTRY_* design above.
+#
+# Mechanism (dormant):
 #   1. A firing signal from one of the five evaluators above is armed
 #      (not bought), watched tick by tick against its own RAW native
 #      levels — never re-run through DELAYED_ENTRY_* or the
@@ -705,23 +705,56 @@ STOP_TRIGGERED_RISK_REWARD_RATIO = 2.0  # target_distance / stop_distance, held 
 #      order is cancelled outright — no trade. A time-based expiry
 #      (shared DELAYED_ENTRY_TIMEOUT_SECS) remains as a fallback safety
 #      net.
-#
-# Worked example (LONG signal, mirrors the handoff's own): evaluator
-# fires LONG on R_75, native_entry_price=100 (informational only),
-# native_stop_price=95, native_target_price=115.
-#   - Price reaching 115 first -> cancelled, no trade.
-#   - Price falling to 95 first -> enter LONG at 95 (live price).
-#     take-profit stays 115. target_distance = 115-95 = 20.
-#     max_sl_distance = 20 / 2.0 = 10. sl_distance = 10 * (1-0.10) = 9.
-#     new stop-loss = 95 - 9 = 86 (ratio 20:9 ≈ 2.22:1, strictly > 2.0).
-# Mirrored symmetrically for SHORT (stop above entry, target below).
-STOP_AS_TRIGGER_ENABLED          = True
+STOP_AS_TRIGGER_ENABLED          = False  # DORMANT — see FLIP_ENTRY_ENABLED below
 STOP_AS_TRIGGER_SYMBOLS = list(dict.fromkeys(
     PULLBACK_TREND_SYMBOLS + FAST_MEAN_REV_SYMBOLS
     + SPIKE_CATCH_1000_SYMBOLS + SPIKE_CATCH_500_SYMBOLS + STEP_GRID_SYMBOLS
 ))
-STOP_AS_TRIGGER_MIN_RR_RATIO     = 2.0   # take_profit_distance / stop_loss_distance must be STRICTLY greater than this
-STOP_AS_TRIGGER_SL_SAFETY_MARGIN = 0.10  # actual stop sits this fraction inside the max-allowed distance (see worked example)
+STOP_AS_TRIGGER_MIN_RR_RATIO     = 2.0   # target_distance / stop_distance must be STRICTLY greater than this — DORMANT, kept for the dormant mechanism above
+STOP_AS_TRIGGER_SL_SAFETY_MARGIN = 0.10  # DORMANT, kept for the dormant mechanism above
+
+# ── FLIP ENTRY (handoff correction, Sep 16 2026) — LIVE, replaces stop-as-trigger entirely ──
+# Corrects a mistake in the Sep 15 handoff: there is NO arm-and-wait/trigger
+# step at all anymore. The instant one of the five evaluators above fires,
+# the signal is transformed and bought IMMEDIATELY, in the same cycle, at
+# its own native_entry_price — see bot_engine.py's
+# _apply_flip_and_swap_levels(), called directly from the main dispatch
+# loop, same as the always-immediate fixed-pct path.
+#
+# Transform (applied to every signal on a config.STOP_AS_TRIGGER_SYMBOLS
+# symbol — that list name is unchanged; it's still exactly the right nine
+# symbols, only the mechanism applied to them changed):
+#   1. Direction is FLIPPED — LONG becomes SHORT, SHORT becomes LONG. This
+#      is intentional, not a bug: the evaluator's own native_stop_price
+#      always sits on the side of entry OPPOSITE its native_target_price,
+#      so using native_stop_price as a take-profit (step 2) only makes
+#      geometric sense for the OPPOSITE direction from what the evaluator
+#      signalled.
+#   2. Entry = native_entry_price, used directly, unchanged, immediate.
+#   3. Take-profit = the evaluator's original native_stop_price (what used
+#      to be its protective stop), unchanged.
+#   4. Stop-loss is computed fresh, on the side of entry OPPOSITE the new
+#      take-profit, so that take_profit_distance / stop_loss_distance is
+#      STRICTLY greater than FLIP_ENTRY_MIN_RR_RATIO — identical
+#      construction to the dormant design above: max_sl_distance =
+#      target_distance / ratio, sl_distance = max_sl_distance *
+#      (1 - FLIP_ENTRY_SL_SAFETY_MARGIN).
+#
+# Worked example (evaluator fires LONG on R_75, native_entry_price=100,
+# native_stop_price=95, native_target_price=115 — native_target_price is
+# no longer used at all once flip entry applies):
+#   - Flip: we execute SHORT, not LONG.
+#   - Entry = 100 (native, immediate — no waiting for price to move).
+#   - Take-profit = 95 (the old stop) — below entry, correct side for a SHORT.
+#     target_distance = 100 - 95 = 5.
+#   - max_sl_distance = 5 / 2.0 = 2.5. sl_distance = 2.5 * (1-0.10) = 2.25.
+#   - Stop-loss = 100 + 2.25 = 102.25 (above entry, correct side for a SHORT).
+#   - Ratio = 5 / 2.25 ≈ 2.22:1, strictly > 2.0.
+# Mirrored symmetrically for an evaluator SHORT (flips to LONG; take-profit
+# = old native_stop_price, above entry; stop-loss below entry).
+FLIP_ENTRY_ENABLED          = True
+FLIP_ENTRY_MIN_RR_RATIO     = 2.0    # take_profit_distance / stop_loss_distance must be STRICTLY greater than this
+FLIP_ENTRY_SL_SAFETY_MARGIN = 0.10   # actual stop sits this fraction inside the max-allowed distance (see worked example)
 
 # ── RESTRICT TRADING TO THE 5 NEW EVALUATORS ONLY (user request, Sep 16 2026) ──
 # When True, the bot scans and trades ONLY the nine STOP_AS_TRIGGER_SYMBOLS —
@@ -733,7 +766,9 @@ STOP_AS_TRIGGER_SL_SAFETY_MARGIN = 0.10  # actual stop sits this fraction inside
 # and symbol_manager.py's get_queue()/update_active() both read, confirmed the
 # only consumer — TRADE_SYMBOLS isn't otherwise defined in this file) down to
 # just the nine. A symbol that's never in the scan queue is never evaluated,
-# so its strategy function never runs, full stop.
+# so its strategy function never runs, full stop. Independent of which
+# mechanism (dormant stop-as-trigger, or live flip entry above) governs how
+# those nine symbols get traded once selected.
 # Flip this back to False (or narrow STOP_AS_TRIGGER_SYMBOLS instead) to bring
 # any of the other strategies back — nothing else needs to change.
 RESTRICT_TRADING_TO_STOP_AS_TRIGGER_SYMBOLS = True
