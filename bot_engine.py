@@ -134,6 +134,48 @@ class PendingEntry:
     strategy:               str
 
 
+@dataclass
+class StopTriggerPendingEntry:
+    """
+    Handoff (Sep 15 2026) — a NEW, PARALLEL pending-order design, scoped
+    only to config.STOP_AS_TRIGGER_SYMBOLS (the nine symbols routed to
+    signal_engine.py's evaluate_pullback_trend / evaluate_fast_mean_reversion
+    / evaluate_spike_catch_1000 / evaluate_spike_catch_500 /
+    evaluate_step_grid). Built alongside — not a modification of —
+    PendingEntry/_arm_pending_entry/_check_pending_entry/
+    _execute_pending_entry above, which keep governing every other
+    symbol's delayed entry exactly as before. See config.py's
+    "STOP-AS-TRIGGER ENTRY" section for the full spec and worked example.
+
+    This is genuinely the mechanic PendingEntry's own docstring describes
+    (stop-as-trigger, no direction flip) — the live DELAYED_ENTRY_* design
+    above evolved into something else (percent-trigger toward target,
+    forced flip) without that docstring ever being updated; this class
+    implements the stop-as-trigger mechanic for real, for these nine
+    symbols only.
+
+    Single trigger: price reaching the evaluator's own native_stop_price.
+    That's also where we enter — direction is NEVER flipped:
+      - take-profit = the evaluator's original native_target_price, used
+        as-is.
+      - stop-loss, re-derived AFTER the fill from the live entry-to-target
+        distance, so that take_profit_distance / stop_loss_distance is
+        STRICTLY greater than config.STOP_AS_TRIGGER_MIN_RR_RATIO.
+    Cancel-before-fill: reaching the ORIGINAL native_target_price before
+    ever reaching the trigger cancels the pending order outright — no
+    trade. A time-based expiry (shared config.DELAYED_ENTRY_TIMEOUT_SECS)
+    remains as a fallback safety net.
+    """
+    symbol:                str
+    sig:                    SignalResult
+    direction:               str     # original evaluator direction, NEVER flipped at execution
+    entry_ref_price:         float   # native_entry_price when armed (informational only)
+    stop_ref_price:          float   # native_stop_price when armed — this IS the trigger
+    target_ref_price:        float   # native_target_price when armed — used as-is for TP, and as the cancel-before-fill level
+    created_at:              float
+    strategy:                str
+
+
 # ─── Thompson sampling bandit ───────────────────────────────────────────────
 
 class _ThompsonBandit:
@@ -285,6 +327,15 @@ class BotEngine:
         #    toward their own native target before actually being bought.
         #    {symbol: PendingEntry}. See config.py for the full mechanism.
         self._pending_entries:        Dict[str, PendingEntry] = {}
+
+        # Handoff (Sep 15 2026) — parallel stop-as-trigger pending-order
+        # state, scoped to config.STOP_AS_TRIGGER_SYMBOLS only. Mutually
+        # exclusive with self._pending_entries per symbol (the dispatch
+        # block below arms a symbol into exactly one of the two dicts,
+        # never both) — see _arm_stop_trigger_entry / _check_stop_trigger_entry
+        # / _execute_stop_trigger_entry and config.py's "STOP-AS-TRIGGER
+        # ENTRY" section.
+        self._stop_trigger_pending:   Dict[str, StopTriggerPendingEntry] = {}
 
         # Closes the race where a symbol sits in neither _pending_entries
         # nor symbol_manager's _active_symbols — from the instant a pending
@@ -801,6 +852,8 @@ class BotEngine:
 
         if symbol in self._pending_entries:
             self._check_pending_entry(symbol, price)
+        if symbol in self._stop_trigger_pending:
+            self._check_stop_trigger_entry(symbol, price)
 
     # ── Degraded-symbol tick resubscription ─────────────────────────────────────
 
@@ -1203,29 +1256,51 @@ class BotEngine:
                         family_open_counts[fam] = count + 1
                     top.append(r)
 
-            # 9. Execute top signals — unless delayed entry applies, in which
-            #    case they're armed and watched instead of bought immediately
-            #    (see _arm_pending_entry / config.DELAYED_ENTRY_ENABLED).
-            #    Delayed-entry signals are armed on their RAW native levels —
-            #    scaled+inverted SL/TP (config.SCALED_SL_TP_ENABLED) is only
-            #    applied once the entry actually triggers, inside
-            #    _execute_pending_entry(), against those original levels —
-            #    not here. Signals that skip delayed entry (no native levels,
-            #    DIGIT contracts, etc.) still get it applied immediately below,
-            #    though it's a no-op for anything without native levels anyway.
+            # 9. Execute top signals — unless delayed entry (or, for the
+            #    handoff's nine symbols, the parallel stop-as-trigger path)
+            #    applies, in which case they're armed and watched instead
+            #    of bought immediately.
+            #    Handoff (Sep 15 2026): config.STOP_AS_TRIGGER_SYMBOLS is
+            #    checked FIRST and, when eligible, takes the symbol
+            #    exclusively — those nine symbols now ALWAYS go through
+            #    _arm_stop_trigger_entry() and never reach
+            #    _arm_pending_entry() (the old DELAYED_ENTRY_* flip design)
+            #    or the immediate fixed-pct path below, so only the
+            #    handoff's own entry/exit design executes for them. Every
+            #    other symbol is completely unaffected — delayed_eligible
+            #    below is unchanged from before this pass.
+            #    Both pending-order paths are armed on their RAW native
+            #    levels — scaled+inverted SL/TP (config.SCALED_SL_TP_ENABLED)
+            #    is only applied once a DELAYED_ENTRY_* entry actually
+            #    triggers, inside _execute_pending_entry(), against those
+            #    original levels — not here. Signals that skip both pending
+            #    paths (no native levels, DIGIT contracts, etc.) still get
+            #    the fixed-pct transform applied immediately below, though
+            #    it's a no-op for anything without native levels anyway.
             if top:
                 to_execute: List[ScanResult] = []
                 for r in top:
                     s = r.sig
-                    delayed_eligible = (
-                        getattr(config, "DELAYED_ENTRY_ENABLED", False)
-                        and s.direction in ("LONG", "SHORT")
+                    has_native_levels = (
+                        s.direction in ("LONG", "SHORT")
                         and getattr(s, "contract_kind", "RISE_FALL") == "RISE_FALL"
                         and s.native_entry_price is not None
                         and s.native_stop_price is not None
                         and s.native_target_price is not None
                     )
-                    if delayed_eligible:
+                    stop_trigger_eligible = (
+                        has_native_levels
+                        and getattr(config, "STOP_AS_TRIGGER_ENABLED", False)
+                        and r.symbol in getattr(config, "STOP_AS_TRIGGER_SYMBOLS", [])
+                    )
+                    delayed_eligible = (
+                        not stop_trigger_eligible
+                        and has_native_levels
+                        and getattr(config, "DELAYED_ENTRY_ENABLED", False)
+                    )
+                    if stop_trigger_eligible:
+                        self._arm_stop_trigger_entry(r.symbol, s)
+                    elif delayed_eligible:
                         self._arm_pending_entry(r.symbol, s)
                     else:
                         # Reserve synchronously, same reasoning as the
@@ -1457,6 +1532,183 @@ class BotEngine:
                 native_target_price=new_target,
                 native_entry_price=live_price,
                 execution_inverted=True,
+            )
+            await self._execute(symbol, swapped_sig)
+        finally:
+            self._executing_symbols.discard(symbol)
+
+    # ── Stop-as-trigger entry — parallel design (handoff, Sep 15 2026) ───────────
+    # See config.py's "STOP-AS-TRIGGER ENTRY" block for the spec and worked
+    # example. Scoped exclusively to config.STOP_AS_TRIGGER_SYMBOLS; every
+    # other symbol keeps using _arm_pending_entry/_check_pending_entry/
+    # _execute_pending_entry above, unchanged. Monitoring here is always
+    # against the RAW, untouched native levels the evaluator computed.
+
+    def _arm_stop_trigger_entry(self, symbol: str, sig: SignalResult) -> None:
+        """Register one of the six-evaluator signals on the stop-as-trigger path."""
+        if symbol in self._stop_trigger_pending:
+            return  # already watching a setup for this symbol — don't reset it
+        if symbol in self._executing_symbols:
+            return  # a trigger for this symbol is already executing — defense in depth
+
+        entry  = float(sig.native_entry_price)
+        stop   = float(sig.native_stop_price)
+        target = float(sig.native_target_price)
+
+        self._stop_trigger_pending[symbol] = StopTriggerPendingEntry(
+            symbol=symbol, sig=sig, direction=sig.direction,
+            entry_ref_price=entry, stop_ref_price=stop, target_ref_price=target,
+            created_at=time.time(), strategy=getattr(sig, "strategy", "unknown"),
+        )
+        ratio = getattr(config, "STOP_AS_TRIGGER_MIN_RR_RATIO", 2.0)
+        logger.info(
+            f"STOP-AS-TRIGGER ARMED: {symbol} | {sig.direction} | "
+            f"entry_ref={entry:.5f} | TRIGGER (native_stop)={stop:.5f} | "
+            f"cancel-if-hit-first (native_target)={target:.5f} | on trigger: "
+            f"enter {sig.direction} (NOT flipped) at live price, take-profit "
+            f"stays {target:.5f}, stop-loss re-derived for a strict "
+            f">{ratio:.1f}:1 ratio"
+        )
+
+    def _check_stop_trigger_entry(self, symbol: str, price: float) -> None:
+        """Called on every live tick for a symbol armed on the stop-as-trigger path."""
+        pe = self._stop_trigger_pending.get(symbol)
+        if pe is None:
+            return
+
+        timeout = getattr(config, "DELAYED_ENTRY_TIMEOUT_SECS", 600)
+        if time.time() - pe.created_at > timeout:
+            logger.info(
+                f"STOP-AS-TRIGGER EXPIRED: {symbol} | {pe.direction} | never "
+                f"reached trigger (native_stop)={pe.stop_ref_price:.5f} "
+                f"within {timeout}s"
+            )
+            del self._stop_trigger_pending[symbol]
+            return
+
+        is_long = pe.direction == "LONG"
+
+        # Cancel-before-fill (spec point 5): the ORIGINAL native_target_price
+        # reached before the trigger ever was -> cancelled outright, no
+        # trade. Checked before the trigger check below — for a LONG the
+        # target sits above entry and the trigger (native_stop) sits
+        # below (mirrored for SHORT), so on any single tick at most one of
+        # the two conditions can be true; checking cancel first is simply
+        # the safer order if that ever weren't the case.
+        target_hit_first = (is_long and price >= pe.target_ref_price) or \
+                            (not is_long and price <= pe.target_ref_price)
+        if target_hit_first:
+            logger.info(
+                f"STOP-AS-TRIGGER CANCELLED: {symbol} | {pe.direction} | "
+                f"price={price:.5f} reached the original native_target="
+                f"{pe.target_ref_price:.5f} before ever reaching the "
+                f"trigger (native_stop)={pe.stop_ref_price:.5f} — no trade"
+            )
+            del self._stop_trigger_pending[symbol]
+            return
+
+        triggered = (is_long and price <= pe.stop_ref_price) or \
+                    (not is_long and price >= pe.stop_ref_price)
+        if not triggered:
+            return
+
+        del self._stop_trigger_pending[symbol]
+        # Reserve the symbol synchronously — same reasoning as
+        # _check_pending_entry's trigger branch above (closes the gap
+        # between deciding to trade and _execute() actually completing).
+        self._executing_symbols.add(symbol)
+        logger.info(
+            f"STOP-AS-TRIGGER FIRED: {symbol} | {pe.direction} | price="
+            f"{price:.5f} reached trigger (native_stop)={pe.stop_ref_price:.5f} "
+            f"— entering {pe.direction} (NOT flipped) at {price:.5f}, "
+            f"take-profit stays at original native_target="
+            f"{pe.target_ref_price:.5f}"
+        )
+        asyncio.create_task(self._execute_stop_trigger_entry(symbol, pe, price))
+
+    async def _execute_stop_trigger_entry(
+            self, symbol: str, pe: StopTriggerPendingEntry, live_price: float) -> None:
+        """
+        Fires the actual buy once price has reached the evaluator's own
+        native_stop_price (the single trigger — see StopTriggerPendingEntry's
+        docstring). Re-checks every guard the normal cycle loop would have
+        applied (can_trade_now, concurrent slots, family cap) since this can
+        fire between cycles — mirrors _execute_pending_entry()'s guard
+        re-checks above.
+
+        Direction is never flipped. Take-profit is the original
+        native_target_price, unchanged. Stop-loss is re-derived from the
+        live entry-to-target distance so that take_profit_distance /
+        stop_loss_distance is strictly greater than
+        config.STOP_AS_TRIGGER_MIN_RR_RATIO (see config.py's worked
+        example for the exact construction).
+
+        Runs under a finally that releases this symbol's
+        _executing_symbols reservation on every exit path, not just the
+        successful one, so a dropped attempt doesn't leave the symbol
+        permanently un-armable.
+        """
+        try:
+            if not self.symbols.can_trade_now(symbol):
+                logger.info(
+                    f"STOP-AS-TRIGGER DROPPED: {symbol} — can_trade_now() False at trigger time")
+                return
+
+            concurrent_limit = self.risk.current_concurrent_limit
+            open_count       = len(self._open_contracts)
+            if open_count >= concurrent_limit:
+                logger.info(
+                    f"STOP-AS-TRIGGER DROPPED: {symbol} — no concurrent slot free "
+                    f"at trigger time ({open_count}/{concurrent_limit})")
+                return
+
+            family_map     = getattr(config, "SYMBOL_FAMILY_MAP", {})
+            max_per_family = getattr(config, "MAX_CONCURRENT_PER_FAMILY", 2)
+            fam = family_map.get(symbol)
+            if fam:
+                family_count = sum(
+                    1 for c in self._open_contracts.values()
+                    if family_map.get(c.get("symbol")) == fam
+                )
+                if family_count >= max_per_family:
+                    logger.info(
+                        f"STOP-AS-TRIGGER DROPPED: {symbol} — family {fam} at "
+                        f"concurrent cap ({family_count}/{max_per_family})")
+                    return
+
+            ratio  = getattr(config, "STOP_AS_TRIGGER_MIN_RR_RATIO", 2.0)
+            margin = getattr(config, "STOP_AS_TRIGGER_SL_SAFETY_MARGIN", 0.10)
+            is_long = pe.direction == "LONG"
+            target  = pe.target_ref_price
+
+            target_distance = (target - live_price) if is_long else (live_price - target)
+            if target_distance <= 0:
+                # Defensive only — _check_stop_trigger_entry's cancel-before-
+                # fill check should make this unreachable in practice, but
+                # never derive a stop-loss from a non-positive distance.
+                logger.warning(
+                    f"STOP-AS-TRIGGER DROPPED: {symbol} — non-positive target "
+                    f"distance at fill ({target_distance:.5f}), refusing to trade"
+                )
+                return
+
+            max_sl_distance = target_distance / ratio
+            sl_distance     = max_sl_distance * (1.0 - margin)
+            new_stop        = (live_price - sl_distance) if is_long else (live_price + sl_distance)
+
+            swapped_sig = replace(
+                pe.sig,
+                direction=pe.direction,            # unchanged — NEVER flipped
+                native_entry_price=live_price,
+                native_stop_price=new_stop,
+                native_target_price=target,        # unchanged
+                execution_inverted=False,
+            )
+            logger.info(
+                f"STOP-AS-TRIGGER EXECUTING: {symbol} | {pe.direction} | "
+                f"fill={live_price:.5f} | take-profit={target:.5f} (unchanged) | "
+                f"new stop-loss={new_stop:.5f} | ratio="
+                f"{(target_distance / sl_distance):.2f}:1 (> {ratio:.1f} required)"
             )
             await self._execute(symbol, swapped_sig)
         finally:
