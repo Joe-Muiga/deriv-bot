@@ -351,6 +351,99 @@ for _sym, (_lo, _hi) in VOL_MULTIPLIER_RANGES.items():
 # sits well before that line.
 MULTIPLIER_SYMBOLS = list(dict.fromkeys(MULTIPLIER_SYMBOLS + VOL_MULTIPLIER_SYMBOLS))
 
+# ── SIX DEDICATED PER-SYMBOL EVALUATORS (handoff, Sep 15 2026) ───────────
+# Replaces evaluate_popular_indicator() for exactly these nine symbols —
+# signal_engine.py's SignalEngine.evaluate() checks these five lists
+# BEFORE its general `if symbol in MULTIPLIER_SYMBOLS` branch, so a
+# symbol listed here never reaches evaluate_popular_indicator() again.
+# Deliberately NOT subtracted from VOL_MULTIPLIER_SYMBOLS / BOOM_CRASH /
+# MULTIPLIER_SYMBOLS above — those still govern execution routing
+# (buy_multiplier()), MULTIPLIER_MAP, STOP_LOSS_MAP, and
+# EXIT_ENGINE_SYMBOLS (defined further below as list(MULTIPLIER_SYMBOLS))
+# for these nine exactly as before; only evaluator selection changes.
+# See signal_engine.py's evaluate_pullback_trend / evaluate_fast_mean_reversion
+# / evaluate_spike_catch_1000 / evaluate_spike_catch_500 / evaluate_step_grid.
+PULLBACK_TREND_SYMBOLS    = ["R_75", "1HZ75V"]                # Row 1
+FAST_MEAN_REV_SYMBOLS     = ["R_100", "1HZ100V"]              # Row 2
+SPIKE_CATCH_1000_SYMBOLS  = ["BOOM1000", "CRASH1000"]         # Row 3
+SPIKE_CATCH_500_SYMBOLS   = ["BOOM500", "CRASH500"]           # Row 4
+STEP_GRID_SYMBOLS         = ["stpRNG"]                         # Row 5
+# Row 6 (Jump/JD75, price-action breakout) deliberately NOT built —
+# flagged back to the user per the handoff's own instruction rather than
+# risking a silent conflict with JD75's existing, currently-live
+# evaluate_jump_buildup() digit-contract strategy. JUMP_BUILDUP_SYMBOLS
+# is untouched; add a JD75-breakout list + evaluator here only once the
+# user has confirmed how (or whether) it should coexist.
+
+# ── Row 1: Trend-following with pullback entries (R_75, 1HZ75V) ─────────
+PULLBACK_TREND_MIN_BARS          = 40
+PULLBACK_EMA_FAST_PERIOD         = 20
+PULLBACK_EMA_SLOW_PERIOD         = 50
+PULLBACK_RSI_PERIOD              = 14
+PULLBACK_RSI_OVERSOLD            = 30.0   # uptrend pullback: RSI must cross back ABOVE this, not just touch it
+PULLBACK_RSI_OVERBOUGHT          = 70.0   # downtrend pullback: RSI must cross back BELOW this
+PULLBACK_SWING_LOOKBACK          = 8      # bars searched for the pullback swing low/high
+PULLBACK_EMA_TOUCH_ATR_MULT      = 1.0    # how close (in ATRs) the swing must come to the fast EMA to count as "pulled back to it"
+PULLBACK_STOP_BUFFER_ATR_MULT    = 0.25   # stop = swing low/high +/- this many ATRs (buffer beyond the swing itself)
+PULLBACK_TREND_RR_RATIO          = 2.0    # target = entry +/- this multiple of the entry-to-stop risk distance
+
+# ── Row 2: Fast mean-reversion scalping (R_100, 1HZ100V) ────────────────
+SCALP_MIN_BARS                   = 25
+SCALP_BB_PERIOD                  = 14     # shorter than the popular-indicator BB period — "fast" scalp read
+SCALP_BB_STD                     = 1.5
+SCALP_RSI_PERIOD                 = 7      # fast RSI, per the handoff's "fast RSI extreme"
+SCALP_RSI_OVERSOLD               = 20.0
+SCALP_RSI_OVERBOUGHT             = 80.0
+SCALP_STOP_BUFFER_ATR_MULT       = 0.15   # deliberately tight — "tight stops, small targets, high frequency"
+# Target = the Bollinger mid-band at fire time (the mean itself) — see
+# evaluate_fast_mean_reversion(), not a config constant since it's read
+# live off bb_mid, not a fixed ratio.
+
+# ── Rows 3/4: Boom/Crash spike-catching (drift-exhaustion entry) ────────
+# Worked mechanism: track the small-tick drift between spikes (Boom
+# drifts down between up-spikes, Crash drifts up between down-spikes);
+# once that drift shows exhaustion/consolidation (ind.find_consolidation)
+# and no spike has printed within the cooldown window, position counter
+# to the drift (buy Boom, sell Crash) for the next spike. Row 4
+# (BOOM500/CRASH500) uses a shorter cooldown (faster re-arm — this pair
+# spikes more often) and a tighter stop buffer than row 3.
+SPIKE_CATCH_1000_MIN_BARS              = 30
+SPIKE_CATCH_1000_CONS_LOOKBACK         = 15
+SPIKE_CATCH_1000_CONS_AVG_LOOKBACK     = 50
+SPIKE_CATCH_1000_CONS_RATIO            = 0.4
+SPIKE_CATCH_1000_DRIFT_LOOKBACK        = 20
+SPIKE_CATCH_1000_MIN_DRIFT_ATR_RATIO   = 0.10
+SPIKE_CATCH_1000_COOLDOWN_BARS         = 10
+SPIKE_CATCH_1000_STOP_BUFFER_ATR_MULT  = 0.30
+SPIKE_CATCH_1000_RR_RATIO              = 3.0   # spikes are typically large vs. the consolidation range — wider target multiple than rows 1/5
+
+SPIKE_CATCH_500_MIN_BARS               = 30
+SPIKE_CATCH_500_CONS_LOOKBACK          = 12    # shorter — this pair's spikes/consolidations cycle faster
+SPIKE_CATCH_500_CONS_AVG_LOOKBACK      = 40
+SPIKE_CATCH_500_CONS_RATIO             = 0.4
+SPIKE_CATCH_500_DRIFT_LOOKBACK         = 15
+SPIKE_CATCH_500_MIN_DRIFT_ATR_RATIO    = 0.10
+SPIKE_CATCH_500_COOLDOWN_BARS          = 5     # faster re-arm than row 3's 10
+SPIKE_CATCH_500_STOP_BUFFER_ATR_MULT   = 0.15  # tighter stop management than row 3's 0.30
+SPIKE_CATCH_500_RR_RATIO               = 3.0
+
+# ── Row 5: Step Index indicator-grid entry (stpRNG) ──────────────────────
+# Hard AND-gate — all four must agree, this is not a scored/weighted pick:
+#   long:  EMA10>EMA20 AND price>EMA20 AND RSI>STEP_GRID_RSI_LONG_MIN AND MACD_line>MACD_signal
+#   short: EMA10<EMA20 AND price<EMA20 AND RSI<STEP_GRID_RSI_SHORT_MAX AND MACD_line<MACD_signal
+STEP_GRID_MIN_BARS               = 30
+STEP_GRID_EMA_FAST_PERIOD        = 10
+STEP_GRID_EMA_SLOW_PERIOD        = 20
+STEP_GRID_RSI_PERIOD             = 14
+STEP_GRID_RSI_LONG_MIN           = 55.0
+STEP_GRID_RSI_SHORT_MAX          = 45.0
+STEP_GRID_MACD_FAST              = 12
+STEP_GRID_MACD_SLOW              = 26
+STEP_GRID_MACD_SIGNAL            = 9
+STEP_GRID_RANGE_LOOKBACK         = 20     # bars searched for the range extreme the stop sits outside of
+STEP_GRID_STOP_BUFFER_ATR_MULT   = 0.30
+STEP_GRID_RR_RATIO               = 2.0
+
 # Retire Mean Reversion entirely — MEAN_REVERSION_SYMBOLS was exactly
 # VOLATILITY_STANDARD + VOLATILITY_1S, i.e. these same 10 symbols (stpRNG
 # was never in it). Emptying this list retires the strategy globally
@@ -567,8 +660,87 @@ DELAYED_ENTRY_ENABLED      = True
 DELAYED_ENTRY_TIMEOUT_SECS = 600   # 10 min — tune if setups expire too eagerly/slowly
 DELAYED_ENTRY_TRIGGER_PCT  = 0.25   # REACTIVATED — was dormant at 0.75; before
                                       # that 0.50, 0.25, 0.15, 0.75, 0.33
+# NOTE (handoff, Sep 15 2026): the above DELAYED_ENTRY_* design and this
+# STOP_TRIGGERED_RISK_REWARD_RATIO constant remain exactly as they were —
+# still live for every symbol EXCEPT the nine in STOP_AS_TRIGGER_SYMBOLS
+# below, which now go through that parallel path instead (see
+# bot_engine.py's dispatch: `stop_trigger_eligible` is checked, and takes
+# priority, before `delayed_eligible`). Nothing here was retired globally.
 
 STOP_TRIGGERED_RISK_REWARD_RATIO = 2.0  # target_distance / stop_distance, held exactly via construction
+
+# ── STOP-AS-TRIGGER ENTRY (handoff, Sep 15 2026) ──────────────────────────
+# A NEW, PARALLEL pending-order path — scoped only to
+# config.STOP_AS_TRIGGER_SYMBOLS (the nine symbols carved out above to
+# evaluate_pullback_trend / evaluate_fast_mean_reversion /
+# evaluate_spike_catch_1000 / evaluate_spike_catch_500 /
+# evaluate_step_grid) — built alongside, not in place of, the
+# DELAYED_ENTRY_* design above. This is the "stop as the trigger, no
+# direction flip" mechanic that bot_engine.py's PendingEntry docstring and
+# this file's dormant STOP_TRIGGERED_TARGET_PCT (below) already describe,
+# but that the live DELAYED_ENTRY_* design (percent-trigger toward
+# target, forced flip) does not actually implement — genuinely built here
+# for the first time, in bot_engine.py's StopTriggerPendingEntry /
+# _arm_stop_trigger_entry / _check_stop_trigger_entry /
+# _execute_stop_trigger_entry.
+#
+# Mechanism:
+#   1. A firing signal from one of the five evaluators above is armed
+#      (not bought), watched tick by tick against its own RAW native
+#      levels — never re-run through DELAYED_ENTRY_* or the
+#      fixed-percentage immediate-entry path.
+#   2. TRIGGER = the evaluator's own native_stop_price. Reaching it is
+#      also where we enter — direction is NEVER flipped, we take exactly
+#      what the evaluator signalled.
+#   3. Take-profit = the evaluator's original native_target_price, used
+#      as-is (unchanged from what was armed).
+#   4. Stop-loss is RE-DERIVED after the fill, from the live entry-to-
+#      target distance, so that take_profit_distance / stop_loss_distance
+#      is STRICTLY greater than STOP_AS_TRIGGER_MIN_RR_RATIO (enforced
+#      with `>`, not `>=`): max_sl_distance = target_distance / ratio,
+#      then the actual sl_distance sits STOP_AS_TRIGGER_SL_SAFETY_MARGIN
+#      below that ceiling so it's never exactly on the boundary.
+#   5. Cancel-before-fill: if price reaches the ORIGINAL
+#      native_target_price before ever reaching the trigger, the pending
+#      order is cancelled outright — no trade. A time-based expiry
+#      (shared DELAYED_ENTRY_TIMEOUT_SECS) remains as a fallback safety
+#      net.
+#
+# Worked example (LONG signal, mirrors the handoff's own): evaluator
+# fires LONG on R_75, native_entry_price=100 (informational only),
+# native_stop_price=95, native_target_price=115.
+#   - Price reaching 115 first -> cancelled, no trade.
+#   - Price falling to 95 first -> enter LONG at 95 (live price).
+#     take-profit stays 115. target_distance = 115-95 = 20.
+#     max_sl_distance = 20 / 2.0 = 10. sl_distance = 10 * (1-0.10) = 9.
+#     new stop-loss = 95 - 9 = 86 (ratio 20:9 ≈ 2.22:1, strictly > 2.0).
+# Mirrored symmetrically for SHORT (stop above entry, target below).
+STOP_AS_TRIGGER_ENABLED          = True
+STOP_AS_TRIGGER_SYMBOLS = list(dict.fromkeys(
+    PULLBACK_TREND_SYMBOLS + FAST_MEAN_REV_SYMBOLS
+    + SPIKE_CATCH_1000_SYMBOLS + SPIKE_CATCH_500_SYMBOLS + STEP_GRID_SYMBOLS
+))
+STOP_AS_TRIGGER_MIN_RR_RATIO     = 2.0   # take_profit_distance / stop_loss_distance must be STRICTLY greater than this
+STOP_AS_TRIGGER_SL_SAFETY_MARGIN = 0.10  # actual stop sits this fraction inside the max-allowed distance (see worked example)
+
+# ── RESTRICT TRADING TO THE 5 NEW EVALUATORS ONLY (user request, Sep 16 2026) ──
+# When True, the bot scans and trades ONLY the nine STOP_AS_TRIGGER_SYMBOLS —
+# every other strategy (evaluate_popular_indicator() on the remaining
+# R_10/R_25/R_50/1HZ10V/1HZ25V/1HZ50V, DIGIT_SYMBOLS, JUMP_BUILDUP_SYMBOLS,
+# BEAR_BULL_SYMBOLS, RANGE_BREAK_SYMBOLS, DRIFT_FADE_SYMBOLS) is effectively
+# disabled — not by deleting or unrouting any of that code, but by shrinking
+# ALL_TRADE_SYMBOLS (the single master scan list bot_engine.py._init_all_symbols()
+# and symbol_manager.py's get_queue()/update_active() both read, confirmed the
+# only consumer — TRADE_SYMBOLS isn't otherwise defined in this file) down to
+# just the nine. A symbol that's never in the scan queue is never evaluated,
+# so its strategy function never runs, full stop.
+# Flip this back to False (or narrow STOP_AS_TRIGGER_SYMBOLS instead) to bring
+# any of the other strategies back — nothing else needs to change.
+RESTRICT_TRADING_TO_STOP_AS_TRIGGER_SYMBOLS = True
+if RESTRICT_TRADING_TO_STOP_AS_TRIGGER_SYMBOLS:
+    ALL_TRADE_SYMBOLS = list(STOP_AS_TRIGGER_SYMBOLS)
+    ALL_SYMBOLS        = ALL_TRADE_SYMBOLS
+    VOLATILITY_SYMBOLS = ALL_TRADE_SYMBOLS
 
 # DORMANT (Sep 12 2026): was the target-placement percentage for the
 # previous "stop as trigger" design (target = trigger + this % of the
@@ -613,7 +785,7 @@ STOP_TRIGGERED_TARGET_PCT = 0.5
 # SignalResult.execution_inverted) for how a flip gets recorded for
 # meta-labeling / strategy_stats.
 FIXED_ENTRY_LEVELS_ENABLED   = True
-FIXED_ENTRY_INVERT_DIRECTION = False 
+FIXED_ENTRY_INVERT_DIRECTION = True
 FIXED_ENTRY_TP_PCT           = 0.50   # was 0.59
 FIXED_ENTRY_SL_PCT           = 0.25   # was 0.29 — ratio held at exactly 2:1
 
@@ -674,7 +846,7 @@ STOP_LOSS_MIDPOINT_PCT = 0.5
 # and it never flips direction ("we are going to trade just how the
 # indicators tell us to, no inversion"). Left in place, dormant.
 SCALED_SL_TP_ENABLED          = False
-SCALED_SL_TP_INVERT_DIRECTION = False 
+SCALED_SL_TP_INVERT_DIRECTION = True
 SCALED_TP_STOP_MULT           = 1.50   # was 1.33
 SCALED_SL_TARGET_MULT         = 0.35   # was 0.60
 
