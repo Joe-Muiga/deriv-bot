@@ -73,6 +73,43 @@ SYNTHETIC = [
                                                            # here; see config.py's RANGE_BREAK note.
 ]
 
+# ── ICT / SMC TRADING UNIVERSE (Sep 2026 pivot) ──────────────
+# Gold, major commodities, and major Forex pairs only — this is the ONLY
+# universe the bot scans/trades now (see config.ALL_TRADE_SYMBOLS, which
+# is pointed at ICT_TRADING_UNIVERSE below). Synthetic indices, crypto,
+# stock indices, and the minor/cross Forex pairs above are kept in this
+# file (nothing is deleted) but are no longer part of the active scan
+# list — see config.py's "ICT TRADING UNIVERSE" section for the switch.
+
+# The 7 USD majors — the most liquid, tightest-spread Forex pairs, and the
+# pairs ICT/SMC methodology is most commonly taught and validated against.
+MAJOR_FOREX = [
+    "frxEURUSD", "frxGBPUSD", "frxUSDJPY", "frxUSDCHF",
+    "frxAUDUSD", "frxUSDCAD", "frxNZDUSD",
+]
+
+# Gold, called out on its own per user request — the single most heavily
+# ICT/SMC-traded instrument (deep liquidity, clean structure, tight London/
+# NY killzone behaviour).
+GOLD = ["frxXAUUSD"]
+
+# Major commodities beyond gold: Silver (the other precious metal majors
+# trade), and WTI/Brent crude (the two major oil benchmarks).
+MAJOR_COMMODITIES = ["frxXAGUSD", "frxUSOIL", "frxUKOIL"]
+
+# The bot's actual active trading universe.
+ICT_TRADING_UNIVERSE = list(dict.fromkeys(GOLD + MAJOR_COMMODITIES + MAJOR_FOREX))
+
+def get_ict_asset_class(sym: str) -> str:
+    """Coarser classification used by ict_engine.py / config.py's per-class
+    tuning (killzone weighting, liquidity tolerance, etc.) — distinct from
+    get_symbol_class() below, which still returns 'forex'/'commodity' for
+    everything, ICT universe or not."""
+    if sym in GOLD:               return "gold"
+    if sym in MAJOR_COMMODITIES:  return "commodity"
+    if sym in MAJOR_FOREX:        return "forex_major"
+    return get_symbol_class(sym)
+
 # Ordered by priority (most liquid / best spreads first)
 PRIORITY_ORDER = (
     SYNTHETIC[:5]          # synthetics always available
