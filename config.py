@@ -59,7 +59,7 @@ import symbols as sym_module
 # ══════════════════════════════════════════════════════════════
 # GENERAL / DERIV API / SERVER
 # ══════════════════════════════════════════════════════════════
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "DEBUG"
 DEBUG     = False
 VERSION   = "2.0.0"   # SMC/ICT pivot
 
