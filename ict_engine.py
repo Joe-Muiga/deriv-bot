@@ -1,0 +1,783 @@
+"""
+ict_engine.py — Smart Money Concepts / ICT signal engine for real markets
+(major Forex pairs, gold, major commodities) traded via Deriv.
+
+This is the REPLACEMENT for the entire synthetic-index technical-indicator
+pipeline that used to live in signal_engine.py (evaluate_popular_indicator,
+evaluate_vol_breakout/evaluate_vol_reversion_mult, evaluate_digit*,
+evaluate_boom_crash, evaluate_jump_buildup, evaluate_trend_shift,
+evaluate_pullback_trend, evaluate_fast_mean_reversion,
+evaluate_spike_catch_*, evaluate_step_grid — RSI/MACD/Bollinger/ADX/
+Parabolic SAR/Ichimoku/chi-square-digit-bias/drift-following logic). None
+of that logic is imported or called from here. See signal_engine.py's
+module docstring for the removal note.
+
+Implements the mechanical, deterministic rule set from
+SMC_ICT_Strategy_Guide.md, adapted from the pandas-based
+smc_ict_bot_framework.py reference so it runs directly on this codebase's
+`Candle` objects (candlestick_builder.Candle) and its existing three-tier
+htf/mtf/ltf bar-fetch pipeline (bot_engine.BotEngine._init_data /
+CandlestickBuilder) — no DataFrame conversion or new data-feed plumbing
+needed.
+
+Top-down sequence implemented in `analyze()` (guide Section 11):
+  1. HTF bias           — market structure (HH/HL vs LH/LL, BOS/CHoCH) on
+                           HTF bars.
+  2. HTF POI             — order block / FVG aligned with bias, sitting in
+                           discount (for longs) / premium (for shorts) of
+                           the current HTF dealing range.
+  3. Price in POI        — gate: nothing happens until price is trading
+                           inside the HTF POI.
+  4. MTF liquidity sweep — inducement sweep of a minor MTF swing at/into
+                           the POI (precondition, not the trigger).
+  5. MTF CHoCH/BOS        — structure shift confirmation on MTF, in the
+                           direction of HTF bias.
+  6. LTF entry OB         — the LTF order block that caused the LTF
+                           structure shift aligned with HTF bias — tight,
+                           late entry with a nearby structural stop.
+  7. Stop-loss            — beyond the entry OB's extreme.
+  8. Take-profit          — next liquidity pool in the trade direction, or
+                           the HTF POI's far edge extended, whichever
+                           clears the minimum R:R.
+  9. Killzone filter      — session computed in UTC from the candle's own
+                           epoch (matches the broker's timestamps),
+                           converted to America/New_York for DST-correct
+                           killzone boundaries.
+ 10. Min R:R gate         — reject if achievable reward:risk is below
+                           min_rr.
+
+Stateless / restart-safe: everything is re-derived fresh from whatever
+bars are currently held in the htf/mtf/ltf CandlestickBuilder buffers on
+every scan cycle — no state persists across cycles beyond what's already
+re-derivable from the bars themselves (consistent with how
+CandlestickBuilder already reseeds history on every (re)start).
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Dict, List, Literal, Optional, Tuple
+
+import numpy as np
+
+from candlestick_builder import Candle
+
+try:
+    from zoneinfo import ZoneInfo
+    _NY_TZ = ZoneInfo("America/New_York")
+except Exception:  # pragma: no cover — stdlib zoneinfo always present on 3.9+
+    _NY_TZ = None
+
+logger = logging.getLogger(__name__)
+
+Direction = Literal["bullish", "bearish"]
+
+
+# ============================================================
+# 1. Data structures
+# ============================================================
+
+@dataclass
+class SwingPoint:
+    index:     int
+    timestamp: int
+    price:     float
+    kind:      Literal["high", "low"]
+
+
+@dataclass
+class StructureEvent:
+    index:        int
+    timestamp:    int
+    kind:         Literal["BOS", "CHoCH"]
+    direction:    Direction
+    broken_swing: SwingPoint
+
+
+@dataclass
+class OrderBlock:
+    start_index: int
+    end_index:   int
+    top:         float
+    bottom:      float
+    direction:   Direction      # 'bullish' = demand, 'bearish' = supply
+    caused_bos:  bool  = False
+    mitigated:   bool  = False
+
+    @property
+    def midpoint(self) -> float:
+        return (self.top + self.bottom) / 2.0
+
+
+@dataclass
+class FVG:
+    index:     int              # index of the middle (displacement) candle
+    top:       float
+    bottom:    float
+    direction: Direction
+    filled:    bool = False
+
+    @property
+    def ce(self) -> float:
+        """Consequent encroachment: the 50% midpoint of the gap."""
+        return (self.top + self.bottom) / 2.0
+
+    @property
+    def midpoint(self) -> float:
+        return self.ce
+
+
+@dataclass
+class LiquidityPool:
+    price:           float
+    kind:            Literal["BSL", "SSL"]   # buy-side / sell-side liquidity
+    member_indices:  List[int] = field(default_factory=list)
+    swept:           bool      = False
+    swept_index:     Optional[int] = None
+
+
+@dataclass
+class ICTSignal:
+    """
+    Result of analyze(). Carries both the tradeable decision (direction /
+    entry / stop / target / score) and enough state-machine context to
+    drive a rich dashboard display (smc_analyzer.py builds its SMCContext
+    from exactly these fields) and useful log lines when nothing fires.
+    """
+    symbol:      str
+    direction:   str = "NONE"     # "LONG" | "SHORT" | "NONE"
+    stage:       str = "NO_DATA"  # how far the state machine reached
+    reason:      str = ""
+
+    entry:       Optional[float] = None
+    stop:        Optional[float] = None
+    target:      Optional[float] = None
+    rr_ratio:    float = 0.0
+    score:       float = 0.0
+
+    htf_bias:       Optional[str] = None   # "bullish" | "bearish" | None
+    htf_structure:  str  = "RANGING"       # "TRENDING_UP"/"TRENDING_DOWN"/"RANGING"
+    dealing_range:  Optional[Tuple[float, float]] = None   # (low, high)
+    price_zone:     Optional[str] = None   # "premium" | "discount"
+    in_htf_poi:     bool = False
+    poi_kind:       Optional[str] = None   # "order_block" | "fvg"
+    active_poi:     Optional[object] = None  # OrderBlock | FVG
+
+    sweep_detected:   bool = False
+    choch_confirmed:  bool = False
+    mtf_event_kind:   Optional[str] = None  # "BOS" | "CHoCH"
+
+    killzone:    Optional[str] = None
+
+    # Richer context, surfaced for the dashboard / logging — not required
+    # for execution.
+    htf_order_blocks:  List[OrderBlock]     = field(default_factory=list)
+    htf_fvgs:          List[FVG]            = field(default_factory=list)
+    htf_liquidity:     List[LiquidityPool]  = field(default_factory=list)
+    mtf_liquidity:     List[LiquidityPool]  = field(default_factory=list)
+
+
+NONE_SIGNAL_KWARGS = dict(direction="NONE")
+
+
+# ============================================================
+# 2. Swing / fractal detection
+# ============================================================
+
+def detect_swings(bars: List[Candle], lookback: int = 2) -> List[SwingPoint]:
+    """
+    Symmetric N-bar fractal swing detection. A swing high at i requires
+    high[i] to be the strict max over [i-lookback, i+lookback]; a swing low
+    requires low[i] to be the strict min over the same window. Only points
+    with `lookback` bars of confirmation on BOTH sides are returned — this
+    function is inherently lagging by `lookback` bars, which is correct and
+    required to avoid lookahead bias (a swing can't be confirmed until the
+    bars on its right exist).
+    """
+    n = len(bars)
+    if n < (2 * lookback + 1):
+        return []
+
+    highs = np.array([b.high for b in bars], dtype=float)
+    lows  = np.array([b.low  for b in bars], dtype=float)
+
+    swings: List[SwingPoint] = []
+    for i in range(lookback, n - lookback):
+        window_high = highs[i - lookback: i + lookback + 1]
+        window_low  = lows[i - lookback: i + lookback + 1]
+
+        if highs[i] == window_high.max() and int(np.argmax(window_high)) == lookback:
+            swings.append(SwingPoint(i, bars[i].timestamp, float(highs[i]), "high"))
+
+        if lows[i] == window_low.min() and int(np.argmin(window_low)) == lookback:
+            swings.append(SwingPoint(i, bars[i].timestamp, float(lows[i]), "low"))
+
+    swings.sort(key=lambda s: s.index)
+    return swings
+
+
+# ============================================================
+# 3. Market structure: BOS / CHoCH
+# ============================================================
+
+def classify_structure(bars: List[Candle], swings: List[SwingPoint]) -> List[StructureEvent]:
+    """
+    Walk forward through candles and confirmed swings, tracking the
+    prevailing trend, emitting BOS when structure continues and CHoCH when
+    it flips.
+
+    Trend state machine:
+      - Track the last confirmed swing high (LSH) and swing low (LSL).
+      - Close above LSH: CHoCH if trend != 'bullish' else BOS. Flip trend
+        bullish, consume LSH (wait for the next one).
+      - Close below LSL: CHoCH if trend != 'bearish' else BOS. Flip trend
+        bearish, consume LSL.
+    """
+    events: List[StructureEvent] = []
+    if not swings:
+        return events
+
+    trend: Optional[Direction] = None
+    last_high: Optional[SwingPoint] = None
+    last_low:  Optional[SwingPoint] = None
+    swing_ptr = 0
+    closes = [b.close for b in bars]
+
+    for i in range(len(bars)):
+        while swing_ptr < len(swings) and swings[swing_ptr].index <= i:
+            sp = swings[swing_ptr]
+            if sp.kind == "high":
+                last_high = sp
+            else:
+                last_low = sp
+            swing_ptr += 1
+
+        if last_high is not None and closes[i] > last_high.price:
+            kind = "BOS" if trend == "bullish" else "CHoCH"
+            events.append(StructureEvent(i, bars[i].timestamp, kind, "bullish", last_high))
+            trend = "bullish"
+            last_high = None
+
+        elif last_low is not None and closes[i] < last_low.price:
+            kind = "BOS" if trend == "bearish" else "CHoCH"
+            events.append(StructureEvent(i, bars[i].timestamp, kind, "bearish", last_low))
+            trend = "bearish"
+            last_low = None
+
+    return events
+
+
+def structure_label(trend: Optional[Direction]) -> str:
+    if trend == "bullish":
+        return "TRENDING_UP"
+    if trend == "bearish":
+        return "TRENDING_DOWN"
+    return "RANGING"
+
+
+# ============================================================
+# 4. Order blocks
+# ============================================================
+
+def detect_order_blocks(
+    bars: List[Candle],
+    structure_events: List[StructureEvent],
+    search_back: int = 15,
+) -> List[OrderBlock]:
+    """
+    For each BOS/CHoCH event, walk backward from the break to find the
+    last opposite-colored candle before the impulsive move — that candle
+    is the order block. Only OBs that caused a structure break are ever
+    constructed here (caused_bos=True on all of them), per the guide's
+    validity filter: "an OB is only considered valid/tradeable if the
+    impulsive move away from it produced a BOS."
+    """
+    obs: List[OrderBlock] = []
+
+    for ev in structure_events:
+        start = max(0, ev.index - search_back)
+        ob_idx = None
+
+        if ev.direction == "bullish":
+            for j in range(ev.index - 1, start - 1, -1):
+                if bars[j].close < bars[j].open:   # last down-close candle
+                    ob_idx = j
+                    break
+        else:
+            for j in range(ev.index - 1, start - 1, -1):
+                if bars[j].close > bars[j].open:   # last up-close candle
+                    ob_idx = j
+                    break
+
+        if ob_idx is not None:
+            obs.append(OrderBlock(
+                start_index=ob_idx,
+                end_index=ob_idx,
+                top=bars[ob_idx].high,
+                bottom=bars[ob_idx].low,
+                direction=ev.direction,
+                caused_bos=True,
+            ))
+
+    return obs
+
+
+def mark_order_block_mitigation(obs: List[OrderBlock], bars: List[Candle], upto_index: int) -> None:
+    """Marks an OB mitigated once price has traded back into its range."""
+    for ob in obs:
+        if ob.mitigated or ob.end_index >= upto_index:
+            continue
+        for i in range(ob.end_index + 1, upto_index + 1):
+            if bars[i].low <= ob.top and bars[i].high >= ob.bottom:
+                ob.mitigated = True
+                break
+
+
+# ============================================================
+# 5. Fair Value Gaps
+# ============================================================
+
+def detect_fvgs(bars: List[Candle]) -> List[FVG]:
+    """
+    3-candle FVG detection.
+    Bullish: high[i-2] < low[i]  -> gap = (low[i], high[i-2])
+    Bearish: low[i-2]  > high[i] -> gap = (low[i-2], high[i])
+    """
+    fvgs: List[FVG] = []
+    for i in range(2, len(bars)):
+        if bars[i - 2].high < bars[i].low:
+            fvgs.append(FVG(index=i - 1, top=bars[i].low, bottom=bars[i - 2].high, direction="bullish"))
+        elif bars[i - 2].low > bars[i].high:
+            fvgs.append(FVG(index=i - 1, top=bars[i - 2].low, bottom=bars[i].high, direction="bearish"))
+    return fvgs
+
+
+def mark_fvg_fill(fvgs: List[FVG], bars: List[Candle], upto_index: int, require_ce: bool = True) -> None:
+    """Marks an FVG filled once price trades to (at least) its CE midpoint."""
+    for gap in fvgs:
+        if gap.filled or gap.index >= upto_index:
+            continue
+        target = gap.ce if require_ce else (gap.top if gap.direction == "bearish" else gap.bottom)
+        for i in range(gap.index + 1, upto_index + 1):
+            if bars[i].low <= target <= bars[i].high:
+                gap.filled = True
+                break
+
+
+# ============================================================
+# 6. Liquidity pools (equal highs / equal lows)
+# ============================================================
+
+def detect_liquidity_pools(swings: List[SwingPoint], tolerance_pct: float = 0.0008) -> List[LiquidityPool]:
+    """
+    Cluster nearby swing highs into BSL pools and swing lows into SSL
+    pools. tolerance_pct is a relative price tolerance for considering two
+    swings "equal" (e.g. 0.0008 = 0.08% — tune per instrument via
+    config.ICT_LIQUIDITY_TOLERANCE_PCT).
+    """
+    pools: List[LiquidityPool] = []
+
+    for kind, pool_kind in (("high", "BSL"), ("low", "SSL")):
+        pts = sorted([s for s in swings if s.kind == kind], key=lambda s: s.price)
+        used = [False] * len(pts)
+
+        for i, s in enumerate(pts):
+            if used[i]:
+                continue
+            cluster = [s]
+            used[i] = True
+            for j in range(i + 1, len(pts)):
+                if used[j]:
+                    continue
+                if abs(pts[j].price - s.price) / max(s.price, 1e-9) <= tolerance_pct:
+                    cluster.append(pts[j])
+                    used[j] = True
+            if len(cluster) >= 2:
+                avg_price = float(np.mean([c.price for c in cluster]))
+                pools.append(LiquidityPool(
+                    price=avg_price,
+                    kind=pool_kind,
+                    member_indices=[c.index for c in cluster],
+                ))
+
+    # Also register every UNCLUSTERED swing as a single-member pool — a
+    # lone swing high/low is still real liquidity (just less obvious than
+    # an equal-highs/lows pool), and target selection (Section 8 below)
+    # needs the full set of untapped pools to find the nearest one, not
+    # just the "obvious" clustered ones.
+    clustered_indices = {idx for p in pools for idx in p.member_indices}
+    for s in swings:
+        if s.index in clustered_indices:
+            continue
+        pools.append(LiquidityPool(
+            price=s.price,
+            kind="BSL" if s.kind == "high" else "SSL",
+            member_indices=[s.index],
+        ))
+
+    pools.sort(key=lambda p: p.price)
+    return pools
+
+
+def mark_liquidity_sweeps(pools: List[LiquidityPool], bars: List[Candle], upto_index: int) -> None:
+    """A sweep = wick through the pool level followed by a close back on the other side."""
+    for pool in pools:
+        if pool.swept:
+            continue
+        last_member = max(pool.member_indices)
+        for i in range(last_member + 1, upto_index + 1):
+            if pool.kind == "BSL" and bars[i].high > pool.price and bars[i].close < pool.price:
+                pool.swept, pool.swept_index = True, i
+                break
+            if pool.kind == "SSL" and bars[i].low < pool.price and bars[i].close > pool.price:
+                pool.swept, pool.swept_index = True, i
+                break
+
+
+# ============================================================
+# 7. Premium / Discount / OTE
+# ============================================================
+
+def zone_of(price: float, swing_low: float, swing_high: float) -> Optional[str]:
+    rng = swing_high - swing_low
+    if rng <= 0:
+        return None
+    pct = (price - swing_low) / rng
+    return "premium" if pct > 0.5 else "discount"
+
+
+def ote_zone(swing_low: float, swing_high: float, direction: Direction) -> Tuple[float, float]:
+    """0.618-0.79 retracement pocket for the given direction."""
+    rng = swing_high - swing_low
+    if direction == "bullish":
+        return (swing_low + 0.618 * rng, swing_low + 0.79 * rng)
+    return (swing_high - 0.79 * rng, swing_high - 0.618 * rng)
+
+
+# ============================================================
+# 8. Killzone / session filter
+# ============================================================
+
+KILLZONES_ET: Dict[str, Tuple[int, int]] = {
+    # (start_minute_of_day, end_minute_of_day), ET clock, midnight-wrapping
+    # handled below.
+    "asian":        (20 * 60,        24 * 60),          # 8:00 PM - 12:00 AM
+    "london":       (2 * 60,         5 * 60),            # 2:00 AM - 5:00 AM
+    "ny_am":        (7 * 60,         10 * 60),           # 7:00 AM - 10:00 AM
+    "london_close": (10 * 60,        12 * 60),           # 10:00 AM - 12:00 PM
+    "ny_pm":        (13 * 60 + 30,   16 * 60),           # 1:30 PM - 4:00 PM
+}
+
+
+def active_killzone(epoch_ts: int) -> Optional[str]:
+    """
+    Returns the name of the killzone containing epoch_ts (UTC seconds), or
+    None if outside all of them. Converts to America/New_York so DST is
+    handled correctly without the caller needing to think about it.
+    """
+    dt_utc = datetime.fromtimestamp(epoch_ts, tz=timezone.utc)
+    if _NY_TZ is not None:
+        dt_et = dt_utc.astimezone(_NY_TZ)
+    else:  # pragma: no cover — fallback if zoneinfo data is unavailable
+        dt_et = dt_utc
+    minute_of_day = dt_et.hour * 60 + dt_et.minute
+
+    for name, (start, end) in KILLZONES_ET.items():
+        if start <= end:
+            if start <= minute_of_day < end:
+                return name
+        else:  # wraps midnight
+            if minute_of_day >= start or minute_of_day < end:
+                return name
+    return None
+
+
+# ============================================================
+# 9. Top-down orchestration
+# ============================================================
+
+DEFAULT_HTF_SWING_LOOKBACK = 3
+DEFAULT_MTF_SWING_LOOKBACK = 2
+DEFAULT_LTF_SWING_LOOKBACK = 2
+DEFAULT_HTF_SEARCH_BACK    = 15
+DEFAULT_MTF_SEARCH_BACK    = 10
+DEFAULT_LTF_SEARCH_BACK    = 8
+DEFAULT_MIN_RR             = 2.0
+DEFAULT_LIQUIDITY_TOL_PCT  = 0.0008
+
+
+def _dealing_range(swings: List[SwingPoint]) -> Optional[Tuple[SwingPoint, SwingPoint]]:
+    """Most recent confirmed swing high and swing low — the bounding box
+    of the currently active HTF leg."""
+    highs = [s for s in swings if s.kind == "high"]
+    lows  = [s for s in swings if s.kind == "low"]
+    if not highs or not lows:
+        return None
+    return lows[-1], highs[-1]
+
+
+def _select_poi(
+    obs: List[OrderBlock],
+    fvgs: List[FVG],
+    bias: Direction,
+    swing_low: float,
+    swing_high: float,
+    current_price: float,
+):
+    """
+    Filters HTF order blocks / FVGs to ones aligned with bias, unmitigated
+    (unfilled), and sitting on the correct side of the dealing range
+    (discount for longs, premium for shorts — guide Section 5's rule).
+    Returns the POI nearest to current price (the one price is most likely
+    to reach next / already reached), and whether current_price is
+    currently trading inside it.
+    """
+    wanted_zone = "discount" if bias == "bullish" else "premium"
+    candidates: List[Tuple[float, str, object]] = []
+
+    for ob in obs:
+        if ob.direction != bias or ob.mitigated:
+            continue
+        if zone_of(ob.midpoint, swing_low, swing_high) != wanted_zone:
+            continue
+        candidates.append((abs(ob.midpoint - current_price), "order_block", ob))
+
+    for gap in fvgs:
+        if gap.direction != bias or gap.filled:
+            continue
+        if zone_of(gap.ce, swing_low, swing_high) != wanted_zone:
+            continue
+        candidates.append((abs(gap.ce - current_price), "fvg", gap))
+
+    if not candidates:
+        return None, None, False
+
+    candidates.sort(key=lambda c: c[0])
+    _, kind, poi = candidates[0]
+    top    = poi.top
+    bottom = poi.bottom
+    in_poi = bottom <= current_price <= top
+    return poi, kind, in_poi
+
+
+def _nearest_liquidity_target(
+    pools: List[LiquidityPool],
+    bias: Direction,
+    current_price: float,
+) -> Optional[float]:
+    """Nearest untapped liquidity pool beyond current price, in the trade
+    direction (BSL above price for longs, SSL below price for shorts) —
+    the guide's "draw on liquidity" target."""
+    want_kind = "BSL" if bias == "bullish" else "SSL"
+    candidates = [
+        p.price for p in pools
+        if p.kind == want_kind and not p.swept and (
+            (bias == "bullish" and p.price > current_price) or
+            (bias == "bearish" and p.price < current_price)
+        )
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda price: abs(price - current_price))
+
+
+def analyze(
+    symbol: str,
+    htf_bars: List[Candle],
+    mtf_bars: List[Candle],
+    ltf_bars: List[Candle],
+    *,
+    htf_swing_lookback: int = DEFAULT_HTF_SWING_LOOKBACK,
+    mtf_swing_lookback: int = DEFAULT_MTF_SWING_LOOKBACK,
+    ltf_swing_lookback: int = DEFAULT_LTF_SWING_LOOKBACK,
+    min_rr: float = DEFAULT_MIN_RR,
+    liquidity_tolerance_pct: float = DEFAULT_LIQUIDITY_TOL_PCT,
+    require_killzone: bool = True,
+) -> ICTSignal:
+    """
+    Runs the full top-down sequence (guide Section 11) and returns an
+    ICTSignal. direction=="NONE" whenever any stage fails to confirm —
+    `stage` tells you exactly which one, for logging/dashboard purposes.
+    """
+    min_htf = 2 * htf_swing_lookback + 10
+    min_mtf = 2 * mtf_swing_lookback + 10
+    min_ltf = 2 * ltf_swing_lookback + 10
+    if len(htf_bars) < min_htf or len(mtf_bars) < min_mtf or len(ltf_bars) < min_ltf:
+        return ICTSignal(symbol=symbol, stage="INSUFFICIENT_DATA",
+                          reason=f"not enough bars yet (htf={len(htf_bars)}, "
+                                 f"mtf={len(mtf_bars)}, ltf={len(ltf_bars)})")
+
+    current_price = float(ltf_bars[-1].close)
+
+    # ── 1. HTF bias ──────────────────────────────────────────────────────
+    htf_swings = detect_swings(htf_bars, htf_swing_lookback)
+    htf_events = classify_structure(htf_bars, htf_swings)
+    htf_bias: Optional[Direction] = htf_events[-1].direction if htf_events else None
+
+    if htf_bias is None:
+        return ICTSignal(symbol=symbol, stage="NO_BIAS",
+                          reason="no confirmed HTF structure event yet",
+                          htf_structure="RANGING")
+
+    htf_obs = detect_order_blocks(htf_bars, htf_events, DEFAULT_HTF_SEARCH_BACK)
+    mark_order_block_mitigation(htf_obs, htf_bars, len(htf_bars) - 1)
+    htf_fvgs = detect_fvgs(htf_bars)
+    mark_fvg_fill(htf_fvgs, htf_bars, len(htf_bars) - 1)
+    htf_liquidity = detect_liquidity_pools(htf_swings, liquidity_tolerance_pct)
+    mark_liquidity_sweeps(htf_liquidity, htf_bars, len(htf_bars) - 1)
+
+    rng = _dealing_range(htf_swings)
+    if rng is None:
+        return ICTSignal(symbol=symbol, stage="NO_DEALING_RANGE",
+                          reason="not enough opposing HTF swings to form a dealing range",
+                          htf_bias=htf_bias, htf_structure=structure_label(htf_bias))
+    swing_low_pt, swing_high_pt = rng
+    swing_low, swing_high = swing_low_pt.price, swing_high_pt.price
+
+    price_zone = zone_of(current_price, swing_low, swing_high)
+
+    # ── 2. HTF POI ───────────────────────────────────────────────────────
+    active_poi, poi_kind, in_poi = _select_poi(
+        htf_obs, htf_fvgs, htf_bias, swing_low, swing_high, current_price
+    )
+
+    base = ICTSignal(
+        symbol=symbol, stage="NO_POI", htf_bias=htf_bias,
+        htf_structure=structure_label(htf_bias),
+        dealing_range=(swing_low, swing_high), price_zone=price_zone,
+        htf_order_blocks=htf_obs, htf_fvgs=htf_fvgs, htf_liquidity=htf_liquidity,
+    )
+    if active_poi is None:
+        base.reason = f"no unmitigated {htf_bias} OB/FVG sitting in {'discount' if htf_bias=='bullish' else 'premium'}"
+        return base
+
+    base.poi_kind = poi_kind
+    base.active_poi = active_poi
+    base.in_htf_poi = in_poi
+
+    # ── 3. Price must be trading inside the POI ─────────────────────────
+    if not in_poi:
+        base.stage = "AWAITING_POI_ARRIVAL"
+        base.reason = (f"watching {poi_kind} [{active_poi.bottom:.5f}-{active_poi.top:.5f}] — "
+                        f"price {current_price:.5f} hasn't reached it yet")
+        return base
+
+    # ── 4/5. MTF liquidity sweep + CHoCH/BOS confirmation ───────────────
+    mtf_swings = detect_swings(mtf_bars, mtf_swing_lookback)
+    mtf_events = classify_structure(mtf_bars, mtf_swings)
+    mtf_liquidity = detect_liquidity_pools(mtf_swings, liquidity_tolerance_pct)
+    mark_liquidity_sweeps(mtf_liquidity, mtf_bars, len(mtf_bars) - 1)
+    base.mtf_liquidity = mtf_liquidity
+
+    if not mtf_events or mtf_events[-1].direction != htf_bias:
+        base.stage = "AWAITING_CHOCH"
+        base.reason = "no MTF structure shift in the HTF bias direction yet"
+        return base
+
+    latest_mtf_event = mtf_events[-1]
+    base.choch_confirmed = latest_mtf_event.kind == "CHoCH"
+    base.mtf_event_kind  = latest_mtf_event.kind
+
+    # Inducement precondition: was a minor opposite-side MTF liquidity pool
+    # swept at or shortly before this confirming event?
+    inducement_kind = "SSL" if htf_bias == "bullish" else "BSL"
+    sweep_detected = any(
+        p.kind == inducement_kind and p.swept and p.swept_index is not None
+        and p.swept_index <= latest_mtf_event.index
+        for p in mtf_liquidity
+    )
+    base.sweep_detected = sweep_detected
+
+    # ── 6. LTF entry order block ─────────────────────────────────────────
+    ltf_swings = detect_swings(ltf_bars, ltf_swing_lookback)
+    ltf_events = classify_structure(ltf_bars, ltf_swings)
+
+    if not ltf_events or ltf_events[-1].direction != htf_bias:
+        base.stage = "AWAITING_LTF_TRIGGER"
+        base.reason = "no LTF structure shift in the HTF bias direction yet"
+        return base
+
+    ltf_obs = detect_order_blocks(ltf_bars, [ltf_events[-1]], DEFAULT_LTF_SEARCH_BACK)
+    if not ltf_obs:
+        base.stage = "NO_ENTRY_OB"
+        base.reason = "LTF structure shifted but no order block caused it"
+        return base
+    entry_ob = ltf_obs[-1]
+
+    # ── 7. Stop-loss — beyond the entry OB's extreme ─────────────────────
+    STOP_BUFFER_PCT = 0.0005   # small buffer beyond the OB extreme so a
+                                # 1-tick wick doesn't invalidate the setup
+    if htf_bias == "bullish":
+        stop_price = entry_ob.bottom * (1 - STOP_BUFFER_PCT)
+    else:
+        stop_price = entry_ob.top * (1 + STOP_BUFFER_PCT)
+
+    entry_price = current_price
+    stop_distance = abs(entry_price - stop_price)
+    if stop_distance <= 0:
+        base.stage = "DEGENERATE_STOP"
+        base.reason = "computed stop distance was zero/negative — skipping"
+        return base
+
+    # ── 8. Take-profit — next liquidity pool, else POI-extension fallback ─
+    liq_target = _nearest_liquidity_target(htf_liquidity, htf_bias, entry_price)
+    if liq_target is not None:
+        target_price = liq_target
+        target_source = "liquidity pool"
+    else:
+        poi_range = active_poi.top - active_poi.bottom
+        if htf_bias == "bullish":
+            target_price = active_poi.top + poi_range * 2.0
+        else:
+            target_price = active_poi.bottom - poi_range * 2.0
+        target_source = "POI extension (no untapped liquidity pool found)"
+
+    target_distance = abs(target_price - entry_price)
+    rr = target_distance / stop_distance if stop_distance > 0 else 0.0
+
+    if rr < min_rr:
+        base.stage = "RR_TOO_LOW"
+        base.reason = (f"best available R:R {rr:.2f} < required {min_rr:.2f} "
+                        f"(target via {target_source})")
+        base.entry, base.stop, base.target, base.rr_ratio = entry_price, stop_price, target_price, rr
+        return base
+
+    # ── 9. Killzone filter ────────────────────────────────────────────────
+    kz = active_killzone(ltf_bars[-1].timestamp)
+    base.killzone = kz
+    if require_killzone and kz is None:
+        base.stage = "OUTSIDE_KILLZONE"
+        base.reason = f"setup valid (R:R {rr:.2f}) but outside all killzones — filtered"
+        base.entry, base.stop, base.target, base.rr_ratio = entry_price, stop_price, target_price, rr
+        return base
+
+    # ── Scoring ────────────────────────────────────────────────────────────
+    score = 0.45
+    if sweep_detected:
+        score += 0.15
+    if base.choch_confirmed:
+        score += 0.10
+    if poi_kind == "order_block":
+        score += 0.05
+    score += min(rr / (min_rr * 2.0), 1.0) * 0.15
+    if kz is not None:
+        score += 0.10
+    score = max(0.0, min(1.0, score))
+
+    direction_out = "LONG" if htf_bias == "bullish" else "SHORT"
+
+    base.direction   = direction_out
+    base.stage        = "SIGNAL"
+    base.entry         = entry_price
+    base.stop           = stop_price
+    base.target          = target_price
+    base.rr_ratio         = rr
+    base.score             = score
+    base.reason = (
+        f"{symbol} HTF {htf_bias} bias | POI={poi_kind} zone={price_zone} | "
+        f"MTF {'sweep+' if sweep_detected else ''}{latest_mtf_event.kind} | "
+        f"LTF OB entry | R:R={rr:.2f} | killzone={kz or 'none'}"
+    )
+    return base
