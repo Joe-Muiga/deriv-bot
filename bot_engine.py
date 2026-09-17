@@ -53,7 +53,6 @@ import restart_scheduler
 import symbols as sym_module
 import strategy_stats
 import meta_labeling
-import pair_suspension
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
@@ -99,81 +98,6 @@ class ScanResult:
     score:     float = 0.0
     rank_key:  float = 0.0   # score * bandit priority weight — sort key only,
                               # never persisted/logged in place of `score`
-
-
-@dataclass
-class PendingEntry:
-    """
-    A signal that fired but hasn't been bought yet — armed and watched
-    tick-by-tick (see bot_engine._check_pending_entry, called from
-    _on_tick) until price reaches the native stop-loss, or it expires
-    unfilled. See config.py's "DELAYED ENTRY — stop as trigger" block
-    (Sep 12 2026 single-trigger redesign, replacing the earlier two-trigger
-    designs entirely).
-
-    Single trigger: price reaching the indicator's own native_stop_price.
-    That's also where we enter — direction is NEVER flipped, we continue
-    the indicator's original call:
-      - target = live entry price + STOP_TRIGGERED_TARGET_PCT * (the
-        ORIGINAL native_target_price - native_entry_price distance),
-        applied toward where the original target was.
-      - stop, computed AFTER the target: placed on the opposite side of
-        entry from the target, at 1/STOP_TRIGGERED_RISK_REWARD_RATIO of
-        the target distance — so the reward:risk ratio is always exactly
-        STOP_TRIGGERED_RISK_REWARD_RATIO (2:1 by default), by construction.
-    There is no "scrap" outcome. Only the timeout still results in no trade.
-    """
-    symbol:                str
-    sig:                   SignalResult
-    direction:              str     # original indicator direction, unchanged at execution
-    entry_ref_price:        float   # native_entry_price when armed (used only for the target-distance calc)
-    stop_ref_price:         float   # native_stop_price when armed — this IS the trigger
-    target_ref_price:       float   # native_target_price when armed (used only for the target-distance calc)
-    trigger_price:          float   # == stop_ref_price; kept as its own field for clarity at call sites
-    created_at:             float
-    strategy:               str
-
-
-@dataclass
-class StopTriggerPendingEntry:
-    """
-    Handoff (Sep 15 2026) — a NEW, PARALLEL pending-order design, scoped
-    only to config.STOP_AS_TRIGGER_SYMBOLS (the nine symbols routed to
-    signal_engine.py's evaluate_pullback_trend / evaluate_fast_mean_reversion
-    / evaluate_spike_catch_1000 / evaluate_spike_catch_500 /
-    evaluate_step_grid). Built alongside — not a modification of —
-    PendingEntry/_arm_pending_entry/_check_pending_entry/
-    _execute_pending_entry above, which keep governing every other
-    symbol's delayed entry exactly as before. See config.py's
-    "STOP-AS-TRIGGER ENTRY" section for the full spec and worked example.
-
-    This is genuinely the mechanic PendingEntry's own docstring describes
-    (stop-as-trigger, no direction flip) — the live DELAYED_ENTRY_* design
-    above evolved into something else (percent-trigger toward target,
-    forced flip) without that docstring ever being updated; this class
-    implements the stop-as-trigger mechanic for real, for these nine
-    symbols only.
-
-    Single trigger: price reaching the evaluator's own native_stop_price.
-    That's also where we enter — direction is NEVER flipped:
-      - take-profit = the evaluator's original native_target_price, used
-        as-is.
-      - stop-loss, re-derived AFTER the fill from the live entry-to-target
-        distance, so that take_profit_distance / stop_loss_distance is
-        STRICTLY greater than config.STOP_AS_TRIGGER_MIN_RR_RATIO.
-    Cancel-before-fill: reaching the ORIGINAL native_target_price before
-    ever reaching the trigger cancels the pending order outright — no
-    trade. A time-based expiry (shared config.DELAYED_ENTRY_TIMEOUT_SECS)
-    remains as a fallback safety net.
-    """
-    symbol:                str
-    sig:                    SignalResult
-    direction:               str     # original evaluator direction, NEVER flipped at execution
-    entry_ref_price:         float   # native_entry_price when armed (informational only)
-    stop_ref_price:          float   # native_stop_price when armed — this IS the trigger
-    target_ref_price:        float   # native_target_price when armed — used as-is for TP, and as the cancel-before-fill level
-    created_at:              float
-    strategy:                str
 
 
 # ─── Thompson sampling bandit ───────────────────────────────────────────────
@@ -316,35 +240,16 @@ class BotEngine:
         self._mtf:                    Dict[str, CandlestickBuilder] = {}
         self._ltf:                    Dict[str, CandlestickBuilder] = {}
 
-        # ── Raw tick buffer — feeds evaluate(ticks=...) for the tick-based
-        #    evaluators (digit parity, drift fade, jump buildup, trend
-        #    shift), which previously always saw ticks=None because
-        #    nothing ever populated or passed a tick buffer.
+        # ── Raw tick buffer — kept for any future tick-level use;
+        #    signal_engine.evaluate() no longer reads it (ICT works
+        #    entirely off completed HTF/MTF/LTF candles).
         self._raw_ticks:              Dict[str, Deque[dict]] = {}
 
-        # ── Delayed-entry / native SL-TP swap (Sep 2026) — signals that
-        #    fired but are waiting for price to move DELAYED_ENTRY_TRIGGER_PCT
-        #    toward their own native target before actually being bought.
-        #    {symbol: PendingEntry}. See config.py for the full mechanism.
-        self._pending_entries:        Dict[str, PendingEntry] = {}
-
-        # Handoff (Sep 15 2026) — parallel stop-as-trigger pending-order
-        # state, scoped to config.STOP_AS_TRIGGER_SYMBOLS only. Mutually
-        # exclusive with self._pending_entries per symbol (the dispatch
-        # block below arms a symbol into exactly one of the two dicts,
-        # never both) — see _arm_stop_trigger_entry / _check_stop_trigger_entry
-        # / _execute_stop_trigger_entry and config.py's "STOP-AS-TRIGGER
-        # ENTRY" section.
-        self._stop_trigger_pending:   Dict[str, StopTriggerPendingEntry] = {}
-
-        # Closes the race where a symbol sits in neither _pending_entries
-        # nor symbol_manager's _active_symbols — from the instant a pending
-        # entry triggers (or an immediate signal is selected for execution)
-        # until _execute() actually finishes registering it as open. See
-        # _check_pending_entry's trigger branch and _execute_pending_entry's
-        # finally block for where this gets set/released on the delayed
-        # path, and the main cycle loop / _execute_and_release for the
-        # immediate path.
+        # Closes the race where a symbol sits in neither "about to be
+        # executed" nor symbol_manager's _active_symbols — from the instant
+        # a signal is selected for execution until _execute() actually
+        # finishes registering it as open. See the main cycle loop /
+        # _execute_and_release.
         self._executing_symbols:      Set[str] = set()
 
         self._initialised_symbols:    Set[str]           = set()
@@ -599,6 +504,7 @@ class BotEngine:
         dash_task     = asyncio.create_task(self._dashboard_loop())
         settle_task   = asyncio.create_task(self._settle_loop())
         degraded_task = asyncio.create_task(self._degraded_retry_loop())
+        htf_mtf_task  = asyncio.create_task(self._htf_mtf_refresh_loop())
         # NOTE: the daily Kenya-midnight redeploy timer (Fix G) is started
         # by main.py's existing restart_scheduler.start_restart_scheduler()
         # call, unchanged — NOT started again here, to avoid two competing
@@ -616,6 +522,7 @@ class BotEngine:
             dash_task.cancel()
             settle_task.cancel()
             degraded_task.cancel()
+            htf_mtf_task.cancel()
             ws_task.cancel()
 
     # ── Startup — TRADE_SYMBOLS only ───────────────────────────────────────────
@@ -850,16 +757,6 @@ class BotEngine:
         self._tick_degraded.discard(symbol)
         logger.debug(f"TICK: {symbol} epoch={epoch} price={price}")
 
-        if symbol in self._pending_entries:
-            self._check_pending_entry(symbol, price)
-        # DORMANT (Sep 16 2026): self._stop_trigger_pending never gets
-        # populated anymore (see _apply_flip_and_swap_levels' comment) — the
-        # membership check below is always False, kept only so the dormant
-        # stop-as-trigger design would resume working immediately if it were
-        # ever re-armed by hand.
-        if symbol in self._stop_trigger_pending:
-            self._check_stop_trigger_entry(symbol, price)
-
     # ── Degraded-symbol tick resubscription ─────────────────────────────────────
 
     async def _degraded_retry_loop(self):
@@ -886,6 +783,60 @@ class BotEngine:
                 return
             except Exception as exc:
                 logger.error(f"_degraded_retry_loop: {exc}")
+
+    # ── HTF/MTF direct-from-Deriv refresh ───────────────────────────────────────
+    # ICT bias/POI (HTF) and sweep/CHoCH confirmation (MTF) are the two most
+    # structure-sensitive stages of ict_engine.analyze() — a handful of
+    # fabricated flat filler candles from a live tick-built buffer crossing
+    # a session close (see candlestick_builder.py's max_gap_fill_bars
+    # docstring) is a much bigger problem for them than for LTF, which is
+    # only used for the final entry trigger. This periodically replaces the
+    # HTF/MTF CandlestickBuilder bars with a fresh pull straight from
+    # Deriv's own candle history (the same ticks_history/style=candles call
+    # used for startup seeding — client.get_candles()) rather than trusting
+    # the live tick-built rolling buffer for these two timeframes at all.
+    # LTF stays purely tick-built between refreshes, for responsive
+    # execution timing — see config.HTF_MTF_REFRESH_FROM_BROKER_SECS.
+    async def _htf_mtf_refresh_loop(self):
+        interval = getattr(config, "HTF_MTF_REFRESH_FROM_BROKER_SECS", 900)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                symbols_now = list(self._htf.keys())
+                if not symbols_now:
+                    continue
+
+                async def _refresh_one(symbol: str):
+                    htf_b = self._htf.get(symbol)
+                    mtf_b = self._mtf.get(symbol)
+                    if htf_b is None or mtf_b is None:
+                        return
+                    try:
+                        htf_data, mtf_data = await asyncio.wait_for(
+                            asyncio.gather(
+                                self.client.get_candles(symbol, config.HTF_GRANULARITY, config.HTF_BARS),
+                                self.client.get_candles(symbol, self._mtf_gran(symbol), config.MTF_BARS),
+                                return_exceptions=True,
+                            ),
+                            timeout=15,
+                        )
+                        if htf_data and not isinstance(htf_data, Exception):
+                            htf_b.replace_bars(htf_data)
+                        if mtf_data and not isinstance(mtf_data, Exception):
+                            mtf_b.replace_bars(mtf_data)
+                        logger.debug(f"{symbol}: HTF/MTF refreshed directly from Deriv")
+                    except Exception as exc:
+                        logger.warning(f"{symbol}: HTF/MTF broker refresh failed — {exc}")
+
+                await asyncio.gather(
+                    *[_refresh_one(s) for s in symbols_now],
+                    return_exceptions=True,
+                )
+                logger.info(f"HTF/MTF refresh: {len(symbols_now)} symbol(s) re-pulled from Deriv")
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                logger.error(f"_htf_mtf_refresh_loop: {exc}")
 
     # ── Dashboard ──────────────────────────────────────────────────────────────
 
@@ -1056,14 +1007,16 @@ class BotEngine:
         #      to their own field (circuit_breaker_symbols) in the
         #      update_status() call below instead of being conflated with
         #      per-pair suspensions under the same key.
+        # Per-(indicator, symbol) suspension display used to source from
+        # pair_suspension.py — deleted along with the multi-indicator
+        # pipeline it existed for (see signal_engine.py's module
+        # docstring). There's one strategy now, so only whole-symbol
+        # suspension (symbol_manager.py) is meaningful; the dashboard's
+        # suspended-pairs list is simply empty going forward.
         try:
-            pair_susp_list = [
-                {"pair": pair, "seconds_remaining": round(secs, 0)}
-                for pair, secs in pair_suspension.snapshot().items()
-            ]
-            update_suspended_symbols(pair_susp_list)
+            update_suspended_symbols([])
         except Exception as exc:
-            logger.warning(f"pair_suspension dashboard push failed: {exc}")
+            logger.warning(f"suspended-symbols dashboard push failed: {exc}")
 
         circuit_breaker_symbols = [
             {
@@ -1261,67 +1214,39 @@ class BotEngine:
                         family_open_counts[fam] = count + 1
                     top.append(r)
 
-            # 9. Execute top signals — unless delayed entry applies, in
-            #    which case it's armed and watched instead of bought
-            #    immediately (see _arm_pending_entry / DELAYED_ENTRY_ENABLED).
-            #    Flip entry (handoff correction, Sep 16 2026): for the nine
-            #    config.STOP_AS_TRIGGER_SYMBOLS, there is NO arm-and-wait
-            #    step anymore — _apply_flip_and_swap_levels() transforms the
-            #    signal (direction flipped, entry=native as-is, take-profit
-            #    = old native_stop_price, stop-loss re-derived on the
-            #    opposite side) and it's bought IMMEDIATELY below, same as
-            #    the always-immediate fixed-pct path. This REPLACES the
-            #    Sep 15 stop-as-trigger arm-and-wait design entirely for
-            #    these nine symbols — config.STOP_AS_TRIGGER_ENABLED is now
-            #    False and _arm_stop_trigger_entry() is never called, so
-            #    only this flip-entry design executes for them. Every other
-            #    symbol is completely unaffected — delayed_eligible below is
-            #    unchanged from before this pass.
-            #    Delayed-entry signals are still armed on their RAW native
-            #    levels — scaled+inverted SL/TP (config.SCALED_SL_TP_ENABLED)
-            #    is only applied once a DELAYED_ENTRY_* entry actually
-            #    triggers, inside _execute_pending_entry(), against those
-            #    original levels — not here.
+            # 9. Execute top signals immediately, exactly as ict_engine.py
+            #    computed them. There is no entry-transform step anymore —
+            #    the old delayed-entry / flip-entry / fixed-pct-native-levels
+            #    machinery (all built to invert or rescale synthetic-index
+            #    momentum signals) has been deleted, not disabled. An ICT
+            #    signal's direction and native_entry_price/native_stop_price/
+            #    native_target_price ARE the structural analysis (entry-OB
+            #    extreme for the stop, next liquidity pool for the target) —
+            #    transforming them the way those mechanisms did would throw
+            #    away the entire basis for the trade. See
+            #    signal_engine.SignalResult's docstring.
             if top:
                 to_execute: List[ScanResult] = []
                 for r in top:
                     s = r.sig
                     has_native_levels = (
                         s.direction in ("LONG", "SHORT")
-                        and getattr(s, "contract_kind", "RISE_FALL") == "RISE_FALL"
                         and s.native_entry_price is not None
                         and s.native_stop_price is not None
                         and s.native_target_price is not None
                     )
-                    flip_entry_eligible = (
-                        has_native_levels
-                        and getattr(config, "FLIP_ENTRY_ENABLED", False)
-                        and r.symbol in getattr(config, "STOP_AS_TRIGGER_SYMBOLS", [])
-                    )
-                    delayed_eligible = (
-                        not flip_entry_eligible
-                        and has_native_levels
-                        and getattr(config, "DELAYED_ENTRY_ENABLED", False)
-                    )
-                    if flip_entry_eligible:
-                        flipped_sig = self._apply_flip_and_swap_levels(s)
-                        if flipped_sig is not None:
-                            self._executing_symbols.add(r.symbol)
-                            to_execute.append(replace(r, sig=flipped_sig))
-                        # else: geometrically invalid (target_distance <= 0)
-                        # — drop the signal for this cycle rather than trade
-                        # a malformed one; should be unreachable given how
-                        # the five evaluators construct their own levels.
-                    elif delayed_eligible:
-                        self._arm_pending_entry(r.symbol, s)
-                    else:
-                        # Reserve synchronously, same reasoning as the
-                        # delayed-entry trigger path: _active_symbols only
-                        # gets set once _execute() finishes, so without this
-                        # a slow buy call leaves the symbol "available" for
-                        # the next cycle to select and execute again.
-                        self._executing_symbols.add(r.symbol)
-                        to_execute.append(replace(r, sig=self._apply_fixed_pct_native_levels(s)))
+                    if not has_native_levels:
+                        logger.warning(
+                            f"SKIP: {r.symbol} ICT signal missing native "
+                            f"entry/stop/target — should not happen, see "
+                            f"ict_engine.analyze()")
+                        continue
+                    # Reserve synchronously — _active_symbols only gets set
+                    # once _execute() finishes, so without this a slow buy
+                    # call leaves the symbol "available" for the next cycle
+                    # to select and execute again.
+                    self._executing_symbols.add(r.symbol)
+                    to_execute.append(r)
 
                 if to_execute:
                     await asyncio.gather(
@@ -1348,602 +1273,44 @@ class BotEngine:
 
     async def _scan(self, symbol: str) -> Optional[ScanResult]:
         try:
-            builder = self._ltf.get(symbol)
-            if builder is None:
+            ltf_builder = self._ltf.get(symbol)
+            htf_builder = self._htf.get(symbol)
+            mtf_builder = self._mtf.get(symbol)
+            if ltf_builder is None or htf_builder is None or mtf_builder is None:
                 return None
 
-            ltf_bars = builder.completed_bars
-            ticks    = list(self._raw_ticks.get(symbol, ()))
+            ltf_bars = ltf_builder.completed_bars
+            htf_bars = htf_builder.completed_bars
+            mtf_bars = mtf_builder.completed_bars
+            if not ltf_bars:
+                return None
 
-            sig = self.signal.evaluate(ltf_bars, symbol, ticks=ticks)
+            sig = self.signal.evaluate(ltf_bars, symbol, htf_bars=htf_bars, mtf_bars=mtf_bars)
             if sig is None or getattr(sig, "direction", "NONE") == "NONE":
                 return None
 
-            price = float(ltf_bars[-1].close) if ltf_bars else 0.0
+            price = float(ltf_bars[-1].close)
+
+            # Real SMC context for the dashboard — see smc_analyzer.py's
+            # module docstring for why this used to always be an empty
+            # placeholder regardless of what _scan found.
+            try:
+                smc_ctx = self.smc.analyse(htf_bars, mtf_bars, current_price=price, symbol=symbol)
+            except Exception as exc:
+                logger.warning(f"{symbol}: smc.analyse() failed for dashboard context — {exc}")
+                smc_ctx = SMCContext()
 
             return ScanResult(
                 symbol  = symbol,
                 sig     = sig,
                 price   = price,
-                smc_ctx = SMCContext(),
+                smc_ctx = smc_ctx,
                 score   = getattr(sig, "score", 0.0),
             )
 
         except Exception as exc:
             logger.error(f"SCAN ERROR {symbol}: {type(exc).__name__}: {exc}", exc_info=True)
             return None
-
-    # ── Delayed entry — two-trigger design (Sep 12 2026) ─────────────────────────
-    # See config.py's "DELAYED ENTRY" block for the spec. Monitoring here is
-    # always against the RAW, untouched native levels the indicator computed.
-
-    def _arm_pending_entry(self, symbol: str, sig: SignalResult) -> None:
-        """Register a firing signal as pending instead of buying it now."""
-        if symbol in self._pending_entries:
-            return  # already watching a setup for this symbol — don't reset it
-        if symbol in self._executing_symbols:
-            return  # a trigger for this symbol is already executing — don't
-                     # arm a second one on top of it (defense in depth; the
-                     # signals-level filter above should already exclude it)
-
-        entry  = float(sig.native_entry_price)
-        stop   = float(sig.native_stop_price)
-        target = float(sig.native_target_price)
-        pct    = getattr(config, "DELAYED_ENTRY_TRIGGER_PCT", 0.25)
-        # Direction-agnostic: (target-entry) already carries the right sign
-        # for LONG vs SHORT, so this lands PCT% of the way toward the
-        # original target whichever direction that is.
-        trigger = entry + pct * (target - entry)
-
-        self._pending_entries[symbol] = PendingEntry(
-            symbol=symbol, sig=sig, direction=sig.direction,
-            entry_ref_price=entry, stop_ref_price=stop, target_ref_price=target,
-            trigger_price=trigger,
-            created_at=time.time(), strategy=getattr(sig, "strategy", "unknown"),
-        )
-        flipped = "SHORT" if sig.direction == "LONG" else "LONG"
-        ratio   = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
-        logger.info(
-            f"PENDING ENTRY ARMED: {symbol} | indicator called {sig.direction} | "
-            f"entry_ref={entry:.5f} | TRIGGER @ {trigger:.5f} ({pct*100:.0f}% "
-            f"toward native_target={target:.5f}) | on trigger: enter "
-            f"{flipped} (inverted — see _execute_pending_entry for why this "
-            f"is forced, not optional), take-profit = native_stop="
-            f"{stop:.5f}, stop-loss computed after at 1/{ratio:.1f} of the "
-            f"target distance for an exact {ratio:.1f}:1 ratio"
-        )
-
-
-    def _check_pending_entry(self, symbol: str, price: float) -> None:
-        """Called on every live tick for a symbol with an armed entry."""
-        pe = self._pending_entries.get(symbol)
-        if pe is None:
-            return
-
-        timeout = getattr(config, "DELAYED_ENTRY_TIMEOUT_SECS", 600)
-        if time.time() - pe.created_at > timeout:
-            logger.info(
-                f"PENDING ENTRY EXPIRED: {symbol} | {pe.direction} | never "
-                f"reached trigger (native_stop)={pe.trigger_price:.5f} "
-                f"within {timeout}s"
-            )
-            del self._pending_entries[symbol]
-            return
-
-        is_long = pe.direction == "LONG"
-
-        # Trigger: price has moved DELAYED_ENTRY_TRIGGER_PCT of the way
-        # toward the indicator's own target. For a LONG the trigger sits
-        # above native_entry (toward the target), so "reaching" it means
-        # price rising to or above it. For a SHORT it's the mirror.
-        triggered = (is_long and price >= pe.trigger_price) or \
-                    (not is_long and price <= pe.trigger_price)
-        if not triggered:
-            return
-
-        del self._pending_entries[symbol]
-        # Reserve the symbol THE INSTANT it's decided, synchronously —
-        # before asyncio.create_task() even schedules the coroutine.
-        # Without this, the symbol sits in neither _pending_entries nor
-        # symbol_manager's _active_symbols (that only gets set once
-        # _execute() actually completes a buy) for the gap between here
-        # and whenever the scheduled task actually runs. Any tick or
-        # scan cycle landing in that gap sees an "available" symbol and
-        # re-arms/re-executes it — this is exactly how multiple
-        # simultaneous same-symbol positions were getting opened.
-        # _execute_pending_entry()'s finally block releases this.
-        self._executing_symbols.add(symbol)
-        flipped = "SHORT" if is_long else "LONG"
-        logger.info(
-            f"PENDING ENTRY TRIGGERED: {symbol} | indicator called "
-            f"{pe.direction} | price={price:.5f} crossed trigger="
-            f"{pe.trigger_price:.5f} — entering {flipped} (inverted) at "
-            f"{price:.5f}, targeting the original native_stop="
-            f"{pe.stop_ref_price:.5f}"
-        )
-        asyncio.create_task(self._execute_pending_entry(symbol, pe, price))
-
-    async def _execute_pending_entry(
-            self, symbol: str, pe: PendingEntry, live_price: float) -> None:
-        """
-        Fires the actual buy once price has reached the native stop-loss
-        (the single trigger — see PendingEntry's docstring). Re-checks
-        every guard the normal cycle loop would have applied (can_trade_now,
-        concurrent slots, family cap) since this can fire between cycles.
-
-        The whole body runs under a finally that releases this symbol's
-        _executing_symbols reservation (taken synchronously in
-        _check_pending_entry right when the trigger fired) — on every exit
-        path, not just the successful one, so a dropped attempt (no slot,
-        family cap, can_trade_now False) doesn't leave the symbol
-        permanently un-armable.
-        """
-        try:
-            if not self.symbols.can_trade_now(symbol):
-                logger.info(
-                    f"PENDING ENTRY DROPPED: {symbol} — can_trade_now() False at trigger time")
-                return
-
-            concurrent_limit = self.risk.current_concurrent_limit
-            open_count       = len(self._open_contracts)
-            if open_count >= concurrent_limit:
-                logger.info(
-                    f"PENDING ENTRY DROPPED: {symbol} — no concurrent slot free "
-                    f"at trigger time ({open_count}/{concurrent_limit})")
-                return
-
-            family_map     = getattr(config, "SYMBOL_FAMILY_MAP", {})
-            max_per_family = getattr(config, "MAX_CONCURRENT_PER_FAMILY", 2)
-            fam = family_map.get(symbol)
-            if fam:
-                family_count = sum(
-                    1 for c in self._open_contracts.values()
-                    if family_map.get(c.get("symbol")) == fam
-                )
-                if family_count >= max_per_family:
-                    logger.info(
-                        f"PENDING ENTRY DROPPED: {symbol} — family {fam} at "
-                        f"concurrent cap ({family_count}/{max_per_family})")
-                    return
-
-            # PERCENT-TRIGGER-TO-NATIVE-STOP design (Sep 12 2026): the
-            # trigger is DELAYED_ENTRY_TRIGGER_PCT of the way toward the
-            # ORIGINAL native_target — price moving that far confirms the
-            # indicator's move looked real. What we then trade is the
-            # OPPOSITE of the indicator's call, targeting the ORIGINAL
-            # native_stop_price directly:
-            #   - take-profit = the original native_stop_price, used as-is.
-            #   - direction MUST flip to match: with entry now sitting
-            #     between the original entry and target, the original
-            #     native_stop_price is on the far side, opposite from where
-            #     price just came from — that side is only ever a valid
-            #     take-profit for the trade running in the OPPOSITE
-            #     direction from the indicator's original call. This isn't
-            #     a toggle, it's a geometric consequence of this design —
-            #     confirmed with the user before implementing.
-            #   - stop-loss, computed AFTER the target: opposite side of
-            #     entry from the target, at 1/STOP_TRIGGERED_RISK_REWARD_RATIO
-            #     of the target distance — so the ratio is always exactly
-            #     STOP_TRIGGERED_RISK_REWARD_RATIO (2:1 default), by
-            #     construction, regardless of what the original indicator's
-            #     own entry-to-stop distance was.
-            # entry_price is overridden to the live trigger price since
-            # deriv_client.buy_multiplier() measures its SL/TP dollar
-            # distance off whatever entry_price it's given.
-            ratio = getattr(config, "STOP_TRIGGERED_RISK_REWARD_RATIO", 2.0)
-
-            new_direction = "SHORT" if pe.direction == "LONG" else "LONG"
-            new_target = pe.stop_ref_price
-            target_distance = new_target - live_price
-            new_stop = live_price - (target_distance / ratio)
-
-            swapped_sig = replace(
-                pe.sig,
-                direction=new_direction,
-                native_stop_price=new_stop,
-                native_target_price=new_target,
-                native_entry_price=live_price,
-                execution_inverted=True,
-            )
-            await self._execute(symbol, swapped_sig)
-        finally:
-            self._executing_symbols.discard(symbol)
-
-    # ── Stop-as-trigger entry — parallel design (handoff, Sep 15 2026) ───────────
-    # DORMANT as of Sep 16 2026 — superseded entirely by _apply_flip_and_swap_levels()
-    # below (see config.py's now-dormant "STOP-AS-TRIGGER ENTRY" block and its
-    # live replacement, "FLIP ENTRY"). Nothing calls _arm_stop_trigger_entry()
-    # from the dispatch anymore, so self._stop_trigger_pending never gets
-    # populated and the rest of this section is unreachable in practice — left
-    # in place only as history / in case this design is ever wanted back.
-    # See config.py's "STOP-AS-TRIGGER ENTRY" block for the spec and worked
-    # example. Scoped exclusively to config.STOP_AS_TRIGGER_SYMBOLS; every
-    # other symbol keeps using _arm_pending_entry/_check_pending_entry/
-    # _execute_pending_entry above, unchanged. Monitoring here is always
-    # against the RAW, untouched native levels the evaluator computed.
-
-    def _arm_stop_trigger_entry(self, symbol: str, sig: SignalResult) -> None:
-        """Register one of the six-evaluator signals on the stop-as-trigger path."""
-        if symbol in self._stop_trigger_pending:
-            return  # already watching a setup for this symbol — don't reset it
-        if symbol in self._executing_symbols:
-            return  # a trigger for this symbol is already executing — defense in depth
-
-        entry  = float(sig.native_entry_price)
-        stop   = float(sig.native_stop_price)
-        target = float(sig.native_target_price)
-
-        self._stop_trigger_pending[symbol] = StopTriggerPendingEntry(
-            symbol=symbol, sig=sig, direction=sig.direction,
-            entry_ref_price=entry, stop_ref_price=stop, target_ref_price=target,
-            created_at=time.time(), strategy=getattr(sig, "strategy", "unknown"),
-        )
-        ratio = getattr(config, "STOP_AS_TRIGGER_MIN_RR_RATIO", 2.0)
-        logger.info(
-            f"STOP-AS-TRIGGER ARMED: {symbol} | {sig.direction} | "
-            f"entry_ref={entry:.5f} | TRIGGER (native_stop)={stop:.5f} | "
-            f"cancel-if-hit-first (native_target)={target:.5f} | on trigger: "
-            f"enter {sig.direction} (NOT flipped) at live price, take-profit "
-            f"stays {target:.5f}, stop-loss re-derived for a strict "
-            f">{ratio:.1f}:1 ratio"
-        )
-
-    def _check_stop_trigger_entry(self, symbol: str, price: float) -> None:
-        """Called on every live tick for a symbol armed on the stop-as-trigger path."""
-        pe = self._stop_trigger_pending.get(symbol)
-        if pe is None:
-            return
-
-        timeout = getattr(config, "DELAYED_ENTRY_TIMEOUT_SECS", 600)
-        if time.time() - pe.created_at > timeout:
-            logger.info(
-                f"STOP-AS-TRIGGER EXPIRED: {symbol} | {pe.direction} | never "
-                f"reached trigger (native_stop)={pe.stop_ref_price:.5f} "
-                f"within {timeout}s"
-            )
-            del self._stop_trigger_pending[symbol]
-            return
-
-        is_long = pe.direction == "LONG"
-
-        # Cancel-before-fill (spec point 5): the ORIGINAL native_target_price
-        # reached before the trigger ever was -> cancelled outright, no
-        # trade. Checked before the trigger check below — for a LONG the
-        # target sits above entry and the trigger (native_stop) sits
-        # below (mirrored for SHORT), so on any single tick at most one of
-        # the two conditions can be true; checking cancel first is simply
-        # the safer order if that ever weren't the case.
-        target_hit_first = (is_long and price >= pe.target_ref_price) or \
-                            (not is_long and price <= pe.target_ref_price)
-        if target_hit_first:
-            logger.info(
-                f"STOP-AS-TRIGGER CANCELLED: {symbol} | {pe.direction} | "
-                f"price={price:.5f} reached the original native_target="
-                f"{pe.target_ref_price:.5f} before ever reaching the "
-                f"trigger (native_stop)={pe.stop_ref_price:.5f} — no trade"
-            )
-            del self._stop_trigger_pending[symbol]
-            return
-
-        triggered = (is_long and price <= pe.stop_ref_price) or \
-                    (not is_long and price >= pe.stop_ref_price)
-        if not triggered:
-            return
-
-        del self._stop_trigger_pending[symbol]
-        # Reserve the symbol synchronously — same reasoning as
-        # _check_pending_entry's trigger branch above (closes the gap
-        # between deciding to trade and _execute() actually completing).
-        self._executing_symbols.add(symbol)
-        logger.info(
-            f"STOP-AS-TRIGGER FIRED: {symbol} | {pe.direction} | price="
-            f"{price:.5f} reached trigger (native_stop)={pe.stop_ref_price:.5f} "
-            f"— entering {pe.direction} (NOT flipped) at {price:.5f}, "
-            f"take-profit stays at original native_target="
-            f"{pe.target_ref_price:.5f}"
-        )
-        asyncio.create_task(self._execute_stop_trigger_entry(symbol, pe, price))
-
-    async def _execute_stop_trigger_entry(
-            self, symbol: str, pe: StopTriggerPendingEntry, live_price: float) -> None:
-        """
-        Fires the actual buy once price has reached the evaluator's own
-        native_stop_price (the single trigger — see StopTriggerPendingEntry's
-        docstring). Re-checks every guard the normal cycle loop would have
-        applied (can_trade_now, concurrent slots, family cap) since this can
-        fire between cycles — mirrors _execute_pending_entry()'s guard
-        re-checks above.
-
-        Direction is never flipped. Take-profit is the original
-        native_target_price, unchanged. Stop-loss is re-derived from the
-        live entry-to-target distance so that take_profit_distance /
-        stop_loss_distance is strictly greater than
-        config.STOP_AS_TRIGGER_MIN_RR_RATIO (see config.py's worked
-        example for the exact construction).
-
-        Runs under a finally that releases this symbol's
-        _executing_symbols reservation on every exit path, not just the
-        successful one, so a dropped attempt doesn't leave the symbol
-        permanently un-armable.
-        """
-        try:
-            if not self.symbols.can_trade_now(symbol):
-                logger.info(
-                    f"STOP-AS-TRIGGER DROPPED: {symbol} — can_trade_now() False at trigger time")
-                return
-
-            concurrent_limit = self.risk.current_concurrent_limit
-            open_count       = len(self._open_contracts)
-            if open_count >= concurrent_limit:
-                logger.info(
-                    f"STOP-AS-TRIGGER DROPPED: {symbol} — no concurrent slot free "
-                    f"at trigger time ({open_count}/{concurrent_limit})")
-                return
-
-            family_map     = getattr(config, "SYMBOL_FAMILY_MAP", {})
-            max_per_family = getattr(config, "MAX_CONCURRENT_PER_FAMILY", 2)
-            fam = family_map.get(symbol)
-            if fam:
-                family_count = sum(
-                    1 for c in self._open_contracts.values()
-                    if family_map.get(c.get("symbol")) == fam
-                )
-                if family_count >= max_per_family:
-                    logger.info(
-                        f"STOP-AS-TRIGGER DROPPED: {symbol} — family {fam} at "
-                        f"concurrent cap ({family_count}/{max_per_family})")
-                    return
-
-            ratio  = getattr(config, "STOP_AS_TRIGGER_MIN_RR_RATIO", 2.0)
-            margin = getattr(config, "STOP_AS_TRIGGER_SL_SAFETY_MARGIN", 0.10)
-            is_long = pe.direction == "LONG"
-            target  = pe.target_ref_price
-
-            target_distance = (target - live_price) if is_long else (live_price - target)
-            if target_distance <= 0:
-                # Defensive only — _check_stop_trigger_entry's cancel-before-
-                # fill check should make this unreachable in practice, but
-                # never derive a stop-loss from a non-positive distance.
-                logger.warning(
-                    f"STOP-AS-TRIGGER DROPPED: {symbol} — non-positive target "
-                    f"distance at fill ({target_distance:.5f}), refusing to trade"
-                )
-                return
-
-            max_sl_distance = target_distance / ratio
-            sl_distance     = max_sl_distance * (1.0 - margin)
-            new_stop        = (live_price - sl_distance) if is_long else (live_price + sl_distance)
-
-            swapped_sig = replace(
-                pe.sig,
-                direction=pe.direction,            # unchanged — NEVER flipped
-                native_entry_price=live_price,
-                native_stop_price=new_stop,
-                native_target_price=target,        # unchanged
-                execution_inverted=False,
-            )
-            logger.info(
-                f"STOP-AS-TRIGGER EXECUTING: {symbol} | {pe.direction} | "
-                f"fill={live_price:.5f} | take-profit={target:.5f} (unchanged) | "
-                f"new stop-loss={new_stop:.5f} | ratio="
-                f"{(target_distance / sl_distance):.2f}:1 (> {ratio:.1f} required)"
-            )
-            await self._execute(symbol, swapped_sig)
-        finally:
-            self._executing_symbols.discard(symbol)
-
-    # ── Flip entry — immediate, direction flipped (handoff correction, Sep 16 2026) ──
-    # LIVE. Replaces the stop-as-trigger arm-and-wait design above entirely
-    # for config.STOP_AS_TRIGGER_SYMBOLS — see config.py's "FLIP ENTRY"
-    # block for the full spec and worked example. Called directly from the
-    # main dispatch loop, same call shape as _apply_fixed_pct_native_levels
-    # below: no arming, no pending state, no ticks watched — the transform
-    # happens once and the result is bought immediately, in the same cycle.
-
-    def _apply_flip_and_swap_levels(self, sig: SignalResult) -> Optional[SignalResult]:
-        """
-        Handoff correction (Sep 16 2026) — for config.STOP_AS_TRIGGER_SYMBOLS
-        only. Transforms a firing signal for IMMEDIATE execution:
-
-          1. Direction is FLIPPED (LONG -> SHORT, SHORT -> LONG). Intentional:
-             the evaluator's own native_stop_price always sits on the side of
-             entry OPPOSITE its native_target_price, so using native_stop_price
-             as a take-profit (step 3) only makes geometric sense for the
-             OPPOSITE direction from what the evaluator signalled.
-          2. Entry = native_entry_price, used directly, unchanged.
-          3. Take-profit = the evaluator's original native_stop_price,
-             unchanged (native_target_price is no longer used at all).
-          4. Stop-loss is computed fresh, on the side of entry OPPOSITE the
-             new take-profit, so that take_profit_distance / stop_loss_distance
-             is STRICTLY greater than config.FLIP_ENTRY_MIN_RR_RATIO — same
-             ratio+margin construction the retired stop-as-trigger design used.
-
-        Returns None (caller drops the signal for this cycle) if the
-        resulting take-profit distance isn't strictly positive — should be
-        geometrically unreachable given how the five evaluators construct
-        their own levels, but this never derives a stop-loss from a
-        non-positive distance regardless.
-        """
-        if sig.direction not in ("LONG", "SHORT"):
-            return None
-        if sig.native_entry_price is None or sig.native_stop_price is None:
-            return None
-
-        flipped_direction = "SHORT" if sig.direction == "LONG" else "LONG"
-        entry  = float(sig.native_entry_price)
-        target = float(sig.native_stop_price)   # evaluator's old stop -> new take-profit
-        is_long = flipped_direction == "LONG"
-
-        target_distance = (target - entry) if is_long else (entry - target)
-        if target_distance <= 0:
-            logger.warning(
-                f"FLIP-ENTRY DROPPED: {sig.strategy} {sig.direction} — "
-                f"non-positive take-profit distance after flip to "
-                f"{flipped_direction} (entry={entry:.5f}, take-profit="
-                f"{target:.5f}), refusing to trade"
-            )
-            return None
-
-        ratio  = getattr(config, "FLIP_ENTRY_MIN_RR_RATIO", 2.0)
-        margin = getattr(config, "FLIP_ENTRY_SL_SAFETY_MARGIN", 0.10)
-        max_sl_distance = target_distance / ratio
-        sl_distance     = max_sl_distance * (1.0 - margin)
-        new_stop        = (entry - sl_distance) if is_long else (entry + sl_distance)
-
-        logger.info(
-            f"FLIP-ENTRY: {sig.strategy} {sig.direction} -> {flipped_direction} | "
-            f"entry={entry:.5f} (native, immediate) | take-profit={target:.5f} "
-            f"(was native_stop) | new stop-loss={new_stop:.5f} | ratio="
-            f"{(target_distance / sl_distance):.2f}:1 (> {ratio:.1f} required)"
-        )
-        return replace(
-            sig,
-            direction=flipped_direction,
-            native_entry_price=entry,
-            native_stop_price=new_stop,
-            native_target_price=target,
-            execution_inverted=True,
-        )
-
-    # ── Fixed-percentage-of-target native levels (immediate entry) ───────────────
-    # See config.py's "FIXED-PERCENTAGE-OF-TARGET NATIVE LEVELS" block for the
-    # spec. Currently the only active transform on the immediate-execution path —
-    # delayed entry and the scaled+inverted transform are both disabled.
-
-    def _apply_fixed_pct_native_levels(self, sig: SignalResult) -> SignalResult:
-        """
-        Entry is immediate, exactly as the indicator signals —
-        native_entry_price is never modified either way. Both stop-loss and
-        take-profit are measured off the SAME entry-to-target distance;
-        whether direction flips and which side each level lands on depends
-        on config.FIXED_ENTRY_INVERT_DIRECTION:
-
-        True (current default): direction flips (LONG<->SHORT) and both
-        levels mirror to the sides that match the FLIPPED direction:
-            take_profit = entry - FIXED_ENTRY_TP_PCT * (target - entry)
-            stop_loss   = entry + FIXED_ENTRY_SL_PCT * (target - entry)
-
-        False: direction is left alone and the same two distances land on
-        their ORIGINAL (non-mirrored) sides instead:
-            take_profit = entry + FIXED_ENTRY_TP_PCT * (target - entry)
-            stop_loss   = entry - FIXED_ENTRY_SL_PCT * (target - entry)
-
-        Either way both formulas are direction-agnostic: (target - entry)
-        already carries the right sign for LONG vs SHORT.
-        """
-        if not getattr(config, "FIXED_ENTRY_LEVELS_ENABLED", False):
-            return sig
-        if sig.direction not in ("LONG", "SHORT"):
-            return sig
-        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL":
-            return sig
-        if sig.native_entry_price is None or sig.native_target_price is None:
-            return sig
-
-        entry    = float(sig.native_entry_price)
-        target   = float(sig.native_target_price)
-        tp_pct   = getattr(config, "FIXED_ENTRY_TP_PCT", 0.50)
-        sl_pct   = getattr(config, "FIXED_ENTRY_SL_PCT", 0.25)
-        invert   = getattr(config, "FIXED_ENTRY_INVERT_DIRECTION", True)
-        distance = target - entry
-
-        if invert:
-            new_direction = "SHORT" if sig.direction == "LONG" else "LONG"
-            new_target    = entry - tp_pct * distance
-            new_stop      = entry + sl_pct * distance
-        else:
-            new_direction = sig.direction
-            new_target    = entry + tp_pct * distance
-            new_stop      = entry - sl_pct * distance
-
-        fixed = replace(
-            sig,
-            direction=new_direction,
-            native_stop_price=new_stop,
-            native_target_price=new_target,
-            execution_inverted=invert,
-        )
-        logger.info(
-            f"FIXED-PCT NATIVE LEVELS: {sig.direction}"
-            f"{' -> ' + new_direction if invert else ''} | entry={entry:.5f} "
-            f"(unchanged) | take_profit={new_target:.5f} ({tp_pct*100:.0f}% "
-            f"of entry-to-target) | stop_loss={new_stop:.5f} "
-            f"({sl_pct*100:.0f}% of entry-to-target) | "
-            f"ratio={tp_pct/sl_pct:.2f}:1"
-        )
-        return fixed
-
-    # ── Scaled native SL/TP (immediate entry) ────────────────────────────────────
-    # See config.py's "SCALED NATIVE SL/TP" block for the spec. Distinct from the
-    # delayed-entry machinery above: entry is immediate, exactly as the indicator
-    # signaled — only the stop-loss and take-profit levels are recomputed.
-
-    def _apply_scaled_native_levels(self, sig: SignalResult) -> SignalResult:
-        """
-        config.SCALED_SL_TP_INVERT_DIRECTION True (current default): the
-        signal's direction is flipped (LONG<->SHORT) and the new stop/target
-        are placed on the sides that now match that flipped direction —
-        entry itself is never moved, this just mirrors both levels through
-        it. With entry=100, native_stop=90, native_target=130 (a LONG) and
-        SL_MULT=0.60/TP_MULT=1.33, the executed trade is a SHORT with
-        stop=118 (60% of the original entry-to-target distance, now above
-        entry) and target=86.7 (133% of the original entry-to-stop
-        distance, now below entry):
-            new_stop   = entry + SL_MULT * (native_target - entry)
-            new_target = entry - TP_MULT * (entry - native_stop)
-
-        False: direction is left alone and the same two distances are
-        scaled onto their ORIGINAL sides instead of mirrored:
-            new_target = entry + TP_MULT * (entry - native_stop)
-            new_stop   = entry - SL_MULT * (native_target - entry)
-
-        Either way both formulas are direction-agnostic — (native_target -
-        entry) and (entry - native_stop) already carry the right sign for
-        LONG vs SHORT, same trick used in _arm_pending_entry's trigger
-        prices — and entry itself (sig.native_entry_price) is never
-        modified by this function either way.
-        """
-        if not getattr(config, "SCALED_SL_TP_ENABLED", False):
-            return sig
-        if sig.direction not in ("LONG", "SHORT"):
-            return sig
-        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL":
-            return sig
-        if sig.native_entry_price is None or sig.native_stop_price is None \
-                or sig.native_target_price is None:
-            return sig
-
-        entry   = float(sig.native_entry_price)
-        stop    = float(sig.native_stop_price)
-        target  = float(sig.native_target_price)
-        tp_mult = getattr(config, "SCALED_TP_STOP_MULT", 1.50)
-        sl_mult = getattr(config, "SCALED_SL_TARGET_MULT", 0.35)
-        invert  = getattr(config, "SCALED_SL_TP_INVERT_DIRECTION", True)
-
-        if invert:
-            new_direction = "SHORT" if sig.direction == "LONG" else "LONG"
-            new_target    = entry - tp_mult * (entry - stop)
-            new_stop      = entry + sl_mult * (target - entry)
-        else:
-            new_direction = sig.direction
-            new_target    = entry + tp_mult * (entry - stop)
-            new_stop      = entry - sl_mult * (target - entry)
-
-        scaled = replace(
-            sig,
-            direction=new_direction,
-            native_stop_price=new_stop,
-            native_target_price=new_target,
-            execution_inverted=invert,
-        )
-        logger.info(
-            f"SCALED NATIVE SL/TP: {sig.direction}"
-            f"{' -> ' + new_direction if invert else ''} | entry={entry:.5f} "
-            f"(unchanged) | native_stop={stop:.5f}, native_target={target:.5f} "
-            f"-> new_stop={new_stop:.5f} ({sl_mult*100:.0f}% of entry-to-target), "
-            f"new_target={new_target:.5f} ({tp_mult*100:.0f}% of entry-to-stop)"
-        )
-        return scaled
 
     # ── Execution ──────────────────────────────────────────────────────────────
 
@@ -2022,10 +1389,7 @@ class BotEngine:
                     ml_kalman_noise_pct = 0.0
 
             ml_multiplier = float(config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER))
-            if strategy == "VOL_BREAKOUT":
-                ml_regime = "TREND"
-            elif strategy == "VOL_REV_MULT":
-                ml_regime = "RANGE"
+            ml_regime = "TREND" if getattr(sig, "ict_stage", "") == "SIGNAL" else "NONE"
 
         # ENHANCEMENT (win-rate pass, Aug 2026): meta_labeling.py's per-pair
         # EV model (_PairEVModel, Implementation Brief v6 PART 5) needs
@@ -2047,49 +1411,22 @@ class BotEngine:
         except Exception as exc:
             logger.debug(f"compute_enriched_features({symbol}) failed: {exc}")
 
-        # SIGNAL DIRECTION (user-directed, Sep 2026 through Sep 11 2026) —
-        # by the time _execute() sees `sig`, any transform has already
-        # happened upstream, once, before this function is ever called:
-        #   - config.DELAYED_ENTRY_ENABLED (currently False): would have
-        #     replaced native_stop_price/native_target_price/native_entry_price
-        #     via _execute_pending_entry(), direction untouched.
-        #   - config.SCALED_SL_TP_ENABLED (currently True, see
-        #     _apply_scaled_native_levels()): rescales native_stop_price/
-        #     native_target_price off the original entry-to-stop /
-        #     entry-to-target distances, and — when
-        #     config.SCALED_SL_TP_INVERT_DIRECTION is also True (currently
-        #     is) — flips direction (LONG<->SHORT) and mirrors those two
-        #     scaled levels to the sides matching the flipped direction.
-        # Either way _execute() itself never inspects or changes
-        # sig.direction / native_stop_price / native_target_price — it just
-        # sends whatever it was handed. `inverted` below reflects whether
-        # THIS particular trade's direction was flipped from what the
-        # indicator originally computed, read off
-        # sig.execution_inverted (set only by _apply_scaled_native_levels,
-        # defaults False for every other path) — this is what
-        # _apply_settlement()'s meta-labeling training-label logic and
-        # strategy_stats.get_take_invert_stats() key off; see the comments
-        # at those call sites for why the field has to keep existing.
+        # `inverted` is always False now — nothing in this codebase flips a
+        # signal's direction anymore (the old delayed-entry/flip-entry/
+        # scaled-SL-TP machinery that used to do that has been deleted, see
+        # signal_engine.SignalResult's docstring). The field itself is kept
+        # on SignalResult and in _open_contracts below only because
+        # _apply_settlement()'s meta-labeling logging and
+        # strategy_stats.get_take_invert_stats() still read it — an ICT
+        # signal's direction and native levels ARE the analysis, executed
+        # exactly as computed.
         inverted = bool(getattr(sig, "execution_inverted", False))
-        if getattr(sig, "contract_kind", "RISE_FALL") != "RISE_FALL" or sig.direction not in ("LONG", "SHORT"):
-            logger.debug(
-                f"DIRECTION PASSTHROUGH: {symbol} | {strategy} | inversion "
-                f"machinery isn't applicable to contract_kind="
-                f"{getattr(sig, 'contract_kind', 'RISE_FALL')} anyway "
-                f"(DIGIT-style contracts have no LONG/SHORT to flip)")
-        elif inverted:
-            logger.info(
-                f"SIGNAL SCALED + INVERTED: {symbol} | {strategy} | "
-                f"executing {sig.direction} (flipped from the indicator's "
-                f"original call) | stop={sig.native_stop_price} "
-                f"target={sig.native_target_price}"
-            )
-        else:
-            logger.info(
-                f"SIGNAL TAKEN AS-IS: {symbol} | {strategy} | {sig.direction} "
-                f"(no inversion) | stop={sig.native_stop_price} "
-                f"target={sig.native_target_price}"
-            )
+        logger.info(
+            f"SIGNAL TAKEN AS-IS: {symbol} | {strategy} | {sig.direction} | "
+            f"stop={sig.native_stop_price} target={sig.native_target_price} | "
+            f"rr={getattr(sig, 'ict_rr_ratio', 0):.2f} "
+            f"killzone={getattr(sig, 'ict_killzone', None) or 'none'}"
+        )
 
         # FIX (profitability audit): this call previously passed no
         # arguments, so RiskManager.calculate_stake()'s Kelly overlay
@@ -2144,103 +1481,28 @@ class BotEngine:
             score     = getattr(sig, "score",    0.0),
         )
 
-        # Implementation Brief v3, finding #3 / task 2: JUMP_BUILDUP fires a
-        # digit-contract recommendation (Matches/Differs), not a price
-        # direction — build-up confidence has no LONG/SHORT read, jump
-        # direction is 50/50 by design. Previously this fell through to the
-        # buy_contract() (CALL/PUT) branch below with a hardcoded direction,
-        # i.e. blindly betting a coin flip on a sub-1:1 payout every time it
-        # fired. sig.contract_kind=="DIGIT" (set by evaluate_jump_buildup())
-        # routes it to the real digit-contract path instead — checked before
-        # the Multiplier/Rise-Fall split since it's an orthogonal axis (which
-        # contract family, not which symbol).
-        if getattr(sig, "contract_kind", "RISE_FALL") == "DIGIT":
-            digit = getattr(sig, "digit", None)
-            match_type = getattr(sig, "match_type", None)
-            if digit is None or match_type is None:
-                logger.warning(
-                    f"PLACEMENT SKIPPED: {symbol} DIGIT signal missing "
-                    f"digit/match_type (digit={digit}, match_type={match_type})"
-                )
-                buy_resp = None
-            else:
-                buy_resp = await self.client.buy_digit_contract(
-                    symbol     = symbol,
-                    stake      = stake,
-                    digit      = digit,
-                    match_type = match_type,
-                )
-        # Boom/Crash, Jump, and Drift Switch symbols don't support CALL/PUT
-        # Rise/Fall on this account — route them to buy_multiplier() instead.
-        # config.MULTIPLIER_SYMBOLS is the single source of truth for this
-        # split (see config.py's "STRATEGY ROUTING" section); everything
-        # else keeps using buy_contract() exactly as before.
-        # Implementation Brief v4 §4 / Fix H, widened to all of
-        # MULTIPLIER_SYMBOLS (user-directed, Aug 2026) — every Multiplier
-        # symbol now gets a stop_loss_pct computed live from ATR/Kalman
-        # instead of the static STOP_LOSS_MAP default, since that map was
-        # calibrated per symbol by hand and the live read is both tighter
-        # and self-adjusting to current volatility (see config.py's
-        # STOP_KALMAN_SAFETY_MULT section / risk_manager
-        # .compute_dynamic_stop_loss_pct()). This now covers Boom/Crash
-        # too, so the plain buy_multiplier() fallback branch below is
-        # only reached if DYNAMIC_STOP_LOSS_ENABLED itself is off.
-        elif (symbol in getattr(config, "MULTIPLIER_SYMBOLS", [])
-                and getattr(config, "DYNAMIC_STOP_LOSS_ENABLED", False)):
-            # ml_atr_pct / ml_kalman_noise_pct / ml_multiplier were
-            # already computed above for the meta-labeling feature dict
-            # — reused here so neither is calculated twice per trade.
-            # Popular-indicator pipeline (spec points 3/6): when the signal
-            # carries native SL/TP PRICE levels (already inverted+swapped
-            # above), those take over entirely — a price-distance stop is
-            # exactly what point 3 requires instead of any percentage-of-
-            # stake method, so dyn_sl_pct/compute_dynamic_stop_loss_pct()
-            # is bypassed on this path (Section 1). Fall back to the old
-            # dynamic-ATR percentage path only when native prices aren't
-            # available (e.g. this signal didn't come from the popular-
-            # indicator evaluator, or its price computation failed).
-            if sig.native_stop_price is not None and sig.native_target_price is not None:
-                buy_resp = await self.client.buy_multiplier(
-                    symbol             = symbol,
-                    direction          = direction,
-                    stake              = stake,
-                    multiplier         = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
-                    strategy           = strategy,
-                    stop_loss_price    = sig.native_stop_price,
-                    take_profit_price  = sig.native_target_price,
-                    entry_price        = sig.native_entry_price,
-                )
-            else:
-                dyn_sl_pct = (
-                    self.risk.compute_dynamic_stop_loss_pct(ml_atr_pct, ml_multiplier)
-                    if ml_atr_pct > 0 else None
-                )
-                buy_resp = await self.client.buy_multiplier(
-                    symbol        = symbol,
-                    direction     = direction,
-                    stake         = stake,
-                    multiplier    = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
-                    stop_loss_pct = dyn_sl_pct,
-                    strategy      = strategy,
-                )
-        elif symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
-            if sig.native_stop_price is not None and sig.native_target_price is not None:
-                buy_resp = await self.client.buy_multiplier(
-                    symbol             = symbol,
-                    direction          = direction,
-                    stake              = stake,
-                    strategy           = strategy,
-                    stop_loss_price    = sig.native_stop_price,
-                    take_profit_price  = sig.native_target_price,
-                    entry_price        = sig.native_entry_price,
-                )
-            else:
-                buy_resp = await self.client.buy_multiplier(
-                    symbol   = symbol,
-                    direction= direction,
-                    stake    = stake,
-                    strategy = strategy,
-                )
+        # Every symbol in this bot's universe trades via Multiplier
+        # contracts (config.MULTIPLIER_SYMBOLS = the full ICT trading
+        # universe) — there is no digit-contract or plain Rise/Fall path
+        # left; ICT/SMC's structural stop/target requires a real price-
+        # based SL/TP, which only Multiplier contracts support. Every ICT
+        # signal always carries native_stop_price/native_target_price/
+        # native_entry_price (guaranteed by the main-loop guard before a
+        # signal ever reaches _execute() — see _main_loop()'s "has_native_levels"
+        # check), so this is always the live branch; the old percentage-of-
+        # stake fallback (DYNAMIC_STOP_LOSS_ENABLED / STOP_LOSS_MAP) is
+        # never reached and has been removed rather than left as dead code.
+        if symbol in getattr(config, "MULTIPLIER_SYMBOLS", set()):
+            buy_resp = await self.client.buy_multiplier(
+                symbol             = symbol,
+                direction          = direction,
+                stake              = stake,
+                multiplier         = int(ml_multiplier) or config.MULTIPLIER_MAP.get(symbol, config.DEFAULT_MULTIPLIER),
+                strategy           = strategy,
+                stop_loss_price    = sig.native_stop_price,
+                take_profit_price  = sig.native_target_price,
+                entry_price        = sig.native_entry_price,
+            )
         else:
             buy_resp = await self.client.buy_contract(
                 symbol      = symbol,
@@ -2305,8 +1567,8 @@ class BotEngine:
                 entry_price    = buy_price,
                 balance_before = bal_before,
                 asset_class    = get_symbol_class(symbol),
-                htf_bias       = "NEUTRAL",
-                smc_structure  = "NONE",
+                htf_bias       = getattr(sig, "direction", "NEUTRAL"),
+                smc_structure  = getattr(sig, "ict_stage", "NONE"),
                 m1             = getattr(sig, "m1_signal", 0),
                 m2             = getattr(sig, "m2_signal", 0),
                 m3             = getattr(sig, "m3_signal", getattr(sig, "strength", 0)),
