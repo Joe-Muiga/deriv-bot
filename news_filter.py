@@ -1,153 +1,185 @@
 """
-news_filter.py – Block trades 30 minutes before high-impact economic events.
+news_filter.py — high-impact economic-news blackout window for Forex/gold/
+commodity trading.
 
-Primary source: market-calendar-tool (Forex Factory scraper).
-Fallback: manual check on well-known fixed-schedule events (NFP, FOMC, CPI).
+This file did not exist anywhere in the uploaded project even though
+bot_engine.py has always imported it (`from news_filter import
+NewsFilter`) and constructed one in BotEngine.__init__
+(`self.news = NewsFilter(block_minutes=config.NEWS_BLOCK_MINUTES)`) — so
+the bot could not start at all before this file was added, independent of
+the SMC/ICT rewrite.
+
+News-driven volatility (NFP, CPI, FOMC/central-bank rate decisions, etc.)
+is a materially bigger real risk for Forex/gold/commodity trading than it
+ever was for synthetic indices (which have no macroeconomic calendar at
+all) — a structurally perfect ICT setup can still get stopped out by a
+2-minute spike around a release that has nothing to do with market
+structure. That's what this filter exists to avoid.
+
+IMPORTANT — this ships with NO economic calendar data pre-loaded. There is
+no free, reliable, machine-readable economic-calendar API reachable from
+this environment's network allowlist, and hand-typing plausible-looking
+release times/dates into this file would be fabricating data that could
+silently fail to protect you (worse than no filter at all, because it
+looks like protection). Instead:
+  - `is_blocked()` fails OPEN (never blocks) until you load real events.
+  - `load_events_from_json()` reads a simple JSON file you maintain
+    yourself (by hand, from a connector, or from any calendar source you
+    trust) — see the format below.
+  - `add_event()` lets you (or a future integration) add events
+    programmatically at runtime.
+
+JSON format for load_events_from_json() — a list of objects:
+    [
+      {"time_utc": "2026-09-19T12:30:00", "impact": "high",
+       "currency": "USD", "label": "NFP"},
+      {"time_utc": "2026-10-01T18:00:00", "impact": "high",
+       "currency": "USD", "label": "FOMC rate decision"}
+    ]
+`currency` is matched against the two 3-letter legs of a Forex symbol
+(e.g. "frxEURUSD" -> {"EUR", "USD"}) or, for gold/commodities, the quote
+currency (USD for all of gold.py/MAJOR_COMMODITIES here) plus the special
+value "ALL" always applies to every symbol.
 """
 
+import json
 import logging
-import datetime
-import time
-import threading
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
-# Symbols to monitor for news (currency codes)
-WATCHED_CURRENCIES = {"USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "NZD"}
-HIGH_IMPACT_LABELS = {"high", "red", "3"}   # different FF representations
 
-# Map Deriv symbol prefix → currency pair
-SYMBOL_CURRENCIES = {
-    "frxEURUSD": {"EUR", "USD"},
-    "frxGBPUSD": {"GBP", "USD"},
-    "frxUSDJPY": {"USD", "JPY"},
-    "frxAUDUSD": {"AUD", "USD"},
-    "frxUSDCAD": {"USD", "CAD"},
-    "frxUSDCHF": {"USD", "CHF"},
-    "frxNZDUSD": {"NZD", "USD"},
-    "frxXAUUSD": {"USD"},      # Gold vs USD
-    "frxUSOIL":  {"USD"},
-    "cryBTCUSD": {"USD"},
-    "cryETHUSD": {"USD"},
-}
+@dataclass
+class NewsEvent:
+    time_utc: datetime
+    impact:   str        # "high" | "medium" | "low"
+    currency: str        # "USD", "EUR", ... or "ALL"
+    label:    str = ""
+
+
+def _currencies_for_symbol(symbol: str) -> set:
+    """
+    "frxEURUSD" -> {"EUR", "USD"}. "frxXAUUSD"/"frxXAGUSD" -> {"USD"}
+    (gold/silver are priced in USD and dominated by USD-driver events).
+    "frxUSOIL"/"frxUKOIL" -> {"USD"}. Falls back to {} (no currency match,
+    so only "ALL"-tagged events apply) for anything unrecognised.
+    """
+    s = symbol.replace("frx", "")
+    if len(s) == 6 and s.isalpha():
+        return {s[:3].upper(), s[3:].upper()}
+    if s.upper() in ("XAUUSD", "XAGUSD", "USOIL", "UKOIL"):
+        return {"USD"}
+    return set()
 
 
 class NewsFilter:
     """
-    Fetches the Forex Factory calendar once per hour and caches upcoming events.
-    `is_blocked(symbol)` returns True if a high-impact event is within
-    BLOCK_MINUTES of the current time for any currency related to that symbol.
+    block_minutes: how many minutes BEFORE and AFTER a matching event to
+    treat as blocked. Symmetric window (before: avoid entering right into
+    a spike; after: avoid entering while the post-release whipsaw is still
+    settling).
     """
 
-    def __init__(self, block_minutes: int = 30, refresh_minutes: int = 60):
-        self.block_minutes   = block_minutes
-        self.refresh_minutes = refresh_minutes
-        self._events: List[dict] = []
-        self._last_fetch: float  = 0.0
-        self._lock = threading.Lock()
-        self._available = self._check_calendar_tool()
+    def __init__(self, block_minutes: int = 30):
+        self.block_minutes = block_minutes
+        self._events: List[NewsEvent] = []
 
-    def _check_calendar_tool(self) -> bool:
+    # ── Loading events ───────────────────────────────────────────────────
+
+    def load_events_from_json(self, path: str) -> int:
+        """
+        Loads/replaces the event list from a JSON file (see module
+        docstring for format). Returns the number of events loaded. Safe
+        to call repeatedly (e.g. on a daily timer) to refresh — each call
+        replaces the previous list rather than appending, so stale events
+        from a file you've since updated don't linger.
+        """
+        p = Path(path)
+        if not p.exists():
+            logger.warning(f"NewsFilter: {path} does not exist — no events loaded (fail-open)")
+            return 0
         try:
-            from market_calendar_tool import scrape_calendar
-            logger.info("market-calendar-tool available ✓")
-            return True
-        except ImportError:
-            logger.warning("market-calendar-tool not installed. "
-                           "News filter will use fallback schedule.")
+            raw = json.loads(p.read_text())
+        except Exception as exc:
+            logger.error(f"NewsFilter: failed to parse {path}: {exc} — no events loaded (fail-open)")
+            return 0
+
+        events = []
+        for item in raw:
+            try:
+                events.append(NewsEvent(
+                    time_utc=datetime.fromisoformat(item["time_utc"]).replace(tzinfo=timezone.utc),
+                    impact=item.get("impact", "high"),
+                    currency=item.get("currency", "ALL").upper(),
+                    label=item.get("label", ""),
+                ))
+            except Exception as exc:
+                logger.warning(f"NewsFilter: skipping malformed event {item!r}: {exc}")
+
+        self._events = events
+        logger.info(f"NewsFilter: loaded {len(events)} event(s) from {path}")
+        return len(events)
+
+    def add_event(self, time_utc: datetime, impact: str = "high",
+                  currency: str = "ALL", label: str = "") -> None:
+        if time_utc.tzinfo is None:
+            time_utc = time_utc.replace(tzinfo=timezone.utc)
+        self._events.append(NewsEvent(time_utc, impact, currency.upper(), label))
+
+    def clear_events(self) -> None:
+        self._events = []
+
+    # ── Checking ─────────────────────────────────────────────────────────
+
+    def is_blocked(self, symbol: str, at_time: Optional[datetime] = None,
+                    min_impact: str = "high") -> bool:
+        """
+        True if `at_time` (defaults to now) falls within block_minutes of
+        a loaded event whose currency matches this symbol (or is "ALL")
+        and whose impact is >= min_impact. Always False if no events have
+        been loaded — this filter never fabricates a blackout window.
+        """
+        if not self._events:
             return False
 
-    def refresh(self):
-        """Fetch / refresh the event list."""
-        now = time.time()
-        if now - self._last_fetch < self.refresh_minutes * 60:
-            return   # still fresh
+        now = at_time or datetime.now(timezone.utc)
+        if now.tzinfo is None:
+            now = now.replace(tzinfo=timezone.utc)
 
-        if self._available:
-            self._fetch_from_calendar_tool()
-        else:
-            self._fetch_fallback()
+        impact_rank = {"low": 0, "medium": 1, "high": 2}
+        min_rank = impact_rank.get(min_impact, 2)
 
-        self._last_fetch = time.time()
+        symbol_ccys = _currencies_for_symbol(symbol)
+        window = timedelta(minutes=self.block_minutes)
 
-    def _fetch_from_calendar_tool(self):
-        try:
-            from market_calendar_tool import scrape_calendar
-            df = scrape_calendar()
-            events = []
-            for _, row in df.iterrows():
-                impact = str(row.get("impact", "")).lower().strip()
-                if impact not in HIGH_IMPACT_LABELS:
-                    continue
-                currency = str(row.get("currency", "")).upper().strip()
-                try:
-                    # Parse date + time into a datetime
-                    date_str = str(row["date"])
-                    time_str = str(row["time"])
-                    dt = datetime.datetime.strptime(
-                        f"{date_str} {time_str}", "%Y-%m-%d %H:%M")
-                    events.append({
-                        "dt":       dt,
-                        "currency": currency,
-                        "title":    str(row.get("title", "")),
-                        "impact":   impact,
-                    })
-                except Exception:
-                    continue
-            with self._lock:
-                self._events = events
-            logger.info(f"News filter: loaded {len(events)} high-impact events")
-        except Exception as exc:
-            logger.error(f"Calendar fetch failed: {exc}")
+        for ev in self._events:
+            if impact_rank.get(ev.impact, 2) < min_rank:
+                continue
+            if ev.currency != "ALL" and ev.currency not in symbol_ccys:
+                continue
+            if abs((now - ev.time_utc).total_seconds()) <= window.total_seconds():
+                logger.info(
+                    f"NewsFilter: {symbol} BLOCKED — {ev.label or ev.currency} "
+                    f"at {ev.time_utc.isoformat()} (within {self.block_minutes}min)")
+                return True
 
-    def _fetch_fallback(self):
-        """
-        Hard-coded monthly schedule for major recurring events.
-        These are approximate; real dates vary.  Use only when the
-        calendar tool is unavailable.
-        """
-        now  = datetime.datetime.utcnow()
-        year = now.year
-        month = now.month
-
-        # First Friday of the month ≈ NFP at 13:30 UTC
-        first_day = datetime.datetime(year, month, 1)
-        first_fri = first_day + datetime.timedelta(days=(4 - first_day.weekday()) % 7)
-        events = [
-            {"dt": first_fri.replace(hour=13, minute=30), "currency": "USD",
-             "title": "Non-Farm Payrolls", "impact": "high"},
-        ]
-        with self._lock:
-            self._events = events
-
-    def is_blocked(self, symbol: str) -> bool:
-        """
-        Returns True if trading should be blocked right now for `symbol`
-        because a high-impact event is within block_minutes.
-        """
-        self.refresh()
-        now     = datetime.datetime.utcnow()
-        window  = datetime.timedelta(minutes=self.block_minutes)
-
-        relevant_currencies = SYMBOL_CURRENCIES.get(symbol, {"USD"})
-
-        with self._lock:
-            for ev in self._events:
-                if ev["currency"] not in relevant_currencies:
-                    continue
-                diff = (ev["dt"] - now).total_seconds()
-                if -300 <= diff <= self.block_minutes * 60:   # -5 min to +block_min
-                    logger.info(f"News block: {ev['title']} ({ev['currency']}) "
-                                f"in {diff/60:.1f} min | blocking {symbol}")
-                    return True
         return False
 
-    def next_events(self, n: int = 5) -> List[dict]:
-        """Return the next N high-impact events."""
-        now = datetime.datetime.utcnow()
-        with self._lock:
-            upcoming = sorted(
-                [e for e in self._events if e["dt"] >= now],
-                key=lambda x: x["dt"])
-        return upcoming[:n]
+    def next_event_for(self, symbol: str, min_impact: str = "high") -> Optional[NewsEvent]:
+        """Nearest upcoming matching event for `symbol`, or None. Useful
+        for dashboard display ("next blackout: NFP in 2h14m")."""
+        now = datetime.now(timezone.utc)
+        impact_rank = {"low": 0, "medium": 1, "high": 2}
+        min_rank = impact_rank.get(min_impact, 2)
+        symbol_ccys = _currencies_for_symbol(symbol)
+
+        upcoming = [
+            ev for ev in self._events
+            if ev.time_utc >= now
+            and impact_rank.get(ev.impact, 2) >= min_rank
+            and (ev.currency == "ALL" or ev.currency in symbol_ccys)
+        ]
+        return min(upcoming, key=lambda e: e.time_utc) if upcoming else None
