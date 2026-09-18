@@ -59,7 +59,7 @@ import symbols as sym_module
 # ══════════════════════════════════════════════════════════════
 # GENERAL / DERIV API / SERVER
 # ══════════════════════════════════════════════════════════════
-LOG_LEVEL = "DEBUG"
+LOG_LEVEL = "INFO"
 DEBUG     = False
 VERSION   = "2.0.0"   # SMC/ICT pivot
 
@@ -78,11 +78,12 @@ KEEP_ALIVE_INTERVAL = 600  # seconds between self-ping requests
 # ══════════════════════════════════════════════════════════════
 # ICT / SMC TRADING UNIVERSE
 # ══════════════════════════════════════════════════════════════
-# The ONLY symbols this bot scans or trades. See symbols.py for the list
-# definitions (MAJOR_FOREX / GOLD / MAJOR_COMMODITIES / ICT_TRADING_UNIVERSE).
-# Never never trades synthetic indices, crypto, or stock indices again —
-# those symbol lists still exist in symbols.py (nothing there was
-# deleted), they're just not part of this union.
+# The 11-symbol ICT/SMC universe. See symbols.py for the list definitions
+# (MAJOR_FOREX / GOLD / MAJOR_COMMODITIES / ICT_TRADING_UNIVERSE).
+# ICT_TRADING_UNIVERSE itself is untouched by the stpRNG addition below —
+# see "STEP GRID (stpRNG) — INDEPENDENT PARALLEL STRATEGY" for how stpRNG
+# is added to the scanned/tradeable set without merging into this list or
+# routing through evaluate_ict().
 TRADE_SYMBOLS      = list(sym_module.ICT_TRADING_UNIVERSE)
 ALL_TRADE_SYMBOLS  = list(sym_module.ICT_TRADING_UNIVERSE)
 ALL_SYMBOLS        = list(sym_module.ICT_TRADING_UNIVERSE)
@@ -97,6 +98,58 @@ VOLATILITY_SYMBOLS = list(sym_module.ICT_TRADING_UNIVERSE)  # alias bot_engine.p
 # native_entry_price fields, which ict_engine.analyze() always populates.
 MULTIPLIER_SYMBOLS = list(sym_module.ICT_TRADING_UNIVERSE)
 RISE_FALL_SYMBOLS  = []   # nothing trades Rise/Fall in this bot anymore
+
+
+# ══════════════════════════════════════════════════════════════
+# STEP GRID (stpRNG) — INDEPENDENT PARALLEL STRATEGY
+# ══════════════════════════════════════════════════════════════
+# stpRNG (Deriv's Step Index) trades as a 12th symbol, in full parallel to
+# the 11 ICT symbols above, via its own standalone evaluator
+# (signal_engine.evaluate_step_grid_final()) — it never touches
+# evaluate_ict() / ict_engine.py / smc_analyzer.py. Deliberately NOT
+# merged into ICT_TRADING_UNIVERSE/MAJOR_FOREX/GOLD/MAJOR_COMMODITIES —
+# those stay exactly as they were. This is the ONLY place stpRNG is added
+# to the bot's scanned/tradeable symbol set; TRADE_SYMBOLS/
+# ALL_TRADE_SYMBOLS/ALL_SYMBOLS/VOLATILITY_SYMBOLS/MULTIPLIER_SYMBOLS
+# below are widened additively so bot_engine.py's startup init and
+# symbol_manager.py's active-symbol list pick it up automatically, and
+# signal_engine.SignalEngine.evaluate() checks STEP_GRID_SYMBOLS ahead of
+# the ICT_TRADING_UNIVERSE check so stpRNG never falls into the ICT branch.
+STEP_GRID_SYMBOLS = ["stpRNG"]
+
+TRADE_SYMBOLS      = list(dict.fromkeys(TRADE_SYMBOLS      + STEP_GRID_SYMBOLS))
+ALL_TRADE_SYMBOLS  = list(dict.fromkeys(ALL_TRADE_SYMBOLS  + STEP_GRID_SYMBOLS))
+ALL_SYMBOLS        = list(dict.fromkeys(ALL_SYMBOLS        + STEP_GRID_SYMBOLS))
+VOLATILITY_SYMBOLS = list(dict.fromkeys(VOLATILITY_SYMBOLS + STEP_GRID_SYMBOLS))
+# stpRNG also trades via Multiplier contracts (its flip-entry transform
+# below produces real native_entry_price/native_stop_price/
+# native_target_price, exactly like ict_engine.analyze() does) — added to
+# MULTIPLIER_SYMBOLS so bot_engine._execute() routes it through
+# buy_multiplier() the same way it does the 11 ICT symbols.
+MULTIPLIER_SYMBOLS = list(dict.fromkeys(MULTIPLIER_SYMBOLS + STEP_GRID_SYMBOLS))
+
+# The exact stpRNG AND-gate strategy (evaluate_step_grid() in
+# signal_engine.py), ported verbatim from the synthetic-indices bot —
+# a dedicated block, not shared with/read by any ICT config above.
+STEP_GRID_MIN_BARS               = 30
+STEP_GRID_EMA_FAST_PERIOD        = 10
+STEP_GRID_EMA_SLOW_PERIOD        = 20
+STEP_GRID_RSI_PERIOD             = 14
+STEP_GRID_RSI_LONG_MIN           = 55.0
+STEP_GRID_RSI_SHORT_MAX          = 45.0
+STEP_GRID_MACD_FAST              = 12
+STEP_GRID_MACD_SLOW              = 26
+STEP_GRID_MACD_SIGNAL            = 9
+STEP_GRID_RANGE_LOOKBACK         = 20
+STEP_GRID_STOP_BUFFER_ATR_MULT   = 0.30
+STEP_GRID_RR_RATIO               = 2.0
+
+# The flip-entry transform applied to stpRNG's raw signal before
+# execution (signal_engine._apply_flip_and_swap_levels()) — confirmed
+# live/profitable yesterday in the synthetic-indices bot. stpRNG-scoped
+# only; not applied to, and not read by, any ICT symbol.
+FLIP_ENTRY_MIN_RR_RATIO      = 2.0
+FLIP_ENTRY_SL_SAFETY_MARGIN  = 0.10
 
 # Priority order for INIT_BATCH_SIZE-batched startup — gold and the EUR/USD,
 # GBP/USD, USD/JPY majors first (deepest liquidity / most actively traded),
@@ -368,7 +421,7 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get("RENDER_DEPLOY_HOOK_URL", "")
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 240 / 60
+REDEPLOY_INTERVAL_HOURS = 11 / 60
 DRAIN_MAX_SECS = 1800
 
 
