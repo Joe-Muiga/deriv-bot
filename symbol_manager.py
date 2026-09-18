@@ -160,6 +160,14 @@ class SymbolManager:
 
         weekday(): Monday=0 .. Sunday=6.
         """
+        # stpRNG (config.STEP_GRID_SYMBOLS) is a synthetic index — unlike
+        # Forex/gold/commodities it has no weekend close, so the real-market
+        # weekday/hour gate below does not apply to it. Scoped to
+        # STEP_GRID_SYMBOLS only; every ICT symbol's session gating below is
+        # unchanged.
+        if symbol in getattr(config, "STEP_GRID_SYMBOLS", ()):
+            return True
+
         now = datetime.now(timezone.utc)
         wd, hour = now.weekday(), now.hour
 
