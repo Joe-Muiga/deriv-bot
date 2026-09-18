@@ -21,6 +21,16 @@ built for the "which indicator gets picked" popular-indicator pipeline,
 which no longer exists — pair_suspension.py itself has been deleted from
 the project).
 
+ADDED BACK (stpRNG handoff): evaluate_step_grid() and its flip-entry
+transform, _apply_flip_and_swap_levels(), are reintroduced as new,
+standalone code for exactly one symbol — stpRNG (config.STEP_GRID_SYMBOLS)
+— running fully in parallel to, and independent of, evaluate_ict(). See
+evaluate_step_grid_final() below for the full stpRNG pipeline (raw AND-gate
+evaluation -> flip transform -> no-consecutive-same-direction gate) and
+SignalEngine.evaluate()'s stpRNG-specific branch, checked ahead of the ICT
+universe check. Nothing here changes evaluate_ict()/ict_engine.py or how
+the 11 ICT symbols are evaluated.
+
 What's left, and why:
   - SignalResult / NONE_RESULT   — the execution-side contract
     (bot_engine.py, deriv_client.py, risk_manager.py, meta_labeling.py all
@@ -50,7 +60,7 @@ from __future__ import annotations
 
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
@@ -272,6 +282,227 @@ def evaluate_ict(
 
 
 # ---------------------------------------------------------------------------
+# stpRNG — Step Grid (independent of evaluate_ict() / ict_engine.py).
+#
+# Ported verbatim from the synthetic-indices bot per the handoff — the
+# AND-gate conditions, indicator periods, and stop/target construction
+# below are NOT redesigned, simplified, or reinterpreted in any way.
+# ---------------------------------------------------------------------------
+
+def evaluate_step_grid(ltf_bars: List["Candle"], symbol: str) -> SignalResult:
+    """
+    stpRNG — Indicator-grid entry, hard AND-gate. ALL four must
+    agree before firing (long: EMA10>EMA20, price>EMA20, RSI>55, MACD
+    line>signal line; short: every condition mirrored) — this is a gate,
+    not a scored/weighted pick, so any single condition failing rejects
+    the whole signal. Stop sits outside the recent range that defined the
+    setup (the greater of a recent swing extreme and EMA20 itself, plus a
+    buffer), not an arbitrary ATR multiple alone; target is a fixed
+    reward:risk multiple of that stop distance.
+    """
+    min_bars = getattr(config, "STEP_GRID_MIN_BARS", 30)
+    if len(ltf_bars) < min_bars:
+        return NONE_RESULT
+
+    C, H, L = _arrays(ltf_bars)
+    if len(C) < 2 or math.isnan(float(C[-1])):
+        return NONE_RESULT
+
+    ema10 = ind.ema(C, getattr(config, "STEP_GRID_EMA_FAST_PERIOD", 10))
+    ema20 = ind.ema(C, getattr(config, "STEP_GRID_EMA_SLOW_PERIOD", 20))
+    rsi_vals = ind.rsi(C, getattr(config, "STEP_GRID_RSI_PERIOD", 14))
+    macd_line, macd_signal, _ = ind.macd(
+        C, getattr(config, "STEP_GRID_MACD_FAST", 12),
+        getattr(config, "STEP_GRID_MACD_SLOW", 26),
+        getattr(config, "STEP_GRID_MACD_SIGNAL", 9))
+    atr_val = _last(ind.atr(H, L, C, 14)) or 1e-9
+
+    last_close = float(C[-1])
+    e10, e20 = float(ema10[-1]), float(ema20[-1])
+    last_rsi = float(rsi_vals[-1])
+    m_line, m_sig = float(macd_line[-1]), float(macd_signal[-1])
+
+    rsi_long_min  = getattr(config, "STEP_GRID_RSI_LONG_MIN", 55.0)
+    rsi_short_max = getattr(config, "STEP_GRID_RSI_SHORT_MAX", 45.0)
+
+    long_gate = (e10 > e20) and (last_close > e20) and (last_rsi > rsi_long_min) and (m_line > m_sig)
+    short_gate = (e10 < e20) and (last_close < e20) and (last_rsi < rsi_short_max) and (m_line < m_sig)
+
+    if long_gate == short_gate:  # neither fired, or (impossible) both did
+        logger.debug(f"REJECTED: {symbol} STEP_GRID strength=0 score=0.000 — below threshold")
+        return NONE_RESULT
+
+    range_lookback = getattr(config, "STEP_GRID_RANGE_LOOKBACK", 20)
+    stop_buf_mult  = getattr(config, "STEP_GRID_STOP_BUFFER_ATR_MULT", 0.30)
+    rr_ratio       = getattr(config, "STEP_GRID_RR_RATIO", 2.0)
+
+    if long_gate:
+        direction = "LONG"
+        range_low = float(np.min(L[-range_lookback:]))
+        native_entry_price = last_close
+        native_stop_price = min(range_low, e20) - stop_buf_mult * atr_val
+        risk = native_entry_price - native_stop_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price + rr_ratio * risk
+    else:
+        direction = "SHORT"
+        range_high = float(np.max(H[-range_lookback:]))
+        native_entry_price = last_close
+        native_stop_price = max(range_high, e20) + stop_buf_mult * atr_val
+        risk = native_stop_price - native_entry_price
+        if risk <= 0:
+            return NONE_RESULT
+        native_target_price = native_entry_price - rr_ratio * risk
+
+    score = 0.75  # hard AND-gate — either every condition agrees (fixed high confidence) or it doesn't fire
+    strength = 3
+
+    logger.info(
+        f"SIGNAL: {symbol} {direction} STEP_GRID strength={strength} score={score:.3f} "
+        f"entry={native_entry_price:.5f} stop={native_stop_price:.5f} target={native_target_price:.5f}"
+    )
+    return SignalResult(
+        direction=direction, strength=strength, score=score,
+        strategy="STEP_GRID",
+        reason=(
+            f"AND-gate: EMA10/20={e10:.5f}/{e20:.5f}, price_vs_EMA20, "
+            f"RSI={last_rsi:.1f}, MACD={m_line:.5f} vs {m_sig:.5f}"
+        ),
+        native_entry_price=native_entry_price,
+        native_stop_price=native_stop_price,
+        native_target_price=native_target_price,
+    )
+
+
+def _apply_flip_and_swap_levels(sig: SignalResult) -> Optional[SignalResult]:
+    """
+    For stpRNG only. Transforms a firing signal for IMMEDIATE execution:
+
+      1. Direction is FLIPPED (LONG -> SHORT, SHORT -> LONG). Intentional:
+         the evaluator's own native_stop_price always sits on the side of
+         entry OPPOSITE its native_target_price, so using native_stop_price
+         as a take-profit (step 3) only makes geometric sense for the
+         OPPOSITE direction from what the evaluator signalled.
+      2. Entry = native_entry_price, used directly, unchanged.
+      3. Take-profit = the evaluator's original native_stop_price,
+         unchanged (native_target_price is no longer used at all).
+      4. Stop-loss is computed fresh, on the side of entry OPPOSITE the
+         new take-profit, so that take_profit_distance / stop_loss_distance
+         is STRICTLY greater than FLIP_ENTRY_MIN_RR_RATIO.
+
+    Returns None (caller drops the signal for this cycle) if the
+    resulting take-profit distance isn't strictly positive.
+    """
+    if sig.direction not in ("LONG", "SHORT"):
+        return None
+    if sig.native_entry_price is None or sig.native_stop_price is None:
+        return None
+
+    flipped_direction = "SHORT" if sig.direction == "LONG" else "LONG"
+    entry  = float(sig.native_entry_price)
+    target = float(sig.native_stop_price)   # evaluator's old stop -> new take-profit
+    is_long = flipped_direction == "LONG"
+
+    target_distance = (target - entry) if is_long else (entry - target)
+    if target_distance <= 0:
+        logger.warning(
+            f"FLIP-ENTRY DROPPED: {sig.strategy} {sig.direction} — "
+            f"non-positive take-profit distance after flip to "
+            f"{flipped_direction} (entry={entry:.5f}, take-profit="
+            f"{target:.5f}), refusing to trade"
+        )
+        return None
+
+    ratio  = getattr(config, "FLIP_ENTRY_MIN_RR_RATIO", 2.0)
+    margin = getattr(config, "FLIP_ENTRY_SL_SAFETY_MARGIN", 0.10)
+    max_sl_distance = target_distance / ratio
+    sl_distance     = max_sl_distance * (1.0 - margin)
+    new_stop        = (entry - sl_distance) if is_long else (entry + sl_distance)
+
+    logger.info(
+        f"FLIP-ENTRY: {sig.strategy} {sig.direction} -> {flipped_direction} | "
+        f"entry={entry:.5f} (native, immediate) | take-profit={target:.5f} "
+        f"(was native_stop) | new stop-loss={new_stop:.5f} | ratio="
+        f"{(target_distance / sl_distance):.2f}:1 (> {ratio:.1f} required)"
+    )
+    return replace(
+        sig,
+        direction=flipped_direction,
+        native_entry_price=entry,
+        native_stop_price=new_stop,
+        native_target_price=target,
+        execution_inverted=True,
+    )
+
+
+class _StepGridDirectionState:
+    """
+    stpRNG-only state: the direction of the last stpRNG trade that was
+    actually confirmed placed at the broker (i.e. the real, post-flip
+    direction — see _apply_flip_and_swap_levels()). Lives here, not in
+    bot_engine.py's shared dicts, and is never read by evaluate_ict() or
+    any ICT-symbol code path.
+    """
+
+    def __init__(self):
+        self.last_executed_direction: Optional[str] = None
+
+    def record_executed(self, direction: str) -> None:
+        self.last_executed_direction = direction
+
+
+_step_grid_direction_state = _StepGridDirectionState()
+
+
+def evaluate_step_grid_final(ltf_bars: List["Candle"], symbol: str) -> SignalResult:
+    """
+    stpRNG's full, independent pipeline:
+      1. evaluate_step_grid() — raw AND-gate evaluation.
+      2. _apply_flip_and_swap_levels() — flip transform for execution.
+      3. "No consecutive same-direction trade" gate — reject (not queue)
+         a same-direction signal until a stpRNG trade actually executes
+         in the opposite direction. Compared against the real, final
+         (post-flip) direction — see _StepGridDirectionState above.
+
+    Returns the SignalResult exactly as it should be executed (direction/
+    native_entry_price/native_stop_price/native_target_price already the
+    final, broker-bound values) or NONE_RESULT. Entirely independent of
+    evaluate_ict() / ict_engine.py / htf_bars / mtf_bars / killzones /
+    order blocks — this function only ever reads ltf_bars.
+    """
+    raw = evaluate_step_grid(ltf_bars, symbol)
+    if raw.direction not in ("LONG", "SHORT"):
+        return NONE_RESULT
+
+    flipped = _apply_flip_and_swap_levels(raw)
+    if flipped is None:
+        return NONE_RESULT
+
+    if flipped.direction == _step_grid_direction_state.last_executed_direction:
+        logger.debug(
+            f"REJECTED: {symbol} STEP_GRID {flipped.direction} — same "
+            f"direction as last executed stpRNG trade, holding until an "
+            f"opposite-direction signal fires"
+        )
+        return NONE_RESULT
+
+    return flipped
+
+
+def record_step_grid_execution(direction: str) -> None:
+    """
+    Call ONLY after a stpRNG trade is confirmed placed at the broker
+    (i.e. bot_engine._execute() has a non-None buy_resp), passing the
+    real direction that was sent (the flipped direction already on the
+    executed SignalResult). Updates the stpRNG-only "last executed
+    direction" state the no-consecutive-same-direction gate above reads.
+    Firing a signal alone does NOT call this — only a confirmed trade.
+    """
+    _step_grid_direction_state.record_executed(direction)
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -289,6 +520,12 @@ class SignalEngine:
         **kwargs,
     ) -> SignalResult:
         """
+        stpRNG (config.STEP_GRID_SYMBOLS) is checked FIRST, ahead of the
+        ICT-universe check below, and routed to its own independent
+        evaluate_step_grid_final() — a separate dispatch branch that
+        never touches evaluate_ict()/ict_engine.py and, being LTF-only,
+        does not require htf_bars/mtf_bars.
+
         Every symbol in symbols.ICT_TRADING_UNIVERSE is routed to
         evaluate_ict(); everything else gets NONE_RESULT unconditionally
         — there is no other strategy left to fall back to. htf_bars/
@@ -297,6 +534,18 @@ class SignalEngine:
         doesn't have them yet (still warming up), this returns NONE_RESULT
         rather than guessing.
         """
+        if symbol in getattr(config, "STEP_GRID_SYMBOLS", ()):
+            if not ltf_bars:
+                logger.debug(f"REJECTED: {symbol} missing ltf bars for STEP_GRID evaluation")
+                return NONE_RESULT
+            result = evaluate_step_grid_final(ltf_bars, symbol)
+            if result.direction != "NONE":
+                logger.info(
+                    f"SIGNAL: {symbol} {result.direction} {result.strategy} "
+                    f"strength={result.strength} score={result.score:.3f}"
+                )
+            return result
+
         if symbol not in sym_module.ICT_TRADING_UNIVERSE:
             logger.debug(f"REJECTED: {symbol} not in ICT trading universe")
             return NONE_RESULT
