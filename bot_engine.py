@@ -56,7 +56,10 @@ import meta_labeling
 from deriv_client import DerivClient
 from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
-from signal_engine import SignalEngine, SignalResult, compute_enriched_features
+from signal_engine import (
+    SignalEngine, SignalResult, compute_enriched_features,
+    record_step_grid_execution,
+)
 from risk_manager import RiskManager
 from news_filter import NewsFilter
 from trade_journal import TradeJournal
@@ -1550,6 +1553,15 @@ class BotEngine:
         cid        = str(buy_resp.get("contract_id", ""))
         bal_before = self.client.balance
         buy_price  = float(buy_resp.get("buy_price", stake))
+
+        # stpRNG-only: the trade is now confirmed placed at the broker —
+        # record its real (already-flipped) direction for the "no
+        # consecutive same-direction trade" gate in
+        # signal_engine.evaluate_step_grid_final(). Scoped to
+        # STEP_GRID_SYMBOLS only; no effect on, and never read by, the 11
+        # ICT symbols' logic.
+        if symbol in getattr(config, "STEP_GRID_SYMBOLS", ()):
+            record_step_grid_execution(direction)
 
         rec = self.risk.register_open(
             symbol      = symbol,
