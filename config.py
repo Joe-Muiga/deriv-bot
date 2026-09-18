@@ -171,8 +171,17 @@ PRIORITY_SYMBOLS = [
 # differ by jurisdiction/account type and can change. See
 # SMC_ICT_MIGRATION_NOTES.md for the exact runbook.
 DEFAULT_MULTIPLIER = 20
-MULTIPLIER_MAP: dict = {}   # intentionally empty — every symbol falls
-                             # through to DEFAULT_MULTIPLIER until audited
+MULTIPLIER_MAP: dict = {
+    # stpRNG only — confirmed valid multiplier range 750-7500 (audited via
+    # symbol_audit.py in the synthetic-indices bot, Aug 2026; not a guess).
+    # DEFAULT_MULTIPLIER (20) sits far below this floor, which caused every
+    # stpRNG buy_multiplier() call to be rejected by Deriv (buy_resp=None) —
+    # this entry is the fix. Every other symbol here is still unaudited for
+    # THIS account and correctly falls through to DEFAULT_MULTIPLIER — do
+    # not add entries for the 11 ICT symbols without a fresh
+    # symbol_audit.py run against this account first (see the warning above).
+    "stpRNG": 750,
+}
 
 # ── STOP-LOSS — not used for this universe ──────────────────────────────
 # DYNAMIC_STOP_LOSS_ENABLED / STOP_LOSS_MAP drove a stake-percentage stop
@@ -399,8 +408,8 @@ MULTIPLIER_MAX_HOLD_MINS = 30
 TICK_BUFFER_MAXLEN = 200
 TICK_RESUBSCRIBE_RETRY_SECS = 30
 
-BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD    =  float('inf') 
-BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS = 5
+BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD    = 5
+BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS = 15
 
 
 # ══════════════════════════════════════════════════════════════
