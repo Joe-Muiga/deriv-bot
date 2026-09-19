@@ -155,11 +155,15 @@ FLIP_ENTRY_SL_SAFETY_MARGIN  = 0.10
 # and the (derived-from-it) stop-loss distance in
 # _apply_flip_and_swap_levels() by this factor, so TP sits somewhere
 # realistically reachable instead of requiring the full original swing
-# distance. 0.5 halves both legs; the R:R ratio between them is
-# unaffected (it's a pure function of FLIP_ENTRY_MIN_RR_RATIO and
+# distance. The R:R ratio between the two legs is unaffected regardless
+# of this value (it's a pure function of FLIP_ENTRY_MIN_RR_RATIO and
 # FLIP_ENTRY_SL_SAFETY_MARGIN above, independent of distance magnitude).
 # stpRNG-scoped only — never read outside _apply_flip_and_swap_levels().
-STEP_GRID_SL_TP_DISTANCE_MULT = 0.5
+# History: started at 0.5 (half); user reported that was still too large
+# and asked to quarter the resulting (already-halved) distance, so this
+# is now 0.125 — 1/8 of the original raw swing distance, 1/4 of the
+# first-pass halved distance.
+STEP_GRID_SL_TP_DISTANCE_MULT = 0.125
 
 # Priority order for INIT_BATCH_SIZE-batched startup — gold and the EUR/USD,
 # GBP/USD, USD/JPY majors first (deepest liquidity / most actively traded),
