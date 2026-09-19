@@ -2231,19 +2231,22 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 def _donkey_signal_1(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
     """
     Inverted frequency logic. Over the last DONKEY_FREQ_WINDOW ticks, finds
-    the hot digit (highest frequency) and cold digit (lowest frequency),
-    then picks whichever of OVER(hot-1) / UNDER(hot+1) puts hot in the
-    winning zone AND cold in the losing zone.
+    the hot digit (highest frequency) and cold digit (lowest frequency);
+    hot/cold only decide DIRECTION now (OVER when cold < hot, UNDER when
+    cold > hot) — the barrier itself is FIXED and wide
+    (config.DONKEY_OVER_BARRIER / DONKEY_UNDER_BARRIER), not hot +/- 1.
 
-    Proof exactly one of the two always works (once hot != cold): OVER(b)
-    with b=hot-1 wins on {hot..9}; UNDER(b) with b=hot+1 wins on {0..hot}.
-    Those two zones overlap only at {hot} itself, so cold (!= hot) sits in
-    exactly one of them — pick the OTHER contract type, i.e. OVER when
-    cold < hot, UNDER when cold > hot.
+    Chat-agreed trade-off vs. the old hot-hugging barrier: firing on
+    nearly every tick at a high, barrier-driven nominal win rate, in
+    exchange for (a) no longer guaranteeing the cold digit itself falls in
+    the losing zone, and (b) a smaller payout per win. Score below is the
+    barrier's own nominal win probability, not the hot/cold frequency
+    gap — that's what makes strength high and consistent instead of
+    depending on rare, heavily-skewed samples.
 
     Returns (match_type, barrier, score, hot, cold), or None if there
     aren't enough ticks yet or the sample is perfectly uniform (no real
-    hot/cold split to trade).
+    hot/cold split to pick a direction from).
     """
     window_n = getattr(config, "DONKEY_FREQ_WINDOW", 100)
     min_n = getattr(config, "DONKEY_FREQ_MIN_SAMPLE", 100)
@@ -2265,16 +2268,17 @@ def _donkey_signal_1(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, 
     hot  = max(range(10), key=lambda d: (counts[d], -d))   # ties -> lowest digit wins "hot"
     cold = min(range(10), key=lambda d: (counts[d], d))    # ties -> lowest digit wins "cold"
     if hot == cold:
-        return None  # perfectly uniform sample -- nothing to trade
-
-    n = len(digits)
-    hot_freq, cold_freq = counts[hot] / n, counts[cold] / n
-    score = max(0.0, min(1.0, hot_freq - cold_freq))
+        return None  # perfectly uniform sample -- no direction to pick
 
     if cold < hot:
-        match_type, barrier = "OVER", hot - 1
+        match_type = "OVER"
+        barrier = getattr(config, "DONKEY_OVER_BARRIER", 1)
     else:
-        match_type, barrier = "UNDER", hot + 1
+        match_type = "UNDER"
+        barrier = getattr(config, "DONKEY_UNDER_BARRIER", 8)
+
+    win_zone_size = (9 - barrier) if match_type == "OVER" else barrier
+    score = max(0.0, min(1.0, win_zone_size / 10.0))
 
     return match_type, barrier, score, hot, cold
 
