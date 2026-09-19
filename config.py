@@ -957,28 +957,16 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 0.35    # USER REQUEST (Aug 2026): set to $100.
-                                # IMPORTANT — read before assuming this is a
-                                # harmless safety floor: base_stake =
-                                # max(BASE_STAKE_PCT × balance, MIN_STAKE),
-                                # so this isn't just a backstop for a small
-                                # account — on the current ~$8.7-8.9k demo
-                                # balance, 0.5% works out to ~$43-45, which
-                                # is BELOW $100, so every single trade will
-                                # now be forced to exactly $100 flat,
-                                # overriding the balance/Kelly-adjusted size
-                                # entirely — the exact failure mode this
-                                # comment previously warned about when this
-                                # was last set to 100 (see git history /
-                                # prior comment: "every logged trade was
-                                # exactly $100.00 regardless of signal
-                                # strength or edge"). Implemented as
-                                # instructed since the request was explicit,
-                                # but flagged here so it's an informed choice
-                                # rather than a surprise the next time this
-                                # file is read. If flat $100 stakes weren't
-                                # the intent, lower this back down and let
-                                # BASE_STAKE_PCT/Kelly drive sizing instead.
+MIN_STAKE            = 0.35   # UPDATED — was 100. Now matches
+                                # MANUAL_STAKE_AMOUNT ($0.35); also the
+                                # codebase's own built-in default
+                                # (risk_manager.py's RiskManager falls back
+                                # to 0.35 here if config.MIN_STAKE is ever
+                                # missing). Doubles as the can_trade()
+                                # balance floor (current_balance > MIN_STAKE
+                                # required to trade at all) — at 100 this
+                                # would have silently blocked all trading
+                                # on any real balance under $100.
                                 # SUPERSEDED Sep 12 2026 by MANUAL_STAKE_MODE
                                 # above — this value (and the dynamics this
                                 # comment describes) only matter again if
@@ -993,10 +981,14 @@ MIN_STAKE            = 0.35    # USER REQUEST (Aug 2026): set to $100.
                                 # losses, not a graceful size-down.
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-DAILY_LOSS_LIMIT_PCT = 2.06    # FIX: was 0.15 (15%) — too loose to act as a
-                                # real circuit breaker. 6% is a more typical
-                                # prudent daily stop for leveraged multiplier
-                                # trading; tune to taste but keep well under 15%.
+DAILY_LOSS_LIMIT_PCT = float("inf")  # REMOVED PER REQUEST — was 0.06 (6%).
+                                # bot_engine._check_confirmed_loss_limit()
+                                # compares confirmed_daily_loss/day_start_balance
+                                # against this value to set _confirmed_paused;
+                                # inf makes that comparison impossible to trip,
+                                # so trading is never auto-paused on daily loss.
+                                # DAILY_LOSS_PAUSE_MINS below is now unused —
+                                # nothing left to trigger a pause to time out.
 DAILY_LOSS_PAUSE_MINS = 30
 
 # FIX (profitability audit, round 2): global, account-wide circuit breaker —
@@ -1006,7 +998,10 @@ DAILY_LOSS_PAUSE_MINS = 30
 # nothing account-wide stopping it short of that much coarser daily-%
 # threshold. See BotEngine._global_consecutive_losses.
 GLOBAL_CONSECUTIVE_LOSS_LIMIT = 4
-GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS = 45
+GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS = 0  # REMOVED PER REQUEST — was 45.
+                                # This is the 2nd of 3 pause mechanisms
+                                # (daily %, this one, buy-failure breaker
+                                # below) — 0min makes a trip a no-op.
 
 # ── EQUITY CURVE STABILIZATION (win-rate/drawdown pass, Aug 2026) ─────────
 # The circuit breaker above is binary: trading stops entirely for
@@ -1171,7 +1166,16 @@ TICK_RESUBSCRIBE_RETRY_SECS = 30
 
 # ── BUY-FAILURE CIRCUIT BREAKER ──────────────────────────────
 BUY_FAILURE_CIRCUIT_BREAKER_THRESHOLD    = 5
-BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS = 15
+BUY_FAILURE_CIRCUIT_BREAKER_SUSPEND_MINS = 0  # REMOVED PER REQUEST — was
+                                # 15. 3rd pause mechanism: per-symbol
+                                # suspend after repeated buy failures.
+                                # 0min = no-op. NOTE: if a symbol's buy
+                                # keeps failing (e.g. it doesn't actually
+                                # support DIGITOVER/DIGITUNDER), the bot
+                                # will now retry it forever every cycle
+                                # instead of backing off — watch the logs
+                                # for repeated PLACEMENT FAILED on one
+                                # symbol.
 
 # ── SCANNING ────────────────────────────────────────────────
 SCAN_CYCLE_SLEEP       = 1
