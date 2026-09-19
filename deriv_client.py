@@ -156,12 +156,7 @@ logger = logging.getLogger(__name__)
 MAX_RETRY_DELAY = 60
 
 _BOOM_CRASH_PREFIXES = ("BOOM", "CRASH")
-# "STPRNG" added for the stpRNG handoff — Step Index is a synthetic index,
-# tradeable 24/7 exactly like R_*/1HZ*, so _check_market_open() below should
-# take the same always-open shortcut for it rather than round-tripping to
-# Deriv's active_symbols API on every buy. Scoped to this one symbol; no
-# effect on any of the 11 ICT (Forex/gold/commodity) symbols.
-_VOLATILITY_PREFIXES = ("R_", "1HZ", "STPRNG")
+_VOLATILITY_PREFIXES = ("R_", "1HZ")
 
 # ── Reconnect defaults (overridden by config if present) ──────────────────────
 _DEFAULT_RECONNECT_INTERVAL = 5   # seconds between retries
@@ -1175,8 +1170,35 @@ class DerivClient:
 
     @staticmethod
     def _digit_contract_type(match_type: str) -> Optional[str]:
-        mapping = {"MATCH": "DIGITMATCH", "DIFFER": "DIGITDIFF"}
+        # OVER/UNDER added for Donkey Strategy (signal_engine.
+        # evaluate_donkey_strategy()) — reuses the exact same match_type/
+        # digit plumbing get_digit_proposal()/buy_digit_contract() already
+        # had for MATCH/DIFFER, no signature changes needed.
+        mapping = {
+            "MATCH":  "DIGITMATCH",
+            "DIFFER": "DIGITDIFF",
+            "OVER":   "DIGITOVER",
+            "UNDER":  "DIGITUNDER",
+        }
         return mapping.get(str(match_type).upper())
+
+    @staticmethod
+    def _digit_barrier_valid(contract_type: str, digit: int) -> bool:
+        """
+        Per-contract-type barrier bounds (Deriv's actual contract rules):
+          DIGITMATCH / DIGITDIFF : barrier 0-9 (any digit)
+          DIGITOVER              : barrier 0-8 (barrier 9 can never win —
+                                    no digit is > 9)
+          DIGITUNDER             : barrier 1-9 (barrier 0 can never win —
+                                    no digit is < 0)
+        """
+        if not (0 <= digit <= 9):
+            return False
+        if contract_type == "DIGITOVER":
+            return digit <= 8
+        if contract_type == "DIGITUNDER":
+            return digit >= 1
+        return True
 
     # ─── Circuit breaker (per symbol+strategy) ─────────────────────────────
     # Suspends new buy attempts on a (symbol, strategy) combination after N
@@ -1981,11 +2003,15 @@ class DerivClient:
         if contract_type is None:
             logger.error(
                 f"FAILED: {symbol} — invalid match_type={match_type!r} "
-                f"(must be 'MATCH' or 'DIFFER')"
+                f"(must be 'MATCH', 'DIFFER', 'OVER', or 'UNDER')"
             )
             return None
-        if not (0 <= digit <= 9):
-            logger.error(f"FAILED: {symbol} — invalid digit={digit} (must be 0-9)")
+        if not self._digit_barrier_valid(contract_type, digit):
+            logger.error(
+                f"FAILED: {symbol} — invalid digit/barrier={digit} for "
+                f"{contract_type} (0-9 for MATCH/DIFFER, 0-8 for OVER, "
+                f"1-9 for UNDER)"
+            )
             return None
 
         try:
@@ -2059,11 +2085,15 @@ class DerivClient:
             if contract_type is None:
                 logger.error(
                     f"FAILED: {symbol} — invalid match_type={match_type!r} "
-                    f"(must be 'MATCH' or 'DIFFER')"
+                    f"(must be 'MATCH', 'DIFFER', 'OVER', or 'UNDER')"
                 )
                 return None
-            if not (0 <= digit <= 9):
-                logger.error(f"FAILED: {symbol} — invalid digit={digit} (must be 0-9)")
+            if not self._digit_barrier_valid(contract_type, digit):
+                logger.error(
+                    f"FAILED: {symbol} — invalid digit/barrier={digit} for "
+                    f"{contract_type} (0-9 for MATCH/DIFFER, 0-8 for OVER, "
+                    f"1-9 for UNDER)"
+                )
                 return None
 
             stake = self._cap_stake(stake, symbol)
