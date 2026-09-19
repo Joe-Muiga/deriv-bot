@@ -470,6 +470,67 @@ def _apply_flip_and_swap_levels(sig: SignalResult) -> Optional[SignalResult]:
     )
 
 
+def _apply_distance_scaling(sig: SignalResult) -> Optional[SignalResult]:
+    """
+    For stpRNG only. Used in place of _apply_flip_and_swap_levels() when
+    STEP_GRID_INVERT_SIGNAL_ENABLED is False (config.py) — i.e. the raw
+    AND-gate signal is executed AS-IS, direction unchanged, instead of
+    flipped. Keeps evaluate_step_grid()'s own direction/entry/stop/target
+    exactly as computed, EXCEPT it scales both the stop-loss distance and
+    the take-profit distance down by STEP_GRID_SL_TP_DISTANCE_MULT — the
+    same scaling _apply_flip_and_swap_levels() applies on the flipped
+    path, so TP stays realistically reachable either way. Scaling both
+    distances by the same factor leaves the R:R ratio (target_distance /
+    stop_distance = STEP_GRID_RR_RATIO, already baked into
+    evaluate_step_grid()'s own target = entry +/- rr_ratio*risk)
+    unchanged.
+
+    Returns None if the resulting stop/target distance isn't strictly
+    positive (should not happen — evaluate_step_grid() already checked
+    this before scaling — but never trust a scaled value without
+    re-checking).
+    """
+    if sig.direction not in ("LONG", "SHORT"):
+        return None
+    if sig.native_entry_price is None or sig.native_stop_price is None or sig.native_target_price is None:
+        return None
+
+    entry  = float(sig.native_entry_price)
+    stop   = float(sig.native_stop_price)
+    target = float(sig.native_target_price)
+    is_long = sig.direction == "LONG"
+
+    raw_stop_distance   = (entry - stop)   if is_long else (stop - entry)
+    raw_target_distance = (target - entry) if is_long else (entry - target)
+    if raw_stop_distance <= 0 or raw_target_distance <= 0:
+        logger.warning(
+            f"RAW-ENTRY DROPPED: {sig.strategy} {sig.direction} — "
+            f"non-positive stop/target distance (entry={entry:.5f}, "
+            f"stop={stop:.5f}, target={target:.5f}), refusing to trade"
+        )
+        return None
+
+    distance_mult = getattr(config, "STEP_GRID_SL_TP_DISTANCE_MULT", 0.125)
+    new_stop_distance   = raw_stop_distance   * distance_mult
+    new_target_distance = raw_target_distance * distance_mult
+    new_stop   = (entry - new_stop_distance)   if is_long else (entry + new_stop_distance)
+    new_target = (entry + new_target_distance) if is_long else (entry - new_target_distance)
+
+    logger.info(
+        f"RAW-ENTRY: {sig.strategy} {sig.direction} (inversion disabled) | "
+        f"entry={entry:.5f} | stop-loss={new_stop:.5f} (was {stop:.5f}) | "
+        f"take-profit={new_target:.5f} (was {target:.5f}) | distance x"
+        f"{distance_mult} | ratio={(new_target_distance / new_stop_distance):.2f}:1"
+    )
+    return replace(
+        sig,
+        native_entry_price=entry,
+        native_stop_price=new_stop,
+        native_target_price=new_target,
+        execution_inverted=False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # stpRNG direction-alternation state — persisted to disk (handoff point 2,
 # Sep 2026) so the "no consecutive same-direction trade" gate below
@@ -569,11 +630,16 @@ def evaluate_step_grid_final(
     """
     stpRNG's full, independent pipeline:
       1. evaluate_step_grid() — raw AND-gate evaluation.
-      2. _apply_flip_and_swap_levels() — flip transform for execution.
+      2. STEP_GRID_INVERT_SIGNAL_ENABLED (config.py) selects the
+         execution transform: _apply_flip_and_swap_levels() (flips
+         direction, reuses the raw stop as take-profit) when True, or
+         _apply_distance_scaling() (keeps the raw direction/stop/target
+         as-is, only scales distances) when False — currently False, so
+         the raw signal executes unflipped.
       3. "No consecutive same-direction trade" gate — reject (not queue)
          a same-direction signal until a stpRNG trade actually executes
          in the opposite direction. Compared against the real, final
-         (post-flip) direction — see _StepGridDirectionState above.
+         (post-transform) direction — see _StepGridDirectionState above.
 
     current_price (handoff point 4, Sep 2026): the live in-progress tick
     price, when the caller has one available (bot_engine._scan() threads
@@ -591,19 +657,28 @@ def evaluate_step_grid_final(
     if raw.direction not in ("LONG", "SHORT"):
         return NONE_RESULT
 
-    flipped = _apply_flip_and_swap_levels(raw)
-    if flipped is None:
+    # Handoff follow-up (Sep 2026): inversion disabled — the user
+    # confirmed the flip should stop and the raw AND-gate signal should
+    # execute as-is. Gated on config.STEP_GRID_INVERT_SIGNAL_ENABLED
+    # (default False) rather than deleted, so it's a one-line revert if
+    # ever wanted back. Either path still applies the same
+    # STEP_GRID_SL_TP_DISTANCE_MULT distance scaling.
+    if getattr(config, "STEP_GRID_INVERT_SIGNAL_ENABLED", False):
+        candidate = _apply_flip_and_swap_levels(raw)
+    else:
+        candidate = _apply_distance_scaling(raw)
+    if candidate is None:
         return NONE_RESULT
 
-    if flipped.direction == _step_grid_direction_state.last_executed_direction:
+    if candidate.direction == _step_grid_direction_state.last_executed_direction:
         logger.debug(
-            f"REJECTED: {symbol} STEP_GRID {flipped.direction} — same "
+            f"REJECTED: {symbol} STEP_GRID {candidate.direction} — same "
             f"direction as last executed stpRNG trade, holding until an "
             f"opposite-direction signal fires"
         )
         return NONE_RESULT
 
-    return flipped
+    return candidate
 
 
 def record_step_grid_execution(direction: str) -> None:
