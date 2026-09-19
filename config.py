@@ -1001,8 +1001,8 @@ DAILY_LOSS_PAUSE_MINS = 5
 # because a bad run (e.g. 5 losses in a 7-trade session) previously had
 # nothing account-wide stopping it short of that much coarser daily-%
 # threshold. See BotEngine._global_consecutive_losses.
-GLOBAL_CONSECUTIVE_LOSS_LIMIT = 4
-GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS = 45
+GLOBAL_CONSECUTIVE_LOSS_LIMIT = 2
+GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS = 2
 
 # ── EQUITY CURVE STABILIZATION (win-rate/drawdown pass, Aug 2026) ─────────
 # The circuit breaker above is binary: trading stops entirely for
