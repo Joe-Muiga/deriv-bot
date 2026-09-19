@@ -989,11 +989,11 @@ MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
                                 # losses, not a graceful size-down.
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-DAILY_LOSS_LIMIT_PCT = 20.06    # FIX: was 0.15 (15%) — too loose to act as a
+DAILY_LOSS_LIMIT_PCT = 0.06    # FIX: was 0.15 (15%) — too loose to act as a
                                 # real circuit breaker. 6% is a more typical
                                 # prudent daily stop for leveraged multiplier
                                 # trading; tune to taste but keep well under 15%.
-DAILY_LOSS_PAUSE_MINS = 5
+DAILY_LOSS_PAUSE_MINS = 30
 
 # FIX (profitability audit, round 2): global, account-wide circuit breaker —
 # pause ALL new entries (any symbol/strategy) after this many consecutive
@@ -1001,8 +1001,8 @@ DAILY_LOSS_PAUSE_MINS = 5
 # because a bad run (e.g. 5 losses in a 7-trade session) previously had
 # nothing account-wide stopping it short of that much coarser daily-%
 # threshold. See BotEngine._global_consecutive_losses.
-GLOBAL_CONSECUTIVE_LOSS_LIMIT = 2
-GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS = 2
+GLOBAL_CONSECUTIVE_LOSS_LIMIT = 4
+GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS = 45
 
 # ── EQUITY CURVE STABILIZATION (win-rate/drawdown pass, Aug 2026) ─────────
 # The circuit breaker above is binary: trading stops entirely for
@@ -1058,7 +1058,7 @@ PLS_WIN_EXTRA_SLOTS = [0,   0,   0,   0,   0   ]
 # highly-correlated symbols (e.g. R_10 and 1HZ10V both track the same
 # volatility parameter). Lowered to reduce simultaneous drawdown risk;
 # raise gradually only once live win-rate/profit-factor justify it.
-MAX_CONCURRENT_TRADES = 8
+MAX_CONCURRENT_TRADES = 6
 
 # Correlated-symbol grouping — synthetic indices sharing the same underlying
 # volatility parameter (just different tick generation) move together far
@@ -1202,7 +1202,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 20 / 60   # 11 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 11 / 60   # 11 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
