@@ -1288,7 +1288,20 @@ class BotEngine:
             if not ltf_bars:
                 return None
 
-            sig = self.signal.evaluate(ltf_bars, symbol, htf_bars=htf_bars, mtf_bars=mtf_bars)
+            # Handoff point 4 (Sep 2026), stpRNG-only: completed_bars only
+            # gains a new element once a full LTF-granularity window
+            # closes (5 min for stpRNG), so ltf_bars[-1].close alone can
+            # lag "the current price" by up to that whole window. The
+            # in-progress tick price is genuinely live — cheap to read for
+            # every symbol (no side effect), and SignalEngine.evaluate()
+            # only actually uses it on the STEP_GRID_SYMBOLS branch;
+            # evaluate_ict() never receives or reads it.
+            live_price = ltf_builder.current_price
+
+            sig = self.signal.evaluate(
+                ltf_bars, symbol, htf_bars=htf_bars, mtf_bars=mtf_bars,
+                current_price=live_price,
+            )
             if sig is None or getattr(sig, "direction", "NONE") == "NONE":
                 return None
 
@@ -2051,10 +2064,28 @@ class BotEngine:
     # ── Multiplier contracts — explicit, active closing only (Fix E) ───────
 
     async def _handle_multiplier_orphan(self, cid: str, info: dict, age: float) -> None:
+        symbol = info.get("symbol", "UNKNOWN")
+
+        # Handoff point 3 (Sep 2026): Step Index (stpRNG) is exempt from
+        # this time-based max-hold force-close — the only mechanism in
+        # this codebase that actively sells a Multiplier contract purely
+        # because of elapsed age, regardless of profit/loss. stpRNG should
+        # only ever close via its own broker-side stop-loss/take-profit
+        # (the limit_order attached at buy time in
+        # deriv_client.buy_multiplier()). Every other Multiplier-contract
+        # symbol (the 11 ICT symbols) keeps this safety net completely
+        # unchanged. Side effect worth knowing: while a stpRNG position is
+        # open, _settle_loop()'s redeploy drain can no longer force it
+        # closed either (it shares this same function) — the ~11-minute
+        # redeploy simply waits (DRAIN_MAX_SECS-bounded, then logs and
+        # keeps retrying) until the position closes on its own SL/TP,
+        # rather than ever timing it out.
+        if symbol in getattr(config, "STEP_GRID_SYMBOLS", ()):
+            return
+
         if age < MULTIPLIER_MAX_HOLD_SECS:
             return
 
-        symbol = info.get("symbol", "UNKNOWN")
         logger.info(
             f"MULTIPLIER MAX-HOLD: {cid} ({symbol}) held {age:.0f}s >= "
             f"{MULTIPLIER_MAX_HOLD_SECS}s — actively selling to realize the "
