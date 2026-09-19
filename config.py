@@ -128,9 +128,17 @@ VOLATILITY_SYMBOLS = list(dict.fromkeys(VOLATILITY_SYMBOLS + STEP_GRID_SYMBOLS))
 # buy_multiplier() the same way it does the 11 ICT symbols.
 MULTIPLIER_SYMBOLS = list(dict.fromkeys(MULTIPLIER_SYMBOLS + STEP_GRID_SYMBOLS))
 
-# The exact stpRNG AND-gate strategy (evaluate_step_grid() in
-# signal_engine.py), ported verbatim from the synthetic-indices bot —
-# a dedicated block, not shared with/read by any ICT config above.
+# DORMANT (superseded by STEP_TICK_SPIKE_* below, Sep 2026) — the
+# candle-close AND-gate strategy (evaluate_step_grid() in
+# signal_engine.py) and its flip-entry transform
+# (_apply_flip_and_swap_levels()). Kept in place for reference per this
+# codebase's established pattern (see DELAYED_ENTRY_ENABLED/
+# FIXED_ENTRY_LEVELS_ENABLED docstrings elsewhere in this file) — NOT
+# read by SignalEngine.evaluate()'s stpRNG branch anymore, which now
+# calls evaluate_step_tick_spike() instead. Left un-deleted only because
+# evaluate_step_grid()/evaluate_step_grid_final()/
+# _apply_flip_and_swap_levels() themselves are still present as dormant
+# functions in signal_engine.py, not because anything still reads these.
 STEP_GRID_MIN_BARS               = 30
 STEP_GRID_EMA_FAST_PERIOD        = 10
 STEP_GRID_EMA_SLOW_PERIOD        = 20
@@ -143,36 +151,60 @@ STEP_GRID_MACD_SIGNAL            = 9
 STEP_GRID_RANGE_LOOKBACK         = 20
 STEP_GRID_STOP_BUFFER_ATR_MULT   = 0.30
 STEP_GRID_RR_RATIO               = 2.0
-
-# The flip-entry transform applied to stpRNG's raw signal before
-# execution (signal_engine._apply_flip_and_swap_levels()) — confirmed
-# live/profitable yesterday in the synthetic-indices bot. stpRNG-scoped
-# only; not applied to, and not read by, any ICT symbol.
-#
-# STEP_GRID_INVERT_SIGNAL_ENABLED — user-directed (Sep 2026): inversion
-# disabled. False routes evaluate_step_grid_final() to
-# _apply_distance_scaling() instead (raw AND-gate direction executed
-# as-is, unflipped; only the SL/TP distances get scaled). Set True to
-# restore the old flip-and-swap behavior — FLIP_ENTRY_MIN_RR_RATIO /
-# FLIP_ENTRY_SL_SAFETY_MARGIN below stay defined either way since
-# _apply_flip_and_swap_levels() is disabled, not deleted.
-STEP_GRID_INVERT_SIGNAL_ENABLED = False
 FLIP_ENTRY_MIN_RR_RATIO      = 2.0
 FLIP_ENTRY_SL_SAFETY_MARGIN  = 0.10
 
-# Handoff point 1 (Sep 2026): multiplies both the take-profit distance
-# and the (derived-from-it) stop-loss distance — in
-# _apply_flip_and_swap_levels() when STEP_GRID_INVERT_SIGNAL_ENABLED is
-# True, or _apply_distance_scaling() when False — by this factor, so TP
-# sits somewhere realistically reachable instead of requiring the full
-# original swing distance. The R:R ratio between the two legs is
-# unaffected regardless of this value (independent of distance
-# magnitude in both paths). stpRNG-scoped only.
-# History: started at 0.5 (half); user reported that was still too large
-# and asked to quarter the resulting (already-halved) distance, so this
-# is now 0.125 — 1/8 of the original raw swing distance, 1/4 of the
-# first-pass halved distance.
-STEP_GRID_SL_TP_DISTANCE_MULT = 0.125
+# ---------------------------------------------------------------------------
+# stpRNG — tick-level spike-fade strategy (evaluate_step_tick_spike() in
+# signal_engine.py). Replaces STEP_GRID_*/FLIP_ENTRY_* above as the live
+# stpRNG strategy (Sep 2026). Reacts to raw ticks (bot_engine._raw_ticks,
+# populated every tick by _on_tick() but previously unread by any
+# evaluator) instead of waiting for a closed LTF candle — Step Index's
+# fixed-tick-size spikes are short enough that a 5-min-candle-close gate
+# was structurally too slow to catch them. stpRNG-scoped only; not read
+# by, and has no effect on, evaluate_ict()/ict_engine.py or any of the 11
+# ICT symbols.
+# ---------------------------------------------------------------------------
+
+# Minimum consecutive same-direction ticks (each tick strictly beyond the
+# previous close) required to call it a "spike" worth fading. User-set at
+# 3 — fast trigger, more signals, smaller edge captured per trade.
+STEP_TICK_SPIKE_MIN_CONSECUTIVE = 3
+
+# The consecutive-tick run above only counts as a spike if it runs
+# against the preceding short-term drift — guards against fading the
+# *start* of a genuine trend rather than a true counter-spike. Measured
+# over this many ticks immediately before the spike run itself.
+STEP_TICK_SPIKE_PRIOR_LOOKBACK  = 12
+
+# Prior-window direction must net-favor the opposite side of the spike by
+# at least this many ticks (net signed tick count, not gross) for the
+# spike to qualify as "against the prior trend". Set low relative to
+# PRIOR_LOOKBACK since Step Index prior drift is often mild.
+STEP_TICK_SPIKE_PRIOR_MIN_NET   = 2
+
+# stpRNG's fixed price increment (confirmed from live quotes — e.g.
+# 7570.1 -> 7569.7 moves in 0.1 steps). No PIP_SIZE_MAP/tick-size map
+# exists elsewhere in this codebase to read this from, so it's set
+# explicitly here, scoped to this strategy only.
+STEP_TICK_SPIKE_TICK_INCREMENT = 0.1
+
+# Stop-loss sits this many extra ticks (in units of
+# STEP_TICK_SPIKE_TICK_INCREMENT above) beyond the spike's own extreme
+# tick (the highest/lowest tick seen during the qualifying run) — a
+# small buffer so normal tick noise right at the extreme doesn't stop
+# the trade out instantly.
+STEP_TICK_SPIKE_STOP_BUFFER_TICKS = 2
+
+# take_profit_distance = STEP_TICK_SPIKE_RR_RATIO * stop_loss_distance.
+# "Minimal profits" per user — kept modest since the stop distance
+# itself is already small (a handful of ticks).
+STEP_TICK_SPIKE_RR_RATIO = 1.5
+
+# Same no-consecutive-same-direction-trade gate as the old flip design
+# (signal_engine._StepGridDirectionState) — reused as-is for the new
+# strategy, scoped to stpRNG only.
+STEP_TICK_SPIKE_NO_REPEAT_DIRECTION = True
 
 # Priority order for INIT_BATCH_SIZE-batched startup — gold and the EUR/USD,
 # GBP/USD, USD/JPY majors first (deepest liquidity / most actively traded),
