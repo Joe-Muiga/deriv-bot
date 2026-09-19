@@ -180,6 +180,19 @@ class CandlestickBuilder:
         return list(self._bars)
 
     @property
+    def current_price(self) -> Optional[float]:
+        """
+        The most recent tick's price, from the still-forming in-progress
+        bar — updates on every add_tick() call. Genuinely live, unlike
+        completed_bars[-1] / closes[-1], which only changes once a full
+        `granularity` window has elapsed and can lag "the current price"
+        by up to that entire window in the meantime. Returns None if no
+        tick has been ingested yet. Purely additive read accessor — does
+        not affect bar-building behavior for any existing caller.
+        """
+        return self._current.close if self._current is not None else None
+
+    @property
     def last_completed(self) -> Optional[Candle]:
         return self._last_completed
 
