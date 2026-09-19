@@ -1615,16 +1615,6 @@ DONKEY_STRATEGY_MODE = "INDEPENDENT"   # "INDEPENDENT" | "COMBINED"
 DONKEY_FREQ_WINDOW      = 100
 DONKEY_FREQ_MIN_SAMPLE  = 100
 
-# Signal 1 barrier — FIXED and wide, not hot +/- 1 (chat-agreed trade-off:
-# fires on ~80% of ticks at ~80% nominal win rate instead of rarely at a
-# tighter, higher-payout zone). hot/cold still pick the direction only.
-# Over 1 wins on {2..9} (8/10); Under 8 wins on {0..7} (8/10). Narrow
-# these back toward hot +/- 1 (e.g. OVER=6, UNDER=8 for a hot digit of 7)
-# for higher payout / lower frequency, or widen further (OVER=0, UNDER=9
-# -> 90% nominal) for even higher frequency / lower payout still.
-DONKEY_OVER_BARRIER  = 1
-DONKEY_UNDER_BARRIER = 8
-
 # Signal 2 — SMA period and fixed DIGITUNDER barrier, per spec.
 DONKEY_TREND_SMA_PERIOD = 8
 DONKEY_TREND_BARRIER    = 3
