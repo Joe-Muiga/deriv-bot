@@ -6,8 +6,12 @@ DEBUG     = False
 VERSION   = "1.1.0"
 
 # ── DERIV API ─────────────────────────────────────────────────
-DERIV_API_TOKEN = os.environ.get("DERIV_API_TOKEN", "")
-DERIV_APP_ID    = os.environ.get("DERIV_APP_ID", "1089")
+DERIV_API_TOKEN   = os.environ.get("DERIV_API_TOKEN", "")
+DERIV_APP_ID      = os.environ.get("DERIV_APP_ID", "1089")
+# "real" or "demo" — picks which Options account _fetch_otp_ws_url() mints
+# an OTP for (deriv_client.py). Was previously never read from env, so it
+# silently defaulted to "demo" no matter what was set on Render.
+DERIV_ACCOUNT_MODE = os.environ.get("DERIV_ACCOUNT_MODE", "demo").strip().lower()
 
 # ── SERVER ────────────────────────────────────────────────────
 PORT = int(os.environ.get("PORT", 10000))
@@ -989,7 +993,7 @@ MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
                                 # losses, not a graceful size-down.
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-DAILY_LOSS_LIMIT_PCT = 40.06    # FIX: was 0.15 (15%) — too loose to act as a
+DAILY_LOSS_LIMIT_PCT = 0.06    # FIX: was 0.15 (15%) — too loose to act as a
                                 # real circuit breaker. 6% is a more typical
                                 # prudent daily stop for leveraged multiplier
                                 # trading; tune to taste but keep well under 15%.
@@ -1202,7 +1206,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 45 / 60   # 11 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 30 / 60   # 30 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
