@@ -148,17 +148,26 @@ STEP_GRID_RR_RATIO               = 2.0
 # execution (signal_engine._apply_flip_and_swap_levels()) — confirmed
 # live/profitable yesterday in the synthetic-indices bot. stpRNG-scoped
 # only; not applied to, and not read by, any ICT symbol.
+#
+# STEP_GRID_INVERT_SIGNAL_ENABLED — user-directed (Sep 2026): inversion
+# disabled. False routes evaluate_step_grid_final() to
+# _apply_distance_scaling() instead (raw AND-gate direction executed
+# as-is, unflipped; only the SL/TP distances get scaled). Set True to
+# restore the old flip-and-swap behavior — FLIP_ENTRY_MIN_RR_RATIO /
+# FLIP_ENTRY_SL_SAFETY_MARGIN below stay defined either way since
+# _apply_flip_and_swap_levels() is disabled, not deleted.
+STEP_GRID_INVERT_SIGNAL_ENABLED = False
 FLIP_ENTRY_MIN_RR_RATIO      = 2.0
 FLIP_ENTRY_SL_SAFETY_MARGIN  = 0.10
 
 # Handoff point 1 (Sep 2026): multiplies both the take-profit distance
-# and the (derived-from-it) stop-loss distance in
-# _apply_flip_and_swap_levels() by this factor, so TP sits somewhere
-# realistically reachable instead of requiring the full original swing
-# distance. The R:R ratio between the two legs is unaffected regardless
-# of this value (it's a pure function of FLIP_ENTRY_MIN_RR_RATIO and
-# FLIP_ENTRY_SL_SAFETY_MARGIN above, independent of distance magnitude).
-# stpRNG-scoped only — never read outside _apply_flip_and_swap_levels().
+# and the (derived-from-it) stop-loss distance — in
+# _apply_flip_and_swap_levels() when STEP_GRID_INVERT_SIGNAL_ENABLED is
+# True, or _apply_distance_scaling() when False — by this factor, so TP
+# sits somewhere realistically reachable instead of requiring the full
+# original swing distance. The R:R ratio between the two legs is
+# unaffected regardless of this value (independent of distance
+# magnitude in both paths). stpRNG-scoped only.
 # History: started at 0.5 (half); user reported that was still too large
 # and asked to quarter the resulting (already-halved) distance, so this
 # is now 0.125 — 1/8 of the original raw swing distance, 1/4 of the
