@@ -431,17 +431,19 @@ def _apply_flip_and_swap_levels(sig: SignalResult) -> Optional[SignalResult]:
         )
         return None
 
-    # Handoff point 1 (Sep 2026): halve both the take-profit distance and
-    # the stop-loss distance from entry, so the take-profit sits somewhere
-    # realistically reachable. Applied here, to target_distance, BEFORE
-    # the stop-loss is derived from it below — sl_distance is already a
-    # pure function of target_distance (via ratio/margin, both fixed
-    # constants), so halving target_distance first automatically halves
-    # sl_distance by the same factor and the resulting R:R ratio
-    # (target_distance / sl_distance = ratio / (1 - margin)) is exactly
-    # unchanged. stpRNG-only — STEP_GRID_SL_TP_DISTANCE_MULT is never read
-    # by evaluate_ict() or any other symbol's code path.
-    distance_mult   = getattr(config, "STEP_GRID_SL_TP_DISTANCE_MULT", 0.5)
+    # Handoff point 1 (Sep 2026): scale both the take-profit distance and
+    # the stop-loss distance from entry down by STEP_GRID_SL_TP_DISTANCE_MULT
+    # (config.py — currently 0.125, i.e. 1/8 of the original raw swing
+    # distance), so the take-profit sits somewhere realistically reachable.
+    # Applied here, to target_distance, BEFORE the stop-loss is derived
+    # from it below — sl_distance is already a pure function of
+    # target_distance (via ratio/margin, both fixed constants), so scaling
+    # target_distance first automatically scales sl_distance by the same
+    # factor and the resulting R:R ratio (target_distance / sl_distance =
+    # ratio / (1 - margin)) is exactly unchanged regardless of this
+    # multiplier's value. stpRNG-only — STEP_GRID_SL_TP_DISTANCE_MULT is
+    # never read by evaluate_ict() or any other symbol's code path.
+    distance_mult   = getattr(config, "STEP_GRID_SL_TP_DISTANCE_MULT", 0.125)
     target_distance = raw_target_distance * distance_mult
     target          = (entry + target_distance) if is_long else (entry - target_distance)
 
