@@ -989,7 +989,7 @@ MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
                                 # losses, not a graceful size-down.
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-DAILY_LOSS_LIMIT_PCT = 0.06    # FIX: was 0.15 (15%) — too loose to act as a
+DAILY_LOSS_LIMIT_PCT = 40.06    # FIX: was 0.15 (15%) — too loose to act as a
                                 # real circuit breaker. 6% is a more typical
                                 # prudent daily stop for leveraged multiplier
                                 # trading; tune to taste but keep well under 15%.
