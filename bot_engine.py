@@ -1568,7 +1568,8 @@ class BotEngine:
         buy_price  = float(buy_resp.get("buy_price", stake))
 
         # stpRNG-only: the trade is now confirmed placed at the broker —
-        # record its real (already-flipped) direction for the "no
+        # record its real executed direction (flipped or raw, depending
+        # on config.STEP_GRID_INVERT_SIGNAL_ENABLED) for the "no
         # consecutive same-direction trade" gate in
         # signal_engine.evaluate_step_grid_final(). Scoped to
         # STEP_GRID_SYMBOLS only; no effect on, and never read by, the 11
