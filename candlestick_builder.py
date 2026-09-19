@@ -53,25 +53,9 @@ class CandlestickBuilder:
         Maximum number of completed bars to keep in memory.
     """
 
-    def __init__(self, granularity: int = 300, max_bars: int = 500,
-                 max_gap_fill_bars: int = 5):
+    def __init__(self, granularity: int = 300, max_bars: int = 500):
         self.granularity  = granularity
         self.max_bars     = max_bars
-        # Real markets (Forex/gold/commodities) close overnight and for the
-        # weekend; synthetic indices never did. A weekend gap at, say, a
-        # 4H granularity is ~12 missing bars — filling all of them with
-        # flat/no-range filler candles (as this builder always used to)
-        # floods swing/order-block/FVG detection with fake doji candles
-        # that can register as false equal-highs/equal-lows liquidity and
-        # dilute genuine structure. Cap it: gaps up to max_gap_fill_bars
-        # bars still get filled (keeps short gaps — a dropped tick or two —
-        # smooth), but anything longer (a session close) is left as a
-        # genuine discontinuity in the bar index instead of fabricated
-        # data. See also BotEngine's periodic HTF/MTF reseed straight from
-        # Deriv's own candle history, which is the primary defence against
-        # this for the timeframes that matter most (bias/POI) — this cap
-        # is the backstop for the live tick-built path.
-        self.max_gap_fill_bars = max_gap_fill_bars
         self._bars: Deque[Candle] = deque(maxlen=max_bars)
         self._current:   Optional[Candle] = None
         self.new_bar_ready: bool = False
@@ -96,23 +80,6 @@ class CandlestickBuilder:
             self._bars.append(candle)
         logger.info(f"Seeded {len(historical)} historical bars "
                     f"(granularity={self.granularity}s)")
-
-    def replace_bars(self, historical: List[dict]):
-        """
-        Like seed(), but clears whatever's currently buffered first (both
-        completed bars AND the in-progress bar) and drops any live-tick
-        gap-filler artifacts along with it. Used by BotEngine to
-        periodically re-pull HTF/MTF bars directly from Deriv's own
-        candle history — the broker's aggregation is authoritative and has
-        no gap-filling problem at all, which live tick-built bars can have
-        across a session close even with max_gap_fill_bars capping the
-        damage. LTF stays tick-built for responsiveness between the
-        (infrequent) HTF/MTF refreshes.
-        """
-        self._bars.clear()
-        self._current = None
-        self.new_bar_ready = False
-        self.seed(historical)
 
     # ── Live tick ingestion ───────────────────────────────────────────────────
 
@@ -143,26 +110,15 @@ class CandlestickBuilder:
             self._last_completed = self._current
             self.new_bar_ready   = True
 
-            # Fill missing intermediate bars with close price (gap handling)
-            # — but only up to max_gap_fill_bars. A longer gap (a session
-            # close over a weekend/holiday) is left as a real discontinuity
-            # instead of manufacturing dozens of fake flat candles — see
-            # the max_gap_fill_bars docstring in __init__.
-            expected  = self._current.timestamp + self.granularity
-            n_missing = max(0, (bar_start - expected) // self.granularity + 1) if expected < bar_start else 0
-            if 0 < n_missing <= self.max_gap_fill_bars:
-                while expected < bar_start:
-                    filler = Candle(timestamp=expected,
-                                    open=self._current.close, high=self._current.close,
-                                    low=self._current.close, close=self._current.close,
-                                    volume=0)
-                    self._bars.append(filler)
-                    expected += self.granularity
-            elif n_missing > self.max_gap_fill_bars:
-                logger.info(
-                    f"gap of {n_missing} bars (granularity={self.granularity}s) "
-                    f"exceeds max_gap_fill_bars={self.max_gap_fill_bars} — "
-                    f"leaving as a real discontinuity, no filler candles inserted")
+            # Fill any missing intermediate bars with close price (gap handling)
+            expected = self._current.timestamp + self.granularity
+            while expected < bar_start:
+                filler = Candle(timestamp=expected,
+                                open=self._current.close, high=self._current.close,
+                                low=self._current.close, close=self._current.close,
+                                volume=0)
+                self._bars.append(filler)
+                expected += self.granularity
 
             # Start the new bar
             self._current = Candle(timestamp=bar_start, open=price,
@@ -178,19 +134,6 @@ class CandlestickBuilder:
     def completed_bars(self) -> List[Candle]:
         """All completed bars as a list (oldest first)."""
         return list(self._bars)
-
-    @property
-    def current_price(self) -> Optional[float]:
-        """
-        The most recent tick's price, from the still-forming in-progress
-        bar — updates on every add_tick() call. Genuinely live, unlike
-        completed_bars[-1] / closes[-1], which only changes once a full
-        `granularity` window has elapsed and can lag "the current price"
-        by up to that entire window in the meantime. Returns None if no
-        tick has been ingested yet. Purely additive read accessor — does
-        not affect bar-building behavior for any existing caller.
-        """
-        return self._current.close if self._current is not None else None
 
     @property
     def last_completed(self) -> Optional[Candle]:
