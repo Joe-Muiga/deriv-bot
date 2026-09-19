@@ -151,6 +151,16 @@ STEP_GRID_RR_RATIO               = 2.0
 FLIP_ENTRY_MIN_RR_RATIO      = 2.0
 FLIP_ENTRY_SL_SAFETY_MARGIN  = 0.10
 
+# Handoff point 1 (Sep 2026): multiplies both the take-profit distance
+# and the (derived-from-it) stop-loss distance in
+# _apply_flip_and_swap_levels() by this factor, so TP sits somewhere
+# realistically reachable instead of requiring the full original swing
+# distance. 0.5 halves both legs; the R:R ratio between them is
+# unaffected (it's a pure function of FLIP_ENTRY_MIN_RR_RATIO and
+# FLIP_ENTRY_SL_SAFETY_MARGIN above, independent of distance magnitude).
+# stpRNG-scoped only — never read outside _apply_flip_and_swap_levels().
+STEP_GRID_SL_TP_DISTANCE_MULT = 0.5
+
 # Priority order for INIT_BATCH_SIZE-batched startup — gold and the EUR/USD,
 # GBP/USD, USD/JPY majors first (deepest liquidity / most actively traded),
 # then the rest.
