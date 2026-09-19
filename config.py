@@ -1058,7 +1058,7 @@ PLS_WIN_EXTRA_SLOTS = [0,   0,   0,   0,   0   ]
 # highly-correlated symbols (e.g. R_10 and 1HZ10V both track the same
 # volatility parameter). Lowered to reduce simultaneous drawdown risk;
 # raise gradually only once live win-rate/profit-factor justify it.
-MAX_CONCURRENT_TRADES = 6
+MAX_CONCURRENT_TRADES = 8
 
 # Correlated-symbol grouping — synthetic indices sharing the same underlying
 # volatility parameter (just different tick generation) move together far
@@ -1202,7 +1202,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 5 / 60   # 11 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 20 / 60   # 11 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
