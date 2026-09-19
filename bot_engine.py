@@ -58,7 +58,7 @@ from candlestick_builder import CandlestickBuilder
 from smc_analyzer import SMCAnalyzer, SMCContext
 from signal_engine import (
     SignalEngine, SignalResult, compute_enriched_features,
-    record_step_grid_execution,
+    record_step_tick_spike_execution,
 )
 from risk_manager import RiskManager
 from news_filter import NewsFilter
@@ -1285,27 +1285,30 @@ class BotEngine:
             ltf_bars = ltf_builder.completed_bars
             htf_bars = htf_builder.completed_bars
             mtf_bars = mtf_builder.completed_bars
-            if not ltf_bars:
-                return None
 
-            # Handoff point 4 (Sep 2026), stpRNG-only: completed_bars only
-            # gains a new element once a full LTF-granularity window
-            # closes (5 min for stpRNG), so ltf_bars[-1].close alone can
-            # lag "the current price" by up to that whole window. The
-            # in-progress tick price is genuinely live — cheap to read for
-            # every symbol (no side effect), and SignalEngine.evaluate()
-            # only actually uses it on the STEP_GRID_SYMBOLS branch;
-            # evaluate_ict() never receives or reads it.
-            live_price = ltf_builder.current_price
+            # stpRNG's live strategy (evaluate_step_tick_spike_final(), via
+            # SignalEngine.evaluate()'s STEP_GRID_SYMBOLS branch) reads raw
+            # ticks, not candles — it can fire with no completed ltf_bars
+            # yet, so the ltf_bars emptiness check below only applies to
+            # the ICT path. self._raw_ticks[symbol] is the same deque
+            # _on_tick() has been populating all along (see its own
+            # comment — previously unread by any evaluator).
+            is_step_grid_symbol = symbol in getattr(config, "STEP_GRID_SYMBOLS", ())
+            raw_ticks = self._raw_ticks.get(symbol) if is_step_grid_symbol else None
+
+            if not is_step_grid_symbol and not ltf_bars:
+                return None
 
             sig = self.signal.evaluate(
                 ltf_bars, symbol, htf_bars=htf_bars, mtf_bars=mtf_bars,
-                current_price=live_price,
-            )
+                raw_ticks=raw_ticks)
             if sig is None or getattr(sig, "direction", "NONE") == "NONE":
                 return None
 
-            price = float(ltf_bars[-1].close)
+            if is_step_grid_symbol and raw_ticks:
+                price = float(raw_ticks[-1]["quote"])
+            else:
+                price = float(ltf_bars[-1].close)
 
             # Real SMC context for the dashboard — see smc_analyzer.py's
             # module docstring for why this used to always be an empty
@@ -1568,14 +1571,14 @@ class BotEngine:
         buy_price  = float(buy_resp.get("buy_price", stake))
 
         # stpRNG-only: the trade is now confirmed placed at the broker —
-        # record its real executed direction (flipped or raw, depending
-        # on config.STEP_GRID_INVERT_SIGNAL_ENABLED) for the "no
-        # consecutive same-direction trade" gate in
-        # signal_engine.evaluate_step_grid_final(). Scoped to
-        # STEP_GRID_SYMBOLS only; no effect on, and never read by, the 11
-        # ICT symbols' logic.
+        # record its real direction for the "no consecutive same-direction
+        # trade" gate in signal_engine.evaluate_step_tick_spike_final()
+        # (the live strategy — see that function's docstring; the dormant
+        # evaluate_step_grid_final()'s own gate/state is untouched but no
+        # longer fed). Scoped to STEP_GRID_SYMBOLS only; no effect on, and
+        # never read by, the 11 ICT symbols' logic.
         if symbol in getattr(config, "STEP_GRID_SYMBOLS", ()):
-            record_step_grid_execution(direction)
+            record_step_tick_spike_execution(direction)
 
         rec = self.risk.register_open(
             symbol      = symbol,
@@ -2065,28 +2068,10 @@ class BotEngine:
     # ── Multiplier contracts — explicit, active closing only (Fix E) ───────
 
     async def _handle_multiplier_orphan(self, cid: str, info: dict, age: float) -> None:
-        symbol = info.get("symbol", "UNKNOWN")
-
-        # Handoff point 3 (Sep 2026): Step Index (stpRNG) is exempt from
-        # this time-based max-hold force-close — the only mechanism in
-        # this codebase that actively sells a Multiplier contract purely
-        # because of elapsed age, regardless of profit/loss. stpRNG should
-        # only ever close via its own broker-side stop-loss/take-profit
-        # (the limit_order attached at buy time in
-        # deriv_client.buy_multiplier()). Every other Multiplier-contract
-        # symbol (the 11 ICT symbols) keeps this safety net completely
-        # unchanged. Side effect worth knowing: while a stpRNG position is
-        # open, _settle_loop()'s redeploy drain can no longer force it
-        # closed either (it shares this same function) — the ~11-minute
-        # redeploy simply waits (DRAIN_MAX_SECS-bounded, then logs and
-        # keeps retrying) until the position closes on its own SL/TP,
-        # rather than ever timing it out.
-        if symbol in getattr(config, "STEP_GRID_SYMBOLS", ()):
-            return
-
         if age < MULTIPLIER_MAX_HOLD_SECS:
             return
 
+        symbol = info.get("symbol", "UNKNOWN")
         logger.info(
             f"MULTIPLIER MAX-HOLD: {cid} ({symbol}) held {age:.0f}s >= "
             f"{MULTIPLIER_MAX_HOLD_SECS}s — actively selling to realize the "
