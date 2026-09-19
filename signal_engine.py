@@ -58,8 +58,10 @@ What's left, and why:
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -69,6 +71,7 @@ import numpy as np
 import config
 import indicators as ind
 import ict_engine as ict
+import strategy_stats
 import symbols as sym_module
 from candlestick_builder import Candle
 
@@ -289,7 +292,9 @@ def evaluate_ict(
 # below are NOT redesigned, simplified, or reinterpreted in any way.
 # ---------------------------------------------------------------------------
 
-def evaluate_step_grid(ltf_bars: List["Candle"], symbol: str) -> SignalResult:
+def evaluate_step_grid(
+    ltf_bars: List["Candle"], symbol: str, current_price: Optional[float] = None
+) -> SignalResult:
     """
     stpRNG — Indicator-grid entry, hard AND-gate. ALL four must
     agree before firing (long: EMA10>EMA20, price>EMA20, RSI>55, MACD
@@ -299,6 +304,16 @@ def evaluate_step_grid(ltf_bars: List["Candle"], symbol: str) -> SignalResult:
     setup (the greater of a recent swing extreme and EMA20 itself, plus a
     buffer), not an arbitrary ATR multiple alone; target is a fixed
     reward:risk multiple of that stop distance.
+
+    current_price (handoff point 4, Sep 2026), optional: a live tick price
+    to use as "the current price" in place of the last COMPLETED bar's
+    close. ltf_bars only gains a new element once a full LTF-granularity
+    window closes (5 min for stpRNG), so C[-1] alone can be stale by up to
+    that whole window at the moment this runs. When provided, this
+    overrides last_close for the AND-gate's price-vs-EMA20 check and for
+    native_entry_price — EMA/RSI/MACD still compute from the completed-bar
+    series C unchanged (indicator lag over a real window is expected and
+    not what this addresses).
     """
     min_bars = getattr(config, "STEP_GRID_MIN_BARS", 30)
     if len(ltf_bars) < min_bars:
@@ -318,6 +333,8 @@ def evaluate_step_grid(ltf_bars: List["Candle"], symbol: str) -> SignalResult:
     atr_val = _last(ind.atr(H, L, C, 14)) or 1e-9
 
     last_close = float(C[-1])
+    if current_price is not None and not math.isnan(current_price):
+        last_close = float(current_price)
     e10, e20 = float(ema10[-1]), float(ema20[-1])
     last_rsi = float(rsi_vals[-1])
     m_line, m_sig = float(macd_line[-1]), float(macd_signal[-1])
@@ -404,8 +421,8 @@ def _apply_flip_and_swap_levels(sig: SignalResult) -> Optional[SignalResult]:
     target = float(sig.native_stop_price)   # evaluator's old stop -> new take-profit
     is_long = flipped_direction == "LONG"
 
-    target_distance = (target - entry) if is_long else (entry - target)
-    if target_distance <= 0:
+    raw_target_distance = (target - entry) if is_long else (entry - target)
+    if raw_target_distance <= 0:
         logger.warning(
             f"FLIP-ENTRY DROPPED: {sig.strategy} {sig.direction} — "
             f"non-positive take-profit distance after flip to "
@@ -413,6 +430,20 @@ def _apply_flip_and_swap_levels(sig: SignalResult) -> Optional[SignalResult]:
             f"{target:.5f}), refusing to trade"
         )
         return None
+
+    # Handoff point 1 (Sep 2026): halve both the take-profit distance and
+    # the stop-loss distance from entry, so the take-profit sits somewhere
+    # realistically reachable. Applied here, to target_distance, BEFORE
+    # the stop-loss is derived from it below — sl_distance is already a
+    # pure function of target_distance (via ratio/margin, both fixed
+    # constants), so halving target_distance first automatically halves
+    # sl_distance by the same factor and the resulting R:R ratio
+    # (target_distance / sl_distance = ratio / (1 - margin)) is exactly
+    # unchanged. stpRNG-only — STEP_GRID_SL_TP_DISTANCE_MULT is never read
+    # by evaluate_ict() or any other symbol's code path.
+    distance_mult   = getattr(config, "STEP_GRID_SL_TP_DISTANCE_MULT", 0.5)
+    target_distance = raw_target_distance * distance_mult
+    target          = (entry + target_distance) if is_long else (entry - target_distance)
 
     ratio  = getattr(config, "FLIP_ENTRY_MIN_RR_RATIO", 2.0)
     margin = getattr(config, "FLIP_ENTRY_SL_SAFETY_MARGIN", 0.10)
@@ -423,8 +454,9 @@ def _apply_flip_and_swap_levels(sig: SignalResult) -> Optional[SignalResult]:
     logger.info(
         f"FLIP-ENTRY: {sig.strategy} {sig.direction} -> {flipped_direction} | "
         f"entry={entry:.5f} (native, immediate) | take-profit={target:.5f} "
-        f"(was native_stop) | new stop-loss={new_stop:.5f} | ratio="
-        f"{(target_distance / sl_distance):.2f}:1 (> {ratio:.1f} required)"
+        f"(was native_stop, distance x{distance_mult}) | new stop-loss="
+        f"{new_stop:.5f} | ratio={(target_distance / sl_distance):.2f}:1 "
+        f"(> {ratio:.1f} required)"
     )
     return replace(
         sig,
@@ -436,26 +468,102 @@ def _apply_flip_and_swap_levels(sig: SignalResult) -> Optional[SignalResult]:
     )
 
 
+# ---------------------------------------------------------------------------
+# stpRNG direction-alternation state — persisted to disk (handoff point 2,
+# Sep 2026) so the "no consecutive same-direction trade" gate below
+# survives the bot's rolling ~11-minute redeploy cycle instead of
+# forgetting the last executed direction (and so potentially allowing two
+# same-direction trades back to back) every time the process restarts.
+#
+# Reuses strategy_stats.py's own DATA_DIR (the STRATEGY_STATS_DIR env var,
+# defaulting to this file's own directory) — "whatever the codebase
+# already uses for cross-restart state" — under a clearly namespaced key
+# (step_index_last_direction) and its own file, so it can't collide with
+# or be confused for strategy_stats.py's own data.
+#
+# CAVEAT, documented here the same way strategy_stats.py/trade_journal.py
+# already document it for their own storage: Render's FREE-TIER
+# filesystem is ephemeral across an actual redeploy. This file survives
+# an in-place crash/restart within the same container, but NOT a real
+# free-tier redeploy unless a persistent disk is mounted and
+# STRATEGY_STATS_DIR points at its mount path. Without that, this still
+# improves on the old pure in-memory state (which forgot on every single
+# restart, guaranteed) but won't be bulletproof across every redeploy —
+# mount a disk for that.
+# ---------------------------------------------------------------------------
+_STEP_STATE_DIR  = getattr(strategy_stats, "DATA_DIR", os.path.dirname(os.path.abspath(__file__)))
+_STEP_STATE_PATH = os.path.join(_STEP_STATE_DIR, "step_index_direction_state.json")
+_STEP_STATE_KEY  = "step_index_last_direction"
+
+
+def _load_step_direction_state() -> Optional[str]:
+    try:
+        with open(_STEP_STATE_PATH, "r") as f:
+            data = json.load(f)
+        direction = data.get(_STEP_STATE_KEY)
+        if direction in ("LONG", "SHORT"):
+            return direction
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        logger.warning(
+            f"STEP_GRID: failed to read persisted direction state "
+            f"({_STEP_STATE_PATH}): {exc} — starting with no known last "
+            f"direction (safe default: the alternation gate simply won't "
+            f"reject anything until the next stpRNG trade executes)"
+        )
+    return None
+
+
+def _save_step_direction_state(direction: str) -> None:
+    try:
+        os.makedirs(_STEP_STATE_DIR, exist_ok=True)
+        tmp_path = _STEP_STATE_PATH + ".tmp"
+        with open(tmp_path, "w") as f:
+            json.dump(
+                {
+                    _STEP_STATE_KEY: direction,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                f,
+            )
+        os.replace(tmp_path, _STEP_STATE_PATH)  # atomic on POSIX
+    except Exception as exc:
+        logger.warning(
+            f"STEP_GRID: failed to persist direction state "
+            f"({_STEP_STATE_PATH}): {exc} — alternation gate will forget "
+            f"this particular update on the next restart"
+        )
+
+
 class _StepGridDirectionState:
     """
     stpRNG-only state: the direction of the last stpRNG trade that was
     actually confirmed placed at the broker (i.e. the real, post-flip
     direction — see _apply_flip_and_swap_levels()). Lives here, not in
     bot_engine.py's shared dicts, and is never read by evaluate_ict() or
-    any ICT-symbol code path.
+    any ICT-symbol code path. Persisted to disk — see the block above.
     """
 
     def __init__(self):
-        self.last_executed_direction: Optional[str] = None
+        self.last_executed_direction: Optional[str] = _load_step_direction_state()
+        if self.last_executed_direction:
+            logger.info(
+                f"STEP_GRID: restored last executed direction from "
+                f"persisted state: {self.last_executed_direction}"
+            )
 
     def record_executed(self, direction: str) -> None:
         self.last_executed_direction = direction
+        _save_step_direction_state(direction)
 
 
 _step_grid_direction_state = _StepGridDirectionState()
 
 
-def evaluate_step_grid_final(ltf_bars: List["Candle"], symbol: str) -> SignalResult:
+def evaluate_step_grid_final(
+    ltf_bars: List["Candle"], symbol: str, current_price: Optional[float] = None
+) -> SignalResult:
     """
     stpRNG's full, independent pipeline:
       1. evaluate_step_grid() — raw AND-gate evaluation.
@@ -465,13 +573,19 @@ def evaluate_step_grid_final(ltf_bars: List["Candle"], symbol: str) -> SignalRes
          in the opposite direction. Compared against the real, final
          (post-flip) direction — see _StepGridDirectionState above.
 
+    current_price (handoff point 4, Sep 2026): the live in-progress tick
+    price, when the caller has one available (bot_engine._scan() threads
+    it through from CandlestickBuilder.current_price). Passed straight to
+    evaluate_step_grid() — see its docstring for exactly what it affects.
+    Optional; None falls back to the old completed-bar-close behavior.
+
     Returns the SignalResult exactly as it should be executed (direction/
     native_entry_price/native_stop_price/native_target_price already the
     final, broker-bound values) or NONE_RESULT. Entirely independent of
     evaluate_ict() / ict_engine.py / htf_bars / mtf_bars / killzones /
     order blocks — this function only ever reads ltf_bars.
     """
-    raw = evaluate_step_grid(ltf_bars, symbol)
+    raw = evaluate_step_grid(ltf_bars, symbol, current_price=current_price)
     if raw.direction not in ("LONG", "SHORT"):
         return NONE_RESULT
 
@@ -517,6 +631,7 @@ class SignalEngine:
         symbol: str,
         htf_bars: Optional[List[Candle]] = None,
         mtf_bars: Optional[List[Candle]] = None,
+        current_price: Optional[float] = None,
         **kwargs,
     ) -> SignalResult:
         """
@@ -525,6 +640,10 @@ class SignalEngine:
         evaluate_step_grid_final() — a separate dispatch branch that
         never touches evaluate_ict()/ict_engine.py and, being LTF-only,
         does not require htf_bars/mtf_bars.
+
+        current_price (handoff point 4, Sep 2026): forwarded only to the
+        stpRNG branch below — evaluate_ict() never receives it and its
+        signature/behavior is untouched.
 
         Every symbol in symbols.ICT_TRADING_UNIVERSE is routed to
         evaluate_ict(); everything else gets NONE_RESULT unconditionally
@@ -538,7 +657,7 @@ class SignalEngine:
             if not ltf_bars:
                 logger.debug(f"REJECTED: {symbol} missing ltf bars for STEP_GRID evaluation")
                 return NONE_RESULT
-            result = evaluate_step_grid_final(ltf_bars, symbol)
+            result = evaluate_step_grid_final(ltf_bars, symbol, current_price=current_price)
             if result.direction != "NONE":
                 logger.info(
                     f"SIGNAL: {symbol} {result.direction} {result.strategy} "
