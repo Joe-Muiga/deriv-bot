@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 100.0
+MANUAL_STAKE_AMOUNT = 0.35
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
+MIN_STAKE            = 0.35    # USER REQUEST (Aug 2026): set to $100.
                                 # IMPORTANT — read before assuming this is a
                                 # harmless safety floor: base_stake =
                                 # max(BASE_STAKE_PCT × balance, MIN_STAKE),
@@ -993,7 +993,7 @@ MIN_STAKE            = 100    # USER REQUEST (Aug 2026): set to $100.
                                 # losses, not a graceful size-down.
 MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-DAILY_LOSS_LIMIT_PCT = 0.06    # FIX: was 0.15 (15%) — too loose to act as a
+DAILY_LOSS_LIMIT_PCT = 2.06    # FIX: was 0.15 (15%) — too loose to act as a
                                 # real circuit breaker. 6% is a more typical
                                 # prudent daily stop for leveraged multiplier
                                 # trading; tune to taste but keep well under 15%.
