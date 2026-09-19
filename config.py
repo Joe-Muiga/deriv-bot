@@ -149,14 +149,14 @@ STEP_GRID_RR_RATIO               = 2.0
 # live/profitable yesterday in the synthetic-indices bot. stpRNG-scoped
 # only; not applied to, and not read by, any ICT symbol.
 #
-# STEP_GRID_INVERT_SIGNAL_ENABLED — user-directed (Sep 2026): inversion
-# disabled. False routes evaluate_step_grid_final() to
-# _apply_distance_scaling() instead (raw AND-gate direction executed
-# as-is, unflipped; only the SL/TP distances get scaled). Set True to
-# restore the old flip-and-swap behavior — FLIP_ENTRY_MIN_RR_RATIO /
-# FLIP_ENTRY_SL_SAFETY_MARGIN below stay defined either way since
-# _apply_flip_and_swap_levels() is disabled, not deleted.
-STEP_GRID_INVERT_SIGNAL_ENABLED = False
+# STEP_GRID_INVERT_SIGNAL_ENABLED — user-directed (Sep 2026): re-enabled
+# after a brief attempt at raw/unflipped execution. True routes
+# evaluate_step_grid_final() to _apply_flip_and_swap_levels() (raw
+# AND-gate signal's direction flipped, raw stop reused as the new
+# take-profit). Set False to route to _apply_distance_scaling() instead
+# (raw direction executed as-is, unflipped) — that function is kept, not
+# deleted, so this is a one-line revert either way.
+STEP_GRID_INVERT_SIGNAL_ENABLED = True
 FLIP_ENTRY_MIN_RR_RATIO      = 2.0
 FLIP_ENTRY_SL_SAFETY_MARGIN  = 0.10
 
