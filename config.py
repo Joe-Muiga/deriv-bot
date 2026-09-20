@@ -1200,8 +1200,8 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 # from Deriv entirely for PROFIT_CYCLE_COOLDOWN_MINUTES (health checks
 # only), then redeploys and starts a fresh cycle from whatever the
 # balance is at that point — a never-ending cycle.
-PROFIT_CYCLE_TARGET_PCT       = float(os.environ.get("PROFIT_CYCLE_TARGET_PCT", "25"))
-PROFIT_CYCLE_COOLDOWN_MINUTES = float(os.environ.get("PROFIT_CYCLE_COOLDOWN_MINUTES", "13"))
+PROFIT_CYCLE_TARGET_PCT       = float(os.environ.get("PROFIT_CYCLE_TARGET_PCT", "10"))
+PROFIT_CYCLE_COOLDOWN_MINUTES = float(os.environ.get("PROFIT_CYCLE_COOLDOWN_MINUTES", "8"))
 
 # Render API credentials used ONLY to persist the profit-cycle's state
 # (phase / starting balance / cooldown deadline) into this service's own
@@ -1232,7 +1232,7 @@ SETTLE_WAIT_SECS = 15
 # and in addition to, the profit_cycle.py cooldown that only kicks in
 # once the balance target is hit.
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 5 / 60    # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 4 / 60    # 5 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 30 min, before that 13.7 min, 1h, 3h.
