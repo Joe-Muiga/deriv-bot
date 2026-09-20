@@ -1200,7 +1200,7 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 # from Deriv entirely for PROFIT_CYCLE_COOLDOWN_MINUTES (health checks
 # only), then redeploys and starts a fresh cycle from whatever the
 # balance is at that point — a never-ending cycle.
-PROFIT_CYCLE_TARGET_PCT       = float(os.environ.get("PROFIT_CYCLE_TARGET_PCT", "20"))
+PROFIT_CYCLE_TARGET_PCT       = float(os.environ.get("PROFIT_CYCLE_TARGET_PCT", "15"))
 PROFIT_CYCLE_COOLDOWN_MINUTES = float(os.environ.get("PROFIT_CYCLE_COOLDOWN_MINUTES", "7"))
 
 # Render API credentials used ONLY to persist the profit-cycle's state
