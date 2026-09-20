@@ -50,6 +50,7 @@ import numpy as np
 import config
 import exit_engine
 import restart_scheduler
+import profit_cycle
 import symbols as sym_module
 import strategy_stats
 import meta_labeling
@@ -306,6 +307,16 @@ class BotEngine:
         self._open_contracts:         dict               = {}
         self._contract_open_times:    dict               = {}
 
+        # ── Profit-target trading cycle (Sep 2026) — see profit_cycle.py.
+        #    _cycle_starting_balance is the persisted (redeploy-proof)
+        #    balance this cycle started from; the bot trades until the
+        #    live balance is PROFIT_CYCLE_TARGET_PCT above it, then
+        #    _entering_cooldown flips True once open contracts are
+        #    drained and _main_loop stops itself so run() can disconnect
+        #    from Deriv for the cooldown window.
+        self._cycle_starting_balance: float              = 0.0
+        self._entering_cooldown:      bool               = False
+
         # ── Contracts past CONTRACT_FORCE_CLOSE_SECS that still haven't
         #    settled for real — actively re-polled on RECONCILE_POLL_
         #    INTERVAL_SECS rather than ever being fabricated (Fix C).
@@ -544,6 +555,18 @@ class BotEngine:
     def _on_balance(self, balance: float):
         self.risk.set_balance(balance)
 
+        # ── Profit-target cycle check (Sep 2026) ────────────────────────
+        # Fires on every live balance push from Deriv. Once the balance
+        # has grown PROFIT_CYCLE_TARGET_PCT above the persisted cycle
+        # starting balance, request a cooldown — _settle_loop drains any
+        # open contracts and _main_loop stops itself; run()'s finally
+        # block then disconnects from Deriv for the cooldown window. Only
+        # requested once per cycle (profit_cycle.request_cooldown() is
+        # itself idempotent, this check is just an extra no-op guard).
+        if not self._entering_cooldown and not profit_cycle.is_cooldown_requested():
+            if profit_cycle.check_target(balance, self._cycle_starting_balance):
+                profit_cycle.request_cooldown()
+
     # ── Entry point ────────────────────────────────────────────────────────────
 
     async def run(self):
@@ -568,6 +591,15 @@ class BotEngine:
         self._day_start_balance     = self.client.balance
         self._session_start_balance = self.client.balance
         self._current_utc_day       = _dt.datetime.utcnow().day
+
+        # ── Profit-target cycle (Sep 2026): resume the persisted cycle
+        # starting balance if one survived from before this redeploy
+        # (the normal case for the every-REDEPLOY_INTERVAL_HOURS rolling
+        # redeploy while trading), or capture+persist a brand-new one if
+        # this is the first run ever, or the first run after a cooldown.
+        # See profit_cycle.py for why this can't just live in memory.
+        self._cycle_starting_balance = profit_cycle.get_or_init_starting_balance(
+            self.client.balance)
 
         # ── Redeploy-proof open-contract recovery (spec point 10, Aug 2026) ──
         # Render's filesystem is ephemeral across deploys on this plan (no
@@ -1139,6 +1171,24 @@ class BotEngine:
                     f"day_start_balance=${self._day_start_balance:.4f}")
 
             if restart_scheduler.is_redeploy_pending():
+                await asyncio.sleep(scan_sleep)
+                continue
+
+            # ── Profit-target cycle (Sep 2026) ──────────────────────────
+            # _entering_cooldown is set by _settle_loop once the target
+            # was reached AND every open contract has been confirmed
+            # closed — stop the main loop for good so run()'s finally
+            # block cancels ws_task and actually disconnects from Deriv.
+            # While a cooldown has merely been *requested* (target hit,
+            # contracts still draining) just pause new entries, exactly
+            # like the redeploy-pending pause above.
+            if self._entering_cooldown:
+                logger.warning(
+                    "PROFIT-CYCLE: cooldown starting — stopping main loop "
+                    "and disconnecting from Deriv")
+                return
+
+            if profit_cycle.is_cooldown_requested():
                 await asyncio.sleep(scan_sleep)
                 continue
 
@@ -2544,6 +2594,62 @@ class BotEngine:
                     # clear _open_contracts / _contract_open_times here —
                     # the next settle tick will re-enter this branch and
                     # keep trying to drain for real.
+
+                # ── Profit-target cooldown drain (Sep 2026) ─────────────
+                # Same non-destructive drain discipline as the redeploy
+                # branch above, triggered by the balance target instead
+                # of the rolling timer. Once every open contract is
+                # confirmed closed, profit_cycle.enter_cooldown_now()
+                # persists the cooldown window (so it survives the
+                # upcoming redeploy) and starts the cooldown supervisor
+                # thread; _entering_cooldown then tells _main_loop to
+                # stop itself so run()'s finally block disconnects from
+                # Deriv.
+                if profit_cycle.is_cooldown_requested() and not self._entering_cooldown:
+                    n_open = len(self._open_contracts)
+                    logger.warning(
+                        f"PROFIT-CYCLE TARGET REACHED: draining {n_open} open "
+                        f"contract(s) before disconnecting for cooldown")
+
+                    drain_started = time.time()
+                    while self._open_contracts:
+                        await self._handle_orphans()
+                        if not self._open_contracts:
+                            break
+
+                        drain_elapsed = time.time() - drain_started
+                        if drain_elapsed >= drain_max_secs:
+                            stuck = [
+                                f"{cid} (age={int(time.time() - info.get('opened_at', time.time()))}s)"
+                                for cid, info in self._open_contracts.items()
+                            ]
+                            logger.warning(
+                                f"DRAIN_MAX_SECS ({drain_max_secs}s) exceeded "
+                                f"with {len(self._open_contracts)} contract(s) "
+                                f"still not confirmed-closed: {', '.join(stuck)} "
+                                f"— DELAYING cooldown entry rather than wiping "
+                                f"their bookkeeping. Will keep actively trying "
+                                f"to close them and re-check on the next "
+                                f"settle tick."
+                            )
+                            break
+
+                        logger.info(
+                            f"Draining before cooldown — "
+                            f"{len(self._open_contracts)} contract(s) open, "
+                            f"actively confirming closes")
+                        await asyncio.sleep(5)
+
+                    if not self._open_contracts:
+                        cooldown_until = profit_cycle.enter_cooldown_now()
+                        cooldown_min = getattr(config, "PROFIT_CYCLE_COOLDOWN_MINUTES", 17)
+                        logger.warning(
+                            f"COOLDOWN ENTERED — {cooldown_min:.0f} min, resuming "
+                            f"via redeploy at "
+                            f"{_dt.datetime.fromtimestamp(cooldown_until, tz=_dt.timezone.utc).isoformat()}")
+                        self._entering_cooldown = True
+                    # else: cooldown stays requested-but-not-entered, same
+                    # non-destructive re-try-next-tick pattern as above.
 
             except asyncio.CancelledError:
                 return
