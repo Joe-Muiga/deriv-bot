@@ -1193,6 +1193,24 @@ MAX_BUY_PER_SECOND     = 3
 # ── RENDER ──────────────────────────────────────────────────
 RENDER_DEPLOY_HOOK_URL = os.environ.get(
     "RENDER_DEPLOY_HOOK_URL","")
+
+# ── Profit-target trading cycle (Sep 2026) — see profit_cycle.py ────────
+# The bot trades from a captured "cycle starting balance" until the
+# account balance has grown PROFIT_CYCLE_TARGET_PCT, then disconnects
+# from Deriv entirely for PROFIT_CYCLE_COOLDOWN_MINUTES (health checks
+# only), then redeploys and starts a fresh cycle from whatever the
+# balance is at that point — a never-ending cycle.
+PROFIT_CYCLE_TARGET_PCT       = float(os.environ.get("PROFIT_CYCLE_TARGET_PCT", "50"))
+PROFIT_CYCLE_COOLDOWN_MINUTES = float(os.environ.get("PROFIT_CYCLE_COOLDOWN_MINUTES", "17"))
+
+# Render API credentials used ONLY to persist the profit-cycle's state
+# (phase / starting balance / cooldown deadline) into this service's own
+# env vars so it survives a redeploy — Render's disk here is ephemeral,
+# so without these the cycle silently resets every redeploy instead of
+# tracking growth across the whole cycle. See profit_cycle.py's module
+# docstring for exactly where to find each value on Render.
+RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 # REDEPLOY_EVERY_N_CYCLES previously = 8. With SETTLE_WAIT_SECS defaulting to
 # 15s (bot_engine._settle_loop), that was an 8*15=120s cycle-based redeploy —
 # fighting restart_scheduler.py's timer. Set high enough that it never fires
@@ -1203,26 +1221,31 @@ RENDER_DEPLOY_HOOK_URL = os.environ.get(
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
 
-# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
-# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
-# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
-# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
-# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
-# _next_scheduled_fire().
+# restart_scheduler.py's run_scheduler() is a ROLLING timer — it fires
+# every REDEPLOY_INTERVAL_HOURS measured from the last actual redeploy,
+# not anchored to a fixed clock time (see that module's docstring).
+# REDEPLOY_TIMEZONE is currently unused by that rolling implementation;
+# left in place only because other parts of the project still reference
+# it for display/logging purposes.
+# Spec (Sep 2026): while the profit-target cycle is ON/trading, the bot
+# force-redeploys itself every 5 minutes for freshness — separate from,
+# and in addition to, the profit_cycle.py cooldown that only kicks in
+# once the balance target is hit.
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 7 / 60   # 30 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 5 / 60    # 5 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
-                                      # Was 13.7 min, before that 1h, 3h.
+                                      # Was 30 min, before that 13.7 min, 1h, 3h.
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
-# scheduled, before delaying the redeploy rather than wiping contract
-# bookkeeping (Fix G). Kept generous even at 4x/day — 30min of drain
-# headroom out of every 6h window is still cheap, and a redeploy that's
+# scheduled (or the profit-cycle cooldown drain, which reuses the same
+# discipline), before delaying rather than wiping contract bookkeeping
+# (Fix G). Lowered alongside REDEPLOY_INTERVAL_HOURS above so a stuck
+# drain can't regularly eat the whole 5-minute cycle — a redeploy that's
 # delayed a few minutes because a contract is still confirming its close
-# is far better than one that guesses.
-DRAIN_MAX_SECS = 1800
+# is still far better than one that guesses.
+DRAIN_MAX_SECS = 240
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
