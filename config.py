@@ -1210,7 +1210,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 5 / 60   # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 5 / 60   # 30 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1617,25 +1617,6 @@ DONKEY_STRATEGY_SYMBOLS = list(ALL_TRADE_SYMBOLS)
 #   restrictive of the two barriers (min) so a combined win is guaranteed
 #   to satisfy both signals' individual criteria at once.
 DONKEY_STRATEGY_MODE = "INDEPENDENT"   # "INDEPENDENT" | "COMBINED"
-
-# ── A/B cycling between the two Donkey variants (chat-requested) ──────
-# ORIGINAL = has inversion (bets hot digit continues, DIGITUNDER trend
-#   filter) — what this file shipped with by default.
-# RAW      = no inversion (bets cold digit is due, DIGITOVER trend
-#   filter) — mirror image, added later.
-# The two alternate forever: DONKEY_CYCLE_START runs first for
-# DONKEY_CYCLE_PHASE_MINUTES minutes, then the other variant runs for the
-# same duration, then back to DONKEY_CYCLE_START, endlessly. Derived from
-# wall-clock time (signal_engine._donkey_active_variant()), not a
-# redeploy counter, so it needs no persistent state across
-# restart_scheduler.py's redeploys (each one fully restarts the
-# container — see REDEPLOY_INTERVAL_HOURS above, now 5min so 3 redeploys
-# = one 15min phase, matching what was asked for).
-DONKEY_CYCLE_START = "ORIGINAL"        # "ORIGINAL" | "RAW" — which variant
-                                        # occupies the first half of every
-                                        # cycle. Yours to manage.
-DONKEY_CYCLE_PHASE_MINUTES = 15        # minutes per variant before
-                                        # switching (3 x 5min redeploys)
 
 # Signal 1 — frequency window (ticks) and minimum sample before it's
 # willing to call a hot/cold digit at all.
