@@ -38,3 +38,20 @@ services:
       # ── Auto-redeploy scheduler ─────────────────────────────────────────
       - key: RENDER_DEPLOY_HOOK_URL
         sync: false          # enter manually – URL contains a secret key!
+
+      # ── REQUIRED for the profit-target cycle to survive redeploys ───────
+      # (see profit_cycle.py's module docstring). Without these two the
+      # cycle's starting balance / cooldown deadline is lost every
+      # redeploy and the 50%-target tracking silently resets each time.
+      - key: RENDER_API_KEY
+        sync: false          # Render Dashboard → Account Settings → API Keys
+
+      - key: RENDER_SERVICE_ID
+        sync: false          # the srv-xxxxxxxx id in this service's own Settings-page URL
+
+      # ── Optional profit-cycle tuning ─────────────────────────────────────
+      - key: PROFIT_CYCLE_TARGET_PCT
+        value: "50"           # trade until balance is this % above the cycle's starting balance
+
+      - key: PROFIT_CYCLE_COOLDOWN_MINUTES
+        value: "17"           # minutes disconnected from Deriv (health checks only) once the target is hit
