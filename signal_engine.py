@@ -2230,18 +2230,16 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
 def _donkey_signal_1(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
     """
-    RAW frequency logic (no inversion) — bets the COLD digit (last
-    DONKEY_FREQ_WINDOW ticks) is "due" to reappear, structured so the HOT
-    digit falls on the losing side. Mirror image of the original inverted
-    version, which bet on hot continuing instead.
+    Inverted frequency logic. Over the last DONKEY_FREQ_WINDOW ticks, finds
+    the hot digit (highest frequency) and cold digit (lowest frequency),
+    then picks whichever of OVER(hot-1) / UNDER(hot+1) puts hot in the
+    winning zone AND cold in the losing zone.
 
-    Picks whichever of OVER(cold-1) / UNDER(cold+1) puts cold in the
-    winning zone AND hot in the losing zone. Proof exactly one of the two
-    always works (once hot != cold): OVER(b) with b=cold-1 wins on
-    {cold..9}; UNDER(b) with b=cold+1 wins on {0..cold}. Those two zones
-    overlap only at {cold} itself, so hot (!= cold) sits in exactly one of
-    them — pick the OTHER contract type, i.e. OVER when hot < cold, UNDER
-    when hot > cold.
+    Proof exactly one of the two always works (once hot != cold): OVER(b)
+    with b=hot-1 wins on {hot..9}; UNDER(b) with b=hot+1 wins on {0..hot}.
+    Those two zones overlap only at {hot} itself, so cold (!= hot) sits in
+    exactly one of them — pick the OTHER contract type, i.e. OVER when
+    cold < hot, UNDER when cold > hot.
 
     Returns (match_type, barrier, score, hot, cold), or None if there
     aren't enough ticks yet or the sample is perfectly uniform (no real
@@ -2273,22 +2271,20 @@ def _donkey_signal_1(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, 
     hot_freq, cold_freq = counts[hot] / n, counts[cold] / n
     score = max(0.0, min(1.0, hot_freq - cold_freq))
 
-    if hot < cold:
-        match_type, barrier = "OVER", cold - 1
+    if cold < hot:
+        match_type, barrier = "OVER", hot - 1
     else:
-        match_type, barrier = "UNDER", cold + 1
+        match_type, barrier = "UNDER", hot + 1
 
     return match_type, barrier, score, hot, cold
 
 
 def _donkey_signal_2(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
     """
-    RAW trend-filter logic (no inversion). DONKEY_TREND_SMA_PERIOD-tick
-    SMA; fires DIGITOVER at DONKEY_TREND_BARRIER when the current tick is
-    BELOW the SMA (flipped from DIGITUNDER — the original spec's
-    inversion — back to the natural/obvious contract type for this
-    trigger), and does nothing when current >= SMA. Returns
-    (match_type, barrier, score) or None.
+    Inverted trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick SMA; fires
+    DIGITUNDER at DONKEY_TREND_BARRIER only when the current tick is BELOW
+    the SMA (per spec — never DIGITOVER on this signal, and does nothing
+    when current >= SMA). Returns (match_type, barrier, score) or None.
     """
     period = getattr(config, "DONKEY_TREND_SMA_PERIOD", 8)
     if len(ticks) < period + 1:
@@ -2307,22 +2303,19 @@ def _donkey_signal_2(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, 
     barrier = getattr(config, "DONKEY_TREND_BARRIER", 3)
     spread = float(np.std(quotes)) or 1e-9
     score = max(0.0, min(1.0, (sma_val - current) / (3 * spread)))
-    return "OVER", barrier, score
+    return "UNDER", barrier, score
 
 
 def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalResult:
     """
-    RAW mode (no inversion) — see _donkey_signal_1/_donkey_signal_2.
     config.DONKEY_STRATEGY_MODE picks how the two signals combine:
       "INDEPENDENT" — either signal fires on its own (signal 1 checked
         first; falls through to signal 2 only if signal 1 has no read).
       "COMBINED" — fires only when BOTH have a read AND both land on
-        DIGITOVER (signal 2 is now OVER-only, so a signal-1 UNDER pick
-        can never combine), taking the more restrictive barrier — for
-        OVER contracts that's the HIGHER of the two (max), since OVER's
-        winning zone {barrier+1..9} shrinks as the barrier rises — so a
-        win under the combined bet is guaranteed to satisfy both signals'
-        individual criteria at once.
+        DIGITUNDER (signal 2 is never DIGITOVER, so a signal-1 OVER pick
+        can never combine), taking the more restrictive barrier (min) so
+        a win under the combined bet is guaranteed to satisfy both
+        signals' individual criteria at once.
     """
     if not ticks:
         return NONE_RESULT
@@ -2340,12 +2333,12 @@ def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalR
         if sig1 is not None and sig2 is not None:
             mt1, b1, score1, hot, cold = sig1
             mt2, b2, score2 = sig2
-            if mt1 == "OVER" and mt2 == "OVER":
-                match_type, barrier = "OVER", max(b1, b2)
+            if mt1 == "UNDER" and mt2 == "UNDER":
+                match_type, barrier = "UNDER", min(b1, b2)
                 score = (score1 + score2) / 2.0
                 reason = (
-                    f"Combined: freq OVER{b1} (hot={hot} cold={cold}) "
-                    f"+ trend OVER{b2} -> OVER{barrier}"
+                    f"Combined: freq UNDER{b1} (hot={hot} cold={cold}) "
+                    f"+ trend UNDER{b2} -> UNDER{barrier}"
                 )
             else:
                 reason = f"Combined mode: signals disagree on contract type (freq={mt1}, trend={mt2})"
