@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -2219,21 +2220,47 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
 
 # ---------------------------------------------------------------------------
-# Donkey Strategy — inverted digit-frequency signal + inverted trend-filter
-# signal, each recommending a DIGITOVER/DIGITUNDER contract. Tick-based,
-# same digit-extraction helpers (_tick_quote/_last_digit/_digit_decimals)
-# evaluate_digit_parity()/evaluate_jump_buildup() already use above. See
-# config.py's "DONKEY STRATEGY" block for the flags read below, and
+# Donkey Strategy — TWO variants, auto-cycling between them forever.
+#   ORIGINAL (has inversion): bets the HOT digit continues, DIGITUNDER on
+#     the trend filter. This is the variant this file shipped with.
+#   RAW (no inversion): bets the COLD digit is "due", DIGITOVER on the
+#     trend filter. Mirror image of ORIGINAL in every respect.
+# config.DONKEY_CYCLE_START picks which variant runs first; the two then
+# alternate every config.DONKEY_CYCLE_PHASE_MINUTES minutes, forever
+# (ORIGINAL 15min -> RAW 15min -> ORIGINAL 15min -> ...). The active
+# variant is derived from wall-clock time (_donkey_active_variant()), NOT
+# a redeploy counter — every restart_scheduler.py redeploy is a full
+# container restart that wipes in-process state, so time.time() is the
+# only thing guaranteed to be right immediately on boot with no
+# persistence needed. See config.py's "DONKEY STRATEGY" block, and
 # SignalEngine.evaluate() for the global exclusivity gate this is wired
 # behind.
 # ---------------------------------------------------------------------------
 
-def _donkey_signal_1(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
+def _donkey_active_variant() -> str:
     """
-    Inverted frequency logic. Over the last DONKEY_FREQ_WINDOW ticks, finds
-    the hot digit (highest frequency) and cold digit (lowest frequency),
-    then picks whichever of OVER(hot-1) / UNDER(hot+1) puts hot in the
-    winning zone AND cold in the losing zone.
+    Which variant is active right now, purely from time.time() -- no
+    stored state, so it's correct immediately after every redeploy
+    (full container restart) with no persistence required. Self-heals
+    against redeploy-timing drift since it's recomputed fresh every call.
+    """
+    phase_secs = max(1, int(getattr(config, "DONKEY_CYCLE_PHASE_MINUTES", 15) * 60))
+    cycle_secs = phase_secs * 2
+    pos = int(time.time()) % cycle_secs
+    first_half = pos < phase_secs
+    start = str(getattr(config, "DONKEY_CYCLE_START", "ORIGINAL")).strip().upper()
+    if start not in ("ORIGINAL", "RAW"):
+        start = "ORIGINAL"
+    other = "RAW" if start == "ORIGINAL" else "ORIGINAL"
+    return start if first_half else other
+
+
+def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
+    """
+    ORIGINAL (inverted) frequency logic. Over the last DONKEY_FREQ_WINDOW
+    ticks, finds the hot digit (highest frequency) and cold digit (lowest
+    frequency), then picks whichever of OVER(hot-1) / UNDER(hot+1) puts
+    hot in the winning zone AND cold in the losing zone.
 
     Proof exactly one of the two always works (once hot != cold): OVER(b)
     with b=hot-1 wins on {hot..9}; UNDER(b) with b=hot+1 wins on {0..hot}.
@@ -2279,12 +2306,12 @@ def _donkey_signal_1(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, 
     return match_type, barrier, score, hot, cold
 
 
-def _donkey_signal_2(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
+def _donkey_signal_2_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
     """
-    Inverted trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick SMA; fires
-    DIGITUNDER at DONKEY_TREND_BARRIER only when the current tick is BELOW
-    the SMA (per spec — never DIGITOVER on this signal, and does nothing
-    when current >= SMA). Returns (match_type, barrier, score) or None.
+    ORIGINAL (inverted) trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick
+    SMA; fires DIGITUNDER at DONKEY_TREND_BARRIER only when the current
+    tick is BELOW the SMA, does nothing when current >= SMA. Returns
+    (match_type, barrier, score) or None.
     """
     period = getattr(config, "DONKEY_TREND_SMA_PERIOD", 8)
     if len(ticks) < period + 1:
@@ -2306,44 +2333,139 @@ def _donkey_signal_2(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, 
     return "UNDER", barrier, score
 
 
+def _donkey_signal_1_raw(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
+    """
+    RAW (no inversion) frequency logic — bets the COLD digit is "due" to
+    reappear, structured so the HOT digit falls on the losing side.
+    Mirror image of _donkey_signal_1_original (hot/cold roles swapped).
+
+    Returns (match_type, barrier, score, hot, cold), or None.
+    """
+    window_n = getattr(config, "DONKEY_FREQ_WINDOW", 100)
+    min_n = getattr(config, "DONKEY_FREQ_MIN_SAMPLE", 100)
+    window = ticks[-window_n:]
+    if len(window) < min_n:
+        return None
+
+    decimals = _digit_decimals(symbol)
+    try:
+        digits = [_last_digit(_tick_quote(t), decimals) for t in window]
+    except ValueError:
+        logger.warning(f"DONKEY: {symbol} could not parse tick quotes for signal 1 — skipping")
+        return None
+
+    counts = [0] * 10
+    for d in digits:
+        counts[d] += 1
+
+    hot  = max(range(10), key=lambda d: (counts[d], -d))
+    cold = min(range(10), key=lambda d: (counts[d], d))
+    if hot == cold:
+        return None
+
+    n = len(digits)
+    hot_freq, cold_freq = counts[hot] / n, counts[cold] / n
+    score = max(0.0, min(1.0, hot_freq - cold_freq))
+
+    if hot < cold:
+        match_type, barrier = "OVER", cold - 1
+    else:
+        match_type, barrier = "UNDER", cold + 1
+
+    return match_type, barrier, score, hot, cold
+
+
+def _donkey_signal_2_raw(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
+    """
+    RAW (no inversion) trend-filter logic. Fires DIGITOVER at
+    DONKEY_TREND_BARRIER when current tick is BELOW the SMA (flipped from
+    _donkey_signal_2_original's DIGITUNDER), does nothing otherwise.
+    Returns (match_type, barrier, score) or None.
+    """
+    period = getattr(config, "DONKEY_TREND_SMA_PERIOD", 8)
+    if len(ticks) < period + 1:
+        return None
+    try:
+        quotes = np.array([_tick_quote(t) for t in ticks[-(period + 1):]], dtype=float)
+    except ValueError:
+        logger.warning(f"DONKEY: {symbol} could not parse tick quotes for signal 2 — skipping")
+        return None
+
+    sma_val = float(ind.sma(quotes, period)[-1])
+    current = float(quotes[-1])
+    if current >= sma_val:
+        return None
+
+    barrier = getattr(config, "DONKEY_TREND_BARRIER", 3)
+    spread = float(np.std(quotes)) or 1e-9
+    score = max(0.0, min(1.0, (sma_val - current) / (3 * spread)))
+    return "OVER", barrier, score
+
+
+def _donkey_combine(
+    sig1: Optional[Tuple[str, int, float, int, int]],
+    sig2: Optional[Tuple[str, int, float]],
+    target_type: str,
+    barrier_combine: Callable[[int, int], int],
+) -> Tuple[Optional[Tuple[str, int, float]], str]:
+    """
+    Shared COMBINED-mode logic for both variants. target_type/
+    barrier_combine differ per variant: ORIGINAL combines on UNDER using
+    min() (UNDER's winning zone {0..barrier-1} grows with barrier, so the
+    more restrictive/intersecting choice is the smaller one); RAW combines
+    on OVER using max() (OVER's winning zone {barrier+1..9} shrinks as the
+    barrier rises, so the more restrictive choice is the larger one).
+    Returns ((match_type, barrier, score), reason) or (None, reason).
+    """
+    if sig1 is None or sig2 is None:
+        return None, "Combined mode: one or both signals not ready"
+    mt1, b1, score1, hot, cold = sig1
+    mt2, b2, score2 = sig2
+    if mt1 != target_type or mt2 != target_type:
+        return None, f"Combined mode: signals disagree on contract type (freq={mt1}, trend={mt2})"
+    barrier = barrier_combine(b1, b2)
+    score = (score1 + score2) / 2.0
+    reason = (
+        f"Combined: freq {mt1}{b1} (hot={hot} cold={cold}) "
+        f"+ trend {mt2}{b2} -> {mt1}{barrier}"
+    )
+    return (mt1, barrier, score), reason
+
+
 def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalResult:
     """
-    config.DONKEY_STRATEGY_MODE picks how the two signals combine:
-      "INDEPENDENT" — either signal fires on its own (signal 1 checked
-        first; falls through to signal 2 only if signal 1 has no read).
-      "COMBINED" — fires only when BOTH have a read AND both land on
-        DIGITUNDER (signal 2 is never DIGITOVER, so a signal-1 OVER pick
-        can never combine), taking the more restrictive barrier (min) so
-        a win under the combined bet is guaranteed to satisfy both
-        signals' individual criteria at once.
+    Dispatches to whichever variant _donkey_active_variant() says is
+    currently active (see that function + config.DONKEY_CYCLE_START /
+    DONKEY_CYCLE_PHASE_MINUTES), then behaves exactly like the
+    single-variant version did: config.DONKEY_STRATEGY_MODE picks
+    INDEPENDENT (either signal fires alone, signal 1 checked first) vs
+    COMBINED (both must agree — see _donkey_combine()).
     """
     if not ticks:
         return NONE_RESULT
     ticks = list(ticks)
 
-    sig1 = _donkey_signal_1(ticks, symbol)
-    sig2 = _donkey_signal_2(ticks, symbol)
+    variant = _donkey_active_variant()
+    if variant == "RAW":
+        sig1_fn, sig2_fn = _donkey_signal_1_raw, _donkey_signal_2_raw
+        target_type, barrier_combine = "OVER", max
+    else:
+        sig1_fn, sig2_fn = _donkey_signal_1_original, _donkey_signal_2_original
+        target_type, barrier_combine = "UNDER", min
+
+    sig1 = sig1_fn(ticks, symbol)
+    sig2 = sig2_fn(ticks, symbol)
     mode = getattr(config, "DONKEY_STRATEGY_MODE", "INDEPENDENT")
+    strategy_label = f"DONKEY-{variant}"
 
     match_type = barrier = None
     score = 0.0
     reason = "Neither signal ready"
 
     if mode == "COMBINED":
-        if sig1 is not None and sig2 is not None:
-            mt1, b1, score1, hot, cold = sig1
-            mt2, b2, score2 = sig2
-            if mt1 == "UNDER" and mt2 == "UNDER":
-                match_type, barrier = "UNDER", min(b1, b2)
-                score = (score1 + score2) / 2.0
-                reason = (
-                    f"Combined: freq UNDER{b1} (hot={hot} cold={cold}) "
-                    f"+ trend UNDER{b2} -> UNDER{barrier}"
-                )
-            else:
-                reason = f"Combined mode: signals disagree on contract type (freq={mt1}, trend={mt2})"
-        else:
-            reason = "Combined mode: one or both signals not ready"
+        combined, reason = _donkey_combine(sig1, sig2, target_type, barrier_combine)
+        if combined is not None:
+            match_type, barrier, score = combined
     else:  # INDEPENDENT
         if sig1 is not None:
             match_type, barrier, score, hot, cold = sig1
@@ -2353,25 +2475,26 @@ def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalR
             reason = f"Trend filter: tick below SMA -> {match_type}{barrier}"
 
     if match_type is None:
-        logger.debug(f"REJECTED: {symbol} DONKEY strength=0 score=0.000 — {reason}")
-        return SignalResult("NONE", 0, 0.0, "DONKEY", reason)
+        logger.debug(f"REJECTED: {symbol} {strategy_label} strength=0 score=0.000 — {reason}")
+        return SignalResult("NONE", 0, 0.0, strategy_label, reason)
 
     strength = 3 if score >= 0.5 else 2 if score >= 0.2 else 0
     if strength < 2:
-        logger.info(f"REJECTED: {symbol} DONKEY strength={strength} score={score:.3f} — below threshold ({reason})")
-        return SignalResult("NONE", 0, score, "DONKEY", f"Below entry threshold ({reason})")
+        logger.info(f"REJECTED: {symbol} {strategy_label} strength={strength} score={score:.3f} — below threshold ({reason})")
+        return SignalResult("NONE", 0, score, strategy_label, f"Below entry threshold ({reason})")
 
-    logger.info(f"SIGNAL: {symbol} DONKEY {match_type}{barrier} strength={strength} score={score:.3f} | {reason}")
+    logger.info(f"SIGNAL: {symbol} {strategy_label} {match_type}{barrier} strength={strength} score={score:.3f} | {reason}")
     return SignalResult(
         direction=match_type,
         strength=strength,
         score=score,
-        strategy="DONKEY",
+        strategy=strategy_label,
         reason=reason,
         contract_kind="DIGIT",
         digit=barrier,
         match_type=match_type,
     )
+
 
 
 # ---------------------------------------------------------------------------
