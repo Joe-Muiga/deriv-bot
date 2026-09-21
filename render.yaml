@@ -39,19 +39,28 @@ services:
       - key: RENDER_DEPLOY_HOOK_URL
         sync: false          # enter manually – URL contains a secret key!
 
-      # ── REQUIRED for the profit-target cycle to survive redeploys ───────
-      # (see profit_cycle.py's module docstring). Without these two the
-      # cycle's starting balance / cooldown deadline is lost every
-      # redeploy and the 50%-target tracking silently resets each time.
+      # ── REQUIRED for the Donkey RAW/ORIGINAL balance-trend switch to
+      # survive redeploys (see strategy_cycle.py's module docstring).
+      # Without these two, the bot forgets which variant it's on and
+      # restarts trend detection from scratch every redeploy.
       - key: RENDER_API_KEY
         sync: false          # Render Dashboard → Account Settings → API Keys
 
       - key: RENDER_SERVICE_ID
         sync: false          # the srv-xxxxxxxx id in this service's own Settings-page URL
 
-      # ── Optional profit-cycle tuning ─────────────────────────────────────
-      - key: PROFIT_CYCLE_TARGET_PCT
-        value: "50"           # trade until balance is this % above the cycle's starting balance
+      # ── Optional strategy-switch tuning ──────────────────────────────────
+      - key: STRATEGY_SWITCH_MIN_MINUTES
+        value: "60"            # never switch before a variant has run this long
 
-      - key: PROFIT_CYCLE_COOLDOWN_MINUTES
-        value: "17"           # minutes disconnected from Deriv (health checks only) once the target is hit
+      - key: STRATEGY_SWITCH_MAX_MINUTES
+        value: "180"           # force a switch by here even with no clear reversal
+
+      - key: STRATEGY_SWITCH_MIN_GAIN_PCT
+        value: "2.0"           # must rise this % above the run's start before a pullback counts
+
+      - key: STRATEGY_SWITCH_DRAWDOWN_PCT
+        value: "1.5"           # then a pullback of this % off the peak triggers the switch
+
+      - key: STRATEGY_SWITCH_COOLDOWN_MINUTES
+        value: "60"            # minutes disconnected from Deriv once a switch triggers
