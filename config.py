@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 100
+MANUAL_STAKE_AMOUNT = 0.35
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 100   # UPDATED — was 100. Now matches
+MIN_STAKE            = 0.35   # UPDATED — was 100. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.35); also the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1193,24 +1193,6 @@ MAX_BUY_PER_SECOND     = 3
 # ── RENDER ──────────────────────────────────────────────────
 RENDER_DEPLOY_HOOK_URL = os.environ.get(
     "RENDER_DEPLOY_HOOK_URL","")
-
-# ── Profit-target trading cycle (Sep 2026) — see profit_cycle.py ────────
-# The bot trades from a captured "cycle starting balance" until the
-# account balance has grown PROFIT_CYCLE_TARGET_PCT, then disconnects
-# from Deriv entirely for PROFIT_CYCLE_COOLDOWN_MINUTES (health checks
-# only), then redeploys and starts a fresh cycle from whatever the
-# balance is at that point — a never-ending cycle.
-PROFIT_CYCLE_TARGET_PCT       = float(os.environ.get("PROFIT_CYCLE_TARGET_PCT", "50"))
-PROFIT_CYCLE_COOLDOWN_MINUTES = float(os.environ.get("PROFIT_CYCLE_COOLDOWN_MINUTES", "17"))
-
-# Render API credentials used ONLY to persist the profit-cycle's state
-# (phase / starting balance / cooldown deadline) into this service's own
-# env vars so it survives a redeploy — Render's disk here is ephemeral,
-# so without these the cycle silently resets every redeploy instead of
-# tracking growth across the whole cycle. See profit_cycle.py's module
-# docstring for exactly where to find each value on Render.
-RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
-RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 # REDEPLOY_EVERY_N_CYCLES previously = 8. With SETTLE_WAIT_SECS defaulting to
 # 15s (bot_engine._settle_loop), that was an 8*15=120s cycle-based redeploy —
 # fighting restart_scheduler.py's timer. Set high enough that it never fires
@@ -1221,31 +1203,26 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 REDEPLOY_EVERY_N_CYCLES = 999999
 SETTLE_WAIT_SECS = 15
 
-# restart_scheduler.py's run_scheduler() is a ROLLING timer — it fires
-# every REDEPLOY_INTERVAL_HOURS measured from the last actual redeploy,
-# not anchored to a fixed clock time (see that module's docstring).
-# REDEPLOY_TIMEZONE is currently unused by that rolling implementation;
-# left in place only because other parts of the project still reference
-# it for display/logging purposes.
-# Spec (Sep 2026): while the profit-target cycle is ON/trading, the bot
-# force-redeploys itself every 5 minutes for freshness — separate from,
-# and in addition to, the profit_cycle.py cooldown that only kicks in
-# once the balance target is hit.
+# restart_scheduler.py fires every REDEPLOY_INTERVAL_HOURS, anchored to
+# 00:00 in this zone (Africa/Nairobi = EAT = UTC+3 year-round, no DST) —
+# so with the default of 6 that's 00:00 / 06:00 / 12:00 / 18:00 EAT (4
+# redeploys/day). Was a once-daily fixed 00:00 timer per Implementation
+# Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
+# _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 5 / 60    # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 5 / 60   # 5 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
-                                      # Was 30 min, before that 13.7 min, 1h, 3h.
+                                      # Was 13.7 min, before that 1h, 3h.
 
 # How long bot_engine.py's _settle_loop will wait, actively trying to
 # confirm-close every remaining open contract, once a redeploy has been
-# scheduled (or the profit-cycle cooldown drain, which reuses the same
-# discipline), before delaying rather than wiping contract bookkeeping
-# (Fix G). Lowered alongside REDEPLOY_INTERVAL_HOURS above so a stuck
-# drain can't regularly eat the whole 5-minute cycle — a redeploy that's
+# scheduled, before delaying the redeploy rather than wiping contract
+# bookkeeping (Fix G). Kept generous even at 4x/day — 30min of drain
+# headroom out of every 6h window is still cheap, and a redeploy that's
 # delayed a few minutes because a contract is still confirming its close
-# is still far better than one that guesses.
-DRAIN_MAX_SECS = 240
+# is far better than one that guesses.
+DRAIN_MAX_SECS = 1800
 
 # ── ALIASES (required by bot_engine.py / risk_manager.py) ────
 RISK_PER_TRADE_PCT = BASE_STAKE_PCT          # alias
@@ -1640,6 +1617,97 @@ DONKEY_STRATEGY_SYMBOLS = list(ALL_TRADE_SYMBOLS)
 #   restrictive of the two barriers (min) so a combined win is guaranteed
 #   to satisfy both signals' individual criteria at once.
 DONKEY_STRATEGY_MODE = "INDEPENDENT"   # "INDEPENDENT" | "COMBINED"
+
+# ── Balance-trend switching between the two Donkey variants (Sep 2026,
+#    chat-requested — supersedes the old fixed-timer A/B cycle) ────────
+# ORIGINAL = has inversion (bets hot digit continues, DIGITUNDER trend
+#   filter) — what this file shipped with by default.
+# RAW      = no inversion (bets cold digit is due, DIGITOVER trend
+#   filter) — mirror image, added later.
+# The two alternate forever, but the switch is now triggered by the
+# ACCOUNT'S BALANCE TREND under the active variant, not a fixed clock:
+# it trades until the balance has risen STRATEGY_SWITCH_MIN_GAIN_PCT off
+# its starting point and then pulled back STRATEGY_SWITCH_DRAWDOWN_PCT
+# off its peak ("increases for a while then suddenly starts to
+# decrease"), bounded to run for at least STRATEGY_SWITCH_MIN_MINUTES and
+# at most STRATEGY_SWITCH_MAX_MINUTES either way. Once triggered: drain
+# open contracts, disconnect from Deriv for
+# STRATEGY_SWITCH_COOLDOWN_MINUTES (health checks only), then redeploy
+# onto the other variant. See strategy_cycle.py for the full state
+# machine. Unlike the old wall-clock scheme this DOES need to remember
+# state (which variant is active, the current run's starting/peak
+# balance) across the redeploys that both the switch itself and the
+# ordinary rolling REDEPLOY_INTERVAL_HOURS redeploy trigger — see
+# strategy_cycle.py's module docstring for exactly why and how.
+DONKEY_CYCLE_START = "ORIGINAL"        # "ORIGINAL" | "RAW" — which variant
+                                        # is used on the very first run
+                                        # ever, before any state has been
+                                        # persisted. Yours to manage.
+
+STRATEGY_SWITCH_MIN_MINUTES      = 60    # floor: never switch before a
+                                          # variant has run at least this
+                                          # long, even on a real reversal
+STRATEGY_SWITCH_MAX_MINUTES      = 180   # ceiling: force a switch here
+                                          # regardless of trend, so a
+                                          # merely-flat run doesn't go on
+                                          # forever ("an hour to 3 hours")
+STRATEGY_SWITCH_MIN_GAIN_PCT     = 2.0   # balance must rise at least this
+                                          # % above the run's starting
+                                          # balance before a pullback
+                                          # counts as a reversal at all
+STRATEGY_SWITCH_DRAWDOWN_PCT     = 1.5   # then a pullback of at least
+                                          # this % off the run's peak
+                                          # balance triggers the switch
+STRATEGY_SWITCH_COOLDOWN_MINUTES = 60    # minutes disconnected from
+                                          # Deriv (health checks only)
+                                          # once a switch triggers
+
+# ── Starting-balance drawdown override (Sep 2026) ─────────────────────
+# Independent of the reversal/max-duration logic above. Checked ONLY at
+# the moment the ordinary rolling REDEPLOY_INTERVAL_HOURS redeploy comes
+# due (restart_scheduler.is_redeploy_pending() flips True): if the
+# CURRENT balance is this % or more BELOW STRAT_PHASE_START_BALANCE (the
+# balance when the active variant's run began, not its peak), the
+# rolling redeploy is skipped entirely and the bot goes straight into a
+# strategy-switch cooldown instead — same drain + disconnect + variant
+# swap as an ordinary reversal-triggered switch, just triggered by this
+# check instead. See strategy_cycle.py's should_redeploy_or_cooldown().
+STRATEGY_SWITCH_STARTING_DRAWDOWN_PCT = 25   # % below phase_start_balance
+                                              # that forces cooldown
+                                              # instead of a redeploy
+
+# ── Profit-target cycle (Sep 2026, profit_cycle.py) ────────────────────
+# Independent of the Donkey ORIGINAL/RAW switch above — runs alongside
+# it. Trades until the live balance is PROFIT_CYCLE_TARGET_PCT above the
+# cycle's own starting balance, then drains open contracts and goes into
+# a PROFIT_CYCLE_COOLDOWN_MINUTES cooldown (disconnected from Deriv,
+# health checks only) before redeploying into a brand-new cycle. See
+# profit_cycle.py's module docstring for the full persisted-state design
+# and PROFIT_CYCLE_STARTING_DRAWDOWN_PCT below for the same
+# skip-the-redeploy-go-straight-to-cooldown override
+# STRATEGY_SWITCH_STARTING_DRAWDOWN_PCT gets, applied here against this
+# cycle's own starting balance instead.
+PROFIT_CYCLE_TARGET_PCT            = 50   # % above cycle starting balance
+                                           # that triggers the cooldown
+PROFIT_CYCLE_COOLDOWN_MINUTES      = 17   # minutes disconnected from
+                                           # Deriv once the target (or the
+                                           # drawdown override) fires
+PROFIT_CYCLE_STARTING_DRAWDOWN_PCT = 25   # % below CYCLE_STARTING_BALANCE
+                                           # that forces cooldown instead
+                                           # of letting the ordinary
+                                           # rolling redeploy go through
+
+# Render API credentials used ONLY to persist the strategy-switcher's
+# state (active variant / run-tracking / cooldown deadline) into this
+# service's own env vars so it survives a redeploy — Render's disk here
+# is ephemeral, so without these the bot forgets which variant it was on
+# and restarts trend detection from scratch every redeploy instead of
+# tracking it across the whole run. See strategy_cycle.py's module
+# docstring for exactly where to find each value on Render. (Shared with
+# profit_cycle.py if that module is also present in this project — same
+# two env vars, independent persisted keys.)
+RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
+RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
 # Signal 1 — frequency window (ticks) and minimum sample before it's
 # willing to call a hot/cold digit at all.
