@@ -13,6 +13,19 @@ elapses this module fires the Render deploy hook, which brings up a
 fresh deploy that starts a brand-new cycle from whatever the balance is
 at that point — forever.
 
+Starting-balance drawdown override (Sep 2026): independent of the
+target-hit path above, checked only at the moment bot_engine sees the
+ordinary rolling REDEPLOY_INTERVAL_HOURS redeploy come due
+(restart_scheduler.is_redeploy_pending()). If the live balance is
+config.PROFIT_CYCLE_STARTING_DRAWDOWN_PCT (default 25%) or more BELOW
+this cycle's own starting balance at that moment, the ordinary redeploy
+is skipped and the bot goes straight into the same cooldown+redeploy
+path a target-hit takes instead — it does NOT redeploy plainly and keep
+trading the same losing cycle. Reaching the profit target, at any other
+time the bot is live, still immediately blocks any further new trade
+from firing (see request_cooldown()) while open contracts drain, exactly
+as before — this override doesn't change that.
+
 PERSISTENCE — why this can't just be a local file or an in-memory dict:
 Render's disk on this plan is ephemeral (see bot_engine.py's
 _recover_open_contracts_from_portfolio docstring for the exact same
@@ -57,6 +70,16 @@ Public interface:
                                          -> target-hit pending flag,
                                             mirrors restart_scheduler.py's
                                             is_redeploy_pending() pattern
+  is_starting_drawdown_breached(balance, starting)
+                                         -> True once balance has fallen
+                                            PROFIT_CYCLE_STARTING_
+                                            DRAWDOWN_PCT below this
+                                            cycle's own starting balance.
+                                            Checked only when an ordinary
+                                            rolling redeploy is due; when
+                                            True the caller requests a
+                                            cooldown instead of letting
+                                            that redeploy go through
   enter_cooldown_now()                  -> persists the cooldown window,
                                             starts the supervisor thread,
                                             returns cooldown_until
@@ -290,6 +313,27 @@ def request_cooldown() -> None:
 
 def is_cooldown_requested() -> bool:
     return _cooldown_requested
+
+
+def is_starting_drawdown_breached(current_balance: float, starting_balance: float) -> bool:
+    """
+    Checked by bot_engine._settle_loop() ONLY at the moment the ordinary
+    rolling REDEPLOY_INTERVAL_HOURS redeploy comes due
+    (restart_scheduler.is_redeploy_pending() is True). True once
+    current_balance has fallen PROFIT_CYCLE_STARTING_DRAWDOWN_PCT (or
+    more) below this cycle's own starting_balance. When this is True the
+    rolling redeploy must NOT be allowed to go through as an ordinary
+    redeploy: the caller should request a cooldown instead (same as
+    hitting the profit target), so the bot drains and starts a brand-new
+    cycle from whatever the balance is once the cooldown elapses, rather
+    than redeploying straight back into the same losing cycle.
+    """
+    if starting_balance <= 0:
+        return False   # cycle not initialized yet — nothing to compare against
+
+    drawdown_pct = (starting_balance - current_balance) / starting_balance * 100.0
+    trigger_pct = getattr(config, "PROFIT_CYCLE_STARTING_DRAWDOWN_PCT", 25)
+    return drawdown_pct >= trigger_pct
 
 
 def enter_cooldown_now() -> float:
