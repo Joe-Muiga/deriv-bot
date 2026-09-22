@@ -43,7 +43,6 @@ import config
 import indicators as ind
 import strategy_stats
 import pair_suspension
-import strategy_cycle
 from candlestick_builder import Candle
 from symbol_manager import SymbolManager
 
@@ -2220,35 +2219,26 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
 
 # ---------------------------------------------------------------------------
-# Donkey Strategy — TWO variants, auto-switching between them forever.
+# Donkey Strategy — ORIGINAL ONLY (Sep 2026, chat-requested).
 #   ORIGINAL (has inversion): bets the HOT digit continues, DIGITUNDER on
-#     the trend filter. This is the variant this file shipped with.
+#     the trend filter. This is the variant this file shipped with, and
+#     now the only one that can ever trade.
 #   RAW (no inversion): bets the COLD digit is "due", DIGITOVER on the
-#     trend filter. Mirror image of ORIGINAL in every respect.
-# Which variant is active is now driven by strategy_cycle.py (Sep 2026),
-# NOT a fixed wall-clock timer: a variant trades for roughly
-# config.STRATEGY_SWITCH_MIN_MINUTES to STRATEGY_SWITCH_MAX_MINUTES (an
-# hour to 3 hours), and the switch itself is triggered by a balance-trend
-# reversal on the live account — rising for a while, then suddenly
-# falling — at which point the bot drains open contracts, disconnects
-# from Deriv for STRATEGY_SWITCH_COOLDOWN_MINUTES (1 hour, health-checks
-# only), then redeploys onto the other variant. See strategy_cycle.py's
-# module docstring for the full state machine and why (unlike the old
-# purely-time-derived scheme) it needs state that survives a redeploy.
-# See SignalEngine.evaluate() for the global exclusivity gate this is
-# wired behind.
+#     trend filter. Mirror image of ORIGINAL — DISABLED. The functions
+#     below (_donkey_signal_1_raw / _donkey_signal_2_raw) stay in the
+#     file untouched but are now unreachable, the same way every
+#     non-Donkey evaluator already was — see SignalEngine.evaluate()'s
+#     global exclusivity gate.
+# The old balance-trend auto-switch between the two variants
+# (strategy_cycle.py) is gone too — that module is no longer imported
+# here or anywhere else in the project. _donkey_active_variant() below no
+# longer reads any persisted state; it's a hardcoded constant.
 # ---------------------------------------------------------------------------
 
 def _donkey_active_variant() -> str:
-    """Which variant is active right now — a cheap read of
-    strategy_cycle.py's persisted state (falls back to
-    config.DONKEY_CYCLE_START if that module can't be imported for any
-    reason, so a signal can still be produced)."""
-    try:
-        return strategy_cycle.active_variant()
-    except Exception:
-        start = str(getattr(config, "DONKEY_CYCLE_START", "ORIGINAL")).strip().upper()
-        return start if start in ("ORIGINAL", "RAW") else "ORIGINAL"
+    """Locked to ORIGINAL — RAW and the balance-trend switch that used to
+    choose between the two are both disabled (Sep 2026, chat-requested)."""
+    return "ORIGINAL"
 
 
 def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
@@ -2431,7 +2421,7 @@ def _donkey_combine(
 def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalResult:
     """
     Dispatches to whichever variant _donkey_active_variant() says is
-    currently active (see that function + strategy_cycle.py), then
+    currently active (always "ORIGINAL" now — see that function), then
     behaves exactly like the single-variant version did:
     config.DONKEY_STRATEGY_MODE picks INDEPENDENT (either signal fires
     alone, signal 1 checked first) vs COMBINED (both must agree — see
