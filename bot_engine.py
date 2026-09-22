@@ -306,12 +306,14 @@ class BotEngine:
         self._session_start_balance:  float              = 0.0
         self._open_contracts:         dict               = {}
 
-        # ── Fixed two-leg trading cycle (Sep 2026, chat-requested) —
-        #    see fixed_cycle.py. Set True once leg 2's ordinary redeploy
-        #    was intercepted into a cooldown request AND every open
-        #    contract is confirmed closed; _main_loop checks this and
-        #    stops itself so run() can disconnect from Deriv for the
-        #    5-minute cooldown between the two legs.
+        # ── Fixed single-leg trading cycle (Sep 2026, chat-requested;
+        #    restructured same day to drop leg 2 and randomize the
+        #    cooldown) — see fixed_cycle.py. Set True once leg 1's
+        #    rolling-redeploy timer was intercepted into a cooldown
+        #    request AND every open contract is confirmed closed;
+        #    _main_loop checks this and stops itself so run() can
+        #    disconnect from Deriv for the randomized cooldown between
+        #    leg 1 runs.
         self._entering_fixed_cooldown: bool = False
         self._contract_open_times:    dict               = {}
 
@@ -553,9 +555,10 @@ class BotEngine:
     def _on_balance(self, balance: float):
         self.risk.set_balance(balance)
         # No balance-driven cycle logic anymore — fixed_cycle.py's
-        # two-leg pattern is purely time-based (see _settle_loop's
-        # redeploy-pending handling), not balance-, profit-, or
-        # drawdown-driven. Nothing to do here for cycle purposes.
+        # single-leg-then-cooldown pattern is purely time-based (see
+        # _settle_loop's redeploy-pending handling), not balance-,
+        # profit-, or drawdown-driven. Nothing to do here for cycle
+        # purposes.
 
     # ── Entry point ────────────────────────────────────────────────────────────
 
@@ -582,13 +585,11 @@ class BotEngine:
         self._session_start_balance = self.client.balance
         self._current_utc_day       = _dt.datetime.utcnow().day
 
-        # ── Fixed two-leg trading cycle (Sep 2026, chat-requested):
-        # makes sure the persisted leg counter ("1" or "2") is actually
-        # set (bootstrap default "1" on the very first run ever) and
-        # logs which leg this run is. Purely for bookkeeping/logging —
-        # unlike the balance-trend switch and profit cycle this replaced,
-        # nothing here depends on the account balance. See fixed_cycle.py.
-        fixed_cycle.get_or_init_leg()
+        # ── Fixed single-leg trading cycle (Sep 2026, chat-requested):
+        # leg 1 is the only leg now, so there's no leg counter to
+        # bootstrap anymore — this just logs the start of a fresh leg 1
+        # run. See fixed_cycle.py.
+        fixed_cycle.log_trading_start()
 
         # ── Redeploy-proof open-contract recovery (spec point 10, Aug 2026) ──
         # Render's filesystem is ephemeral across deploys on this plan (no
@@ -1169,7 +1170,7 @@ class BotEngine:
             # request AND every open contract has been confirmed closed
             # — stop the main loop for good so run()'s finally block
             # cancels ws_task and actually disconnects from Deriv. While
-            # a cooldown has merely been *requested* (leg 2 finishing,
+            # a cooldown has merely been *requested* (leg 1 finishing,
             # contracts still draining) just pause new entries, same as
             # the redeploy-pending pause above.
             if self._entering_fixed_cooldown:
@@ -2538,31 +2539,33 @@ class BotEngine:
                     or restart_scheduler.is_redeploy_pending()
                 )
 
-                # ── Fixed two-leg cycle: leg-2 check (Sep 2026,
-                # chat-requested) ──────────────────────────────────────
+                # ── Fixed single-leg cycle: redeploy-due check (Sep 2026,
+                # chat-requested; restructured same day to drop leg 2)
+                # ──────────────────────────────────────────────────────
                 # Checked ONLY here, at the moment an ordinary redeploy is
                 # actually about to be allowed through — NOT on every
                 # settle tick, so it can't fire ahead of a real redeploy
-                # being due. Purely a leg-counter check now, nothing
-                # balance-, profit-, or drawdown-driven: if the leg
-                # that's finishing is leg "2", the plain redeploy-and-
-                # keep-trading path below must not run — redirect into
-                # the cooldown between cycles instead
+                # being due. Leg 1 is the only leg now, so there's no
+                # leg-counter check left to make: the rolling-redeploy
+                # timer firing always means leg 1 just finished, so this
+                # always redirects into the cooldown instead
                 # (fixed_cycle.request_cooldown()), which the drain block
-                # further down picks up on this same tick. If it's leg
-                # "1", nothing happens here; the ordinary redeploy goes
-                # through below and advance_leg_after_redeploy() bumps
-                # the leg to "2" once it actually fires.
+                # further down picks up on this same tick. The plain
+                # "redeploy and keep trading" path below is effectively
+                # dead under this trigger now — kept only as a fallback
+                # for the (disabled, REDEPLOY_EVERY_N_CYCLES=999999)
+                # cycle-count trigger, which never goes through
+                # fixed_cycle at all.
                 if restart_scheduler.is_redeploy_pending():
                     try:
-                        fixed_cycle.on_ordinary_redeploy_due()
+                        fixed_cycle.on_redeploy_due()
                     except Exception as exc:
-                        logger.error(f"FIXED-CYCLE: leg check error: {exc}")
+                        logger.error(f"FIXED-CYCLE: redeploy check error: {exc}")
 
                 # Ordinary redeploy is suppressed for this tick if the
-                # check above just requested the between-cycles cooldown
-                # — the drain block below handles draining+disconnecting
-                # from here on, not this plain redeploy path.
+                # check above just requested the cooldown — the drain
+                # block below handles draining+disconnecting from here
+                # on, not this plain redeploy path.
                 if fixed_cycle.is_cooldown_requested():
                     redeploy_wanted = False
 
@@ -2605,8 +2608,15 @@ class BotEngine:
                         await asyncio.sleep(5)
 
                     if not self._open_contracts:
+                        # No leg to advance anymore (single-leg cycle) —
+                        # this branch only still exists for the disabled
+                        # cycle-count fallback; under the timer trigger
+                        # fixed_cycle.on_redeploy_due() above always
+                        # requests a cooldown before redeploy_wanted gets
+                        # here, so in practice this path isn't taken by
+                        # the normal leg-1-ends flow (see cooldown drain
+                        # block below).
                         restart_scheduler.trigger_redeploy()
-                        fixed_cycle.advance_leg_after_redeploy()
                         logger.info("Redeploy triggered — standing by")
                         self._cycle_count = 0
                     # else: redeploy stays pending. We deliberately do NOT
@@ -2614,18 +2624,22 @@ class BotEngine:
                     # the next settle tick will re-enter this branch and
                     # keep trying to drain for real.
 
-                # ── Fixed two-leg cycle cooldown drain (Sep 2026,
-                # chat-requested) ─────────────────────────────────────────
+                # ── Fixed single-leg cycle cooldown drain (Sep 2026,
+                # chat-requested; restructured same day to drop leg 2 and
+                # randomize the cooldown length) ─────────────────────────
                 # Same non-destructive drain discipline as the redeploy
-                # branch above, triggered by fixed_cycle.on_ordinary_
-                # redeploy_due() finding leg "2" finishing instead of the
-                # rolling timer alone. Once every open contract is
-                # confirmed closed, fixed_cycle.enter_cooldown_now()
-                # persists the 5-minute cooldown window (so it survives
-                # the upcoming redeploy) and resets the leg counter back
-                # to "1", then starts the cooldown supervisor thread;
-                # _entering_fixed_cooldown then tells _main_loop to stop
-                # itself so run()'s finally block disconnects from Deriv.
+                # branch above, triggered by fixed_cycle.on_redeploy_due()
+                # — leg 1 is the only leg, so its rolling-redeploy timer
+                # firing always requests this cooldown. Once every open
+                # contract is confirmed closed, fixed_cycle.enter_
+                # cooldown_now() draws a fresh random cooldown length
+                # (between config.FIXED_CYCLE_COOLDOWN_MIN_MINUTES and
+                # _MAX_MINUTES) and persists that window (so it survives
+                # the upcoming redeploy, and any other redeploy landing
+                # mid-cooldown), then starts the cooldown supervisor
+                # thread; _entering_fixed_cooldown then tells _main_loop
+                # to stop itself so run()'s finally block disconnects
+                # from Deriv.
                 if fixed_cycle.is_cooldown_requested() and not self._entering_fixed_cooldown:
                     n_open = len(self._open_contracts)
                     logger.warning(
@@ -2662,10 +2676,14 @@ class BotEngine:
                         await asyncio.sleep(5)
 
                     if not self._open_contracts:
+                        # enter_cooldown_now() draws + persists a fresh
+                        # random cooldown length itself (see fixed_cycle.
+                        # py) and logs it there; just report the
+                        # resulting deadline here.
                         cooldown_until = fixed_cycle.enter_cooldown_now()
-                        cooldown_min = getattr(config, "FIXED_CYCLE_COOLDOWN_MINUTES", 5)
+                        cooldown_min = max(0.0, cooldown_until - time.time()) / 60
                         logger.warning(
-                            f"FIXED-CYCLE COOLDOWN ENTERED — {cooldown_min:.0f} "
+                            f"FIXED-CYCLE COOLDOWN ENTERED — ~{cooldown_min:.1f} "
                             f"min, resuming on a fresh leg 1 via redeploy at "
                             f"{_dt.datetime.fromtimestamp(cooldown_until, tz=_dt.timezone.utc).isoformat()}")
                         self._entering_fixed_cooldown = True
