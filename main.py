@@ -21,24 +21,25 @@ Architecture:
                        (started from inside fixed_cycle.py itself in
                        that case, not from here).
 
-Fixed two-leg trading cycle (Sep 2026, chat-requested, see
-fixed_cycle.py — supersedes the old balance-trend Donkey ORIGINAL/RAW
-switch and the profit-target cycle, neither of which is imported
-anywhere anymore; Donkey Strategy itself now runs ORIGINAL only, RAW is
-disabled, see signal_engine._donkey_active_variant()): trading runs
-forever on a simple fixed pattern that no balance, profit, drawdown, or
-time-of-day condition can alter —
-  1. Trade for config.FIXED_CYCLE_LEG_MINUTES ("leg 1"). config.
-     REDEPLOY_INTERVAL_HOURS is already set to this same 5 minutes, so
-     the ordinary rolling-redeploy mechanism below IS leg 1's timer.
-  2. Ordinary redeploy: drain open contracts, redeploy, resume trading
-     immediately as leg 2 — no deliberate disconnect beyond the redeploy
-     itself.
-  3. Trade for FIXED_CYCLE_LEG_MINUTES again ("leg 2").
-  4. Drain open contracts, then disconnect from Deriv entirely for
-     config.FIXED_CYCLE_COOLDOWN_MINUTES (health checks only), then
+Fixed single-leg trading cycle (Sep 2026, chat-requested; restructured
+same day to drop leg 2 and randomize the cooldown — see fixed_cycle.py.
+Supersedes the old balance-trend Donkey ORIGINAL/RAW switch and the
+profit-target cycle, neither of which is imported anywhere anymore;
+Donkey Strategy itself now runs ORIGINAL only, RAW is disabled, see
+signal_engine._donkey_active_variant()): trading runs forever on a
+simple fixed pattern that no balance, profit, drawdown, or time-of-day
+condition can alter —
+  1. Trade for config.FIXED_CYCLE_LEG_MINUTES ("leg 1") — ONE deploy, no
+     auto-redeploy while it's running. config.REDEPLOY_INTERVAL_HOURS is
+     already set to this same 5 minutes, so the rolling-redeploy
+     mechanism below IS leg 1's timer, and its firing always means leg 1
+     just ended.
+  2. Drain open contracts, then disconnect from Deriv entirely for a
+     cooldown drawn fresh, uniformly at random, between config.
+     FIXED_CYCLE_COOLDOWN_MIN_MINUTES and config.
+     FIXED_CYCLE_COOLDOWN_MAX_MINUTES (health checks only), then
      redeploy back into a fresh leg 1.
-  5. Repeat forever.
+  3. Repeat forever.
 
 main.py's only job for this is deciding, once per boot, whether this
 deploy should start the bot at all or just sit in cooldown — everything
@@ -52,9 +53,10 @@ Environment variables required:
   RENDER_DEPLOY_HOOK_URL – deploy hook URL from Render dashboard (required
                             for the fixed-cycle cooldown to actually
                             redeploy once it elapses)
-  RENDER_API_KEY         – Render API key (required for the active leg /
-                            cooldown state to survive a redeploy — see
-                            fixed_cycle.py)
+  RENDER_API_KEY         – Render API key (required for the trading/
+                            cooldown phase and the randomly chosen
+                            cooldown deadline to survive a redeploy —
+                            see fixed_cycle.py)
   RENDER_SERVICE_ID      – this service's srv-xxxxxxxx id (same as above)
 """
 
@@ -95,7 +97,7 @@ def _run_bot():
     else:
         # run() can now return normally (not just via exception/cancel)
         # when bot_engine decided to enter the fixed-cycle cooldown after
-        # leg 2 — see bot_engine.py's _main_loop / _settle_loop.
+        # leg 1 — see bot_engine.py's _main_loop / _settle_loop.
         # Nothing further to do here: fixed_cycle.enter_cooldown_now()
         # already persisted the cooldown window and started its own
         # supervisor thread before _main_loop stopped itself, so this
@@ -123,8 +125,9 @@ if __name__ == "__main__":
 
     # 2. Cooldown phase check (Sep 2026) — decides whether this deploy
     #    should start the bot at all or just sit in cooldown, for
-    #    fixed_cycle.py's single fixed two-leg-then-cooldown pattern
-    #    (supersedes the old dual strategy-cycle / profit-cycle check).
+    #    fixed_cycle.py's single fixed leg-1-then-randomized-cooldown
+    #    pattern (supersedes the old dual strategy-cycle / profit-cycle
+    #    check).
     #    This deploy sits out — bot thread and rolling restart scheduler
     #    both stay off — while the cooldown is active; its own supervisor
     #    thread (started below) fires the Render deploy hook once the
@@ -156,10 +159,10 @@ if __name__ == "__main__":
         # fixed_cooldown_until being None covers both.
         if fixed_cycle.load_state()["phase"] == "cooldown":
             # The second case above — flip the persisted phase back to
-            # "trading" and the leg counter back to "1" now so it
-            # doesn't linger as a stale "cooldown" forever. This is just
-            # for a clean, non-stale phase record; bot_engine.run() ->
-            # get_or_init_leg() below reads the reset leg regardless.
+            # "trading" now so it doesn't linger as a stale "cooldown"
+            # forever. Just for a clean, non-stale phase record;
+            # bot_engine.run() starts a fresh leg 1 regardless via
+            # fixed_cycle.log_trading_start().
             fixed_cycle.clear_cooldown_and_resume_trading()
 
         # 3. Start auto-redeploy scheduler (no-op if RENDER_DEPLOY_HOOK_URL
