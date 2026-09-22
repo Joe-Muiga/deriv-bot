@@ -50,8 +50,7 @@ import numpy as np
 import config
 import exit_engine
 import restart_scheduler
-import strategy_cycle
-import profit_cycle
+import fixed_cycle
 import symbols as sym_module
 import strategy_stats
 import meta_labeling
@@ -307,23 +306,13 @@ class BotEngine:
         self._session_start_balance:  float              = 0.0
         self._open_contracts:         dict               = {}
 
-        # ── Donkey RAW/ORIGINAL balance-trend switch (Sep 2026) — see
-        #    strategy_cycle.py. Set True once the reversal (or the
-        #    max-duration safety net) has fired AND every open contract
-        #    is confirmed closed; _main_loop checks this and stops
-        #    itself so run() can disconnect from Deriv for the switch's
-        #    1-hour cooldown.
-        self._entering_strategy_cooldown: bool = False
-
-        # ── Profit-target cycle (Sep 2026) — see profit_cycle.py. Set
-        #    True once the target (or the starting-balance drawdown
-        #    override) has fired AND every open contract is confirmed
-        #    closed; _main_loop checks this alongside
-        #    _entering_strategy_cooldown and stops itself so run()'s
-        #    finally block disconnects from Deriv for the cycle's
-        #    cooldown.
-        self._entering_profit_cooldown: bool = False
-        self._profit_cycle_starting_balance: float = 0.0
+        # ── Fixed two-leg trading cycle (Sep 2026, chat-requested) —
+        #    see fixed_cycle.py. Set True once leg 2's ordinary redeploy
+        #    was intercepted into a cooldown request AND every open
+        #    contract is confirmed closed; _main_loop checks this and
+        #    stops itself so run() can disconnect from Deriv for the
+        #    5-minute cooldown between the two legs.
+        self._entering_fixed_cooldown: bool = False
         self._contract_open_times:    dict               = {}
 
         # ── Contracts past CONTRACT_FORCE_CLOSE_SECS that still haven't
@@ -563,37 +552,10 @@ class BotEngine:
 
     def _on_balance(self, balance: float):
         self.risk.set_balance(balance)
-
-        # ── Donkey RAW/ORIGINAL balance-trend switch (Sep 2026) ─────────
-        # Fires on every live balance push from Deriv. Updates the
-        # current variant's peak balance and checks both the reversal
-        # condition (rose, then suddenly fell) and the max-duration
-        # safety net; requests a switch if either fires. No-ops once a
-        # switch is already requested/entered, and no-ops entirely if
-        # strategy_cycle.get_or_init_phase() hasn't run yet this
-        # connection (called from run(), right after this callback is
-        # registered but before the first real balance push settles in).
-        if not self._entering_strategy_cooldown:
-            try:
-                strategy_cycle.update_and_check(balance)
-            except Exception as exc:
-                logger.error(f"STRATEGY-CYCLE: update_and_check error: {exc}")
-
-        # ── Profit-target cycle (Sep 2026) ───────────────────────────────
-        # Fires on every live balance push. The target check itself
-        # immediately blocks any further new trade from firing the
-        # instant it's reached — request_cooldown() sets the pending
-        # flag _main_loop checks below — regardless of when in the run
-        # this happens. No-ops once a cooldown is already
-        # requested/entered, and no-ops if get_or_init_starting_balance()
-        # hasn't run yet this connection (called from run(), right after
-        # this callback is registered).
-        if not self._entering_profit_cooldown and not profit_cycle.is_cooldown_requested():
-            try:
-                if profit_cycle.check_target(balance, self._profit_cycle_starting_balance):
-                    profit_cycle.request_cooldown()
-            except Exception as exc:
-                logger.error(f"PROFIT-CYCLE: target check error: {exc}")
+        # No balance-driven cycle logic anymore — fixed_cycle.py's
+        # two-leg pattern is purely time-based (see _settle_loop's
+        # redeploy-pending handling), not balance-, profit-, or
+        # drawdown-driven. Nothing to do here for cycle purposes.
 
     # ── Entry point ────────────────────────────────────────────────────────────
 
@@ -620,26 +582,13 @@ class BotEngine:
         self._session_start_balance = self.client.balance
         self._current_utc_day       = _dt.datetime.utcnow().day
 
-        # ── Donkey RAW/ORIGINAL balance-trend switch (Sep 2026): resume
-        # the in-progress run's trend tracking if one survived from
-        # before this redeploy (the normal case for the rolling
-        # REDEPLOY_INTERVAL_HOURS redeploy while trading), or capture a
-        # fresh phase_started_at/phase_start_balance/peak if this is the
-        # first run ever, or the first run after a strategy-switch
-        # cooldown. See strategy_cycle.py for why this can't just live
-        # in memory.
-        strategy_cycle.get_or_init_phase(self.client.balance)
-
-        # ── Profit-target cycle (Sep 2026): resume the in-progress
-        # cycle's starting balance if one survived from before this
-        # redeploy (the normal case for the rolling
-        # REDEPLOY_INTERVAL_HOURS redeploy while trading), or capture a
-        # fresh one if this is the first run ever, or the first run
-        # after a profit-cycle cooldown. See profit_cycle.py for why
-        # this can't just live in memory. Runs independently of, and
-        # alongside, the Donkey ORIGINAL/RAW switch above.
-        self._profit_cycle_starting_balance = profit_cycle.get_or_init_starting_balance(
-            self.client.balance)
+        # ── Fixed two-leg trading cycle (Sep 2026, chat-requested):
+        # makes sure the persisted leg counter ("1" or "2") is actually
+        # set (bootstrap default "1" on the very first run ever) and
+        # logs which leg this run is. Purely for bookkeeping/logging —
+        # unlike the balance-trend switch and profit cycle this replaced,
+        # nothing here depends on the account balance. See fixed_cycle.py.
+        fixed_cycle.get_or_init_leg()
 
         # ── Redeploy-proof open-contract recovery (spec point 10, Aug 2026) ──
         # Render's filesystem is ephemeral across deploys on this plan (no
@@ -1214,37 +1163,22 @@ class BotEngine:
                 await asyncio.sleep(scan_sleep)
                 continue
 
-            # ── Donkey RAW/ORIGINAL balance-trend switch (Sep 2026) ─────
-            # _entering_strategy_cooldown is set by _settle_loop once a
-            # switch was requested AND every open contract has been
-            # confirmed closed — stop the main loop for good so run()'s
-            # finally block cancels ws_task and actually disconnects
-            # from Deriv. While a switch has merely been *requested*
-            # (reversal/max-duration hit, contracts still draining) just
-            # pause new entries, same as the redeploy-pending pause above.
-            if self._entering_strategy_cooldown:
+            # ── Fixed two-leg trading cycle (Sep 2026, chat-requested) ──
+            # _entering_fixed_cooldown is set by _settle_loop once leg
+            # 2's ordinary redeploy was intercepted into a cooldown
+            # request AND every open contract has been confirmed closed
+            # — stop the main loop for good so run()'s finally block
+            # cancels ws_task and actually disconnects from Deriv. While
+            # a cooldown has merely been *requested* (leg 2 finishing,
+            # contracts still draining) just pause new entries, same as
+            # the redeploy-pending pause above.
+            if self._entering_fixed_cooldown:
                 logger.warning(
-                    "STRATEGY-CYCLE: switch cooldown starting — stopping "
-                    "main loop and disconnecting from Deriv")
-                return
-
-            if strategy_cycle.is_switch_requested():
-                await asyncio.sleep(scan_sleep)
-                continue
-
-            # ── Profit-target cycle (Sep 2026) ───────────────────────────
-            # Same stop-for-good / pause-new-entries split as the
-            # strategy-cycle block above. _entering_profit_cooldown is
-            # set by _settle_loop once a cooldown was requested (target
-            # hit, or the starting-balance drawdown override below) AND
-            # every open contract has been confirmed closed.
-            if self._entering_profit_cooldown:
-                logger.warning(
-                    "PROFIT-CYCLE: cooldown starting — stopping main "
+                    "FIXED-CYCLE: cooldown starting — stopping main "
                     "loop and disconnecting from Deriv")
                 return
 
-            if profit_cycle.is_cooldown_requested():
+            if fixed_cycle.is_cooldown_requested():
                 await asyncio.sleep(scan_sleep)
                 continue
 
@@ -2604,50 +2538,32 @@ class BotEngine:
                     or restart_scheduler.is_redeploy_pending()
                 )
 
-                # ── Starting-balance drawdown override (Sep 2026) ────────
+                # ── Fixed two-leg cycle: leg-2 check (Sep 2026,
+                # chat-requested) ──────────────────────────────────────
                 # Checked ONLY here, at the moment an ordinary redeploy is
                 # actually about to be allowed through — NOT on every
                 # settle tick, so it can't fire ahead of a real redeploy
-                # being due. If either cycle's balance has fallen its
-                # configured % below ITS OWN starting balance, the plain
-                # redeploy-and-keep-trading path below must not run for
-                # that cycle: redirect into that cycle's own cooldown
-                # instead (strategy_cycle.request_switch() /
-                # profit_cycle.request_cooldown()), which the existing
-                # drain blocks further down pick up on this same tick.
-                # Both are checked independently — either can redirect,
-                # and if both are breached at once both cooldowns get
-                # requested; whichever's drain block runs first below
-                # enters cooldown and disconnects, and the other stays
-                # requested-pending until the bot resumes.
+                # being due. Purely a leg-counter check now, nothing
+                # balance-, profit-, or drawdown-driven: if the leg
+                # that's finishing is leg "2", the plain redeploy-and-
+                # keep-trading path below must not run — redirect into
+                # the cooldown between cycles instead
+                # (fixed_cycle.request_cooldown()), which the drain block
+                # further down picks up on this same tick. If it's leg
+                # "1", nothing happens here; the ordinary redeploy goes
+                # through below and advance_leg_after_redeploy() bumps
+                # the leg to "2" once it actually fires.
                 if restart_scheduler.is_redeploy_pending():
                     try:
-                        if strategy_cycle.is_starting_drawdown_breached(self.client.balance):
-                            strategy_cycle.request_switch(
-                                "starting-balance drawdown "
-                                f"({getattr(config, 'STRATEGY_SWITCH_STARTING_DRAWDOWN_PCT', 25)}%+) "
-                                "at rolling-redeploy time — cooldown instead of redeploy")
+                        fixed_cycle.on_ordinary_redeploy_due()
                     except Exception as exc:
-                        logger.error(f"STRATEGY-CYCLE: drawdown check error: {exc}")
+                        logger.error(f"FIXED-CYCLE: leg check error: {exc}")
 
-                    try:
-                        if profit_cycle.is_starting_drawdown_breached(
-                            self.client.balance, self._profit_cycle_starting_balance
-                        ):
-                            profit_cycle.request_cooldown()
-                            logger.warning(
-                                "PROFIT-CYCLE: starting-balance drawdown "
-                                f"({getattr(config, 'PROFIT_CYCLE_STARTING_DRAWDOWN_PCT', 25)}%+) "
-                                "at rolling-redeploy time — cooldown instead of redeploy")
-                    except Exception as exc:
-                        logger.error(f"PROFIT-CYCLE: drawdown check error: {exc}")
-
-                # Ordinary redeploy is suppressed for this tick if either
-                # cycle just redirected into its own cooldown above (or
-                # already had one pending from a reversal/target hit) —
-                # their own drain blocks below own draining+disconnecting
+                # Ordinary redeploy is suppressed for this tick if the
+                # check above just requested the between-cycles cooldown
+                # — the drain block below handles draining+disconnecting
                 # from here on, not this plain redeploy path.
-                if strategy_cycle.is_switch_requested() or profit_cycle.is_cooldown_requested():
+                if fixed_cycle.is_cooldown_requested():
                     redeploy_wanted = False
 
                 if redeploy_wanted:
@@ -2690,6 +2606,7 @@ class BotEngine:
 
                     if not self._open_contracts:
                         restart_scheduler.trigger_redeploy()
+                        fixed_cycle.advance_leg_after_redeploy()
                         logger.info("Redeploy triggered — standing by")
                         self._cycle_count = 0
                     # else: redeploy stays pending. We deliberately do NOT
@@ -2697,22 +2614,22 @@ class BotEngine:
                     # the next settle tick will re-enter this branch and
                     # keep trying to drain for real.
 
-                # ── Donkey RAW/ORIGINAL balance-trend switch drain
-                # (Sep 2026) ─────────────────────────────────────────────
+                # ── Fixed two-leg cycle cooldown drain (Sep 2026,
+                # chat-requested) ─────────────────────────────────────────
                 # Same non-destructive drain discipline as the redeploy
-                # branch above, triggered by strategy_cycle's balance
-                # reversal / max-duration check instead of the rolling
-                # timer. Once every open contract is confirmed closed,
-                # strategy_cycle.enter_cooldown_now() swaps the active
-                # variant, persists the 1-hour cooldown window (so it
-                # survives the upcoming redeploy) and starts the cooldown
-                # supervisor thread; _entering_strategy_cooldown then
-                # tells _main_loop to stop itself so run()'s finally
-                # block disconnects from Deriv.
-                if strategy_cycle.is_switch_requested() and not self._entering_strategy_cooldown:
+                # branch above, triggered by fixed_cycle.on_ordinary_
+                # redeploy_due() finding leg "2" finishing instead of the
+                # rolling timer alone. Once every open contract is
+                # confirmed closed, fixed_cycle.enter_cooldown_now()
+                # persists the 5-minute cooldown window (so it survives
+                # the upcoming redeploy) and resets the leg counter back
+                # to "1", then starts the cooldown supervisor thread;
+                # _entering_fixed_cooldown then tells _main_loop to stop
+                # itself so run()'s finally block disconnects from Deriv.
+                if fixed_cycle.is_cooldown_requested() and not self._entering_fixed_cooldown:
                     n_open = len(self._open_contracts)
                     logger.warning(
-                        f"STRATEGY-CYCLE SWITCH REQUESTED: draining {n_open} "
+                        f"FIXED-CYCLE COOLDOWN REQUESTED: draining {n_open} "
                         f"open contract(s) before disconnecting")
 
                     drain_started = time.time()
@@ -2731,65 +2648,7 @@ class BotEngine:
                                 f"DRAIN_MAX_SECS ({drain_max_secs}s) exceeded "
                                 f"with {len(self._open_contracts)} contract(s) "
                                 f"still not confirmed-closed: {', '.join(stuck)} "
-                                f"— DELAYING the strategy switch rather than "
-                                f"wiping their bookkeeping. Will keep actively "
-                                f"trying to close them and re-check on the "
-                                f"next settle tick."
-                            )
-                            break
-
-                        logger.info(
-                            f"Draining before strategy switch — "
-                            f"{len(self._open_contracts)} contract(s) open, "
-                            f"actively confirming closes")
-                        await asyncio.sleep(5)
-
-                    if not self._open_contracts:
-                        cooldown_until = strategy_cycle.enter_cooldown_now()
-                        cooldown_min = getattr(config, "STRATEGY_SWITCH_COOLDOWN_MINUTES", 60)
-                        logger.warning(
-                            f"STRATEGY-CYCLE COOLDOWN ENTERED — {cooldown_min:.0f} "
-                            f"min, resuming on the new variant via redeploy at "
-                            f"{_dt.datetime.fromtimestamp(cooldown_until, tz=_dt.timezone.utc).isoformat()}")
-                        self._entering_strategy_cooldown = True
-                    # else: switch stays requested-but-not-entered, same
-                    # non-destructive re-try-next-tick pattern as above.
-
-                # ── Profit-target cycle drain (Sep 2026) ──────────────────
-                # Same non-destructive drain discipline as the two blocks
-                # above, triggered by profit_cycle's target check (Sep 2026:
-                # blocks new trades the instant the target is reached, any
-                # time the bot is live — see _on_balance) or by the
-                # starting-balance drawdown override checked earlier this
-                # tick. Once every open contract is confirmed closed,
-                # profit_cycle.enter_cooldown_now() persists the cooldown
-                # window (so it survives the upcoming redeploy) and starts
-                # the cooldown supervisor thread; _entering_profit_cooldown
-                # then tells _main_loop to stop itself so run()'s finally
-                # block disconnects from Deriv.
-                if profit_cycle.is_cooldown_requested() and not self._entering_profit_cooldown:
-                    n_open = len(self._open_contracts)
-                    logger.warning(
-                        f"PROFIT-CYCLE COOLDOWN REQUESTED: draining {n_open} "
-                        f"open contract(s) before disconnecting")
-
-                    drain_started = time.time()
-                    while self._open_contracts:
-                        await self._handle_orphans()
-                        if not self._open_contracts:
-                            break
-
-                        drain_elapsed = time.time() - drain_started
-                        if drain_elapsed >= drain_max_secs:
-                            stuck = [
-                                f"{cid} (age={int(time.time() - info.get('opened_at', time.time()))}s)"
-                                for cid, info in self._open_contracts.items()
-                            ]
-                            logger.warning(
-                                f"DRAIN_MAX_SECS ({drain_max_secs}s) exceeded "
-                                f"with {len(self._open_contracts)} contract(s) "
-                                f"still not confirmed-closed: {', '.join(stuck)} "
-                                f"— DELAYING the profit-cycle cooldown rather "
+                                f"— DELAYING the fixed-cycle cooldown rather "
                                 f"than wiping their bookkeeping. Will keep "
                                 f"actively trying to close them and re-check "
                                 f"on the next settle tick."
@@ -2797,19 +2656,19 @@ class BotEngine:
                             break
 
                         logger.info(
-                            f"Draining before profit-cycle cooldown — "
+                            f"Draining before fixed-cycle cooldown — "
                             f"{len(self._open_contracts)} contract(s) open, "
                             f"actively confirming closes")
                         await asyncio.sleep(5)
 
                     if not self._open_contracts:
-                        cooldown_until = profit_cycle.enter_cooldown_now()
-                        cooldown_min = getattr(config, "PROFIT_CYCLE_COOLDOWN_MINUTES", 17)
+                        cooldown_until = fixed_cycle.enter_cooldown_now()
+                        cooldown_min = getattr(config, "FIXED_CYCLE_COOLDOWN_MINUTES", 5)
                         logger.warning(
-                            f"PROFIT-CYCLE COOLDOWN ENTERED — {cooldown_min:.0f} "
-                            f"min, starting a brand-new cycle via redeploy at "
+                            f"FIXED-CYCLE COOLDOWN ENTERED — {cooldown_min:.0f} "
+                            f"min, resuming on a fresh leg 1 via redeploy at "
                             f"{_dt.datetime.fromtimestamp(cooldown_until, tz=_dt.timezone.utc).isoformat()}")
-                        self._entering_profit_cooldown = True
+                        self._entering_fixed_cooldown = True
                     # else: cooldown stays requested-but-not-entered, same
                     # non-destructive re-try-next-tick pattern as above.
 
