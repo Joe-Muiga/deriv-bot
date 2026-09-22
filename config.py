@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 0.5
+MANUAL_STAKE_AMOUNT = 1
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 0.5    # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 1    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1661,10 +1661,10 @@ FIXED_CYCLE_LEG_MINUTES          = 5     # length of leg 1 — kept equal
                                           # (5 min) above; change both
                                           # together if you ever want a
                                           # different leg length
-FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 75    # 1h15m — lower bound of the
+FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 25    # 1h15m — lower bound of the
                                           # randomized cooldown after
                                           # every leg 1
-FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 150   # 2h30m — upper bound; a fresh
+FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 60   # 2h30m — upper bound; a fresh
                                           # value is drawn uniformly at
                                           # random between these two
                                           # every time leg 1 ends (see
