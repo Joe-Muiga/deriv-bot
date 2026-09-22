@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 1
+MANUAL_STAKE_AMOUNT = 0.5
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 1    # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.5    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1213,7 +1213,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 10 / 60   # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 5 / 60   # 5 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1634,43 +1634,52 @@ DONKEY_CYCLE_START = "ORIGINAL"        # kept only as _donkey_active_
                                         # fallback value; not otherwise
                                         # read anymore.
 
-# ── Fixed trading cycle (Sep 2026, chat-requested — supersedes and
-#    disables the old balance-trend Donkey switch above AND the
-#    profit-target cycle that used to live in this section; both
-#    strategy_cycle.py and profit_cycle.py are no longer imported
-#    anywhere) ────────────────────────────────────────────────────────
-# Trading now runs on a simple, fixed, never-ending pattern instead of
-# anything balance-, profit-, drawdown-, or time-of-day-driven — see
-# fixed_cycle.py for the full state machine:
-#   1. Trade for FIXED_CYCLE_LEG_MINUTES ("leg 1"). REDEPLOY_INTERVAL_
-#      HOURS above is already set to this same 5 minutes, so the
-#      existing rolling-redeploy mechanism (restart_scheduler.py) IS leg
-#      1's timer — no separate clock needed for it.
-#   2. Ordinary "leg 1 -> leg 2" redeploy: drain open contracts,
-#      redeploy, resume trading immediately — no deliberate disconnect
-#      beyond the redeploy itself.
-#   3. Trade for FIXED_CYCLE_LEG_MINUTES again ("leg 2").
-#   4. Drain open contracts, then disconnect from Deriv entirely for
-#      FIXED_CYCLE_COOLDOWN_MINUTES (health checks only), then redeploy
+# ── Fixed trading cycle (Sep 2026, chat-requested; restructured same
+#    day from an earlier two-leg version — leg 2 removed, cooldown
+#    length randomized. Supersedes and disables the old balance-trend
+#    Donkey switch above AND the profit-target cycle that used to live
+#    in this section; strategy_cycle.py and profit_cycle.py are no
+#    longer imported anywhere) ────────────────────────────────────────
+# Trading now runs on a simple, fixed, never-ending single-leg pattern
+# instead of anything balance-, profit-, drawdown-, or time-of-day-
+# driven — see fixed_cycle.py for the full state machine:
+#   1. Trade for FIXED_CYCLE_LEG_MINUTES ("leg 1") — ONE deploy, no
+#      auto-redeploy while it's running. REDEPLOY_INTERVAL_HOURS above
+#      is already set to this same 5 minutes, so the existing rolling-
+#      redeploy mechanism (restart_scheduler.py) IS leg 1's timer — no
+#      separate clock needed for it, and its firing always means leg 1
+#      just ended (there's no leg 2 to redeploy into anymore).
+#   2. Drain open contracts, then disconnect from Deriv entirely for a
+#      cooldown drawn fresh, uniformly at random, between
+#      FIXED_CYCLE_COOLDOWN_MIN_MINUTES and FIXED_CYCLE_COOLDOWN_MAX_
+#      MINUTES (health checks only during this window), then redeploy
 #      back into a fresh leg 1.
-#   5. Repeat forever. Nothing — not daily drawdown, not profit, not
+#   3. Repeat forever. Nothing — not daily drawdown, not profit, not
 #      time of day — can skip, shorten, lengthen, or pause any of this.
-FIXED_CYCLE_LEG_MINUTES      = 10   # length of each of the two trading
-                                    # legs — kept equal to REDEPLOY_
-                                    # INTERVAL_HOURS (5 min) above; change
-                                    # both together if you ever want a
-                                    # different leg length
-FIXED_CYCLE_COOLDOWN_MINUTES = 15   # minutes disconnected from Deriv
-                                    # (health checks only) after every
-                                    # second leg, before redeploying into
-                                    # a fresh leg 1
+FIXED_CYCLE_LEG_MINUTES          = 5     # length of leg 1 — kept equal
+                                          # to REDEPLOY_INTERVAL_HOURS
+                                          # (5 min) above; change both
+                                          # together if you ever want a
+                                          # different leg length
+FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 75    # 1h15m — lower bound of the
+                                          # randomized cooldown after
+                                          # every leg 1
+FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 150   # 2h30m — upper bound; a fresh
+                                          # value is drawn uniformly at
+                                          # random between these two
+                                          # every time leg 1 ends (see
+                                          # fixed_cycle.enter_cooldown_
+                                          # now()), then persisted as an
+                                          # absolute deadline so it
+                                          # can't be re-rolled by a
+                                          # redeploy landing mid-cooldown
 
 # Render API credentials used ONLY to persist fixed_cycle.py's state
-# (which leg is active / cooldown deadline) into this service's own env
-# vars so it survives a redeploy — Render's disk here is ephemeral, so
-# without these the bot forgets which leg it was on and treats every
-# redeploy as leg 1 instead of tracking the 2-leg pattern across the
-# whole run.
+# (trading/cooldown phase + the cooldown deadline) into this service's
+# own env vars so it survives a redeploy — Render's disk here is
+# ephemeral, so without these the bot would forget an in-progress
+# cooldown (and its randomly chosen length) on any redeploy that lands
+# mid-cooldown for an unrelated reason.
 RENDER_API_KEY    = os.environ.get("RENDER_API_KEY", "")
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 
