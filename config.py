@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 0.5
+MANUAL_STAKE_AMOUNT = 1
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 0.5    # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 1    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1213,7 +1213,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 5 / 60   # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 10 / 60   # 5 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1655,7 +1655,7 @@ DONKEY_CYCLE_START = "ORIGINAL"        # kept only as _donkey_active_
 #      back into a fresh leg 1.
 #   5. Repeat forever. Nothing — not daily drawdown, not profit, not
 #      time of day — can skip, shorten, lengthen, or pause any of this.
-FIXED_CYCLE_LEG_MINUTES      = 5   # length of each of the two trading
+FIXED_CYCLE_LEG_MINUTES      = 10   # length of each of the two trading
                                     # legs — kept equal to REDEPLOY_
                                     # INTERVAL_HOURS (5 min) above; change
                                     # both together if you ever want a
