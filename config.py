@@ -1660,7 +1660,7 @@ FIXED_CYCLE_LEG_MINUTES      = 5   # length of each of the two trading
                                     # INTERVAL_HOURS (5 min) above; change
                                     # both together if you ever want a
                                     # different leg length
-FIXED_CYCLE_COOLDOWN_MINUTES = 5   # minutes disconnected from Deriv
+FIXED_CYCLE_COOLDOWN_MINUTES = 15   # minutes disconnected from Deriv
                                     # (health checks only) after every
                                     # second leg, before redeploying into
                                     # a fresh leg 1
