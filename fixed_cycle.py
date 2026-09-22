@@ -1,32 +1,38 @@
 """
-fixed_cycle.py – fixed, never-ending two-leg trading cycle.
+fixed_cycle.py – fixed, never-ending single-leg-then-cooldown trading cycle.
 
-Spec (Sep 2026, chat-requested): replaces both strategy_cycle.py's
-balance-trend Donkey ORIGINAL/RAW switch and profit_cycle.py's
-profit-target cycle. Neither balance, profit, drawdown, nor time of day
-has any say in this anymore — the pattern is purely fixed-length:
+Spec (Sep 2026, chat-requested — restructured from the earlier two-leg
+version): leg 2 is removed entirely. Leg 1 now gets exactly ONE deploy —
+no auto-redeploy while it's running — and every time it ends, the bot
+goes straight into a cooldown of RANDOM length before redeploying back
+into a fresh leg 1:
 
-  1. Trade for config.FIXED_CYCLE_LEG_MINUTES ("leg 1"). config.
-     REDEPLOY_INTERVAL_HOURS is already set to this same 5 minutes, so
-     restart_scheduler.py's existing rolling-redeploy timer IS leg 1's
-     clock — this module doesn't need a separate one for it.
-  2. Ordinary "leg 1 -> leg 2" redeploy: drain open contracts, redeploy,
-     resume trading immediately — no deliberate disconnect beyond the
-     redeploy itself.
-  3. Trade for FIXED_CYCLE_LEG_MINUTES again ("leg 2").
-  4. Drain open contracts, then disconnect from Deriv entirely for
-     config.FIXED_CYCLE_COOLDOWN_MINUTES (health checks only), then
-     redeploy back into a fresh leg 1.
-  5. Repeat forever.
+  1. Trade for config.FIXED_CYCLE_LEG_MINUTES ("leg 1"), on a single
+     deploy with no mid-leg redeploy. config.REDEPLOY_INTERVAL_HOURS is
+     already set to this same 5 minutes, so restart_scheduler.py's
+     existing rolling-redeploy timer IS leg 1's clock — this module
+     doesn't need a separate one for it. Unlike the old two-leg version,
+     that timer firing is now ALWAYS treated as leg 1 being over; there
+     is no "ordinary redeploy that keeps trading" path left to take.
+  2. Drain open contracts, then disconnect from Deriv entirely for a
+     cooldown drawn fresh, uniformly at random, between config.
+     FIXED_CYCLE_COOLDOWN_MIN_MINUTES and config.
+     FIXED_CYCLE_COOLDOWN_MAX_MINUTES (health checks only during this
+     window), then redeploy back into a fresh leg 1.
+  3. Repeat forever.
 
-PERSISTENCE — same reasoning as strategy_cycle.py / profit_cycle.py
-before it: Render's disk on this plan is ephemeral, every redeploy is a
-brand-new container, so which leg is active has to survive that redeploy
-somewhere durable. State is written into THIS SERVICE'S OWN Render
-environment variables via Render's public API (PUT /v1/services/
-{serviceId}/env-vars/{envVarKey}) every time it changes, and read back
-out of os.environ at boot. Needs the same two env vars the two modules
-this replaces needed:
+PERSISTENCE — same reasoning as the two-leg version before it: Render's
+disk on this plan is ephemeral, every redeploy is a brand-new container,
+so the cooldown deadline (once chosen) has to survive that redeploy
+somewhere durable — including any redeploy that happens to land mid-
+cooldown for an unrelated reason (a manual deploy, a platform restart,
+etc.), which must NOT re-roll the random duration or shorten/lengthen
+it. State is written into THIS SERVICE'S OWN Render environment
+variables via Render's public API (PUT /v1/services/{serviceId}/
+env-vars/{envVarKey}) every time it changes, and read back out of
+os.environ at boot — so cooldown_until, once persisted as an absolute
+epoch timestamp, survives any number of redeploys unchanged until it
+naturally elapses. Needs the same two env vars the old version needed:
 
   RENDER_API_KEY     – Render Dashboard -> Account Settings -> API Keys
   RENDER_SERVICE_ID  – the "srv-xxxxxxxxxxxxxxxxxxxx" id in this
@@ -37,35 +43,34 @@ matter what this module does — see _warn_persistence_not_configured().
 
 Persisted keys (plain env vars on the service):
   FIXED_PHASE            "trading" | "cooldown"
-  FIXED_LEG              "1" | "2" — which trading leg is active/next
   FIXED_COOLDOWN_UNTIL    epoch seconds the current cooldown ends at
+                          (the randomly chosen duration, already baked
+                          in as an absolute deadline — nothing needs to
+                          re-roll it on a later redeploy)
 
 Public interface:
-  load_state()                          -> {"phase", "leg", "cooldown_until"}
+  load_state()                          -> {"phase", "cooldown_until"}
   in_cooldown_at_boot()                 -> cooldown_until epoch, or None
-  clear_cooldown_and_resume_trading()   -> flip phase back to "trading",
-                                            leg back to "1"
-  get_or_init_leg()                     -> ensures FIXED_LEG is set
-                                            (bootstrap default "1" on the
-                                            very first run ever)
-  on_ordinary_redeploy_due()            -> called every settle tick
+  clear_cooldown_and_resume_trading()   -> flip phase back to "trading"
+                                            for a fresh leg 1
+  log_trading_start()                   -> bootstrap/logging only, no
+                                            leg counter to initialise
+                                            anymore
+  on_redeploy_due()                     -> called every settle tick
                                             while restart_scheduler.
-                                            is_redeploy_pending() is True;
-                                            requests a cooldown instead
-                                            of letting the redeploy go
-                                            through plainly once leg "2"
-                                            is the one finishing
-  advance_leg_after_redeploy()          -> called right after an
-                                            ordinary (non-cooldown)
-                                            redeploy actually fires;
-                                            bumps leg "1" -> "2"
+                                            is_redeploy_pending() is
+                                            True; leg 1 is the only leg,
+                                            so this always requests a
+                                            cooldown instead of letting
+                                            an ordinary redeploy go
+                                            through
   request_cooldown() / is_cooldown_requested()
                                          -> pending-flag, mirrors
                                             restart_scheduler.py's
                                             is_redeploy_pending() pattern
-  enter_cooldown_now()                  -> persists the cooldown window
-                                            + resets leg to "1", starts
-                                            the supervisor thread,
+  enter_cooldown_now()                  -> draws a fresh random cooldown
+                                            length, persists the window,
+                                            starts the supervisor thread,
                                             returns cooldown_until
   start_cooldown_supervisor(until)      -> the thread that waits out the
                                             cooldown then fires the
@@ -75,6 +80,7 @@ Public interface:
 import asyncio
 import logging
 import os
+import random
 import threading
 import time
 from typing import Optional
@@ -93,7 +99,7 @@ _persistence_warned_at: float = 0.0
 
 def _push_dashboard_flag(**kwargs) -> None:
     """Soft/optional dashboard visibility — same guarded-lazy-import
-    pattern strategy_cycle.py / profit_cycle.py used. Never let a
+    pattern the rest of this module's predecessors used. Never let a
     missing/broken keep_alive break the cycle logic itself."""
     try:
         import keep_alive
@@ -118,13 +124,13 @@ def _warn_persistence_not_configured() -> None:
     logger.critical(
         "\n" + "=" * 78 + "\n"
         "FIXED-CYCLE PERSISTENCE NOT CONFIGURED\n"
-        "RENDER_API_KEY and/or RENDER_SERVICE_ID are not set. Which leg "
-        "is active, and the cooldown deadline, will only live in this "
-        "process's own environment — they WILL be lost on the next "
-        "redeploy (Render's disk here is ephemeral), so the bot will "
-        "treat every redeploy as leg 1 instead of tracking the 2-leg "
-        "pattern across the whole run. Set both in the Render dashboard "
-        "to fix this:\n"
+        "RENDER_API_KEY and/or RENDER_SERVICE_ID are not set. The cooldown "
+        "deadline will only live in this process's own environment — it "
+        "WILL be lost on the next redeploy (Render's disk here is "
+        "ephemeral), so a redeploy landing mid-cooldown would wrongly "
+        "resume trading immediately instead of waiting out the rest of "
+        "the randomly chosen cooldown window. Set both in the Render "
+        "dashboard to fix this:\n"
         "  RENDER_API_KEY    -> Account Settings -> API Keys\n"
         "  RENDER_SERVICE_ID -> the srv-xxxxxxxx id in this service's own "
         "Settings-page URL\n" + "=" * 78
@@ -136,8 +142,7 @@ def _persist_env_vars(mapping: dict) -> None:
     """Reflects `mapping` in this process's own os.environ immediately,
     and best-effort pushes each key to this service's Render env vars so
     a FUTURE deploy starts from them too. Same async-task-with-sync-
-    fallback shape as strategy_cycle.py's / profit_cycle.py's helper of
-    the same name."""
+    fallback shape as the previous version's helper of the same name."""
     for key, value in mapping.items():
         os.environ[key] = str(value)
 
@@ -199,12 +204,8 @@ def load_state() -> dict:
     phase = os.environ.get("FIXED_PHASE", "trading").strip().lower()
     if phase not in ("trading", "cooldown"):
         phase = "trading"
-    leg = os.environ.get("FIXED_LEG", "1").strip()
-    if leg not in ("1", "2"):
-        leg = "1"
     return {
         "phase":          phase,
-        "leg":            leg,
         "cooldown_until": _read_float_env("FIXED_COOLDOWN_UNTIL", 0.0),
     }
 
@@ -214,7 +215,10 @@ def in_cooldown_at_boot() -> Optional[float]:
     cooldown (main.py must NOT start the bot / connect to Deriv in that
     case), or None if it's clear to trade — either genuinely trading
     already, or a cooldown that has already elapsed (this process IS the
-    post-cooldown redeploy)."""
+    post-cooldown redeploy). Because cooldown_until is an absolute epoch
+    persisted at the moment the random duration was chosen, an unrelated
+    redeploy landing mid-cooldown still returns the SAME deadline here —
+    the random length is never re-rolled or reset by a stray redeploy."""
     state = load_state()
     if state["phase"] == "cooldown" and state["cooldown_until"] > time.time():
         return state["cooldown_until"]
@@ -225,31 +229,21 @@ def clear_cooldown_and_resume_trading() -> None:
     """Called by main.py at boot when the persisted phase is 'cooldown'
     but the deadline has already passed — i.e. this process is the
     redeploy the cooldown supervisor triggered. Flips the phase back to
-    'trading' and resets the leg counter to '1' for a fresh pair of
-    legs."""
+    'trading' for a fresh leg 1."""
     logger.info("FIXED-CYCLE: cooldown window elapsed — resuming trading on a fresh leg 1")
     _persist_env_vars({
-        "FIXED_PHASE":           "trading",
-        "FIXED_LEG":             "1",
-        "FIXED_COOLDOWN_UNTIL":  "0",
+        "FIXED_PHASE":          "trading",
+        "FIXED_COOLDOWN_UNTIL": "0",
     })
 
 
-# ── Leg tracking ─────────────────────────────────────────────────────────────
+# ── Boot logging (no leg counter anymore — leg 1 is the only leg) ──────────
 
-def get_or_init_leg() -> str:
-    """
-    Called once by bot_engine.run() right after connecting, purely for
-    logging/bootstrap — unlike strategy_cycle.py's / profit_cycle.py's
-    equivalents this doesn't need a balance snapshot, since nothing here
-    is balance-driven. Makes sure FIXED_LEG is actually set (bootstrap
-    default "1" on the very first run ever) and returns it.
-    """
-    state = load_state()
-    if "FIXED_LEG" not in os.environ:
-        _persist_env_vars({"FIXED_PHASE": "trading", "FIXED_LEG": state["leg"]})
-    logger.info(f"FIXED-CYCLE: this run is leg {state['leg']} of 2")
-    return state["leg"]
+def log_trading_start() -> None:
+    """Called once by bot_engine.run() right after connecting, purely
+    for logging — leg 1 is the only leg now, so there's nothing to
+    bootstrap or persist here, unlike the old two-leg get_or_init_leg()."""
+    logger.info("FIXED-CYCLE: starting a fresh leg 1 trading window")
 
 
 # ── Pending-cooldown flag (mirrors restart_scheduler.py's
@@ -269,58 +263,45 @@ def request_cooldown(reason: str) -> None:
         _push_dashboard_flag(fixed_cycle_cooldown_reason=reason)
 
 
-def on_ordinary_redeploy_due() -> None:
+def on_redeploy_due() -> None:
     """
     Called by bot_engine._settle_loop() on every settle tick while
     restart_scheduler.is_redeploy_pending() is True — mirrors exactly
-    where strategy_cycle.is_starting_drawdown_breached() / profit_cycle.
-    is_starting_drawdown_breached() used to be checked. If the leg that's
-    about to redeploy is leg "2", this is the end of the two-leg pattern:
-    request a cooldown instead of letting the ordinary redeploy go
-    through. If it's leg "1", there's nothing to do here — the leg
-    advances to "2" in advance_leg_after_redeploy() once the ordinary
-    redeploy actually fires. No-ops once a cooldown is already requested.
+    where the old on_ordinary_redeploy_due() used to be checked. Leg 1
+    is now the ONLY leg, so unlike the old two-leg version there's no
+    leg number to check: the rolling-redeploy timer firing always means
+    leg 1 just finished, so this always requests a cooldown instead of
+    letting an ordinary "redeploy and keep trading" path run. No-ops
+    once a cooldown is already requested.
     """
     if is_cooldown_requested():
         return
-    state = load_state()
-    if state["leg"] == "2":
-        request_cooldown("second 5-minute leg complete")
-
-
-def advance_leg_after_redeploy() -> None:
-    """
-    Called by bot_engine._settle_loop() immediately after restart_
-    scheduler.trigger_redeploy() actually fires for the PLAIN "leg 1 ->
-    leg 2" redeploy path (i.e. only reached when on_ordinary_redeploy_due
-    did NOT request a cooldown this tick, meaning the leg that just
-    finished was "1"). Persists leg "2" so the fresh deploy that comes up
-    trades leg 2 instead of restarting leg 1.
-    """
-    state = load_state()
-    if state["leg"] == "1":
-        logger.info("FIXED-CYCLE: leg 1 complete — advancing to leg 2")
-        _persist_env_vars({"FIXED_LEG": "2"})
+    request_cooldown("leg 1 complete (single-leg cycle)")
 
 
 def enter_cooldown_now() -> float:
     """
     Called by bot_engine._settle_loop() ONLY once every open contract has
-    been actively, confirmably closed. Persists the cooldown window (so
-    it survives the redeploy that ends it) and resets the leg counter
-    back to "1" so the post-cooldown deploy starts a fresh pair of legs,
-    then starts the supervisor thread that waits it out and fires the
-    Render deploy hook. Returns the cooldown_until epoch.
+    been actively, confirmably closed. Draws a fresh cooldown length,
+    uniformly at random, between config.FIXED_CYCLE_COOLDOWN_MIN_MINUTES
+    and config.FIXED_CYCLE_COOLDOWN_MAX_MINUTES, persists the resulting
+    absolute deadline (so it survives any redeploy, including one that
+    lands mid-cooldown for an unrelated reason — see in_cooldown_at_boot
+    above), then starts the supervisor thread that waits it out and
+    fires the Render deploy hook. Returns the cooldown_until epoch.
     """
     global _cooldown_requested
 
-    cooldown_mins  = getattr(config, "FIXED_CYCLE_COOLDOWN_MINUTES", 5)
+    min_mins = getattr(config, "FIXED_CYCLE_COOLDOWN_MIN_MINUTES", 75)
+    max_mins = getattr(config, "FIXED_CYCLE_COOLDOWN_MAX_MINUTES", 150)
+    if max_mins < min_mins:
+        min_mins, max_mins = max_mins, min_mins
+    cooldown_mins  = random.uniform(min_mins, max_mins)
     cooldown_until = time.time() + cooldown_mins * 60
 
     _persist_env_vars({
         "FIXED_PHASE":          "cooldown",
         "FIXED_COOLDOWN_UNTIL": f"{cooldown_until:.0f}",
-        "FIXED_LEG":            "1",
     })
     _cooldown_requested = False
     _push_dashboard_flag(
@@ -328,17 +309,17 @@ def enter_cooldown_now() -> float:
         fixed_cycle_cooldown_until=cooldown_until,
     )
     logger.warning(
-        f"FIXED-CYCLE: both legs complete — {cooldown_mins:.0f} min "
-        f"cooldown, then back to a fresh leg 1")
+        f"FIXED-CYCLE: leg 1 complete — {cooldown_mins:.1f} min cooldown "
+        f"(randomly chosen between {min_mins:.0f} and {max_mins:.0f} min), "
+        f"then back to a fresh leg 1")
     start_cooldown_supervisor(cooldown_until)
     return cooldown_until
 
 
 # ── Cooldown supervisor — dedicated thread, deliberately NOT tied to the
-#    bot's asyncio event loop, same reasoning as strategy_cycle.py's /
-#    profit_cycle.py's supervisor of the same shape (that loop is torn
-#    down the moment run() returns and asyncio.run() in main.py's
-#    _run_bot() exits). ───────────────────────────────────────────────────
+#    bot's asyncio event loop, same reasoning as the previous version's
+#    supervisor of the same shape (that loop is torn down the moment
+#    run() returns and asyncio.run() in main.py's _run_bot() exits). ───────
 
 def _fire_deploy_hook() -> None:
     hook_url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "") or \
@@ -350,8 +331,8 @@ def _fire_deploy_hook() -> None:
             "COOLDOWN OVER BUT RENDER_DEPLOY_HOOK_URL IS NOT SET\n"
             "Cannot redeploy to resume trading on a fresh leg 1. Add it "
             "in the Render dashboard — doing so restarts this service "
-            "itself, which will pick the reset leg counter up from "
-            "there. Rechecking every 5 min.\n" + "=" * 78
+            "itself, which will pick the reset phase up from there. "
+            "Rechecking every 5 min.\n" + "=" * 78
         )
         _push_dashboard_flag(fixed_cycle_redeploy_hook_missing=True)
         time.sleep(300)
