@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -2219,26 +2220,39 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
 
 # ---------------------------------------------------------------------------
-# Donkey Strategy — ORIGINAL ONLY (Sep 2026, chat-requested).
+# Donkey Strategy — TWO variants, auto-cycling between them forever.
 #   ORIGINAL (has inversion): bets the HOT digit continues, DIGITUNDER on
-#     the trend filter. This is the variant this file shipped with, and
-#     now the only one that can ever trade.
+#     the trend filter. This is the variant this file shipped with.
 #   RAW (no inversion): bets the COLD digit is "due", DIGITOVER on the
-#     trend filter. Mirror image of ORIGINAL — DISABLED. The functions
-#     below (_donkey_signal_1_raw / _donkey_signal_2_raw) stay in the
-#     file untouched but are now unreachable, the same way every
-#     non-Donkey evaluator already was — see SignalEngine.evaluate()'s
-#     global exclusivity gate.
-# The old balance-trend auto-switch between the two variants
-# (strategy_cycle.py) is gone too — that module is no longer imported
-# here or anywhere else in the project. _donkey_active_variant() below no
-# longer reads any persisted state; it's a hardcoded constant.
+#     trend filter. Mirror image of ORIGINAL in every respect.
+# config.DONKEY_CYCLE_START picks which variant runs first; the two then
+# alternate every config.DONKEY_CYCLE_PHASE_MINUTES minutes, forever
+# (ORIGINAL 15min -> RAW 15min -> ORIGINAL 15min -> ...). The active
+# variant is derived from wall-clock time (_donkey_active_variant()), NOT
+# a redeploy counter — every restart_scheduler.py redeploy is a full
+# container restart that wipes in-process state, so time.time() is the
+# only thing guaranteed to be right immediately on boot with no
+# persistence needed. See config.py's "DONKEY STRATEGY" block, and
+# SignalEngine.evaluate() for the global exclusivity gate this is wired
+# behind.
 # ---------------------------------------------------------------------------
 
 def _donkey_active_variant() -> str:
-    """Locked to ORIGINAL — RAW and the balance-trend switch that used to
-    choose between the two are both disabled (Sep 2026, chat-requested)."""
-    return "ORIGINAL"
+    """
+    Which variant is active right now, purely from time.time() -- no
+    stored state, so it's correct immediately after every redeploy
+    (full container restart) with no persistence required. Self-heals
+    against redeploy-timing drift since it's recomputed fresh every call.
+    """
+    phase_secs = max(1, int(getattr(config, "DONKEY_CYCLE_PHASE_MINUTES", 15) * 60))
+    cycle_secs = phase_secs * 2
+    pos = int(time.time()) % cycle_secs
+    first_half = pos < phase_secs
+    start = str(getattr(config, "DONKEY_CYCLE_START", "ORIGINAL")).strip().upper()
+    if start not in ("ORIGINAL", "RAW"):
+        start = "ORIGINAL"
+    other = "RAW" if start == "ORIGINAL" else "ORIGINAL"
+    return start if first_half else other
 
 
 def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
@@ -2421,11 +2435,11 @@ def _donkey_combine(
 def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalResult:
     """
     Dispatches to whichever variant _donkey_active_variant() says is
-    currently active (always "ORIGINAL" now — see that function), then
-    behaves exactly like the single-variant version did:
-    config.DONKEY_STRATEGY_MODE picks INDEPENDENT (either signal fires
-    alone, signal 1 checked first) vs COMBINED (both must agree — see
-    _donkey_combine()).
+    currently active (see that function + config.DONKEY_CYCLE_START /
+    DONKEY_CYCLE_PHASE_MINUTES), then behaves exactly like the
+    single-variant version did: config.DONKEY_STRATEGY_MODE picks
+    INDEPENDENT (either signal fires alone, signal 1 checked first) vs
+    COMBINED (both must agree — see _donkey_combine()).
     """
     if not ticks:
         return NONE_RESULT
