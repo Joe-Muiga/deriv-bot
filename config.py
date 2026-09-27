@@ -1213,7 +1213,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 5 / 60   # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 3 / 60   # 5 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1664,7 +1664,7 @@ FIXED_CYCLE_LEG_MINUTES          = 5     # length of leg 1 — kept equal
 FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 1     # 1h15m — lower bound of the
                                           # randomized cooldown after
                                           # every leg 1
-FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 5   # 2h30m — upper bound; a fresh
+FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 3  # 2h30m — upper bound; a fresh
                                           # value is drawn uniformly at
                                           # random between these two
                                           # every time leg 1 ends (see
