@@ -2294,10 +2294,16 @@ def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[s
 
 def _donkey_signal_2_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
     """
-    ORIGINAL (inverted) trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick
-    SMA; fires DIGITUNDER at DONKEY_TREND_BARRIER only when the current
-    tick is BELOW the SMA, does nothing when current >= SMA. Returns
+    ORIGINAL trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick SMA; fires
+    DIGITOVER at DONKEY_TREND_BARRIER only when the current tick is BELOW
+    the SMA (counter-trend), does nothing when current >= SMA. Returns
     (match_type, barrier, score) or None.
+
+    NOTE (Sep 2026, chat-requested one-line flip): trigger condition,
+    SMA period, and barrier are unchanged from before — only the
+    match_type returned when it fires was flipped from "UNDER" to
+    "OVER". Signal 1 and the INDEPENDENT/COMBINED combination logic in
+    _donkey_combine()/evaluate_donkey_strategy() were NOT touched.
     """
     period = getattr(config, "DONKEY_TREND_SMA_PERIOD", 8)
     if len(ticks) < period + 1:
@@ -2316,7 +2322,7 @@ def _donkey_signal_2_original(ticks: List[Any], symbol: str) -> Optional[Tuple[s
     barrier = getattr(config, "DONKEY_TREND_BARRIER", 3)
     spread = float(np.std(quotes)) or 1e-9
     score = max(0.0, min(1.0, (sma_val - current) / (3 * spread)))
-    return "UNDER", barrier, score
+    return "OVER", barrier, score
 
 
 def _donkey_signal_1_raw(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float, int, int]]:
