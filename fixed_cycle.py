@@ -299,10 +299,16 @@ def enter_cooldown_now() -> float:
     cooldown_mins  = random.uniform(min_mins, max_mins)
     cooldown_until = time.time() + cooldown_mins * 60
 
-    _persist_env_vars({
+    _state = {
         "FIXED_PHASE":          "cooldown",
         "FIXED_COOLDOWN_UNTIL": f"{cooldown_until:.0f}",
-    })
+    }
+    try:  # carry the donkey guard's session state across the redeploy
+        from donkey_guard import get_guard
+        _state["DONKEY_GUARD_STATE"] = get_guard().export_state()
+    except Exception as exc:
+        logger.warning(f"FIXED-CYCLE: could not export donkey guard state: {exc}")
+    _persist_env_vars(_state)
     _cooldown_requested = False
     _push_dashboard_flag(
         fixed_cycle_phase="cooldown",
