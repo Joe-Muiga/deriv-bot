@@ -2284,7 +2284,22 @@ def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[s
     hot_freq, cold_freq = counts[hot] / n, counts[cold] / n
     score = max(0.0, min(1.0, hot_freq - cold_freq))
 
-    if getattr(config, "DONKEY_WIDEST_ZONE", True):
+    # PAYOUT-RATIO mode (Sep 28 2026, chat-requested — highest win rate
+    # possible while payout stays >= config.DONKEY_MIN_PAYOUT_RATIO x
+    # stake) takes over whenever that ratio is configured; it's checked
+    # first and, when it applies, is authoritative — no silent fallback
+    # to a wider/riskier-payout zone if this hot/cold pair can't clear it,
+    # since that would break the payout guarantee the setting promises.
+    payout_pick = _donkey_payout_target_barrier(hot, cold)
+    if payout_pick is not None:
+        match_type, barrier = payout_pick
+    elif getattr(config, "DONKEY_MIN_PAYOUT_RATIO", None):
+        # Ratio mode is on but this specific hot/cold pair can't reach a
+        # barrier that both satisfies the contrarian constraint AND clears
+        # the payout floor — skip this tick rather than take a trade that
+        # breaks the payout promise.
+        return None
+    elif getattr(config, "DONKEY_WIDEST_ZONE", True):
         # WIDEST-ZONE selection (win-rate fix, Sep 2026). Same contrarian
         # constraint as before (hot digit inside the winning zone, cold
         # digit outside it) but the barrier is now the one that gives the
@@ -2321,6 +2336,70 @@ def _donkey_win_prob(match_type: str, barrier: int) -> float:
     return barrier / 10.0
 
 
+def _donkey_max_win_prob() -> Optional[float]:
+    """config.DONKEY_MIN_PAYOUT_RATIO (payout as a multiple of stake, e.g.
+    2.0 = payout >= 2x stake) converted to the win-probability CEILING a
+    contract must stay under to guarantee that payout, via Deriv's fair-
+    price relationship payout_ratio = (1-P)/P  =>  P = 1/(1+payout_ratio).
+    Returns None if the payout-ratio mode is off (ratio unset/<=0), in
+    which case barrier selection falls back to DONKEY_WIDEST_ZONE /
+    DONKEY_MIN_WIN_PROB (maximize win rate, no payout floor)."""
+    ratio = getattr(config, "DONKEY_MIN_PAYOUT_RATIO", None)
+    if not ratio or ratio <= 0:
+        return None
+    return 1.0 / (1.0 + float(ratio))
+
+
+def _donkey_payout_target_barrier(hot: int, cold: int) -> Optional[Tuple[str, int]]:
+    """Highest-win-rate barrier that still keeps payout >= config.
+    DONKEY_MIN_PAYOUT_RATIO x stake, subject to the contrarian constraint
+    (hot inside the winning zone, cold outside it). Returns None if no
+    barrier satisfies both at once for this hot/cold pair (this hot/cold
+    read just can't clear the payout floor this tick) or if payout-ratio
+    mode is off.
+
+    OVER (cold < hot): winning zone {b+1..9}. Structural range for b is
+    [cold, hot-1] (hot inside needs b<=hot-1, cold outside needs b>=cold).
+    P=(9-b)/10 falls as b rises, so the smallest b in range that still
+    clears the ceiling is the highest win rate available.
+
+    UNDER (cold > hot): winning zone {0..b-1}. Structural range for b is
+    [hot+1, cold]. P=b/10 rises as b rises, so the largest b in range that
+    still clears the ceiling is the highest win rate available.
+    """
+    max_p = _donkey_max_win_prob()
+    if max_p is None:
+        return None
+    if cold < hot:
+        lo, hi = cold, hot - 1
+        if lo > hi:
+            return None
+        b_floor = math.ceil(9 - 10 * max_p)
+        b = max(lo, b_floor)
+        if b > hi:
+            return None
+        return "OVER", b
+    else:
+        lo, hi = hot + 1, cold
+        if lo > hi:
+            return None
+        b_ceil = math.floor(10 * max_p)
+        b = min(hi, b_ceil)
+        if b < lo:
+            return None
+        return "UNDER", b
+
+
+def _donkey_trend_barrier() -> int:
+    """Signal 2's fixed DIGITUNDER barrier. When payout-ratio mode is on,
+    derived from the same P=1/(1+ratio) ceiling as signal 1 instead of the
+    static config.DONKEY_TREND_BARRIER, so both signals honor one knob."""
+    max_p = _donkey_max_win_prob()
+    if max_p is not None:
+        return max(1, min(9, int(math.floor(10 * max_p))))
+    return int(getattr(config, "DONKEY_TREND_BARRIER", 3))
+
+
 def _donkey_signal_2_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
     """
     ORIGINAL (inverted) trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick
@@ -2342,7 +2421,7 @@ def _donkey_signal_2_original(ticks: List[Any], symbol: str) -> Optional[Tuple[s
     if current >= sma_val:
         return None  # spec: skip unless current tick < SMA
 
-    barrier = getattr(config, "DONKEY_TREND_BARRIER", 3)
+    barrier = _donkey_trend_barrier()
     spread = float(np.std(quotes)) or 1e-9
     score = max(0.0, min(1.0, (sma_val - current) / (3 * spread)))
     return "UNDER", barrier, score
@@ -2480,7 +2559,9 @@ def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalR
     mode = getattr(config, "DONKEY_STRATEGY_MODE", "INDEPENDENT")
     strategy_label = f"DONKEY-{variant}"
 
-    min_p = float(getattr(config, "DONKEY_MIN_WIN_PROB", 0.80))
+    ratio_mode = bool(getattr(config, "DONKEY_MIN_PAYOUT_RATIO", None))
+    max_p = _donkey_max_win_prob()   # ceiling, ratio mode only (else None)
+    min_p = float(getattr(config, "DONKEY_MIN_WIN_PROB", 0.80))  # floor, non-ratio mode only
     min_freq_score = float(getattr(config, "DONKEY_MIN_SCORE", 0.10))
     min_trend_score = float(getattr(config, "DONKEY_TREND_MIN_SCORE", 0.20))
 
@@ -2518,12 +2599,21 @@ def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalR
     best = max(cands, key=lambda c: (c[0], c[1]))
     p_win, _raw, match_type, barrier, reason = best
 
-    if p_win < min_p:
-        why = f"P(win) {p_win:.0%} < min {min_p:.0%} ({reason})"
-        logger.info(f"REJECTED: {symbol} {strategy_label} strength=0 score={p_win:.3f} — {why}")
-        return SignalResult("NONE", 0, p_win, strategy_label, f"Below win-prob floor ({why})")
-
-    strength = 3 if p_win >= 0.90 else 2
+    if ratio_mode:
+        # Barrier selection (_donkey_payout_target_barrier / _donkey_trend_
+        # barrier) already enforces P(win) <= max_p so payout stays >=
+        # DONKEY_MIN_PAYOUT_RATIO x stake — this is just a safety net.
+        if max_p is not None and p_win > max_p + 1e-9:
+            why = f"P(win) {p_win:.0%} > payout-ratio ceiling {max_p:.0%} ({reason})"
+            logger.warning(f"REJECTED: {symbol} {strategy_label} strength=0 score={p_win:.3f} — {why}")
+            return SignalResult("NONE", 0, p_win, strategy_label, f"Above payout ceiling ({why})")
+        strength = 3 if (max_p is not None and p_win >= max_p - 0.05) else 2
+    else:
+        if p_win < min_p:
+            why = f"P(win) {p_win:.0%} < min {min_p:.0%} ({reason})"
+            logger.info(f"REJECTED: {symbol} {strategy_label} strength=0 score={p_win:.3f} — {why}")
+            return SignalResult("NONE", 0, p_win, strategy_label, f"Below win-prob floor ({why})")
+        strength = 3 if p_win >= 0.90 else 2
     logger.info(f"SIGNAL: {symbol} {strategy_label} {match_type}{barrier} strength={strength} P(win)={p_win:.2f} | {reason}")
     return SignalResult(
         direction=match_type,
