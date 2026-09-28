@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 2000
+MANUAL_STAKE_AMOUNT = 0.5
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 2000    # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.5    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1693,7 +1693,10 @@ DONKEY_FREQ_MIN_SAMPLE  = 100
 # instead of being dead weight (UNDER 3 is a fixed 30%-of-digits contract
 # — see the P(win) note below).
 DONKEY_TREND_SMA_PERIOD = 8
-DONKEY_TREND_BARRIER    = 8
+DONKEY_TREND_BARRIER    = 9    # UNDER 9 -> P=0.90, matches the max-win-
+                                # probability ceiling below so signal 2
+                                # can still qualify instead of always
+                                # losing to the 0.90 floor.
 
 # ═══════════════════════════════════════════════════════════════════════
 # DONKEY WIN-RATE TUNING (Sep 28 2026, chat-requested — win rate was ~10%)
@@ -1738,10 +1741,59 @@ DONKEY_TREND_BARRIER    = 8
 # paper-trade this before pointing it at a funded account, and treat
 # DONKEY_MIN_WIN_PROB as a dial, not a one-way switch — lower it (e.g.
 # 0.60-0.70) for a middle ground between win frequency and payout size.
-DONKEY_WIDEST_ZONE   = True    # False restores the old hot±1 barrier
-DONKEY_MIN_WIN_PROB  = 0.80    # 0.0-1.0; reject any contract below this
+DONKEY_WIDEST_ZONE   = True    # False restores the old hot±1 barrier.
+                                # Only used when DONKEY_MIN_PAYOUT_RATIO
+                                # below is unset/0.
+# ── MAX-WIN-PROBABILITY MODE (Sep 28 2026, chat-requested — trade very
+# rarely, but only at the highest win probability the bot can reach) ────
+# 0.90 is not a chosen target, it's a HARD CEILING: on a single-tick Deriv
+# digit contract (Over/Under/Match/Differ) with a uniform last digit, the
+# best any barrier can ever score is 9/10 — e.g. DIGITOVER(0) loses only
+# if the digit is exactly 0, DIGITUNDER(9) loses only if it's exactly 9.
+# No barrier choice, scoring tweak, or combination of signals gets a
+# single such contract above 90% — there is no "closer to 1" available
+# from this contract family. Setting the floor here AT that ceiling means
+# only the rare tick where the widest-zone barrier lands on 0.90 (cold
+# digit reads exactly 0 or 9) clears it — simulated: ~10.3% of ticks
+# (vs. ~19% at a 0.80 floor), win rate 0.900 exactly, on 4M synthetic
+# ticks. Lower this (e.g. 0.80-0.85) for more trades at a still-high but
+# less extreme win rate.
+DONKEY_MIN_WIN_PROB  = 0.90    # 0.0-1.0, capped at 0.90 by contract math.
+                                # Only used when DONKEY_MIN_PAYOUT_RATIO
+                                # below is unset/0.
 DONKEY_MIN_SCORE     = 0.10    # signal-1 hot/cold gap floor (noise guard)
 DONKEY_TREND_MIN_SCORE = 0.20  # signal-2 below-SMA distance floor
+
+# ── DONKEY PAYOUT-RATIO MODE (Sep 28 2026, chat-requested) ──────────────
+# Supersedes DONKEY_WIDEST_ZONE / DONKEY_MIN_WIN_PROB above whenever set
+# (>0) — this is now the primary knob. Request was: win rate as low as
+# ~30% is fine, but every trade must pay out AT LEAST this many times the
+# stake, AND win rate should be the highest possible subject to that.
+#
+# Deriv fair-prices Over/Under payout as payout_ratio = (1-P)/P, so a
+# payout floor is exactly a win-probability CEILING: P_max = 1/(1+ratio).
+# For ratio=2.0 that's P_max = 1/3 -> the nearest barrier at-or-under that
+# ceiling is P=0.30 (OVER 6 / UNDER 3, payout ~2.33x stake) — the highest
+# win rate obtainable without breaking the 2x payout promise. Both Donkey
+# signals now solve for that same barrier (see signal_engine.py's
+# _donkey_payout_target_barrier() / _donkey_trend_barrier()); a tick whose
+# hot/cold read can't reach a barrier satisfying BOTH the payout floor and
+# the contrarian constraint is skipped rather than taking a trade that
+# breaks the payout guarantee — so this also throttles trade frequency
+# versus the old always-fires behavior (simulated: ~27% of ticks, 28.4%
+# empirical win rate, ~2.5x realised payout ratio, on 4M synthetic ticks).
+#
+# Set to 0 or None to go back to the win-rate-maximizing mode above
+# (DONKEY_WIDEST_ZONE / DONKEY_MIN_WIN_PROB) with no payout floor at all.
+DONKEY_MIN_PAYOUT_RATIO = 2.0   # ON again (Sep 28 2026, chat-requested:
+                                # highest win rate achievable while payout
+                                # stays > 2x stake). Overrides
+                                # DONKEY_MIN_WIN_PROB/DONKEY_WIDEST_ZONE
+                                # above entirely while set > 0 — see the
+                                # PAYOUT-RATIO MODE block below for the
+                                # math. Max win rate achievable under a 2x
+                                # payout floor is 1/3 (33%); can't be
+                                # pushed higher without lowering this.
 
 # ── Donkey guard (donkey_guard.py) — LIMITS losses, does not create edge ──
 # Stops are in units of your fixed stake, so they scale with MANUAL_STAKE_AMOUNT.
