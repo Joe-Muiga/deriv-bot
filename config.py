@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 110
+MANUAL_STAKE_AMOUNT = 2000
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 110   # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 2000    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1688,9 +1688,60 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "")
 DONKEY_FREQ_WINDOW      = 100
 DONKEY_FREQ_MIN_SAMPLE  = 100
 
-# Signal 2 — SMA period and fixed DIGITUNDER barrier, per spec.
+# Signal 2 — SMA period. DONKEY_TREND_BARRIER default raised 3 -> 8 (see
+# below) so this signal has a chance of clearing DONKEY_MIN_WIN_PROB
+# instead of being dead weight (UNDER 3 is a fixed 30%-of-digits contract
+# — see the P(win) note below).
 DONKEY_TREND_SMA_PERIOD = 8
-DONKEY_TREND_BARRIER    = 3
+DONKEY_TREND_BARRIER    = 8
+
+# ═══════════════════════════════════════════════════════════════════════
+# DONKEY WIN-RATE TUNING (Sep 28 2026, chat-requested — win rate was ~10%)
+# ═══════════════════════════════════════════════════════════════════════
+# Root cause of the ~10% win rate: signal_engine._donkey_signal_1_original
+# picked the barrier CLOSEST to the hot digit (OVER hot-1 / UNDER hot+1),
+# which is the NARROWEST winning zone of every barrier choice that still
+# keeps hot inside and cold outside — e.g. hot=9 -> OVER 8, a contract
+# that only wins on a single digit (10% of ticks). Signal 2 additionally
+# used a FIXED 30%-win DIGITUNDER 3, taken uncritically whenever it fired
+# and signal 1 hadn't. Neither signal's "score" (hot/cold frequency gap,
+# distance below the SMA) is actually a probability of winning — score
+# was being used as if it were one.
+#
+# For a Deriv digit Over/Under contract, the win probability is a fact of
+# arithmetic, not a read on the market: DIGITOVER(b) wins on digits > b,
+# i.e. P = (9-b)/10; DIGITUNDER(b) wins on digits < b, i.e. P = b/10 —
+# true regardless of any hot/cold/trend read, as long as the underlying
+# last digit is close to uniformly distributed (true by design on these
+# synthetic indices). Two changes now apply:
+#   1. DONKEY_WIDEST_ZONE: signal 1's barrier is chosen to be the WIDEST
+#      zone that still keeps hot inside / cold outside (barrier = cold,
+#      not hot±1) — this alone raises the ceiling from ~10-50% to 50-90%
+#      depending on where the cold digit lands.
+#   2. DONKEY_MIN_WIN_PROB: a hard floor — evaluate_donkey_strategy() now
+#      computes both signals' actual P(win) and REJECTS the trade
+#      entirely (no entry that tick) unless the best one clears this bar,
+#      taking the higher-P(win) signal when both qualify instead of
+#      always preferring signal 1.
+#
+# ── IMPORTANT — this does NOT create a bigger edge, it reshapes the bet ──
+# Deriv prices Over/Under payouts off this same win probability (minus
+# its house edge), so a 90%-win contract pays out only slightly more than
+# stake per win, while the ~10-20%-win contracts the bot was taking
+# before pay out several times stake per win. Raising DONKEY_MIN_WIN_PROB
+# trades "loses often, wins big" for "wins often, wins small" — it does
+# NOT change the long-run expected value of a single bet, which stays
+# governed by Deriv's built-in edge either way. If most of the account's
+# actual profit has been coming from the rare big wins on those
+# low-probability barriers, pushing win rate this high can shrink realised
+# profit even though the strategy now "wins" far more often. Back-test /
+# paper-trade this before pointing it at a funded account, and treat
+# DONKEY_MIN_WIN_PROB as a dial, not a one-way switch — lower it (e.g.
+# 0.60-0.70) for a middle ground between win frequency and payout size.
+DONKEY_WIDEST_ZONE   = True    # False restores the old hot±1 barrier
+DONKEY_MIN_WIN_PROB  = 0.80    # 0.0-1.0; reject any contract below this
+DONKEY_MIN_SCORE     = 0.10    # signal-1 hot/cold gap floor (noise guard)
+DONKEY_TREND_MIN_SCORE = 0.20  # signal-2 below-SMA distance floor
 
 # ── Donkey guard (donkey_guard.py) — LIMITS losses, does not create edge ──
 # Stops are in units of your fixed stake, so they scale with MANUAL_STAKE_AMOUNT.
@@ -1703,4 +1754,3 @@ DONKEY_GUARD_HALT_MINS                   = 120  # halt length, then a fresh sess
 DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 8    # losses in a row before pausing
 DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30
 DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
- 
