@@ -62,6 +62,7 @@ from signal_engine import SignalEngine, SignalResult, compute_enriched_features
 from risk_manager import RiskManager
 from news_filter import NewsFilter
 from trade_journal import TradeJournal
+from donkey_guard import get_guard, signal_kind_from_reason
 from symbol_manager import SymbolManager
 import indicators as ind
 from keep_alive import (update_status, set_active_trades,
@@ -388,6 +389,7 @@ class BotEngine:
         #    daily limit.
         self._global_consecutive_losses: int              = 0
         self._loss_streak_paused_until:  float             = 0.0
+        self._donkey_guard = get_guard()  # session stop/take-profit, streak pause, edge log
 
         # ── Ensemble voting: per-symbol rolling history of (strategy,
         #    direction, timestamp) tuples for every signal produced by
@@ -1281,6 +1283,12 @@ class BotEngine:
                     f"PAUSED: global consecutive-loss cooldown — "
                     f"{remaining:.1f}min remaining, no new entries")
 
+            _guard_ok, _guard_reason = self._donkey_guard.can_enter()
+            if not _guard_ok:
+                if available_slots > 0:
+                    logger.info(f"PAUSED: donkey guard — {_guard_reason}")
+                in_loss_streak_pause = True
+
             top: List[ScanResult] = []
             if available_slots > 0 and not self._confirmed_paused and not in_loss_streak_pause:
                 for r in ranked:
@@ -2120,6 +2128,8 @@ class BotEngine:
                     digit      = digit,
                     match_type = match_type,
                 )
+                if buy_resp:
+                    self._donkey_guard.note_entry()
         # Boom/Crash, Jump, and Drift Switch symbols don't support CALL/PUT
         # Rise/Fall on this account — route them to buy_multiplier() instead.
         # config.MULTIPLIER_SYMBOLS is the single source of truth for this
@@ -2446,6 +2456,23 @@ class BotEngine:
         if pnl < 0:
             self._confirmed_daily_loss += abs(pnl)
         self._check_confirmed_loss_limit()
+
+        # Donkey guard: edge log (real payout, breakeven) + session limits.
+        if str(strategy).startswith("DONKEY"):
+            try:
+                _sig = info.get("sig")
+                self._donkey_guard.record(
+                    symbol      = symbol,
+                    signal_kind = signal_kind_from_reason(getattr(_sig, "reason", "")),
+                    contract    = str(getattr(_sig, "match_type", "") or ""),
+                    barrier     = getattr(_sig, "digit", ""),
+                    stake       = stake,
+                    payout      = payout,
+                    won         = won,
+                    pnl         = pnl,
+                )
+            except Exception as exc:
+                logger.warning(f"donkey_guard.record({symbol}) failed: {exc}")
 
         # ── Global consecutive-loss circuit breaker ─────────────────────
         if won:
