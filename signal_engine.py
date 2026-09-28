@@ -2219,18 +2219,16 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 
 
 # ---------------------------------------------------------------------------
-# Donkey Strategy — RAW ONLY (Sep 2026, chat-requested).
+# Donkey Strategy — ORIGINAL ONLY (Sep 2026, chat-requested).
+#   ORIGINAL (has inversion): bets the HOT digit continues, DIGITUNDER on
+#     the trend filter. This is the variant this file shipped with, and
+#     now the only one that can ever trade.
 #   RAW (no inversion): bets the COLD digit is "due", DIGITOVER on the
-#     trend filter. This is now the only variant that can ever trade —
-#     both Signal 1 and Signal 2 run un-inverted.
-#   ORIGINAL (has inversion): bets the HOT digit continues; its trend
-#     filter (_donkey_signal_2_original) was itself hand-edited in a
-#     prior request to fire DIGITOVER instead of DIGITUNDER, but that
-#     edit is now moot — ORIGINAL is DISABLED, so neither
-#     _donkey_signal_1_original nor _donkey_signal_2_original can run.
-#     Both stay in the file untouched but unreachable, the same way
-#     every non-Donkey evaluator already was — see
-#     SignalEngine.evaluate()'s global exclusivity gate.
+#     trend filter. Mirror image of ORIGINAL — DISABLED. The functions
+#     below (_donkey_signal_1_raw / _donkey_signal_2_raw) stay in the
+#     file untouched but are now unreachable, the same way every
+#     non-Donkey evaluator already was — see SignalEngine.evaluate()'s
+#     global exclusivity gate.
 # The old balance-trend auto-switch between the two variants
 # (strategy_cycle.py) is gone too — that module is no longer imported
 # here or anywhere else in the project. _donkey_active_variant() below no
@@ -2238,9 +2236,8 @@ def evaluate_step_grid(ltf_bars: List[Candle], symbol: str) -> SignalResult:
 # ---------------------------------------------------------------------------
 
 def _donkey_active_variant() -> str:
-    """Locked to ORIGINAL (conventional: hot-digit-continues + trade-with-
-    trend) — RAW and the balance-trend switch that used to choose between
-    the two are both disabled (Sep 2026, chat-requested)."""
+    """Locked to ORIGINAL — RAW and the balance-trend switch that used to
+    choose between the two are both disabled (Sep 2026, chat-requested)."""
     return "ORIGINAL"
 
 
@@ -2297,16 +2294,10 @@ def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[s
 
 def _donkey_signal_2_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
     """
-    ORIGINAL trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick SMA; fires
-    DIGITOVER at DONKEY_TREND_BARRIER only when the current tick is BELOW
-    the SMA (counter-trend), does nothing when current >= SMA. Returns
+    ORIGINAL (inverted) trend-filter logic. DONKEY_TREND_SMA_PERIOD-tick
+    SMA; fires DIGITUNDER at DONKEY_TREND_BARRIER only when the current
+    tick is BELOW the SMA, does nothing when current >= SMA. Returns
     (match_type, barrier, score) or None.
-
-    NOTE (Sep 2026, chat-requested one-line flip): trigger condition,
-    SMA period, and barrier are unchanged from before — only the
-    match_type returned when it fires was flipped from "UNDER" to
-    "OVER". Signal 1 and the INDEPENDENT/COMBINED combination logic in
-    _donkey_combine()/evaluate_donkey_strategy() were NOT touched.
     """
     period = getattr(config, "DONKEY_TREND_SMA_PERIOD", 8)
     if len(ticks) < period + 1:
