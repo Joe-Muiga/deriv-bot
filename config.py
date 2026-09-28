@@ -1703,3 +1703,4 @@ DONKEY_GUARD_HALT_MINS                   = 120  # halt length, then a fresh sess
 DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 8    # losses in a row before pausing
 DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30
 DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
+ 
