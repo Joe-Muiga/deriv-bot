@@ -2284,12 +2284,41 @@ def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[s
     hot_freq, cold_freq = counts[hot] / n, counts[cold] / n
     score = max(0.0, min(1.0, hot_freq - cold_freq))
 
-    if cold < hot:
-        match_type, barrier = "OVER", hot - 1
+    if getattr(config, "DONKEY_WIDEST_ZONE", True):
+        # WIDEST-ZONE selection (win-rate fix, Sep 2026). Same contrarian
+        # constraint as before (hot digit inside the winning zone, cold
+        # digit outside it) but the barrier is now the one that gives the
+        # LARGEST such zone instead of the smallest-extreme one:
+        #   cold < hot : OVER(b) wins {b+1..9}; hot inside needs b <= hot-1,
+        #                cold outside needs b >= cold  ->  b = cold is the
+        #                widest -> P(win) = (9-cold)/10.
+        #   cold > hot : UNDER(b) wins {0..b-1}; hot inside needs b >= hot+1,
+        #                cold outside needs b <= cold  ->  b = cold is the
+        #                widest -> P(win) = cold/10.
+        # The old barrier (hot-1 / hot+1) collapsed to a 10% contract
+        # whenever the hot digit was 0 or 9 (OVER 8 / UNDER 1) and averaged
+        # far lower than this for mid/edge hot digits.
+        if cold < hot:
+            match_type, barrier = "OVER", cold
+        else:
+            match_type, barrier = "UNDER", cold
     else:
-        match_type, barrier = "UNDER", hot + 1
+        if cold < hot:
+            match_type, barrier = "OVER", hot - 1
+        else:
+            match_type, barrier = "UNDER", hot + 1
 
     return match_type, barrier, score, hot, cold
+
+
+def _donkey_win_prob(match_type: str, barrier: int) -> float:
+    """Theoretical P(win) of a Deriv digit Over/Under at `barrier`, assuming
+    the last digit is uniform (which it is on synthetic indices).
+    DIGITOVER b wins on digits > b -> (9-b)/10; DIGITUNDER b wins on
+    digits < b -> b/10."""
+    if match_type == "OVER":
+        return (9 - barrier) / 10.0
+    return barrier / 10.0
 
 
 def _donkey_signal_2_original(ticks: List[Any], symbol: str) -> Optional[Tuple[str, int, float]]:
@@ -2421,11 +2450,18 @@ def _donkey_combine(
 def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalResult:
     """
     Dispatches to whichever variant _donkey_active_variant() says is
-    currently active (always "ORIGINAL" now — see that function), then
-    behaves exactly like the single-variant version did:
-    config.DONKEY_STRATEGY_MODE picks INDEPENDENT (either signal fires
-    alone, signal 1 checked first) vs COMBINED (both must agree — see
-    _donkey_combine()).
+    currently active (always "ORIGINAL" now — see that function).
+
+    WIN-RATE GATE (Sep 2026): every candidate contract must clear
+    config.DONKEY_MIN_WIN_PROB (theoretical P(win) of the Over/Under
+    barrier). The old code accepted any barrier, including OVER 8 / UNDER 1
+    (10% contracts) and the fixed UNDER 3 trend bet (30%), which is what
+    dragged the realised win rate to ~10%. Signal 1 is also no longer
+    allowed to silently block Signal 2: both are evaluated and the
+    candidate with the higher P(win) (ties: higher score) is taken.
+
+    SignalResult.score is now the contract's P(win) (0-1), so the bot's
+    ranking (which sorts by score) always prefers the safest contract.
     """
     if not ticks:
         return NONE_RESULT
@@ -2444,36 +2480,55 @@ def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalR
     mode = getattr(config, "DONKEY_STRATEGY_MODE", "INDEPENDENT")
     strategy_label = f"DONKEY-{variant}"
 
-    match_type = barrier = None
-    score = 0.0
+    min_p = float(getattr(config, "DONKEY_MIN_WIN_PROB", 0.80))
+    min_freq_score = float(getattr(config, "DONKEY_MIN_SCORE", 0.10))
+    min_trend_score = float(getattr(config, "DONKEY_TREND_MIN_SCORE", 0.20))
+
+    # candidates: (p_win, raw_score, match_type, barrier, reason)
+    cands: List[Tuple[float, float, str, int, str]] = []
     reason = "Neither signal ready"
 
     if mode == "COMBINED":
         combined, reason = _donkey_combine(sig1, sig2, target_type, barrier_combine)
         if combined is not None:
-            match_type, barrier, score = combined
-    else:  # INDEPENDENT
+            mt, b, sc = combined
+            cands.append((_donkey_win_prob(mt, b), sc, mt, b, reason))
+    else:  # INDEPENDENT — evaluate both, do not let signal 1 shadow signal 2
         if sig1 is not None:
-            match_type, barrier, score, hot, cold = sig1
-            reason = f"Frequency: hot={hot} cold={cold} -> {match_type}{barrier}"
-        elif sig2 is not None:
-            match_type, barrier, score = sig2
-            reason = f"Trend filter: tick below SMA -> {match_type}{barrier}"
+            mt, b, sc, hot, cold = sig1
+            p = _donkey_win_prob(mt, b)
+            r = f"Frequency: hot={hot} cold={cold} -> {mt}{b} (P(win)={p:.0%})"
+            if sc >= min_freq_score:
+                cands.append((p, sc, mt, b, r))
+            else:
+                reason = f"hot/cold gap {sc:.2f} < {min_freq_score:.2f} ({r})"
+        if sig2 is not None:
+            mt, b, sc = sig2
+            p = _donkey_win_prob(mt, b)
+            r = f"Trend filter: tick below SMA -> {mt}{b} (P(win)={p:.0%})"
+            if sc >= min_trend_score:
+                cands.append((p, sc, mt, b, r))
+            elif not cands:
+                reason = f"trend score {sc:.2f} < {min_trend_score:.2f} ({r})"
 
-    if match_type is None:
+    if not cands:
         logger.debug(f"REJECTED: {symbol} {strategy_label} strength=0 score=0.000 — {reason}")
         return SignalResult("NONE", 0, 0.0, strategy_label, reason)
 
-    strength = 3 if score >= 0.5 else 2 if score >= 0.2 else 0
-    if strength < 2:
-        logger.info(f"REJECTED: {symbol} {strategy_label} strength={strength} score={score:.3f} — below threshold ({reason})")
-        return SignalResult("NONE", 0, score, strategy_label, f"Below entry threshold ({reason})")
+    best = max(cands, key=lambda c: (c[0], c[1]))
+    p_win, _raw, match_type, barrier, reason = best
 
-    logger.info(f"SIGNAL: {symbol} {strategy_label} {match_type}{barrier} strength={strength} score={score:.3f} | {reason}")
+    if p_win < min_p:
+        why = f"P(win) {p_win:.0%} < min {min_p:.0%} ({reason})"
+        logger.info(f"REJECTED: {symbol} {strategy_label} strength=0 score={p_win:.3f} — {why}")
+        return SignalResult("NONE", 0, p_win, strategy_label, f"Below win-prob floor ({why})")
+
+    strength = 3 if p_win >= 0.90 else 2
+    logger.info(f"SIGNAL: {symbol} {strategy_label} {match_type}{barrier} strength={strength} P(win)={p_win:.2f} | {reason}")
     return SignalResult(
         direction=match_type,
         strength=strength,
-        score=score,
+        score=p_win,
         strategy=strategy_label,
         reason=reason,
         contract_kind="DIGIT",
