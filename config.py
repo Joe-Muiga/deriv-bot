@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 0.35
+MANUAL_STAKE_AMOUNT = 0.5
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 0.35   # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.5    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1213,7 +1213,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 3 / 60   # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 5 / 60   # 5 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1661,10 +1661,10 @@ FIXED_CYCLE_LEG_MINUTES          = 5     # length of leg 1 — kept equal
                                           # (5 min) above; change both
                                           # together if you ever want a
                                           # different leg length
-FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 1     # 1h15m — lower bound of the
+FIXED_CYCLE_COOLDOWN_MIN_MINUTES = 1     # was 75 — lower bound of the
                                           # randomized cooldown after
                                           # every leg 1
-FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 3  # 2h30m — upper bound; a fresh
+FIXED_CYCLE_COOLDOWN_MAX_MINUTES = 3     # was 150 — upper bound; a fresh
                                           # value is drawn uniformly at
                                           # random between these two
                                           # every time leg 1 ends (see
@@ -1691,3 +1691,15 @@ DONKEY_FREQ_MIN_SAMPLE  = 100
 # Signal 2 — SMA period and fixed DIGITUNDER barrier, per spec.
 DONKEY_TREND_SMA_PERIOD = 8
 DONKEY_TREND_BARRIER    = 3
+
+# ── Donkey guard (donkey_guard.py) — LIMITS losses, does not create edge ──
+# Stops are in units of your fixed stake, so they scale with MANUAL_STAKE_AMOUNT.
+# State is saved at the end of every leg (fixed_cycle.enter_cooldown_now) so
+# it survives the redeploy between legs.
+DONKEY_GUARD_ENABLED                     = True
+DONKEY_GUARD_SESSION_STOP_LOSS_STAKES    = 15   # halt after net -15 stakes
+DONKEY_GUARD_SESSION_TAKE_PROFIT_STAKES  = 10   # halt after net +10 stakes
+DONKEY_GUARD_HALT_MINS                   = 120  # halt length, then a fresh session
+DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 8    # losses in a row before pausing
+DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30
+DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
