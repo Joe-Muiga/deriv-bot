@@ -999,6 +999,21 @@ class DerivClient:
             )
             return []
 
+    async def get_tick_history(self, symbol: str, count: int = 3000) -> List[dict]:
+        """Last `count` raw ticks as [{'epoch','quote'}], oldest first.
+        Returns [] on any failure. Used to seed the edge gate's history."""
+        await self._ready.wait()
+        try:
+            resp = await self._send(
+                {"ticks_history": symbol, "count": min(int(count), 5000),
+                 "end": "latest", "style": "ticks"}, timeout=20)
+            h = resp.get("history", {}) or {}
+            times, prices = h.get("times", []), h.get("prices", [])
+            return [{"epoch": int(t), "quote": float(p)} for t, p in zip(times, prices)]
+        except Exception as exc:
+            logger.warning(f"TICK HISTORY FETCH FAILED: {symbol} | {exc}")
+            return []
+
     # ─── Live tick subscription ───────────────────────────────────────────────
 
     async def subscribe_ticks(
@@ -2138,6 +2153,27 @@ class DerivClient:
                         f"FAILED: {symbol} — proposal_rejected (no id in {proposal})"
                     )
                     return None
+
+                # EDGE GATE — buy-time check against the REAL proposal payout
+                # (Sep 29 2026). Requires payout ratio >= min_payout_ratio and
+                # positive expected value using the conservative lower-bound
+                # win probability from edge_engine. Skips the buy otherwise.
+                _min_ratio = kwargs.get("min_payout_ratio")
+                _p_lb      = kwargs.get("p_win_lb")
+                try:
+                    _ask = float(ask_price)
+                    _pay = float(proposal.get("payout", 0))
+                    _ratio = (_pay - _ask) / _ask if _ask > 0 else 0.0
+                except (TypeError, ValueError):
+                    _ratio = 0.0
+                if _min_ratio and _ratio < float(_min_ratio):
+                    logger.info(f"EDGE GATE: {symbol} buy skipped — real payout {_ratio:.2f}x < {float(_min_ratio):.2f}x")
+                    return None
+                if _p_lb is not None:
+                    _ev = float(_p_lb) * _ratio - (1.0 - float(_p_lb))
+                    if _ev <= 0:
+                        logger.info(f"EDGE GATE: {symbol} buy skipped — EV {_ev:+.3f}/stake at real payout {_ratio:.2f}x")
+                        return None
 
                 buy_req = {"buy": proposal_id, "price": ask_price}
                 resp = await self._send(buy_req)
