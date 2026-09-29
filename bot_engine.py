@@ -2139,7 +2139,7 @@ class BotEngine:
                     stake      = stake,
                     digit      = digit,
                     match_type = match_type,
-                    min_payout_ratio = getattr(config, "DONKEY_MIN_PAYOUT_RATIO", None),
+                    min_payout_ratio = (getattr(config, "DONKEY_MIN_PAYOUT_RATIO", None) if getattr(config, "EDGE_GATE_ENABLED", False) else None),
                     p_win_lb   = getattr(sig, "p_win_lb", None),
                 )
                 if buy_resp:
