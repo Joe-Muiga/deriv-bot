@@ -316,6 +316,7 @@ class BotEngine:
         #    disconnect from Deriv for the randomized cooldown between
         #    leg 1 runs.
         self._entering_fixed_cooldown: bool = False
+        self.connect_failed: bool = False   # set by run() if the initial connect never came up
         self._contract_open_times:    dict               = {}
 
         # ── Contracts past CONTRACT_FORCE_CLOSE_SECS that still haven't
@@ -570,13 +571,21 @@ class BotEngine:
         logger.info("=" * 64)
 
         ws_task = asyncio.create_task(self.client.connect())
-        for _ in range(60):
+        # Connectivity fix: 60 s was too tight right after a Render redeploy
+        # (cold DNS/TLS, slow OTP REST call). connect() retries on its own
+        # forever, so just give it longer; if it STILL isn't up, flag the
+        # failure so main.py's supervisor starts a fresh engine instead of
+        # leaving the bot dead until the next manual redeploy.
+        for _ in range(120):
             if self.client.is_connected:
+                break
+            if ws_task.done():          # connect() died — no point waiting
                 break
             await asyncio.sleep(1)
 
         if not self.client.is_connected:
-            logger.error("Could not connect/authorise within 60 s")
+            logger.error("Could not connect/authorise within 120 s")
+            self.connect_failed = True
             ws_task.cancel()
             return
 
