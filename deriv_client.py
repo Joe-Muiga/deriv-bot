@@ -160,9 +160,7 @@ _VOLATILITY_PREFIXES = ("R_", "1HZ")
 
 # ── Reconnect defaults (overridden by config if present) ──────────────────────
 _DEFAULT_RECONNECT_INTERVAL = 5   # seconds between retries
-_DEFAULT_MAX_RECONNECTS     = 0   # 0 = unlimited (was 10: after 10 failures the
-                                  # WS task died silently and the bot sat
-                                  # 'running' but disconnected forever)
+_DEFAULT_MAX_RECONNECTS     = 10  # 0 = unlimited
 
 # Contract polling interval in seconds
 _CONTRACT_POLL_INTERVAL = 30
@@ -256,10 +254,7 @@ class DerivClient:
             "Authorization": f"Bearer {token}",
         }
 
-        # Explicit timeouts: aiohttp's default total timeout is 300 s, so one
-        # hung REST call used to eat the whole 60 s connect window in run().
-        _to = aiohttp.ClientTimeout(total=15, connect=8, sock_read=10)
-        async with aiohttp.ClientSession(timeout=_to) as session:
+        async with aiohttp.ClientSession() as session:
             # Step 1 — list accounts
             async with session.get(
                 f"{_OPTIONS_API_BASE}/accounts", headers=headers
@@ -360,7 +355,6 @@ class DerivClient:
                     ping_interval=20,
                     ping_timeout=20,
                     close_timeout=5,
-                    open_timeout=15,
                 ) as ws:
                     self._ws        = ws
                     self._connected = True
@@ -438,10 +432,7 @@ class DerivClient:
                     f"WebSocket failed after {max_reconnects} reconnect attempts."
                 )
 
-            # Gentle backoff (5s, 10s, 15s ... capped at 30s) so a rate-limited
-            # or briefly-down endpoint isn't hammered. attempt resets to 0 on
-            # every successful connection.
-            await asyncio.sleep(min(reconnect_interval * max(attempt, 1), 30))
+            await asyncio.sleep(reconnect_interval)
 
     # ─── Message dispatch ─────────────────────────────────────────────────────
 
@@ -831,22 +822,9 @@ class DerivClient:
 
     # ─── Request helper ───────────────────────────────────────────────────────
 
-    async def _wait_until_ready(self, max_wait: float = 20.0) -> bool:
-        """If the socket is mid-reconnect, wait (up to max_wait s) for it to
-        come back instead of failing the request outright."""
-        if self._ws and self._connected:
-            return True
-        try:
-            await asyncio.wait_for(self._ready.wait(), timeout=max_wait)
-        except asyncio.TimeoutError:
-            return False
-        return bool(self._ws and self._connected)
-
     async def _send(self, payload: dict, timeout: float = 30.0) -> dict:
         if not self._ws or not self._connected:
-            # Brief reconnect blip — ride it out rather than failing a trade.
-            if not await self._wait_until_ready():
-                raise RuntimeError("Not connected")
+            raise RuntimeError("Not connected")
 
         req_id                = self._req_id_counter
         self._req_id_counter += 1
