@@ -177,33 +177,44 @@ def trigger_redeploy() -> None:
         _pending = False
         return
 
-    def _fire():
-        # Plain thread + blocking requests, with retries: the old fire-and-
-        # forget asyncio task made a single attempt and could be cancelled
-        # if the bot's event loop wound down; one 5xx/timeout meant no
-        # redeploy at all.
+    async def _fire():
         global _last_confirmed_redeploy_at
-        import requests
-        for attempt in range(1, 7):
-            try:
-                resp = requests.post(hook_url, timeout=30)
-                if resp.status_code in (200, 201, 202):
-                    logger.info(f"REDEPLOY HOOK FIRED: HTTP {resp.status_code}")
-                    _last_confirmed_redeploy_at = time.time()
-                    _push_dashboard_flag(
-                        redeploy_hook_missing=False,
-                        redeploy_watchdog_overdue=False,
-                    )
-                    return
-                logger.error(
-                    f"REDEPLOY HOOK FAILED (attempt {attempt}/6): "
-                    f"HTTP {resp.status_code} — {resp.text[:500]}")
-            except Exception as exc:
-                logger.error(f"REDEPLOY HOOK ERROR (attempt {attempt}/6): {exc}")
-            time.sleep(min(5 * attempt, 30))
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(hook_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
+                    body = await resp.text()
+                    if resp.status in (200, 201, 202):
+                        logger.info(f"REDEPLOY HOOK FIRED: HTTP {resp.status}")
+                        _last_confirmed_redeploy_at = time.time()
+                        _push_dashboard_flag(
+                            redeploy_hook_missing=False,
+                            redeploy_watchdog_overdue=False,
+                        )
+                    else:
+                        logger.error(
+                            f"REDEPLOY HOOK FAILED: HTTP {resp.status} — {body[:500]}"
+                        )
+        except Exception as exc:
+            logger.error(f"REDEPLOY HOOK ERROR: {exc}")
 
-    import threading
-    threading.Thread(target=_fire, name="redeploy-hook", daemon=True).start()
+    try:
+        loop = asyncio.get_event_loop()
+        loop.create_task(_fire())
+    except RuntimeError:
+        # No running loop — fall back to a synchronous best-effort call.
+        try:
+            import requests
+            resp = requests.post(hook_url, timeout=20)
+            logger.info(f"REDEPLOY HOOK FIRED (sync): HTTP {resp.status_code}")
+            if resp.status_code in (200, 201, 202):
+                global _last_confirmed_redeploy_at
+                _last_confirmed_redeploy_at = time.time()
+                _push_dashboard_flag(
+                    redeploy_hook_missing=False,
+                    redeploy_watchdog_overdue=False,
+                )
+        except Exception as exc:
+            logger.error(f"REDEPLOY HOOK ERROR (sync fallback): {exc}")
 
     _pending = False
 
