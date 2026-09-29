@@ -103,8 +103,6 @@ class SignalResult:
     # training-label logic and strategy_stats.get_take_invert_stats())
     # know a flip happened without needing sight of the pre-transform sig.
     execution_inverted:  bool = False
-    # Edge gate (edge_engine.py): conservative lower-bound win probability.
-    p_win_lb: Optional[float] = None
 
 
 NONE_RESULT = SignalResult("NONE", 0, 0.0, "NONE", "No signal")
@@ -2302,19 +2300,6 @@ def _donkey_signal_1_original(ticks: List[Any], symbol: str) -> Optional[Tuple[s
         if p_value >= alpha:
             return None  # hot/cold gap not distinguishable from chance at this alpha
 
-    # CONSISTENCY GATE (Sep 29 2026, chat-requested "stronger signals").
-    # The hot/cold read must hold in BOTH halves of the window, not just
-    # in aggregate: hot must out-count cold in the older half AND the
-    # recent half, by at least DONKEY_CONFIRM_MIN_GAP ticks each. A gap
-    # that came from one burst is rejected. Pure filter -- it only vetoes
-    # ticks, never changes which barrier/contract is picked.
-    if getattr(config, "DONKEY_CONFIRM_ENABLED", True):
-        half = len(digits) // 2
-        gap_min = int(getattr(config, "DONKEY_CONFIRM_MIN_GAP", 1))
-        for part in (digits[:half], digits[half:]):
-            if part.count(hot) - part.count(cold) < gap_min:
-                return None
-
     n = len(digits)
     hot_freq, cold_freq = counts[hot] / n, counts[cold] / n
     score = max(0.0, min(1.0, hot_freq - cold_freq))
@@ -2649,33 +2634,8 @@ def evaluate_donkey_strategy(ticks: Optional[List[Any]], symbol: str) -> SignalR
             logger.info(f"REJECTED: {symbol} {strategy_label} strength=0 score={p_win:.3f} — {why}")
             return SignalResult("NONE", 0, p_win, strategy_label, f"Below win-prob floor ({why})")
         strength = 3 if p_win >= 0.90 else 2
-    p_win_lb = None
-    if getattr(config, "EDGE_GATE_ENABLED", False):
-        import edge_engine
-        decimals = _digit_decimals(symbol)
-        try:
-            all_digits = [_last_digit(_tick_quote(t), decimals) for t in ticks]
-        except ValueError:
-            return NONE_RESULT
-        est_ratio = float(getattr(config, "EDGE_ASSUMED_RTP", 0.95)) / max(p_win, 1e-6) - 1.0
-        if ratio_mode and est_ratio < float(config.DONKEY_MIN_PAYOUT_RATIO):
-            return SignalResult("NONE", 0, p_win, strategy_label, f"est payout {est_ratio:.2f}x below floor")
-        verdict = edge_engine.evaluate_edge(
-            all_digits, match_type, barrier, est_ratio,
-            alpha=float(getattr(config, "EDGE_ALPHA", 1e-5)),
-            min_ticks=int(getattr(config, "EDGE_MIN_TICKS", 1500)),
-            train_frac=float(getattr(config, "EDGE_TRAIN_FRAC", 0.6)),
-            min_ctx_samples=int(getattr(config, "EDGE_MIN_CTX_SAMPLES", 60)),
-            ev_margin=float(getattr(config, "EDGE_EV_MARGIN", 0.02)),
-        )
-        if not verdict.go:
-            logger.debug(f"EDGE GATE: {symbol} {match_type}{barrier} blocked — {verdict.reason}")
-            return SignalResult("NONE", 0, p_win, strategy_label, f"Edge gate: {verdict.reason}")
-        p_win_lb = verdict.p_win_lb
-        reason = f"{reason} | EDGE {verdict.model} lb={p_win_lb:.3f} (n={verdict.n_train}/{verdict.n_test})"
     logger.info(f"SIGNAL: {symbol} {strategy_label} {match_type}{barrier} strength={strength} P(win)={p_win:.2f} | {reason}")
     return SignalResult(
-        p_win_lb=p_win_lb,
         direction=match_type,
         strength=strength,
         score=p_win,
