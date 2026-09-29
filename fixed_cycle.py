@@ -158,32 +158,44 @@ def _persist_env_vars(mapping: dict) -> None:
         "Accept":        "application/json",
     }
 
-    # Runs on a plain daemon thread, NOT a task on the bot's asyncio loop:
-    # that loop is torn down the moment run() returns (asyncio.run() cancels
-    # leftover tasks), which could cancel this PUT mid-flight and lose the
-    # cooldown deadline. Also retries transient failures.
-    def _push():
+    async def _push():
+        async with aiohttp.ClientSession(headers=headers) as session:
+            for key, value in mapping.items():
+                url = f"https://api.render.com/v1/services/{service_id}/env-vars/{key}"
+                try:
+                    async with session.put(
+                        url, json={"value": str(value)},
+                        timeout=aiohttp.ClientTimeout(total=20),
+                    ) as resp:
+                        if resp.status in (200, 201):
+                            logger.info(f"FIXED-CYCLE: persisted {key}={value} ✓")
+                        else:
+                            body = await resp.text()
+                            logger.error(
+                                f"FIXED-CYCLE: failed to persist {key} — "
+                                f"HTTP {resp.status}: {body[:300]}")
+                except Exception as exc:
+                    logger.error(f"FIXED-CYCLE: error persisting {key}: {exc}")
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_push())
+    except RuntimeError:
+        # No running loop (e.g. called from main.py's synchronous boot
+        # path) — fall back to plain blocking requests, one call per key.
         for key, value in mapping.items():
             url = f"https://api.render.com/v1/services/{service_id}/env-vars/{key}"
-            for attempt in range(1, 6):
-                try:
-                    resp = requests.put(
-                        url, json={"value": str(value)},
-                        headers=headers, timeout=20)
-                    if resp.status_code in (200, 201):
-                        logger.info(f"FIXED-CYCLE: persisted {key}={value} ✓")
-                        break
+            try:
+                resp = requests.put(
+                    url, json={"value": str(value)}, headers=headers, timeout=20)
+                if resp.status_code in (200, 201):
+                    logger.info(f"FIXED-CYCLE: persisted {key}={value} ✓ (sync)")
+                else:
                     logger.error(
-                        f"FIXED-CYCLE: failed to persist {key} (attempt "
-                        f"{attempt}/5) — HTTP {resp.status_code}: "
-                        f"{resp.text[:300]}")
-                except Exception as exc:
-                    logger.error(
-                        f"FIXED-CYCLE: error persisting {key} (attempt "
-                        f"{attempt}/5): {exc}")
-                time.sleep(2 * attempt)
-
-    threading.Thread(target=_push, name="fixed-cycle-persist", daemon=True).start()
+                        f"FIXED-CYCLE: failed to persist {key} (sync) — "
+                        f"HTTP {resp.status_code}: {resp.text[:300]}")
+            except Exception as exc:
+                logger.error(f"FIXED-CYCLE: error persisting {key} (sync): {exc}")
 
 
 # ── State loading ────────────────────────────────────────────────────────────
@@ -333,25 +345,17 @@ def _fire_deploy_hook() -> None:
         hook_url = os.environ.get("RENDER_DEPLOY_HOOK_URL", "") or \
             getattr(config, "RENDER_DEPLOY_HOOK_URL", "")
 
-    # Retry until Render accepts the hook. A single failed POST (timeout,
-    # 5xx, brief network blip) used to leave the service sitting in cooldown
-    # forever, since nothing ever fired the hook again.
-    attempt = 0
-    while True:
-        attempt += 1
-        try:
-            resp = requests.post(hook_url, timeout=30)
-            if resp.status_code in (200, 201, 202):
-                logger.info(f"FIXED-CYCLE: redeploy hook fired ✓ HTTP {resp.status_code}")
-                _push_dashboard_flag(fixed_cycle_redeploy_hook_missing=False)
-                return
+    try:
+        resp = requests.post(hook_url, timeout=20)
+        if resp.status_code in (200, 201, 202):
+            logger.info(f"FIXED-CYCLE: redeploy hook fired ✓ HTTP {resp.status_code}")
+            _push_dashboard_flag(fixed_cycle_redeploy_hook_missing=False)
+        else:
             logger.error(
-                f"FIXED-CYCLE: redeploy hook FAILED (attempt {attempt}) — HTTP "
+                f"FIXED-CYCLE: redeploy hook FAILED — HTTP "
                 f"{resp.status_code}: {resp.text[:300]}")
-        except Exception as exc:
-            logger.error(
-                f"FIXED-CYCLE: redeploy hook ERROR (attempt {attempt}): {exc}")
-        time.sleep(min(10 * attempt, 60))
+    except Exception as exc:
+        logger.error(f"FIXED-CYCLE: redeploy hook ERROR: {exc}")
 
 
 def _cooldown_supervisor_thread(cooldown_until: float) -> None:
