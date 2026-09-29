@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 0.35   # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.35    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1763,26 +1763,6 @@ DONKEY_MIN_WIN_PROB  = 0.90    # 0.0-1.0, capped at 0.90 by contract math.
                                 # below is unset/0.
 DONKEY_MIN_SCORE     = 0.10    # signal-1 hot/cold gap floor (noise guard)
 DONKEY_TREND_MIN_SCORE = 0.20  # signal-2 below-SMA distance floor
-
-# ── SIGNIFICANCE GATE (Sep 28 2026, chat-requested) ──────────────────────
-# Extra filter on top of whichever mode above is active (payout-ratio or
-# max-win-probability) — NOT a way to exceed either one's guarantees. Only
-# lets signal 1 fire when a chi-square test says the observed hot/cold gap
-# is unlikely (p < DONKEY_SIGNIFICANCE_ALPHA) to be pure chance, using the
-# same exact test _digit_hybrid_check() elsewhere in this file already
-# uses. This is a noise filter, not an edge detector: on a genuinely fair
-# digit stream (which these synthetic indices are built to be) it can
-# ONLY reduce trade frequency, never raise the realised win rate above
-# what DONKEY_MIN_WIN_PROB / DONKEY_MIN_PAYOUT_RATIO already guarantee by
-# construction. Simulated: alpha=0.01 cuts trade frequency ~63% and
-# leaves win rate exactly where it was without this gate (0.2817 vs
-# 0.2817, 4M synthetic ticks) — confirming there's no hidden edge for it
-# to surface, only weaker reads for it to filter out.
-DONKEY_SIGNIFICANCE_ENABLED = True
-DONKEY_SIGNIFICANCE_ALPHA   = 0.01   # require p < this to trade at all;
-                                      # lower (e.g. 0.001) = rarer, more
-                                      # demanding; higher (e.g. 0.05) =
-                                      # more frequent, less demanding
 
 # ── DONKEY PAYOUT-RATIO MODE (Sep 28 2026, chat-requested) ──────────────
 # Supersedes DONKEY_WIDEST_ZONE / DONKEY_MIN_WIN_PROB above whenever set
