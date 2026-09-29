@@ -947,7 +947,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 2000
+MANUAL_STAKE_AMOUNT = 0.5
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +957,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 2000    # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.5    # UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -1779,24 +1779,6 @@ DONKEY_TREND_MIN_SCORE = 0.20  # signal-2 below-SMA distance floor
 # 0.2817, 4M synthetic ticks) — confirming there's no hidden edge for it
 # to surface, only weaker reads for it to filter out.
 DONKEY_SIGNIFICANCE_ENABLED = True
-# Consistency gate (Sep 29 2026): hot must out-count cold in BOTH halves
-# of the 100-tick window by at least this many ticks.
-DONKEY_CONFIRM_ENABLED = False
-# ── EDGE GATE (Sep 29 2026) — edge_engine.py ──────────────────────────
-# Walk-forward statistical gate: trade only if the symbol's own digit
-# history shows a win rate whose Wilson lower bound beats break-even for
-# the contract's payout, in BOTH a fit window and an untouched
-# confirmation window. Also checked again at buy time against the REAL
-# Deriv proposal payout. On a fair RNG this rarely/never opens -- by design.
-EDGE_GATE_ENABLED   = False   # OFF: extra gate blocked all trades
-EDGE_ALPHA          = 1e-5     # per-look false-positive rate (strict: many symbols x ticks)
-EDGE_MIN_TICKS      = 1500
-EDGE_TRAIN_FRAC     = 0.6
-EDGE_MIN_CTX_SAMPLES = 60
-EDGE_EV_MARGIN      = 0.02     # lower-bound win prob must beat break-even by this much
-EDGE_ASSUMED_RTP    = 0.95     # est. Deriv return-to-player for pre-buy payout estimate
-EDGE_HISTORY_SEED_TICKS = 3000 # ticks_history fetched per symbol at startup
-DONKEY_CONFIRM_MIN_GAP = 2
 DONKEY_SIGNIFICANCE_ALPHA   = 0.01   # require p < this to trade at all;
                                       # lower (e.g. 0.001) = rarer, more
                                       # demanding; higher (e.g. 0.05) =
@@ -1823,7 +1805,7 @@ DONKEY_SIGNIFICANCE_ALPHA   = 0.01   # require p < this to trade at all;
 #
 # Set to 0 or None to go back to the win-rate-maximizing mode above
 # (DONKEY_WIDEST_ZONE / DONKEY_MIN_WIN_PROB) with no payout floor at all.
-DONKEY_MIN_PAYOUT_RATIO = 2.0   # ON (payout must exceed 2x stake, chat-requested Sep 29 2026). Previously: ON again (Sep 28 2026, chat-requested:
+DONKEY_MIN_PAYOUT_RATIO = 2.0   # ON again (Sep 28 2026, chat-requested:
                                 # highest win rate achievable while payout
                                 # stays > 2x stake). Overrides
                                 # DONKEY_MIN_WIN_PROB/DONKEY_WIDEST_ZONE
@@ -1841,6 +1823,6 @@ DONKEY_GUARD_ENABLED                     = True
 DONKEY_GUARD_SESSION_STOP_LOSS_STAKES    = 15   # halt after net -15 stakes
 DONKEY_GUARD_SESSION_TAKE_PROFIT_STAKES  = 10   # halt after net +10 stakes
 DONKEY_GUARD_HALT_MINS                   = 120  # halt length, then a fresh session
-DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 5    # losses in a row before pausing
+DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 8    # losses in a row before pausing
 DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30
 DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
