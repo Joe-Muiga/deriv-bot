@@ -822,6 +822,18 @@ class BotEngine:
             self._ltf[symbol] = ltf_b
             self._initialised_symbols.add(symbol)
 
+            # Seed raw tick history for the edge gate (Sep 29 2026).
+            if getattr(config, "EDGE_GATE_ENABLED", False) and symbol not in self._raw_ticks:
+                try:
+                    hist = await asyncio.wait_for(
+                        self.client.get_tick_history(
+                            symbol, getattr(config, "EDGE_HISTORY_SEED_TICKS", 3000)),
+                        timeout=20)
+                    if hist:
+                        self._raw_ticks[symbol] = deque(hist, maxlen=config.TICK_BUFFER_MAXLEN)
+                except Exception as hist_exc:
+                    logger.warning(f"{symbol}: tick history seed failed — {hist_exc}")
+
             try:
                 await asyncio.wait_for(
                     self.client.subscribe_ticks(
@@ -2127,6 +2139,8 @@ class BotEngine:
                     stake      = stake,
                     digit      = digit,
                     match_type = match_type,
+                    min_payout_ratio = getattr(config, "DONKEY_MIN_PAYOUT_RATIO", None),
+                    p_win_lb   = getattr(sig, "p_win_lb", None),
                 )
                 if buy_resp:
                     self._donkey_guard.note_entry()
