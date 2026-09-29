@@ -1162,7 +1162,7 @@ SYMBOL_MIN_GAP_MINS       = 1
 SESSION_LOSS_SUSPEND_LADDER_MINS = [70, 130, 190, 250]  # was [60,120,180,240] — +10min per tier per user request
 
 # ── RAW TICK BUFFER (feeds tick-based evaluators via evaluate(ticks=...)) ──
-TICK_BUFFER_MAXLEN = 3000   # raised from 200 (Sep 29 2026): edge gate needs long digit history
+TICK_BUFFER_MAXLEN = 200
 
 # ── DEGRADED-SYMBOL TICK-SUBSCRIPTION RETRY ──────────────────
 TICK_RESUBSCRIBE_RETRY_SECS = 30
@@ -1761,7 +1761,7 @@ DONKEY_WIDEST_ZONE   = True    # False restores the old hot±1 barrier.
 DONKEY_MIN_WIN_PROB  = 0.90    # 0.0-1.0, capped at 0.90 by contract math.
                                 # Only used when DONKEY_MIN_PAYOUT_RATIO
                                 # below is unset/0.
-DONKEY_MIN_SCORE     = 0.15    # signal-1 hot/cold gap floor (noise guard)
+DONKEY_MIN_SCORE     = 0.10    # signal-1 hot/cold gap floor (noise guard)
 DONKEY_TREND_MIN_SCORE = 0.20  # signal-2 below-SMA distance floor
 
 # ── SIGNIFICANCE GATE (Sep 28 2026, chat-requested) ──────────────────────
@@ -1781,14 +1781,14 @@ DONKEY_TREND_MIN_SCORE = 0.20  # signal-2 below-SMA distance floor
 DONKEY_SIGNIFICANCE_ENABLED = True
 # Consistency gate (Sep 29 2026): hot must out-count cold in BOTH halves
 # of the 100-tick window by at least this many ticks.
-DONKEY_CONFIRM_ENABLED = True
+DONKEY_CONFIRM_ENABLED = False
 # ── EDGE GATE (Sep 29 2026) — edge_engine.py ──────────────────────────
 # Walk-forward statistical gate: trade only if the symbol's own digit
 # history shows a win rate whose Wilson lower bound beats break-even for
 # the contract's payout, in BOTH a fit window and an untouched
 # confirmation window. Also checked again at buy time against the REAL
 # Deriv proposal payout. On a fair RNG this rarely/never opens -- by design.
-EDGE_GATE_ENABLED   = True
+EDGE_GATE_ENABLED   = False   # OFF: extra gate blocked all trades
 EDGE_ALPHA          = 1e-5     # per-look false-positive rate (strict: many symbols x ticks)
 EDGE_MIN_TICKS      = 1500
 EDGE_TRAIN_FRAC     = 0.6
@@ -1797,7 +1797,7 @@ EDGE_EV_MARGIN      = 0.02     # lower-bound win prob must beat break-even by th
 EDGE_ASSUMED_RTP    = 0.95     # est. Deriv return-to-player for pre-buy payout estimate
 EDGE_HISTORY_SEED_TICKS = 3000 # ticks_history fetched per symbol at startup
 DONKEY_CONFIRM_MIN_GAP = 2
-DONKEY_SIGNIFICANCE_ALPHA   = 0.001  # require p < this to trade at all;
+DONKEY_SIGNIFICANCE_ALPHA   = 0.01   # require p < this to trade at all;
                                       # lower (e.g. 0.001) = rarer, more
                                       # demanding; higher (e.g. 0.05) =
                                       # more frequent, less demanding
@@ -1841,6 +1841,6 @@ DONKEY_GUARD_ENABLED                     = True
 DONKEY_GUARD_SESSION_STOP_LOSS_STAKES    = 15   # halt after net -15 stakes
 DONKEY_GUARD_SESSION_TAKE_PROFIT_STAKES  = 10   # halt after net +10 stakes
 DONKEY_GUARD_HALT_MINS                   = 120  # halt length, then a fresh session
-DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 8    # losses in a row before pausing
+DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 5    # losses in a row before pausing
 DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30
 DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
