@@ -88,23 +88,40 @@ if not config.DERIV_API_TOKEN:
 
 # ─── Bot thread ───────────────────────────────────────────────────────────────
 def _run_bot():
+    """
+    Supervises the bot engine. Before this, a failed initial connect (or any
+    crash) made this thread exit for good: Flask kept the service 'healthy'
+    while the bot sat dead at 'Starting / $0.00' and the pending redeploy
+    could never be confirmed (the settle loop that fires it was gone).
+    Now the engine is rebuilt and retried until it either runs or has
+    deliberately entered the fixed-cycle cooldown.
+    """
     from bot_engine import BotEngine
-    bot = BotEngine()
-    try:
-        asyncio.run(bot.run())
-    except Exception as exc:
-        logger.error(f"Bot crashed: {exc}", exc_info=True)
-    else:
-        # run() can now return normally (not just via exception/cancel)
-        # when bot_engine decided to enter the fixed-cycle cooldown after
-        # leg 1 — see bot_engine.py's _main_loop / _settle_loop.
-        # Nothing further to do here: fixed_cycle.enter_cooldown_now()
-        # already persisted the cooldown window and started its own
-        # supervisor thread before _main_loop stopped itself, so this
-        # thread simply ends.
-        logger.info(
-            "Bot engine thread exited (redeploy-pending or "
-            "fixed-cycle-cooldown-entered)")
+
+    attempt = 0
+    while True:
+        attempt += 1
+        bot = None
+        try:
+            bot = BotEngine()
+            asyncio.run(bot.run())
+        except Exception as exc:
+            logger.error(f"Bot crashed: {exc}", exc_info=True)
+
+        if bot is not None and getattr(bot, "_entering_fixed_cooldown", False):
+            # Deliberate exit: fixed_cycle.enter_cooldown_now() already
+            # persisted the cooldown window and started its own supervisor.
+            logger.info(
+                "Bot engine thread exited (fixed-cycle-cooldown-entered)")
+            return
+
+        delay = min(10 * attempt, 60)
+        logger.warning(
+            f"Bot engine stopped unexpectedly (connect failure or crash) — "
+            f"restarting a fresh engine in {delay}s (restart #{attempt})")
+        time.sleep(delay)
+        if bot is not None and not getattr(bot, "connect_failed", False):
+            attempt = 0     # it had been running fine; reset the backoff
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
@@ -163,7 +180,12 @@ if __name__ == "__main__":
             # forever. Just for a clean, non-stale phase record;
             # bot_engine.run() starts a fresh leg 1 regardless via
             # fixed_cycle.log_trading_start().
-            fixed_cycle.clear_cooldown_and_resume_trading()
+            # Run in a background thread: it may do a blocking Render API
+            # call (up to 20 s) and must not delay Flask binding the port —
+            # a slow bind is what makes Render report a deploy timeout.
+            threading.Thread(
+                target=fixed_cycle.clear_cooldown_and_resume_trading,
+                name="fixed-cycle-resume", daemon=True).start()
 
         # 3. Start auto-redeploy scheduler (no-op if RENDER_DEPLOY_HOOK_URL
         #    is unset) — rolling redeploy every REDEPLOY_INTERVAL_HOURS
