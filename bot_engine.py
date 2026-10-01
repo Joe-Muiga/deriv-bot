@@ -51,6 +51,7 @@ import config
 import exit_engine
 import restart_scheduler
 import fixed_cycle
+from deriv_client import is_confirmed_close
 import symbols as sym_module
 import strategy_stats
 import meta_labeling
@@ -2469,6 +2470,8 @@ class BotEngine:
             try:
                 _sig = info.get("sig")
                 self._donkey_guard.record(
+                    contract_id = str(cid),
+                    confirmed   = is_confirmed_close(poc),
                     symbol      = symbol,
                     signal_kind = signal_kind_from_reason(getattr(_sig, "reason", "")),
                     contract    = str(getattr(_sig, "match_type", "") or ""),
@@ -2564,7 +2567,11 @@ class BotEngine:
                 # random 11-18 min cooldown; the drain block below handles it.
                 try:
                     import profit_pause
-                    profit_pause.check(self.client.balance)
+                    # Open contracts have their stake deducted from the live
+                    # balance; add it back so only SETTLED results count.
+                    _tied_up = sum(float(i.get("stake", 0) or 0)
+                                   for i in self._open_contracts.values())
+                    profit_pause.check(self.client.balance + _tied_up)
                 except Exception as exc:
                     logger.warning(f"PROFIT-PAUSE: check failed: {exc}")
 
@@ -2786,7 +2793,7 @@ class BotEngine:
             logger.warning(f"force_check_contract({cid}) at reconcile-start: {exc}")
             poc = {}
 
-        if poc.get("is_sold") or poc.get("is_expired"):
+        if is_confirmed_close(poc):
             self._open_contracts.pop(cid, None)
             self._contract_open_times.pop(cid, None)
             self._reconciling.pop(cid, None)
@@ -2829,7 +2836,7 @@ class BotEngine:
 
         elapsed = now - state["reconcile_started_at"]
 
-        if poc.get("is_sold") or poc.get("is_expired"):
+        if is_confirmed_close(poc):
             self._open_contracts.pop(cid, None)
             self._contract_open_times.pop(cid, None)
             self._reconciling.pop(cid, None)
@@ -2910,14 +2917,14 @@ class BotEngine:
                 logger.warning(f"force_check_contract({cid}) after failed sell: {exc}")
                 poc = {}
 
-            if not (poc.get("is_sold") or poc.get("is_expired")):
+            if not (is_confirmed_close(poc)):
                 try:
                     poc = await self.client.profit_table_lookup(cid)
                 except Exception as exc:
                     logger.warning(f"profit_table_lookup({cid}) after failed sell: {exc}")
                     poc = {}
 
-            if poc.get("is_sold") or poc.get("is_expired"):
+            if is_confirmed_close(poc):
                 logger.info(
                     f"MULTIPLIER ALREADY CLOSED: {cid} ({symbol}) — sell "
                     f"failed because Deriv already considers it closed; "
@@ -2952,7 +2959,7 @@ class BotEngine:
         except Exception:
             poc = {}
 
-        if not (poc.get("is_sold") or poc.get("is_expired")):
+        if not (is_confirmed_close(poc)):
             # Fall back to the sell response itself — sold_for is a real,
             # confirmed value even if the follow-up check hasn't caught up.
             sold_for = float(sell_resp.get("sold_for", 0))
@@ -3008,7 +3015,7 @@ class BotEngine:
                     logger.warning(f"_monitor_exit force_check_contract({cid}): {exc}")
                     continue
 
-                if poc.get("is_sold") or poc.get("is_expired"):
+                if is_confirmed_close(poc):
                     # Natural close — the existing settlement path handles
                     # recording it. Not our job; just stop monitoring.
                     return
@@ -3107,14 +3114,14 @@ class BotEngine:
                             logger.warning(f"force_check_contract({cid}) after failed adaptive-exit sell: {exc}")
                             check_poc = {}
 
-                        if not (check_poc.get("is_sold") or check_poc.get("is_expired")):
+                        if not (is_confirmed_close(check_poc)):
                             try:
                                 check_poc = await self.client.profit_table_lookup(cid)
                             except Exception as exc:
                                 logger.warning(f"profit_table_lookup({cid}) after failed adaptive-exit sell: {exc}")
                                 check_poc = {}
 
-                        if check_poc.get("is_sold") or check_poc.get("is_expired"):
+                        if is_confirmed_close(check_poc):
                             logger.info(
                                 f"ADAPTIVE EXIT ALREADY CLOSED: {cid} ({symbol}) "
                                 f"— sell failed because Deriv already considers "
@@ -3151,7 +3158,7 @@ class BotEngine:
                     except Exception:
                         close_poc = {}
 
-                    if not (close_poc.get("is_sold") or close_poc.get("is_expired")):
+                    if not (is_confirmed_close(close_poc)):
                         sold_for = float(sell_resp.get("sold_for", 0))
                         stake    = float(info.get("stake", 0.0))
                         close_poc = {
