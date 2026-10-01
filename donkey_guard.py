@@ -48,6 +48,7 @@ class DonkeyGuard:
         self._file_lock = threading.Lock()
         self._path = edge_log_path
         self._trade_times: Deque[float] = deque()
+        self._seen_ids: set = set()
         self._reset_session()
         self._halt_until = 0.0
         self._halt_reason = ""
@@ -131,8 +132,24 @@ class DonkeyGuard:
     # ── settlement hook ─────────────────────────────────────────────────
     def record(self, *, symbol: str, signal_kind: str, contract: str,
                barrier, stake: float, payout: float, won: bool, pnl: float,
-               now: Optional[float] = None) -> None:
+               now: Optional[float] = None, contract_id: str = "",
+               confirmed: bool = True) -> None:
         now = time.time() if now is None else now
+        # Only a CONFIRMED close (contract settled, final profit known) may
+        # count. An open/expired-but-unsettled contract reports profit == -stake
+        # because the stake was deducted — that is not a loss.
+        if not confirmed:
+            logger.warning(
+                f"DONKEY GUARD: ignoring unconfirmed result for contract "
+                f"{contract_id or '?'} ({symbol}) pnl={pnl:+.4f} — not a settled close")
+            return
+        if contract_id:
+            if contract_id in self._seen_ids:
+                return                       # never count the same contract twice
+            self._seen_ids.add(contract_id)
+            if len(self._seen_ids) > 500:
+                self._seen_ids.clear()
+        won = pnl > 0
         breakeven = (stake / payout) if payout and payout > stake > 0 else ""
         try:
             row = {
@@ -156,7 +173,15 @@ class DonkeyGuard:
                 self._session_stake_unit = stake
             unit = self._session_stake_unit or stake or 1.0
             self._session_pnl += pnl
-            self._consec_losses = 0 if won else self._consec_losses + 1
+            if pnl > 0:
+                self._consec_losses = 0
+            elif pnl < 0:                    # only a real, confirmed loss
+                self._consec_losses += 1
+            # pnl == 0 (cancelled / break-even): neither a win nor a loss
+            logger.info(
+                f"DONKEY GUARD: confirmed {'WIN' if pnl > 0 else 'LOSS' if pnl < 0 else 'FLAT'} "
+                f"contract={contract_id or '?'} pnl={pnl:+.4f} | streak={self._consec_losses} "
+                f"session_pnl={self._session_pnl:+.4f}")
 
             tiered = None
             if bool(_cfg("DONKEY_GUARD_TIERED", True)):
