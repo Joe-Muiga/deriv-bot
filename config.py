@@ -947,7 +947,25 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 1000
+MANUAL_STAKE_AMOUNT = 0.5
+
+# BALANCE-TIER STAKING (Sep 2026, chat-requested): stake follows the account
+# balance band table in balance_tiers.py ($0.35 up to $8 ... $2,000 from
+# $36,500 to $50,000). Takes priority over MANUAL_STAKE_MODE while True.
+BALANCE_TIER_STAKE_MODE = True
+
+# PROFIT-TARGET PAUSE: once session profit reaches the target for the stake
+# tier (balance_tiers.py), stop opening trades, drain open contracts and
+# pause a random PROFIT_PAUSE_MIN..MAX_MINUTES (11-18). Session = since the last pause ended; its start
+# balance is persisted in the PROFIT_PAUSE_START_BALANCE env var (needs the
+# same RENDER_API_KEY/RENDER_SERVICE_ID as fixed_cycle.py).
+# TARGET_BASIS: "start" = tier of the session's starting balance fixes the
+# target; "current" = tier of the live balance is used on every check.
+PROFIT_PAUSE_ENABLED      = True
+PROFIT_PAUSE_MIN_MINUTES  = 11   # pause length is drawn uniformly at random
+PROFIT_PAUSE_MAX_MINUTES  = 18   # between these (was a fixed 45)
+PROFIT_PAUSE_TARGET_BASIS = "start"
+
 # Only remaining size-relevant guard when MANUAL_STAKE_MODE is True:
 # MAX_CONCURRENT_TRADES below caps position COUNT (not total $ exposure) —
 # at 100.0 × that limit, worst-case simultaneous exposure is bounded, just
@@ -957,7 +975,7 @@ BASE_STAKE_PCT       = 0.005   # 0.5% of current balance per trade — this
                                 # IS the compounding: stake grows/shrinks
                                 # automatically as balance grows/shrinks.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
-MIN_STAKE            = 1000    # UPDATED — was 100, then 0.35. Now matches
+MIN_STAKE            = 0.35   # Sep 2026: tier ladder starts at 0.35 (was 0.5). UPDATED — was 100, then 0.35. Now matches
                                 # MANUAL_STAKE_AMOUNT ($0.5); the
                                 # codebase's own built-in default
                                 # (risk_manager.py's RiskManager falls back
@@ -982,7 +1000,7 @@ MIN_STAKE            = 1000    # UPDATED — was 100, then 0.35. Now matches
                                 # zeroed it outright rather than shrinking it
                                 # — a hard stop after as few as 2 consecutive
                                 # losses, not a graceful size-down.
-MAX_STAKE            = 1000.0  # safety backstop only, not the everyday driver.
+MAX_STAKE            = 2000.0  # Sep 2026: tier ladder tops out at 2000 (was 1000). safety backstop only, not the everyday driver.
                                 # INACTIVE while MANUAL_STAKE_MODE = True.
 DAILY_LOSS_LIMIT_PCT = float("inf")  # REMOVED PER REQUEST — was 0.06 (6%).
                                 # bot_engine._check_confirmed_loss_limit()
@@ -1820,9 +1838,19 @@ DONKEY_MIN_PAYOUT_RATIO = 2.0   # ON again (Sep 28 2026, chat-requested:
 # State is saved at the end of every leg (fixed_cycle.enter_cooldown_now) so
 # it survives the redeploy between legs.
 DONKEY_GUARD_ENABLED                     = True
+# Sep 2026: thresholds now come from balance_tiers.py by stake/account range
+# (stop-loss 9 -> 5 stakes, loss streak 7 -> 5). The flat values below are
+# only the fallback when DONKEY_GUARD_TIERED = False. Take-profit is handled
+# by PROFIT_PAUSE (donkey_guard ignores its own TP while that is enabled).
+DONKEY_GUARD_TIERED                      = True
 DONKEY_GUARD_SESSION_STOP_LOSS_STAKES    = 15   # halt after net -15 stakes
 DONKEY_GUARD_SESSION_TAKE_PROFIT_STAKES  = 10   # halt after net +10 stakes
-DONKEY_GUARD_HALT_MINS                   = 120  # halt length, then a fresh session
+DONKEY_GUARD_HALT_MINS                   = 120  # fallback only (used if the MIN/MAX pair below is removed)
+# Oct 2026: guard pauses now random, closer to the 11-18 min profit pause.
+DONKEY_GUARD_HALT_MIN_MINS               = 30   # session stop-loss halt: random 30-45 min (was fixed 120)
+DONKEY_GUARD_HALT_MAX_MINS               = 45
 DONKEY_GUARD_CONSEC_LOSS_LIMIT           = 8    # losses in a row before pausing
-DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30
+DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30   # fallback only
+DONKEY_GUARD_CONSEC_LOSS_PAUSE_MIN_MINS  = 11   # loss-streak pause: random 11-18 min (was fixed 30)
+DONKEY_GUARD_CONSEC_LOSS_PAUSE_MAX_MINS  = 18
 DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
