@@ -593,6 +593,13 @@ class BotEngine:
         # run. See fixed_cycle.py.
         fixed_cycle.log_trading_start()
 
+        # Profit-target pause: restore (or open) this session's start balance.
+        try:
+            import profit_pause
+            profit_pause.on_boot(self.client.balance)
+        except Exception as exc:
+            logger.warning(f"PROFIT-PAUSE: boot hook failed: {exc}")
+
         # ── Redeploy-proof open-contract recovery (spec point 10, Aug 2026) ──
         # Render's filesystem is ephemeral across deploys on this plan (no
         # persistent disk attached) and this process's own in-memory
@@ -2552,6 +2559,14 @@ class BotEngine:
 
                 await self._handle_orphans()
                 self._check_confirmed_loss_limit()
+
+                # Profit-target pause (balance_tiers.py table): requests a
+                # random 11-18 min cooldown; the drain block below handles it.
+                try:
+                    import profit_pause
+                    profit_pause.check(self.client.balance)
+                except Exception as exc:
+                    logger.warning(f"PROFIT-PAUSE: check failed: {exc}")
 
                 self._cycle_count += 1
 
