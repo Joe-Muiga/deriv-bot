@@ -153,6 +153,20 @@ _OPTIONS_API_BASE = "https://api.derivws.com/trading/v1/options"
 
 logger = logging.getLogger(__name__)
 
+
+def is_confirmed_close(poc) -> bool:
+    """True only when Deriv reports the contract as genuinely SETTLED:
+    is_sold == 1, or status won/lost/sold. A bare is_expired flag is NOT
+    enough: an expired digit contract can still report status "open" with
+    profit == -stake (the stake has left the balance, the payout hasn't
+    been credited yet) for a few ticks before it settles as a win."""
+    if not poc:
+        return False
+    if poc.get("is_sold"):
+        return True
+    return str(poc.get("status", "")).lower() in ("won", "lost", "sold")
+
+
 MAX_RETRY_DELAY = 60
 
 _BOOM_CRASH_PREFIXES = ("BOOM", "CRASH")
@@ -499,9 +513,7 @@ class DerivClient:
         if msg_type == "proposal_open_contract":
             poc = msg.get("proposal_open_contract", {})
             cid = str(poc.get("contract_id", ""))
-            closed = bool(
-                poc.get("is_sold") or poc.get("is_expired") or poc.get("status") == "sold"
-            )
+            closed = is_confirmed_close(poc)
             if cid and closed:
                 info = self._polling_contracts.get(cid)
                 self.stop_tracking(cid)
@@ -542,7 +554,7 @@ class DerivClient:
             for cid in list(self._polling_contracts.keys()):
                 try:
                     result = await self.force_check_contract(cid)
-                    if result.get("is_sold") or result.get("is_expired") or result.get("status") == "sold":
+                    if is_confirmed_close(result):
                         info = self._polling_contracts.get(cid)
                         self.stop_tracking(cid)
                         if info and info.get("callback"):
