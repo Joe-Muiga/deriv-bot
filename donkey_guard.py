@@ -17,6 +17,7 @@ import csv
 import json
 import logging
 import os
+import random
 import threading
 import time
 from collections import deque
@@ -95,6 +96,13 @@ class DonkeyGuard:
         self._session_pnl = 0.0
         self._session_stake_unit = 0.0  # learned from first trade
 
+    def reset_session(self) -> None:
+        """Public: start a fresh session (called when a profit-target pause
+        begins, so the stop-loss counts from zero afterwards)."""
+        with self._lock:
+            self._reset_session()
+            self._consec_losses = 0
+
     # ── gate: call before opening any new entry ─────────────────────────
     def can_enter(self, now: Optional[float] = None) -> Tuple[bool, str]:
         if not self.enabled:
@@ -150,18 +158,32 @@ class DonkeyGuard:
             self._session_pnl += pnl
             self._consec_losses = 0 if won else self._consec_losses + 1
 
-            max_losses = int(_cfg("DONKEY_GUARD_CONSEC_LOSS_LIMIT", 8))
+            tiered = None
+            if bool(_cfg("DONKEY_GUARD_TIERED", True)):
+                try:  # thresholds by account range / stake (balance_tiers.py)
+                    import balance_tiers
+                    tiered = balance_tiers.guard_params_for_stake(unit)
+                except Exception as exc:
+                    logger.warning(f"DONKEY GUARD: tier lookup failed: {exc}")
+
+            max_losses = int(tiered["loss_streak"] if tiered
+                             else _cfg("DONKEY_GUARD_CONSEC_LOSS_LIMIT", 8))
             if max_losses > 0 and self._consec_losses >= max_losses:
-                mins = float(_cfg("DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS", 30))
+                mins = self._draw_mins("DONKEY_GUARD_CONSEC_LOSS_PAUSE_MIN_MINS",
+                                       "DONKEY_GUARD_CONSEC_LOSS_PAUSE_MAX_MINS",
+                                       "DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS", 30)
                 self._pause_until = now + mins * 60
                 logger.warning(
                     f"DONKEY GUARD: {self._consec_losses} losses in a row — "
                     f"pausing new entries {mins:.0f}min")
                 self._consec_losses = 0
 
-            sl = float(_cfg("DONKEY_GUARD_SESSION_STOP_LOSS_STAKES", 15))
+            sl = float(tiered["sl_stakes"] if tiered
+                       else _cfg("DONKEY_GUARD_SESSION_STOP_LOSS_STAKES", 15))
             tp = float(_cfg("DONKEY_GUARD_SESSION_TAKE_PROFIT_STAKES", 10))
-            halt_mins = float(_cfg("DONKEY_GUARD_HALT_MINS", 120))
+            if bool(_cfg("PROFIT_PAUSE_ENABLED", False)):
+                tp = 0.0   # profit_pause.py owns take-profit (45 min pause)
+            halt_mins = None   # drawn below only if a halt actually triggers
             in_stakes = self._session_pnl / unit
             reason = ""
             if sl > 0 and in_stakes <= -sl:
@@ -169,11 +191,27 @@ class DonkeyGuard:
             elif tp > 0 and in_stakes >= tp:
                 reason = f"session take-profit hit ({in_stakes:+.1f} stakes)"
             if reason:
+                halt_mins = self._draw_mins("DONKEY_GUARD_HALT_MIN_MINS",
+                                            "DONKEY_GUARD_HALT_MAX_MINS",
+                                            "DONKEY_GUARD_HALT_MINS", 120)
                 self._halt_until = now + halt_mins * 60
                 self._halt_reason = reason
                 logger.warning(f"DONKEY GUARD: {reason} — no new entries "
                                f"for {halt_mins:.0f}min, then fresh session")
                 self._reset_session()  # next session starts from zero
+
+    @staticmethod
+    def _draw_mins(min_key: str, max_key: str, fixed_key: str, fixed_default: float) -> float:
+        """Random length between config min/max; falls back to the old fixed
+        value if the range keys are missing."""
+        lo = _cfg(min_key, None)
+        hi = _cfg(max_key, None)
+        if lo is None or hi is None:
+            return float(_cfg(fixed_key, fixed_default))
+        lo, hi = float(lo), float(hi)
+        if hi < lo:
+            lo, hi = hi, lo
+        return random.uniform(lo, hi)
 
     # ── internals ───────────────────────────────────────────────────────
     def _append_csv(self, row: dict) -> None:
