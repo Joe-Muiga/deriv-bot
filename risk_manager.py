@@ -535,6 +535,9 @@ class RiskManager:
         next trade on this (strategy, symbol) pair, PLS + Kelly overlay
         combined, using the current cached balance.
         """
+        if getattr(config, "BALANCE_TIER_STAKE_MODE", False):
+            import balance_tiers
+            return balance_tiers.stake_for_balance(self._current_balance)
         if getattr(config, "MANUAL_STAKE_MODE", False):
             return float(getattr(config, "MANUAL_STAKE_AMOUNT", self.min_stake))
         pls_stake = self._compute_stake(self._current_balance)
@@ -561,6 +564,31 @@ class RiskManager:
         Log format:
           STAKE: $X (pls=$Y base=$Z ×M streak=+N [strategy=... symbol=...])
         """
+        # BALANCE-TIER STAKING (Sep 2026, chat-requested): stake is read from
+        # the balance band table in balance_tiers.py, replacing the fixed
+        # MANUAL_STAKE_AMOUNT. Checked first; set BALANCE_TIER_STAKE_MODE =
+        # False in config.py to fall back to the manual/dynamic paths below.
+        if getattr(config, "BALANCE_TIER_STAKE_MODE", False):
+            import balance_tiers
+            await self._fetch_live_balance()
+            tier  = balance_tiers.tier_for_balance(self._current_balance)
+            stake = tier.stake
+            # Exposure ceiling still applies so concurrent trades can't
+            # commit more than EXPOSURE_CEILING_PCT of the account.
+            ceiling = self._current_balance * getattr(config, "EXPOSURE_CEILING_PCT", 0.90)
+            room    = ceiling - self._committed_exposure()
+            if room < stake:
+                logger.info(
+                    f"STAKE: $0.00 — tier stake ${stake:g} exceeds remaining "
+                    f"exposure room ${max(room, 0):.2f}")
+                return 0.0
+            logger.info(
+                f"STAKE: ${stake:g} — balance tier #{tier.n} "
+                f"(${tier.bal_low:,.2f}-${tier.bal_high:,.2f}, "
+                f"balance ${self._current_balance:,.2f})"
+                + (f" strategy={strategy} symbol={symbol}" if strategy and symbol else ""))
+            return float(stake)
+
         if getattr(config, "MANUAL_STAKE_MODE", False):
             manual_stake = float(getattr(config, "MANUAL_STAKE_AMOUNT", self.min_stake))
             logger.info(
