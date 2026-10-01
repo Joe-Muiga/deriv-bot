@@ -94,6 +94,7 @@ logger = logging.getLogger(__name__)
 
 # ── Module-level state ──────────────────────────────────────────────────────
 _cooldown_requested:    bool  = False
+_pending_cooldown_mins: Optional[float] = None   # fixed length override (profit pause)
 _persistence_warned_at: float = 0.0
 
 
@@ -253,14 +254,23 @@ def is_cooldown_requested() -> bool:
     return _cooldown_requested
 
 
-def request_cooldown(reason: str) -> None:
-    global _cooldown_requested
+def request_cooldown(reason: str, fixed_mins: Optional[float] = None) -> None:
+    """fixed_mins (profit pause) overrides the random cooldown length. If a
+    normal leg-end cooldown is already pending, a fixed_mins request upgrades
+    it so the profit pause length wins."""
+    global _cooldown_requested, _pending_cooldown_mins
+    if fixed_mins is not None:
+        _pending_cooldown_mins = float(fixed_mins)
     if not _cooldown_requested:
         _cooldown_requested = True
         logger.warning(
             f"FIXED-CYCLE: COOLDOWN REQUESTED ({reason}) — no new trades "
             f"will open while open contracts drain")
         _push_dashboard_flag(fixed_cycle_cooldown_reason=reason)
+    elif fixed_mins is not None:
+        logger.warning(
+            f"FIXED-CYCLE: pending cooldown upgraded to a {fixed_mins:.0f} min "
+            f"pause ({reason})")
 
 
 def on_redeploy_due() -> None:
@@ -290,19 +300,29 @@ def enter_cooldown_now() -> float:
     above), then starts the supervisor thread that waits it out and
     fires the Render deploy hook. Returns the cooldown_until epoch.
     """
-    global _cooldown_requested
+    global _cooldown_requested, _pending_cooldown_mins
 
     min_mins = getattr(config, "FIXED_CYCLE_COOLDOWN_MIN_MINUTES", 75)
     max_mins = getattr(config, "FIXED_CYCLE_COOLDOWN_MAX_MINUTES", 150)
     if max_mins < min_mins:
         min_mins, max_mins = max_mins, min_mins
-    cooldown_mins  = random.uniform(min_mins, max_mins)
+    if _pending_cooldown_mins is not None:      # profit-target pause (random 11-18 min)
+        cooldown_mins = _pending_cooldown_mins
+        min_mins = max_mins = cooldown_mins
+        _pending_cooldown_mins = None
+    else:
+        cooldown_mins = random.uniform(min_mins, max_mins)
     cooldown_until = time.time() + cooldown_mins * 60
 
     _state = {
         "FIXED_PHASE":          "cooldown",
         "FIXED_COOLDOWN_UNTIL": f"{cooldown_until:.0f}",
     }
+    try:  # profit pause: close the session (reset guard + clear start balance)
+        import profit_pause
+        _state.update(profit_pause.on_pause_entered())
+    except Exception as exc:
+        logger.warning(f"FIXED-CYCLE: profit_pause hook failed: {exc}")
     try:  # carry the donkey guard's session state across the redeploy
         from donkey_guard import get_guard
         _state["DONKEY_GUARD_STATE"] = get_guard().export_state()
