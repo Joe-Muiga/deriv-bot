@@ -328,6 +328,11 @@ def enter_cooldown_now() -> float:
         _state["DONKEY_GUARD_STATE"] = get_guard().export_state()
     except Exception as exc:
         logger.warning(f"FIXED-CYCLE: could not export donkey guard state: {exc}")
+    try:  # Scout+Follower (Oct 2026): gate window, follower balance etc. — {} if off
+        import scout_follower
+        _state.update(scout_follower.export_env())
+    except Exception as exc:
+        logger.warning(f"FIXED-CYCLE: could not export scout/follower state: {exc}")
     _persist_env_vars(_state)
     _cooldown_requested = False
     _push_dashboard_flag(
