@@ -1250,7 +1250,15 @@ def _render_strategy_stats_page() -> str:
 
 @app.route("/")
 def index():
-    return Response(_render_dashboard(), mimetype="text/html")
+    html = _render_dashboard()
+    # Oct 2026 (Scout+Follower): add the Scout/Follower panel to this page.
+    # inject() is a no-op when disabled and never raises.
+    try:
+        import sf_dashboard
+        html = sf_dashboard.inject(html)
+    except Exception:
+        pass
+    return Response(html, mimetype="text/html")
 
 
 @app.route("/health")
