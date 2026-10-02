@@ -27,6 +27,7 @@ from typing import Optional
 import config
 from edge_gate import EdgeGate
 from event_bus import bus
+from regime_gate import RegimeGate, build_gate
 
 logger = logging.getLogger("scout_follower")
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -43,7 +44,18 @@ def scout_data_mode() -> bool:
 class Hub:
     def __init__(self, follower_factory=None, clock=time.time, events_path=None):
         self._clock = clock
-        self.gate = EdgeGate(clock=clock)
+        self.gate_mode = str(getattr(config, "GATE_MODE", "regime")).lower()
+        self.gate = build_gate(clock=clock) if self.gate_mode == "regime" else EdgeGate(clock=clock)
+        self.learner = None
+        self.tuner = None
+        if getattr(config, "ML_ENABLED", True) and self.gate_mode == "regime":
+            try:
+                from online_learner import OnlineLearner
+                from auto_tuner import AutoTuner
+                self.learner = OnlineLearner(self.gate, clock=clock)
+                self.tuner = AutoTuner(self.gate, clock=clock)
+            except Exception as exc:
+                logger.critical(f"ML NOT STARTED: {exc}")
         self.follower = None
         self.follower_error = ""
         self._events_path = events_path or os.path.join(
@@ -66,16 +78,20 @@ class Hub:
         if self.follower is not None:
             self._load_follower_env()
         bus.clear()
+        if self.learner is not None:
+            bus.subscribe("entry", self.learner.on_entry)      # BEFORE the follower: p is ready for it
         bus.subscribe("result", self._on_scout_result)
         if self.follower is not None:
+            self.follower.ml = self.learner
+            self.follower.tuner = self.tuner
             bus.subscribe("entry", self.follower.on_entry)
             bus.subscribe("result", self.follower.on_scout_result)
             bus.subscribe("result", self._equity_tick)   # after the follower updated baseline
         logger.warning(
             f"SCOUT+FOLLOWER enabled | follower mode="
-            f"{self.follower.mode if self.follower else 'DISABLED'} | gate window="
-            f"{self.gate.window} min_trades={self.gate.min_trades} "
-            f"open P>={self.gate.open_prob} close P<{self.gate.close_prob}")
+            f"{self.follower.mode if self.follower else 'DISABLED'} | gate={self.gate_mode} "
+            f"| engine={getattr(self.gate, 'ENGINE', 'edge')} "
+            f"| ML={'on' if self.learner else 'off'} | params={getattr(self.gate, 'params', '-')}")
 
     # ── events ──────────────────────────────────────────────────────────
     def write_event(self, ev: dict) -> None:
@@ -101,6 +117,11 @@ class Hub:
         if not ev.get("confirmed", True):
             return
         self.gate.on_result(ev)
+        if self.learner is not None:
+            self.learner.on_result(ev)
+        if self.tuner is not None:
+            self.tuner.note_result()
+            self.tuner.maybe_tune()
         pnl = float(ev.get("pnl", 0) or 0)
         stake = float(ev.get("stake", 0) or 0)
         if pnl != 0:
@@ -132,16 +153,27 @@ class Hub:
         if self.follower is not None:
             out["SF_FOLLOWER_STATE"] = json.dumps(self.follower.export(),
                                                   separators=(",", ":"))
+        if self.learner is not None:
+            out["SF_ML_STATE"] = json.dumps({"l": self.learner.export(),
+                                             "t": self.tuner.export() if self.tuner else {}},
+                                            separators=(",", ":"))
         return out
 
     def _load_env(self) -> None:
-        for key, fn in (("SF_GATE_STATE", self.gate.load), ("SF_SCOUT_STATS", self._load_stats)):
+        for key, fn in (("SF_GATE_STATE", self.gate.load), ("SF_SCOUT_STATS", self._load_stats),
+                        ("SF_ML_STATE", self._load_ml)):
             raw = os.environ.get(key, "")
             if raw:
                 try:
                     fn(json.loads(raw))
                 except Exception as exc:
                     logger.warning(f"SF: could not restore {key}: {exc}")
+
+    def _load_ml(self, d: dict) -> None:
+        if self.learner is not None:
+            self.learner.load(d.get("l") or {})
+        if self.tuner is not None:
+            self.tuner.load(d.get("t") or {})
 
     def _load_stats(self, d: dict) -> None:
         self.scout_buckets = {str(k): v for k, v in (d.get("b") or {}).items()}
@@ -224,7 +256,10 @@ class Hub:
                 "cooldown_until": fc.get("cooldown_until", 0), "config": cfg,
                 "equity": list(self.equity), "recent": list(self.recent)[::-1],
                 "gate_history": [[int(t), st, r] for t, st, r in self.gate.history][::-1],
-                "gate": self.gate.state(),
+                "gate": self.gate.state(), "gate_mode": self.gate_mode,
+                "ml": ({"learner": self.learner.state(),
+                        "tuner": self.tuner.state() if self.tuner else None}
+                       if self.learner is not None else None),
                 "scout_1h": self._window_stats(1), "scout_24h": self._window_stats(24),
                 "scout_total": self.scout_total,
                 "follower": self.follower.state() if self.follower else
@@ -239,6 +274,19 @@ class Hub:
             f"SF REPORT | SCOUT 1h {s['scout_1h']['wins']}W/{s['scout_1h']['losses']}L "
             f"pnl {s['scout_1h']['pnl']:+.2f} | 24h {s['scout_24h']['wins']}W/"
             f"{s['scout_24h']['losses']}L pnl {s['scout_24h']['pnl']:+.2f}"]
+        if s.get("ml"):
+            lm = s["ml"]["learner"]; tn = s["ml"]["tuner"] or {}
+            ll = f"{lm['logloss']:.3f} vs base {lm['baseline_logloss']:.3f}" if lm["logloss"] else "n/a"
+            if g.get("engine") == "hmm":
+                out.append(f"SF REPORT | HMM P(hot)={g['belief']:.2f} forecast {g['q']*100:.1f}% vs breakeven "
+                           f"{g['breakeven']*100:.1f}% edge {g['edge']*100:+.1f}pt | fit p_hot={g['p_hot']*100:.0f}% "
+                           f"p_cold={g['p_cold']*100:.0f}% session~{g['session_secs']:.0f}s "
+                           f"regimes_real={g['regimes_real']} (LR {g['fit_lr']})")
+            out.append(f"SF REPORT | REGIME {g.get('phase','-')} heat {g.get('wins_fast','-')}/{g.get('n_fast','-')} "
+                       f"eq {g.get('eq_r',0):+.1f}R | ML n={lm['n_learned']} useful={lm['useful']} "
+                       f"logloss {ll} lift {lm['lift'] if lm['lift'] is not None else 'n/a'} "
+                       f"veto {lm['vetoed']} | TUNER runs={tn.get('runs')} adopted={tn.get('adopted')} "
+                       f"no_edge={tn.get('no_edge')}")
         if "disabled" in f:
             out.append(f"SF REPORT | FOLLOWER disabled: {f['disabled']}")
         else:
