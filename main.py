@@ -62,6 +62,7 @@ Environment variables required:
 
 import asyncio
 import logging
+import os
 import threading
 import sys
 import time
@@ -116,6 +117,21 @@ if __name__ == "__main__":
     logger.info(f"  API token    : {'SET ✓' if config.DERIV_API_TOKEN else 'MISSING ✗'}")
     logger.info(f"  Port         : {config.PORT}")
     logger.info(f"  Self-URL     : {config.SELF_URL}")
+
+    # Scout+Follower (Oct 2026): phone-friendly on-demand report at /sf
+    # (JSON). Read-only, never shows tokens. Inert unless enabled.
+    if config.SCOUT_FOLLOWER_ENABLED:
+        import json as _json
+        import scout_follower as _sfmod
+
+        def _sf_report():
+            hub = _sfmod._hub
+            body = (_json.dumps(hub.summary(), default=str, indent=1)
+                    if hub else '{"status": "scout/follower not running in this phase"}')
+            return body, 200, {"Content-Type": "application/json"}
+        app.add_url_rule("/sf", "sf_report", _sf_report)
+        logger.info(f"  Scout+Follower: ON | follower mode {config.FOLLOWER_MODE} | "
+                    f"follower token {'SET ✓' if os.environ.get('DERIV_FOLLOWER_TOKEN') else 'missing'}")
 
     # 1. Start keep-alive pinger — ALWAYS, in every phase. This (plus the
     #    Flask app started at the bottom) is what keeps Render's health
