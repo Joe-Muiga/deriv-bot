@@ -1899,9 +1899,9 @@ EDGE_GATE_PRIOR_STRENGTH   = 2.0    # Beta prior pseudo-trades, centred on break
 #          FOLLOWER_LIVE_CONFIRM == "I_UNDERSTAND_REAL_MONEY". Not for this phase.
 FOLLOWER_MODE              = os.environ.get("FOLLOWER_MODE", "shadow").strip().lower()
 FOLLOWER_LIVE_CONFIRM      = os.environ.get("FOLLOWER_LIVE_CONFIRM", "")
-FOLLOWER_START_BALANCE     = 10000.0
+FOLLOWER_START_BALANCE     = 2.0
 FOLLOWER_MAX_OPEN          = 3      # concurrent open follower contracts
-FOLLOWER_MAX_EXPOSURE_PCT  = 0.10   # open stakes <= this share of virtual balance
+FOLLOWER_MAX_EXPOSURE_PCT  = 0.50   # open stakes <= this share of virtual balance
 FOLLOWER_MAX_TRADES_PER_HOUR = 60
 FOLLOWER_MAX_ENTRY_AGE_SECS  = 8    # skip an entry event older than this
 
