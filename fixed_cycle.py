@@ -93,6 +93,13 @@ import config
 logger = logging.getLogger(__name__)
 
 # ── Module-level state ──────────────────────────────────────────────────────
+def enabled() -> bool:
+    """Oct 2026: config.FIXED_CYCLE_ENABLED = False turns the whole leg->cooldown
+    cycle OFF. Every public entry point below becomes a no-op and the Scout just
+    redeploys every config.REDEPLOY_INTERVAL_SECS and keeps trading."""
+    return bool(getattr(config, "FIXED_CYCLE_ENABLED", True))
+
+
 _cooldown_requested:    bool  = False
 _pending_cooldown_mins: Optional[float] = None   # fixed length override (profit pause)
 _persistence_warned_at: float = 0.0
@@ -220,6 +227,8 @@ def in_cooldown_at_boot() -> Optional[float]:
     persisted at the moment the random duration was chosen, an unrelated
     redeploy landing mid-cooldown still returns the SAME deadline here —
     the random length is never re-rolled or reset by a stray redeploy."""
+    if not enabled():
+        return None
     state = load_state()
     if state["phase"] == "cooldown" and state["cooldown_until"] > time.time():
         return state["cooldown_until"]
@@ -259,6 +268,9 @@ def request_cooldown(reason: str, fixed_mins: Optional[float] = None) -> None:
     normal leg-end cooldown is already pending, a fixed_mins request upgrades
     it so the profit pause length wins."""
     global _cooldown_requested, _pending_cooldown_mins
+    if not enabled():
+        logger.info(f"FIXED-CYCLE: cycle is OFF — ignoring cooldown request ({reason})")
+        return
     if fixed_mins is not None:
         _pending_cooldown_mins = float(fixed_mins)
     if not _cooldown_requested:
@@ -284,7 +296,7 @@ def on_redeploy_due() -> None:
     letting an ordinary "redeploy and keep trading" path run. No-ops
     once a cooldown is already requested.
     """
-    if is_cooldown_requested():
+    if not enabled() or is_cooldown_requested():
         return
     request_cooldown("leg 1 complete (single-leg cycle)")
 
@@ -419,3 +431,43 @@ def start_cooldown_supervisor(cooldown_until: float) -> None:
         daemon=True,
     )
     t.start()
+
+
+# ── Oct 2026: persist state for the cooldown-free 3m45s redeploy ────────────
+def _push_sync(mapping: dict) -> None:
+    api_key    = getattr(config, "RENDER_API_KEY", "")
+    service_id = getattr(config, "RENDER_SERVICE_ID", "")
+    for key, value in mapping.items():
+        os.environ[key] = str(value)
+    if not api_key or not service_id:
+        _warn_persistence_not_configured()
+        return
+    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json",
+               "Accept": "application/json"}
+    for key, value in mapping.items():
+        url = f"https://api.render.com/v1/services/{service_id}/env-vars/{key}"
+        try:
+            resp = requests.put(url, json={"value": str(value)}, headers=headers, timeout=20)
+            if resp.status_code not in (200, 201):
+                logger.error(f"REDEPLOY-PERSIST: {key} HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as exc:
+            logger.error(f"REDEPLOY-PERSIST: {key}: {exc}")
+
+
+async def persist_for_redeploy() -> None:
+    """Called by bot_engine right BEFORE the deploy hook on every plain redeploy
+    (no cooldown any more). Writes the gate / follower / ML state and the donkey
+    guard to Render env vars and WAITS for it, so the hook never races the
+    writes. Same keys the old enter_cooldown_now() batch carried."""
+    state = {"FIXED_PHASE": "trading", "FIXED_COOLDOWN_UNTIL": "0"}
+    try:
+        from donkey_guard import get_guard
+        state["DONKEY_GUARD_STATE"] = get_guard().export_state()
+    except Exception as exc:
+        logger.warning(f"REDEPLOY-PERSIST: guard export failed: {exc}")
+    try:
+        import scout_follower
+        state.update(scout_follower.export_env())
+    except Exception as exc:
+        logger.warning(f"REDEPLOY-PERSIST: scout/follower export failed: {exc}")
+    await asyncio.to_thread(_push_sync, state)
