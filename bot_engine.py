@@ -1186,7 +1186,7 @@ class BotEngine:
                     f"(symbol suspension ladder NOT reset — redeploy-only) | "
                     f"day_start_balance=${self._day_start_balance:.4f}")
 
-            if restart_scheduler.is_redeploy_pending():
+            if restart_scheduler.is_redeploy_pending() or restart_scheduler.in_handoff():
                 await asyncio.sleep(scan_sleep)
                 continue
 
@@ -2612,7 +2612,10 @@ class BotEngine:
 
         while True:
             try:
-                await asyncio.sleep(settle_wait)
+                _t_wait = time.time()
+                while (time.time() - _t_wait < settle_wait
+                       and not restart_scheduler.is_redeploy_pending()):
+                    await asyncio.sleep(1)      # wake instantly when the 3m45s timer fires
 
                 await self._handle_orphans()
                 self._check_confirmed_loss_limit()
@@ -2683,13 +2686,13 @@ class BotEngine:
                         f"contract(s) before restart")
 
                     drain_started = time.time()
-                    while self._open_contracts:
+                    while self._open_contracts or _sf.follower_busy():
                         # Actively try to confirm-close everything
                         # remaining — reuses the exact same reconciliation
                         # (Fix C) and Multiplier max-hold (Fix E) machinery
                         # as normal operation. Never a guess.
                         await self._handle_orphans()
-                        if not self._open_contracts:
+                        if not (self._open_contracts or _sf.follower_busy()):
                             break
 
                         drain_elapsed = time.time() - drain_started
@@ -2714,7 +2717,13 @@ class BotEngine:
                             f"contract(s) open, actively confirming closes")
                         await asyncio.sleep(5)
 
-                    if not self._open_contracts:
+                    if not (self._open_contracts or _sf.follower_busy()):
+                        # Oct 2026: no cooldown any more. Persist gate / follower /
+                        # ML state FIRST (and wait for it), then fire the hook.
+                        try:
+                            await fixed_cycle.persist_for_redeploy()
+                        except Exception as exc:
+                            logger.error(f"REDEPLOY: state persist failed: {exc}")
                         # No leg to advance anymore (single-leg cycle) —
                         # this branch only still exists for the disabled
                         # cycle-count fallback; under the timer trigger
