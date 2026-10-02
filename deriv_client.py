@@ -194,7 +194,16 @@ def _is_volatility_index(symbol: str) -> bool:
 
 class DerivClient:
 
-    def __init__(self):
+    def __init__(self, token: Optional[str] = None,
+                 app_id: Optional[str] = None,
+                 account_mode: Optional[str] = None):
+        # Oct 2026 (Scout+Follower): credentials can be passed per instance so
+        # a second client (the Follower) can use its own token. All default to
+        # the config values, so existing single-client behaviour is unchanged.
+        # The token is never logged.
+        self._token        = token if token is not None else config.DERIV_API_TOKEN
+        self._app_id       = app_id if app_id is not None else config.DERIV_APP_ID
+        self._account_mode = account_mode
         self._ws: Optional[Any]    = None
         self._ready: asyncio.Event = asyncio.Event()
         self._connected: bool      = False
@@ -250,9 +259,10 @@ class DerivClient:
         Returns the ready-to-connect wss:// URL. OTPs are short-lived, so this
         must be called fresh on every (re)connect attempt — never cache the URL.
         """
-        app_id = config.DERIV_APP_ID
-        token  = config.DERIV_API_TOKEN
-        mode   = getattr(config, "DERIV_ACCOUNT_MODE", "demo").strip().lower()
+        app_id = self._app_id
+        token  = self._token
+        mode   = (self._account_mode
+                  or getattr(config, "DERIV_ACCOUNT_MODE", "demo")).strip().lower()
 
         if not app_id:
             raise ValueError("DERIV_APP_ID is not set.")
@@ -855,10 +865,10 @@ class DerivClient:
     # ─── Auth & balance ───────────────────────────────────────────────────────
 
     async def _authorize(self):
-        if not config.DERIV_API_TOKEN:
+        if not self._token:
             raise ValueError("DERIV_API_TOKEN is not set.")
 
-        payload = {"authorize": config.DERIV_API_TOKEN, "req_id": 1}
+        payload = {"authorize": self._token, "req_id": 1}
         await self._ws.send(json.dumps(payload))
         raw = await asyncio.wait_for(self._ws.recv(), timeout=30)
         msg = json.loads(raw)
