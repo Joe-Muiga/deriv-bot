@@ -127,6 +127,10 @@ if __name__ == "__main__":
                     f"follower token {'SET ✓' if os.environ.get('DERIV_FOLLOWER_TOKEN') else 'missing'}"
                     f" | dashboard: /sf/view")
 
+    logger.info(f"  Redeploy leg : {config.REDEPLOY_INTERVAL_SECS}s strict, never-ending | "
+                f"fixed cycle {'ON' if config.FIXED_CYCLE_ENABLED else 'OFF (no cooldowns)'} | "
+                f"gate {config.GATE_MODE} | ML {'on' if config.ML_ENABLED else 'off'}")
+
     # 1. Start keep-alive pinger — ALWAYS, in every phase. This (plus the
     #    Flask app started at the bottom) is what keeps Render's health
     #    checks green during a strategy-switch cooldown even though the
