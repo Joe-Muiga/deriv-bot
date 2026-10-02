@@ -118,3 +118,62 @@ def on_pause_entered() -> dict:
     except Exception as exc:
         logger.warning(f"PROFIT-PAUSE: guard reset failed: {exc}")
     return {ENV_KEY: "0"}
+
+
+# ── Oct 2026 (Scout+Follower): per-instance version for the Follower ──────────
+# The module-level functions above stay exactly as they were (the Scout /
+# legacy bot path). This class holds the SAME rule with its own state, no
+# Render redeploy and no env-var writes of its own: the Follower pauses by
+# simply not opening new trades until `pause_until`.
+class ProfitPause:
+    def __init__(self, min_minutes: Optional[float] = None,
+                 max_minutes: Optional[float] = None,
+                 target_basis: Optional[str] = None):
+        self.min_minutes = float(min_minutes if min_minutes is not None else
+                                 getattr(config, "PROFIT_PAUSE_MIN_MINUTES",
+                                         balance_tiers.PAUSE_MIN_MINUTES))
+        self.max_minutes = float(max_minutes if max_minutes is not None else
+                                 getattr(config, "PROFIT_PAUSE_MAX_MINUTES",
+                                         balance_tiers.PAUSE_MAX_MINUTES))
+        self.target_basis = str(target_basis or getattr(
+            config, "PROFIT_PAUSE_TARGET_BASIS", "start")).lower()
+        self.start_balance: Optional[float] = None
+        self.pause_until: float = 0.0
+
+    def on_boot(self, balance: float) -> None:
+        if self.start_balance is None:
+            self.start_balance = float(balance)
+
+    def paused(self, now: float) -> bool:
+        return now < self.pause_until
+
+    def seconds_left(self, now: float) -> float:
+        return max(0.0, self.pause_until - now)
+
+    def check(self, balance: float, now: float) -> Optional[float]:
+        """Call after each confirmed settle with SETTLED equity. Returns the
+        pause length in minutes the one time the target is hit, else None."""
+        if not _enabled() or self.start_balance is None or balance <= 0:
+            return None
+        if now < self.pause_until:
+            return None
+        ref = self.start_balance if self.target_basis == "start" else balance
+        target = balance_tiers.profit_target_for_balance(ref)
+        if balance - self.start_balance < target:
+            return None
+        lo, hi = sorted((self.min_minutes, self.max_minutes))
+        mins = random.uniform(lo, hi)
+        self.pause_until = now + mins * 60
+        self.start_balance = None        # fresh session starts after the pause
+        return mins
+
+    def export(self) -> dict:
+        return {"start": self.start_balance, "until": self.pause_until}
+
+    def load(self, d: dict) -> None:
+        try:
+            self.start_balance = (None if d.get("start") is None
+                                  else float(d["start"]))
+            self.pause_until = float(d.get("until", 0.0))
+        except Exception:
+            pass
