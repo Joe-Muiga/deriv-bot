@@ -60,6 +60,22 @@ def _push_dashboard_flag(**kwargs) -> None:
         pass
 
 
+_handoff_until: float = 0.0
+
+
+def interval_secs() -> float:
+    """Oct 2026: strict leg length. REDEPLOY_INTERVAL_SECS wins over the old hours setting."""
+    s = getattr(config, "REDEPLOY_INTERVAL_SECS", 0)
+    return float(s) if s else float(getattr(config, "REDEPLOY_INTERVAL_HOURS", 3)) * 3600
+
+
+def in_handoff() -> bool:
+    """True from the moment the deploy hook fires until the new instance replaces
+    this one (or REDEPLOY_HANDOFF_MAX_SECS passes). bot_engine takes no new
+    entries meanwhile so two instances never trade the same token at once."""
+    return time.time() < _handoff_until
+
+
 def is_redeploy_pending() -> bool:
     """True once the rolling REDEPLOY_INTERVAL_HOURS timer has fired and a
     redeploy is due but hasn't been confirmed-triggered yet."""
@@ -81,18 +97,19 @@ async def run_scheduler():
 
     while True:
         try:
-            interval_hours = getattr(config, "REDEPLOY_INTERVAL_HOURS", 3)
-            interval_secs = interval_hours * 3600
+            interval_secs_ = interval_secs()
+            interval_hours = interval_secs_ / 3600
+            interval_secs_v = interval_secs_
             _last_scheduled_at = time.time()
 
             next_fire = datetime.fromtimestamp(
-                _last_scheduled_at + interval_secs, tz=timezone.utc
+                _last_scheduled_at + interval_secs_v, tz=timezone.utc
             )
             logger.info(
                 f"REDEPLOY SCHEDULER: next redeploy at {next_fire.isoformat()} "
-                f"({interval_hours}h from now, rolling) — sleeping {interval_secs:.0f}s"
+                f"({interval_secs_v:.0f}s from now, rolling) — sleeping {interval_secs_v:.0f}s"
             )
-            await asyncio.sleep(interval_secs)
+            await asyncio.sleep(interval_secs_v)
 
             _pending = True
             logger.warning(
@@ -178,7 +195,7 @@ def trigger_redeploy() -> None:
         return
 
     async def _fire():
-        global _last_confirmed_redeploy_at
+        global _last_confirmed_redeploy_at, _handoff_until
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(hook_url, timeout=aiohttp.ClientTimeout(total=20)) as resp:
@@ -186,6 +203,9 @@ def trigger_redeploy() -> None:
                     if resp.status in (200, 201, 202):
                         logger.info(f"REDEPLOY HOOK FIRED: HTTP {resp.status}")
                         _last_confirmed_redeploy_at = time.time()
+                        if getattr(config, "REDEPLOY_HANDOFF_PAUSE", True):
+                            _handoff_until = time.time() + float(
+                                getattr(config, "REDEPLOY_HANDOFF_MAX_SECS", 240))
                         _push_dashboard_flag(
                             redeploy_hook_missing=False,
                             redeploy_watchdog_overdue=False,
@@ -242,11 +262,11 @@ async def _watchdog_loop():
     while True:
         try:
             await asyncio.sleep(check_interval_secs)
-            interval_hours = getattr(config, "REDEPLOY_INTERVAL_HOURS", 3)
-            interval_secs = interval_hours * 3600
+            interval_hours = interval_secs() / 3600
+            interval_secs_w = interval_secs()
             baseline = _last_confirmed_redeploy_at or _process_start_time
             uptime_secs = time.time() - baseline
-            overdue_by = uptime_secs - interval_secs
+            overdue_by = uptime_secs - interval_secs_w
 
             if overdue_by > grace_secs:
                 now = time.time()
