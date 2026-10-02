@@ -21,6 +21,7 @@ import json
 import logging
 import os
 import time
+from collections import deque
 from typing import Optional
 
 import config
@@ -52,6 +53,8 @@ class Hub:
         self.scout_buckets: dict = {}        # hour_epoch -> [n, wins, pnl, sumR]
         self.scout_total = {"n": 0, "wins": 0, "pnl": 0.0}
         self.started = clock()
+        self.recent: deque = deque(maxlen=30)     # last settled trades (both sides)
+        self.equity: deque = deque(maxlen=120)    # [ts, follower_balance, baseline_balance]
         self._load_env()
         try:
             from follower import Follower
@@ -67,6 +70,7 @@ class Hub:
         if self.follower is not None:
             bus.subscribe("entry", self.follower.on_entry)
             bus.subscribe("result", self.follower.on_scout_result)
+            bus.subscribe("result", self._equity_tick)   # after the follower updated baseline
         logger.warning(
             f"SCOUT+FOLLOWER enabled | follower mode="
             f"{self.follower.mode if self.follower else 'DISABLED'} | gate window="
@@ -77,6 +81,14 @@ class Hub:
     def write_event(self, ev: dict) -> None:
         """Append-only settled-event file + the same row in the log stream
         (Render's disk is wiped on redeploy; logs are the durable copy)."""
+        try:
+            self.recent.append([int(ev.get("ts", self._clock())), ev.get("who", "?")[0],
+                                ev.get("symbol"), ev.get("contract_type"), ev.get("barrier"),
+                                ev.get("stake"), ev.get("pnl"), ev.get("won")])
+            if ev.get("who") == "follower":
+                self._equity_tick(ev)
+        except Exception:
+            pass
         try:
             line = json.dumps(ev, separators=(",", ":"), default=str)
             logger.info("SF_EVENT," + line)
@@ -105,11 +117,18 @@ class Hub:
             "ts", "contract_id", "symbol", "strategy", "contract_type", "barrier",
             "duration", "stake", "payout", "pnl", "won")}})
 
+    def _equity_tick(self, ev=None) -> None:
+        f = self.follower
+        if f is not None:
+            self.equity.append([int(self._clock()), round(f.balance, 2),
+                                round(f.baseline_balance, 2)])
+
     # ── persistence ─────────────────────────────────────────────────────
     def export_env(self) -> dict:
         out = {"SF_GATE_STATE": json.dumps(self.gate.export(), separators=(",", ":")),
-               "SF_SCOUT_STATS": json.dumps({"b": self.scout_buckets,
-                                             "t": self.scout_total}, separators=(",", ":"))}
+               "SF_SCOUT_STATS": json.dumps({"b": self.scout_buckets, "t": self.scout_total,
+                                             "eq": list(self.equity), "rc": list(self.recent)},
+                                            separators=(",", ":"))}
         if self.follower is not None:
             out["SF_FOLLOWER_STATE"] = json.dumps(self.follower.export(),
                                                   separators=(",", ":"))
@@ -127,6 +146,8 @@ class Hub:
     def _load_stats(self, d: dict) -> None:
         self.scout_buckets = {str(k): v for k, v in (d.get("b") or {}).items()}
         self.scout_total.update(d.get("t") or {})
+        self.equity.extend(d.get("eq") or [])
+        self.recent.extend(d.get("rc") or [])
 
     def _load_follower_env(self) -> None:
         raw = os.environ.get("SF_FOLLOWER_STATE", "")
@@ -188,7 +209,22 @@ class Hub:
         return {"trades": n, "wins": w, "losses": n - w, "pnl": round(pnl, 2)}
 
     def summary(self) -> dict:
-        return {"ts": int(self._clock()), "gate": self.gate.state(),
+        try:
+            import fixed_cycle
+            fc = fixed_cycle.load_state()
+        except Exception:
+            fc = {"phase": "unknown", "cooldown_until": 0}
+        cfg = {k: getattr(config, k, None) for k in (
+            "EDGE_GATE_WINDOW", "EDGE_GATE_MIN_TRADES", "EDGE_GATE_OPEN_PROB",
+            "EDGE_GATE_CLOSE_PROB", "EDGE_GATE_CLOSE_LOSS_RUN", "EDGE_GATE_MARGIN",
+            "EDGE_PAYOUT_MULTIPLE", "FOLLOWER_MAX_OPEN", "FOLLOWER_MAX_EXPOSURE_PCT",
+            "FOLLOWER_MAX_TRADES_PER_HOUR", "FOLLOWER_START_BALANCE",
+            "FIXED_CYCLE_LEG_MINUTES")}
+        return {"ts": int(self._clock()), "phase": fc.get("phase"),
+                "cooldown_until": fc.get("cooldown_until", 0), "config": cfg,
+                "equity": list(self.equity), "recent": list(self.recent)[::-1],
+                "gate_history": [[int(t), st, r] for t, st, r in self.gate.history][::-1],
+                "gate": self.gate.state(),
                 "scout_1h": self._window_stats(1), "scout_24h": self._window_stats(24),
                 "scout_total": self.scout_total,
                 "follower": self.follower.state() if self.follower else
