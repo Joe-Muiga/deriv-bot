@@ -74,6 +74,8 @@ class Follower:
         self._factory = client_factory
         self._write = writer or (lambda ev: None)
         self.client = None
+        self.ml = None           # online_learner.OnlineLearner (set by the hub)
+        self.tuner = None        # auto_tuner.AutoTuner (set by the hub)
 
         self.balance = float(start_balance if start_balance is not None
                              else _cfg("FOLLOWER_START_BALANCE", 10000.0))
@@ -99,6 +101,7 @@ class Follower:
             "taken": 0, "wins": 0, "losses": 0, "pnl": 0.0,
             "skipped_gate": 0, "skipped_guard": 0, "skipped_pause": 0,
             "skipped_limits": 0, "skipped_stale": 0, "skipped_unsupported": 0,
+            "skipped_ml": 0, "skipped_noedge": 0,
             "place_failed": 0,
             "base_trades": 0, "base_wins": 0, "base_pnl": 0.0,
             "gate_on_n": 0, "gate_on_w": 0, "gate_off_n": 0, "gate_off_w": 0,
@@ -161,9 +164,23 @@ class Follower:
             self.c["skipped_guard"] += 1
             logger.info(f"FOLLOWER: guard blocks entry — {why}")
             return
+        # Edge brake: the auto-tuner's honest verdict says the gated follower is
+        # losing on the newest data -> stand aside until that clears.
+        if (getattr(self.tuner, "no_edge", False) and bool(_cfg("REGIME_EDGE_BRAKE", True))):
+            self.c["skipped_noedge"] += 1
+            return
+        # ML veto (only once trained AND proven better than baseline out-of-sample)
+        if self.ml is not None:
+            ok_ml, why_ml = self.ml.allow(cid)
+            if not ok_ml:
+                self.c["skipped_ml"] += 1
+                logger.info(f"FOLLOWER: ML veto — {why_ml}")
+                return
         stake = self.stake()
         max_open = int(_cfg("FOLLOWER_MAX_OPEN", 3))
-        ceiling = float(_cfg("FOLLOWER_MAX_EXPOSURE_PCT", 0.10)) * self.balance
+        # small-account fix: 10% of a $2 balance is $0.21 — below the $0.35 minimum
+        # stake, which blocked EVERY entry. Always allow at least one stake open.
+        ceiling = max(float(_cfg("FOLLOWER_MAX_EXPOSURE_PCT", 0.10)) * self.balance, stake)
         if (self.open_count() >= max_open
                 or self.open_stake() + stake > ceiling
                 or stake > float(_cfg("MAX_STAKE", 2000.0))):
