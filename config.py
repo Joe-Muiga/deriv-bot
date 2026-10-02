@@ -1233,7 +1233,8 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 4 / 60   # Oct 2026: 4-min Scout leg (was 5). 4 minutes, expressed as hours since
+REDEPLOY_INTERVAL_SECS  = 225      # Oct 2026: STRICT 3 min 45 s Scout leg, never-ending.
+REDEPLOY_INTERVAL_HOURS = REDEPLOY_INTERVAL_SECS / 3600   # (3m45s) was 4 min. 4-min Scout leg (was 5). 4 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1676,6 +1677,8 @@ DONKEY_CYCLE_START = "ORIGINAL"        # kept only as _donkey_active_
 #      back into a fresh leg 1.
 #   3. Repeat forever. Nothing — not daily drawdown, not profit, not
 #      time of day — can skip, shorten, lengthen, or pause any of this.
+FIXED_CYCLE_ENABLED = False   # Oct 2026: fixed leg->cooldown cycle is OFF. Scout just redeploys
+                               # every REDEPLOY_INTERVAL_SECS and keeps trading, forever.
 FIXED_CYCLE_LEG_MINUTES          = 4     # Oct 2026: was 5. length of leg 1 — kept equal
                                           # to REDEPLOY_INTERVAL_HOURS
                                           # (5 min) above; change both
@@ -1899,9 +1902,9 @@ EDGE_GATE_PRIOR_STRENGTH   = 2.0    # Beta prior pseudo-trades, centred on break
 #          FOLLOWER_LIVE_CONFIRM == "I_UNDERSTAND_REAL_MONEY". Not for this phase.
 FOLLOWER_MODE              = os.environ.get("FOLLOWER_MODE", "shadow").strip().lower()
 FOLLOWER_LIVE_CONFIRM      = os.environ.get("FOLLOWER_LIVE_CONFIRM", "")
-FOLLOWER_START_BALANCE     = 2.0
+FOLLOWER_START_BALANCE     = float(os.environ.get("FOLLOWER_START_BALANCE", "2.08"))
 FOLLOWER_MAX_OPEN          = 3      # concurrent open follower contracts
-FOLLOWER_MAX_EXPOSURE_PCT  = 0.50   # open stakes <= this share of virtual balance
+FOLLOWER_MAX_EXPOSURE_PCT  = 0.10   # open stakes <= this share of virtual balance
 FOLLOWER_MAX_TRADES_PER_HOUR = 60
 FOLLOWER_MAX_ENTRY_AGE_SECS  = 8    # skip an entry event older than this
 
@@ -1909,3 +1912,66 @@ FOLLOWER_MAX_ENTRY_AGE_SECS  = 8    # skip an entry event older than this
 SF_REPORT_EVERY_SECS       = 120
 SF_EVENTS_FILE             = "sf_events.jsonl"    # append-only settled events
 SF_SUMMARY_FILE            = "sf_summary.json"
+
+
+# ── Oct 2026: strict redeploy handoff ───────────────────────────────────
+# After the deploy hook fires, the old instance takes no new entries (so the old
+# and new instance never trade the same token at once). If the new deploy has not
+# replaced it within this many seconds, it resumes trading.
+REDEPLOY_HANDOFF_PAUSE     = True
+REDEPLOY_HANDOFF_MAX_SECS  = 240
+
+# ── Oct 2026: regime gate (replaces the slow Beta edge gate) ────────────
+GATE_MODE                  = os.environ.get("GATE_MODE", "regime")   # "regime" | "edge"
+REGIME_FAST                = 6      # results in the fast window
+REGIME_SLOW                = 12     # results in the slow window
+REGIME_ENTRY_WINS          = 4      # wins needed in the fast window to go HOT
+REGIME_ENTRY_WR_SLOW       = 0.55   # and slow-window win rate at least this
+REGIME_EXIT_LOSS_RUN       = 2      # go COLD after this many straight losses
+REGIME_EXIT_WINS           = 3      # ...or when fast-window wins fall to this
+REGIME_EXIT_DD_R           = 2.0    # ...or equity falls this many R below its peak
+REGIME_WARMUP              = 12     # results needed before the first HOT
+REGIME_MIN_CLOSED_RESULTS  = 2      # results to wait after a close (anti-whipsaw)
+REGIME_STALE_SECS          = 150    # no Scout result this long -> COLD
+REGIME_RELOAD_MAX_GAP_SECS = 300    # restored OPEN gate older than this -> COLD
+REGIME_SETTLE_LAG          = 1      # tuner: entries are placed before the last N settles
+REGIME_EDGE_BRAKE          = True   # follower stands aside while the tuner says no_edge
+
+# ── Oct 2026: ML (online learner + auto-tuner) ──────────────────────────
+ML_ENABLED                 = True
+ML_FILTER_ENABLED          = True   # learner may veto weak entries (only once trained AND useful)
+ML_FILTER_MARGIN           = 0.0
+ML_MIN_SAMPLES             = 150
+ML_USEFUL_MIN_SCORED       = 150
+ML_MIN_LOGLOSS_GAIN        = 0.002
+ML_MIN_LIFT                = 0.03
+ML_LR                      = 0.01   # swept on simulated data: higher rates were WORSE than baseline (SGD noise)
+ML_LR_MIN                  = 0.003
+ML_L2                      = 0.002
+ML_ENTITY_ALPHA            = 0.08
+ML_TUNER_ENABLED           = True
+ML_TUNE_EVERY              = 40     # new Scout results between tuning runs (was 60)
+ML_TUNE_MIN_RESULTS        = 100
+ML_TUNE_MIN_TAKEN          = 20
+ML_TUNE_MIN_GAIN_R         = 1.0
+ML_TUNE_FLIP_PENALTY       = 0.1
+ML_NO_EDGE_MIN_TAKEN       = 20
+
+# ── Oct 2026: HMM regime engine (fast, time-aware hot/cold tracking) ────────
+# "hmm"   = Bayesian two-state tracker: P(hot) updated per result, decayed by elapsed time,
+#           p_hot / p_cold / session length fitted by maximum likelihood, trades only while the
+#           forecast win probability beats payout breakeven by a margin.
+# "rules" = the previous counting rules (REGIME_* above). Set REGIME_ENGINE=rules to roll back.
+REGIME_ENGINE              = os.environ.get("REGIME_ENGINE", "hmm")
+HMM_ENTER_MARGIN           = 0.03   # open when forecast win prob >= breakeven + this (tuner moves it)
+HMM_EXIT_MARGIN            = 0.0    # close when it drops below breakeven + this (kept <= enter-0.02)
+HMM_EXIT_DD_R              = 3.0    # backstop: close if equity falls this many R from its peak
+HMM_WARMUP                 = 40     # results before the first fit
+HMM_REFIT_EVERY            = 20     # results between maximum-likelihood refits
+HMM_FIT_WINDOW             = 400    # results the fit looks at
+HMM_LR_MIN                 = 5.0    # 2*dLogLik vs "no regimes" needed to call the zig-zag real
+HMM_MIN_SEP                = 0.12   # p_hot - p_cold must be at least this
+HMM_PRIOR_HOT              = 0.62
+HMM_PRIOR_COLD             = 0.36
+HMM_STALE_SECS             = 150
+
