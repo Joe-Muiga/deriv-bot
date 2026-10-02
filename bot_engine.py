@@ -51,6 +51,7 @@ import config
 import exit_engine
 import restart_scheduler
 import fixed_cycle
+import scout_follower as _sf   # Oct 2026: Scout+Follower hooks (inert unless enabled)
 from deriv_client import is_confirmed_close
 import symbols as sym_module
 import strategy_stats
@@ -391,6 +392,14 @@ class BotEngine:
         self._global_consecutive_losses: int              = 0
         self._loss_streak_paused_until:  float             = 0.0
         self._donkey_guard = get_guard()  # session stop/take-profit, streak pause, edge log
+        # Oct 2026 Scout+Follower: in Scout data mode the guard's stop-loss /
+        # loss-streak pauses are bypassed (only an hourly entry cap remains) so
+        # the Scout keeps collecting evidence for the edge gate. Off = unchanged.
+        if _sf.scout_data_mode():
+            self._donkey_guard.cap_only = True
+            self._donkey_guard._cap_override = int(
+                getattr(config, "SCOUT_MAX_TRADES_PER_HOUR", 400))
+        self._sf_hub = _sf.get_hub()   # None when SCOUT_FOLLOWER_ENABLED is off
 
         # ── Ensemble voting: per-symbol rolling history of (strategy,
         #    direction, timestamp) tuples for every signal produced by
@@ -628,6 +637,11 @@ class BotEngine:
         except Exception:
             pass
 
+        if self._sf_hub is not None:
+            try:
+                await self._sf_hub.start()
+            except Exception as exc:
+                logger.error(f"SCOUT+FOLLOWER start failed (Scout continues): {exc}")
         dash_task     = asyncio.create_task(self._dashboard_loop())
         settle_task   = asyncio.create_task(self._settle_loop())
         degraded_task = asyncio.create_task(self._degraded_retry_loop())
@@ -645,6 +659,8 @@ class BotEngine:
         except Exception as exc:
             logger.critical(f"Main loop crashed: {exc}\n{traceback.format_exc()}")
         finally:
+            if self._sf_hub is not None:
+                self._sf_hub.stop()
             dash_task.cancel()
             settle_task.cancel()
             degraded_task.cancel()
@@ -2317,6 +2333,31 @@ class BotEngine:
         }
         self._contract_open_times[cid] = time.time()
 
+        # ── Scout+Follower (Oct 2026): publish the entry event. Inert unless
+        #    SCOUT_FOLLOWER_ENABLED. Never allowed to affect trading.
+        if self._sf_hub is not None:
+            try:
+                _kind = ("DIGIT" if getattr(sig, "contract_kind", "RISE_FALL") == "DIGIT"
+                         else "MULT" if symbol in getattr(config, "MULTIPLIER_SYMBOLS", set())
+                         else "RISE_FALL")
+                _sfd = {
+                    "contract_id": cid, "symbol": symbol, "kind": _kind,
+                    "strategy": getattr(sig, "strategy", "unknown"),
+                    "contract_type": (str(getattr(sig, "match_type", "")) if _kind == "DIGIT"
+                                      else "MULT" if _kind == "MULT"
+                                      else ("CALL" if direction == "LONG" else "PUT")),
+                    "barrier": getattr(sig, "digit", None) if _kind == "DIGIT" else None,
+                    "duration": ("5t" if _kind == "DIGIT" else
+                                 f"{getattr(config, 'TRADE_DURATION', 5)}"
+                                 f"{getattr(config, 'TRADE_DURATION_UNIT', 'm')}"),
+                    "direction": direction,
+                    "signal_score": float(getattr(sig, "score", 0.0) or 0.0),
+                }
+                self._open_contracts[cid]["sf"] = _sfd
+                _sf.publish_entry(**_sfd)
+            except Exception as exc:
+                logger.warning(f"SCOUT+FOLLOWER entry publish failed: {exc}")
+
         # ── Adaptive Exit Engine — tighter-cadence per-contract monitor for
         #    Multiplier contracts only (open-ended risk; Rise/Fall keeps its
         #    existing fixed-expiry handling untouched). Purely additive: does
@@ -2465,6 +2506,18 @@ class BotEngine:
             self._confirmed_daily_loss += abs(pnl)
         self._check_confirmed_loss_limit()
 
+        # Scout+Follower (Oct 2026): publish ONLY confirmed settlements.
+        if self._sf_hub is not None and info.get("sf") and is_confirmed_close(poc):
+            try:
+                _e = dict(info["sf"])
+                _copyable = _e.get("kind") in ("DIGIT", "RISE_FALL")
+                _e.update({"stake": stake, "payout": payout if _copyable else 0.0,
+                           "pnl": pnl, "won": won, "confirmed": True,
+                           "gate_eligible": _copyable})
+                _sf.publish_result(**_e)
+            except Exception as exc:
+                logger.warning(f"SCOUT+FOLLOWER result publish failed: {exc}")
+
         # Donkey guard: edge log (real payout, breakeven) + session limits.
         if str(strategy).startswith("DONKEY"):
             try:
@@ -2490,7 +2543,8 @@ class BotEngine:
         else:
             self._global_consecutive_losses += 1
             limit = getattr(config, "GLOBAL_CONSECUTIVE_LOSS_LIMIT", 4)
-            if self._global_consecutive_losses >= limit:
+            if (self._global_consecutive_losses >= limit
+                    and not _sf.scout_data_mode()):
                 pause_mins = getattr(config, "GLOBAL_CONSECUTIVE_LOSS_PAUSE_MINS", 45)
                 self._loss_streak_paused_until = time.time() + pause_mins * 60
                 logger.warning(
@@ -2566,12 +2620,16 @@ class BotEngine:
                 # Profit-target pause (balance_tiers.py table): requests a
                 # random 11-18 min cooldown; the drain block below handles it.
                 try:
+                    if _sf.scout_data_mode():
+                        raise StopIteration   # Scout data mode: no profit pause
                     import profit_pause
                     # Open contracts have their stake deducted from the live
                     # balance; add it back so only SETTLED results count.
                     _tied_up = sum(float(i.get("stake", 0) or 0)
                                    for i in self._open_contracts.values())
                     profit_pause.check(self.client.balance + _tied_up)
+                except StopIteration:
+                    pass
                 except Exception as exc:
                     logger.warning(f"PROFIT-PAUSE: check failed: {exc}")
 
@@ -2696,9 +2754,9 @@ class BotEngine:
                         f"open contract(s) before disconnecting")
 
                     drain_started = time.time()
-                    while self._open_contracts:
+                    while self._open_contracts or _sf.follower_busy():
                         await self._handle_orphans()
-                        if not self._open_contracts:
+                        if not (self._open_contracts or _sf.follower_busy()):
                             break
 
                         drain_elapsed = time.time() - drain_started
@@ -2724,7 +2782,7 @@ class BotEngine:
                             f"actively confirming closes")
                         await asyncio.sleep(5)
 
-                    if not self._open_contracts:
+                    if not (self._open_contracts or _sf.follower_busy()):
                         # enter_cooldown_now() draws + persists a fresh
                         # random cooldown length itself (see fixed_cycle.
                         # py) and logs it there; just report the
