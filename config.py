@@ -6,7 +6,9 @@ DEBUG     = False
 VERSION   = "1.1.0"
 
 # ── DERIV API ─────────────────────────────────────────────────
-DERIV_API_TOKEN   = os.environ.get("DERIV_API_TOKEN", "")
+# Oct 2026 (Scout+Follower): DERIV_SCOUT_TOKEN, when set, is the Scout's token;
+# otherwise the original DERIV_API_TOKEN is used exactly as before.
+DERIV_API_TOKEN   = os.environ.get("DERIV_SCOUT_TOKEN") or os.environ.get("DERIV_API_TOKEN", "")
 DERIV_APP_ID      = os.environ.get("DERIV_APP_ID", "1089")
 # "real" or "demo" — picks which Options account _fetch_otp_ws_url() mints
 # an OTP for (deriv_client.py). Was previously never read from env, so it
@@ -1231,7 +1233,7 @@ SETTLE_WAIT_SECS = 15
 # Brief v2, Fix G; widened to 4x/day on request — see restart_scheduler.py's
 # _next_scheduled_fire().
 REDEPLOY_TIMEZONE = "Africa/Nairobi"
-REDEPLOY_INTERVAL_HOURS = 5 / 60   # 5 minutes, expressed as hours since
+REDEPLOY_INTERVAL_HOURS = 4 / 60   # Oct 2026: 4-min Scout leg (was 5). 4 minutes, expressed as hours since
                                       # that's the unit restart_scheduler.py
                                       # expects (interval_secs = hours*3600).
                                       # Was 13.7 min, before that 1h, 3h.
@@ -1674,7 +1676,7 @@ DONKEY_CYCLE_START = "ORIGINAL"        # kept only as _donkey_active_
 #      back into a fresh leg 1.
 #   3. Repeat forever. Nothing — not daily drawdown, not profit, not
 #      time of day — can skip, shorten, lengthen, or pause any of this.
-FIXED_CYCLE_LEG_MINUTES          = 5     # length of leg 1 — kept equal
+FIXED_CYCLE_LEG_MINUTES          = 4     # Oct 2026: was 5. length of leg 1 — kept equal
                                           # to REDEPLOY_INTERVAL_HOURS
                                           # (5 min) above; change both
                                           # together if you ever want a
@@ -1854,3 +1856,56 @@ DONKEY_GUARD_CONSEC_LOSS_PAUSE_MINS      = 30   # fallback only
 DONKEY_GUARD_CONSEC_LOSS_PAUSE_MIN_MINS  = 11   # loss-streak pause: random 11-18 min (was fixed 30)
 DONKEY_GUARD_CONSEC_LOSS_PAUSE_MAX_MINS  = 18
 DONKEY_GUARD_MAX_TRADES_PER_HOUR         = 60   # 0 disables the cap
+
+
+# ════════════════════════════════════════════════════════════════════════
+# SCOUT + FOLLOWER (Oct 2026, handoff_prompt_scout_follower.md)
+# ════════════════════════════════════════════════════════════════════════
+# Everything below is OFF by default: with SCOUT_FOLLOWER_ENABLED = False the
+# bot behaves exactly as before. Tokens come from env vars only:
+#   DERIV_SCOUT_TOKEN    (falls back to DERIV_API_TOKEN) — the Scout, demo
+#   DERIV_FOLLOWER_TOKEN                                 — the Follower
+SCOUT_FOLLOWER_ENABLED = os.environ.get("SCOUT_FOLLOWER_ENABLED", "0").strip() in ("1", "true", "True")
+
+# Scout = the existing engine, kept trading so the gate always has fresh
+# evidence. In data mode the Scout's profit pause, loss-streak/stop-loss
+# guard pauses and the 4-loss global pause are OFF. Kept as safety nets:
+# the daily loss limit and an hourly entry cap (below).
+SCOUT_DATA_MODE            = True
+SCOUT_MAX_TRADES_PER_HOUR  = 400
+
+# Payout multiple (stake 100 -> returns 212). NEVER hard-coded elsewhere.
+# Break-even win rate = 1 / payout. Where the real per-contract payout is
+# known (from settled wins) the gate uses that instead.
+EDGE_PAYOUT_MULTIPLE       = 2.12
+
+# ── Edge gate (rule-based, no ML) ───────────────────────────────────────
+EDGE_GATE_WINDOW           = 50     # last N confirmed Scout results (sweep: 50 beats 30)
+EDGE_GATE_MIN_TRADES       = 10     # handoff reply: 10 (was 40 in the brief)
+EDGE_GATE_MARGIN           = 0.02   # required edge over break-even
+EDGE_GATE_OPEN_PROB        = 0.97   # was 0.90 in the brief. With min_trades=10, 0.90 opened on a
+                                    # NO-edge 47% stream in 85% of 300-trade runs; 0.97 -> 29%.
+EDGE_GATE_CLOSE_PROB       = 0.60   # close when it falls below this
+EDGE_GATE_CLOSE_LOSS_RUN   = 5      # ...or the last K results are all losses
+EDGE_GATE_MIN_OPEN_SECS    = 180    # hysteresis: stay open at least this long
+EDGE_GATE_MIN_CLOSED_SECS  = 180    # ...and stay closed at least this long
+EDGE_GATE_DECAY_HALFLIFE   = 0      # trades; 0 = no time decay
+EDGE_GATE_PRIOR_STRENGTH   = 2.0    # Beta prior pseudo-trades, centred on break-even
+
+# ── Follower ────────────────────────────────────────────────────────────
+# shadow = log what it WOULD trade, place nothing (default)
+# demo   = place on the Follower demo token, virtual balance
+# live   = real token, REAL balance. Refuses to start unless
+#          FOLLOWER_LIVE_CONFIRM == "I_UNDERSTAND_REAL_MONEY". Not for this phase.
+FOLLOWER_MODE              = os.environ.get("FOLLOWER_MODE", "shadow").strip().lower()
+FOLLOWER_LIVE_CONFIRM      = os.environ.get("FOLLOWER_LIVE_CONFIRM", "")
+FOLLOWER_START_BALANCE     = 10000.0
+FOLLOWER_MAX_OPEN          = 3      # concurrent open follower contracts
+FOLLOWER_MAX_EXPOSURE_PCT  = 0.10   # open stakes <= this share of virtual balance
+FOLLOWER_MAX_TRADES_PER_HOUR = 60
+FOLLOWER_MAX_ENTRY_AGE_SECS  = 8    # skip an entry event older than this
+
+# ── Reporting ───────────────────────────────────────────────────────────
+SF_REPORT_EVERY_SECS       = 120
+SF_EVENTS_FILE             = "sf_events.jsonl"    # append-only settled events
+SF_SUMMARY_FILE            = "sf_summary.json"
