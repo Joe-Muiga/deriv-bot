@@ -43,7 +43,19 @@ def _cfg(name: str, default):
 
 
 class DonkeyGuard:
-    def __init__(self, edge_log_path: str = EDGE_LOG_PATH):
+    def __init__(self, edge_log_path: str = EDGE_LOG_PATH,
+                 state_env_key: str = "DONKEY_GUARD_STATE",
+                 cap_only: bool = False,
+                 cap_override: Optional[int] = None,
+                 label: str = "DONKEY GUARD"):
+        # Oct 2026 (Scout+Follower): per-instance options so the Follower gets
+        # its OWN guard (own env key / log), and the Scout's guard can run in
+        # "cap_only" mode (hourly cap only; no stop-loss/streak pauses) so it
+        # keeps collecting evidence. Defaults = old behaviour exactly.
+        self._state_env_key = state_env_key
+        self.cap_only = cap_only
+        self._cap_override = cap_override
+        self._label = label
         self._lock = threading.Lock()
         self._file_lock = threading.Lock()
         self._path = edge_log_path
@@ -72,7 +84,7 @@ class DonkeyGuard:
             })
 
     def load_from_env(self) -> None:
-        raw = os.environ.get("DONKEY_GUARD_STATE", "")
+        raw = os.environ.get(self._state_env_key, "")
         if not raw:
             return
         try:
@@ -110,14 +122,17 @@ class DonkeyGuard:
             return True, ""
         now = time.time() if now is None else now
         with self._lock:
-            if now < self._halt_until:
+            if self.cap_only:
+                pass   # Scout data mode: only the hourly cap below applies
+            elif now < self._halt_until:
                 mins = (self._halt_until - now) / 60
                 return False, f"{self._halt_reason} — halted {mins:.0f}min more"
-            if now < self._pause_until:
+            elif now < self._pause_until:
                 mins = (self._pause_until - now) / 60
                 return False, f"loss-streak pause — {mins:.1f}min more"
 
-            cap = int(_cfg("DONKEY_GUARD_MAX_TRADES_PER_HOUR", 60))
+            cap = int(self._cap_override if self._cap_override is not None
+                      else _cfg("DONKEY_GUARD_MAX_TRADES_PER_HOUR", 60))
             while self._trade_times and now - self._trade_times[0] > 3600:
                 self._trade_times.popleft()
             if cap > 0 and len(self._trade_times) >= cap:
@@ -166,7 +181,7 @@ class DonkeyGuard:
         except Exception as exc:  # logging must never break trading
             logger.warning(f"edge log write failed: {exc}")
 
-        if not self.enabled:
+        if not self.enabled or self.cap_only:
             return
         with self._lock:
             if self._session_stake_unit == 0.0 and stake > 0:
