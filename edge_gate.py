@@ -223,7 +223,8 @@ class EdgeGate:
         return {"win": [[int(w), round(r, 4), round(t, 1)] for w, r, t in self._win],
                 "seen": list(self._seen), "open": self._open, "since": self._since,
                 "reason": self._reason, "last": self._last_result_ts,
-                "cycles": self.cycles}
+                "cycles": self.cycles,
+                "hist": [[round(t, 1), st, r] for t, st, r in self.history[-20:]]}
 
     def load(self, d: dict) -> None:
         try:
@@ -236,6 +237,7 @@ class EdgeGate:
             self._reason = str(d.get("reason", "restored"))
             self._last_result_ts = float(d.get("last", 0.0))
             self.cycles = int(d.get("cycles", 0))
+            self.history = [(float(t), str(st), str(r)) for t, st, r in d.get("hist", [])]
             logger.info(f"EDGE GATE: restored {len(self._win)} results, "
                         f"{'OPEN' if self._open else 'CLOSED'}")
         except Exception as exc:
