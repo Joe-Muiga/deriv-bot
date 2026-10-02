@@ -10,6 +10,7 @@ for k in ("SF_GATE_STATE", "SF_FOLLOWER_STATE", "SF_FOLLOWER_GUARD", "SF_SCOUT_S
     os.environ.pop(k, None)
 import config
 config.SCOUT_FOLLOWER_ENABLED = True
+config.REGIME_ENGINE = "rules"   # this file tests hub/follower plumbing with the counting rules; HMM is in test_hmm.py
 import edge_gate as eg
 from edge_gate import EdgeGate
 import follower as fw
@@ -190,7 +191,7 @@ for i in range(12): sf.bus.publish("result", {**res(True, f"r{i}"), "ts": clk()}
 sf.bus.publish("entry", entry("Z1", clk)); asyncio.run(asyncio.sleep(0)) if False else None
 h.follower.balance = 10321.5; h.follower.c["taken"] = 7
 env = h.export_env()
-assert set(env) == {"SF_GATE_STATE", "SF_SCOUT_STATS", "SF_FOLLOWER_STATE"}
+assert set(env) == {"SF_GATE_STATE", "SF_SCOUT_STATS", "SF_FOLLOWER_STATE", "SF_ML_STATE"}
 assert all(len(v) < 8000 for v in env.values()), {k: len(v) for k, v in env.items()}
 for k, v in env.items(): os.environ[k] = v
 h2 = sf.Hub(clock=clk, events_path="/tmp/sf_test_events.jsonl")
@@ -222,3 +223,44 @@ print("profit pause ok (balance %.0f)" % ff.balance)
 # 16. report renders
 print("\n".join(h.report_lines()))
 print("\nALL EDGE/FOLLOWER TESTS PASSED")
+
+# 17. dashboard: JSON endpoint serialises, page served, state survives via env
+import logging
+from flask import Flask
+import sf_dashboard
+sf._hub = None
+for k in ("SF_GATE_STATE", "SF_FOLLOWER_STATE", "SF_FOLLOWER_GUARD", "SF_SCOUT_STATS"):
+    os.environ.pop(k, None)
+hub = sf.get_hub()
+clk0 = time.time()
+for i in range(14):
+    sf.bus.publish("result", {**res(i % 4 != 0, f"d{i}"), "ts": clk0 + i})
+hub.follower.c["taken"] = 3
+app = Flask(__name__); sf_dashboard.register(app); cl = app.test_client()
+j = cl.get("/sf").get_json()
+for key in ("gate", "follower", "equity", "recent", "gate_history", "config", "phase",
+            "scout_1h", "scout_24h"):
+    assert key in j, key
+assert len(j["recent"]) >= 10 and j["gate"]["n"] == 12
+assert "token" not in json.dumps(j).lower()
+page = cl.get("/sf/view")
+assert page.status_code == 200 and b"Scout + Follower" in page.data
+open("/tmp/sf_page.html", "wb").write(page.data)
+print("dashboard endpoints ok; recent=%d equity=%d" % (len(j["recent"]), len(j["equity"])))
+sf._hub = None
+
+# 18. panel is injected into the existing home dashboard
+sf._hub = None
+for k in ("SF_GATE_STATE", "SF_FOLLOWER_STATE", "SF_FOLLOWER_GUARD", "SF_SCOUT_STATS"):
+    os.environ.pop(k, None)
+host = '<html><body><h1>SIFM</h1>{banner}<div class="grid">CARDS</div></body></html>'
+out = sf_dashboard.inject(host)
+assert out.count('id="sf-root"') == 1 and out.index("sf-root") < out.index("CARDS")
+assert "window.__SF=" in out and out.endswith("</body></html>")
+config.SCOUT_FOLLOWER_ENABLED = False
+assert sf_dashboard.inject(host) == host                 # disabled -> untouched
+config.SCOUT_FOLLOWER_ENABLED = True
+assert "sf-root" in sf_dashboard.inject("<html><body>x</body></html>")   # fallback marker
+open("/tmp/injected.html", "w").write(out)
+print("panel injection ok")
+sf._hub = None
