@@ -949,7 +949,7 @@ POPULAR_HURST_MIN_BARS      = 40
 # immediately, no other stake logic runs at all. Set False to restore all
 # of the dynamic sizing below exactly as it was.
 MANUAL_STAKE_MODE   = True
-MANUAL_STAKE_AMOUNT = 0.5
+MANUAL_STAKE_AMOUNT = 0.35
 
 # BALANCE-TIER STAKING (Sep 2026, chat-requested): stake follows the account
 # balance band table in balance_tiers.py ($0.35 up to $8 ... $2,000 from
